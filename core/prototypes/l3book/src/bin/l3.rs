@@ -63,11 +63,7 @@ impl IdMap {
                 break;
             }
             let h = self.home(self.keys[j]);
-            let in_range = if i <= j {
-                i < h && h <= j
-            } else {
-                i < h || h <= j
-            };
+            let in_range = if i <= j { i < h && h <= j } else { i < h || h <= j };
             if !in_range {
                 self.keys[i] = self.keys[j];
                 self.vals[i] = self.vals[j];
@@ -91,17 +87,7 @@ struct Book {
 }
 impl Book {
     fn new(cap: usize) -> Self {
-        let mut slab = vec![
-            Order {
-                id: 0,
-                qty: 0,
-                price: 0,
-                side: 0,
-                prev: NIL,
-                next: NIL
-            };
-            cap
-        ];
+        let mut slab = vec![Order { id: 0, qty: 0, price: 0, side: 0, prev: NIL, next: NIL }; cap];
         for i in 0..cap {
             slab[i].next = if i + 1 < cap { (i + 1) as u32 } else { NIL };
         } // free list threaded through `next`
@@ -135,14 +121,7 @@ impl Book {
         self.live += 1;
         let p = price as usize;
         let t = self.level_tail[p];
-        self.slab[s as usize] = Order {
-            id,
-            qty,
-            price,
-            side,
-            prev: t,
-            next: NIL,
-        };
+        self.slab[s as usize] = Order { id, qty, price, side, prev: t, next: NIL };
         if t != NIL {
             self.slab[t as usize].next = s;
         } else {
@@ -206,14 +185,7 @@ impl Book {
         true
     }
     // match from the front of the best level, then rest any remainder
-    fn submit(
-        &mut self,
-        id: u64,
-        side: u8,
-        price: u8,
-        mut qty: u32,
-        fills: &mut Vec<(u64, u8, u32)>,
-    ) -> bool {
+    fn submit(&mut self, id: u64, side: u8, price: u8, mut qty: u32, fills: &mut Vec<(u64, u8, u32)>) -> bool {
         loop {
             if qty == 0 {
                 return true;
@@ -268,32 +240,15 @@ impl Book {
             assert_eq!(self.level_tail[p], prev, "tail");
             assert_eq!(self.level_qty[p], sum, "level qty");
             let bit = |m: u128| (m >> p) & 1 == 1;
-            assert_eq!(
-                bit(self.bid_mask) || bit(self.ask_mask),
-                !v.is_empty(),
-                "mask vs list"
-            );
-            assert!(
-                !(bit(self.bid_mask) && bit(self.ask_mask)),
-                "tick holds both sides"
-            );
+            assert_eq!(bit(self.bid_mask) || bit(self.ask_mask), !v.is_empty(), "mask vs list");
+            assert!(!(bit(self.bid_mask) && bit(self.ask_mask)), "tick holds both sides");
             if !v.is_empty() {
-                assert_eq!(
-                    if side == 0 {
-                        bit(self.bid_mask)
-                    } else {
-                        bit(self.ask_mask)
-                    },
-                    true
-                );
+                assert_eq!(if side == 0 { bit(self.bid_mask) } else { bit(self.ask_mask) }, true);
                 out.push((p as u8, side, v));
             }
         }
         if self.bid_mask != 0 && self.ask_mask != 0 {
-            assert!(
-                127 - self.bid_mask.leading_zeros() < self.ask_mask.trailing_zeros(),
-                "crossed book"
-            );
+            assert!(127 - self.bid_mask.leading_zeros() < self.ask_mask.trailing_zeros(), "crossed book");
         }
         out
     }
@@ -320,16 +275,8 @@ impl Model {
             if qty == 0 {
                 return true;
             }
-            let opp = if side == 0 {
-                &mut self.asks
-            } else {
-                &mut self.bids
-            };
-            let best = if side == 0 {
-                opp.keys().next().copied()
-            } else {
-                opp.keys().next_back().copied()
-            };
+            let opp = if side == 0 { &mut self.asks } else { &mut self.bids };
+            let best = if side == 0 { opp.keys().next().copied() } else { opp.keys().next_back().copied() };
             let Some(b) = best else { break };
             if (side == 0 && b > price) || (side == 1 && b < price) {
                 break;
@@ -353,14 +300,7 @@ impl Model {
         if self.live >= cap {
             return false;
         }
-        (if side == 0 {
-            &mut self.bids
-        } else {
-            &mut self.asks
-        })
-        .entry(price)
-        .or_default()
-        .push_back((id, qty));
+        (if side == 0 { &mut self.bids } else { &mut self.asks }).entry(price).or_default().push_back((id, qty));
         self.live += 1;
         true
     }
@@ -378,11 +318,7 @@ impl Model {
         let Some((side, p, i)) = self.find(id) else {
             return false;
         };
-        let m = if side == 0 {
-            &mut self.bids
-        } else {
-            &mut self.asks
-        };
+        let m = if side == 0 { &mut self.bids } else { &mut self.asks };
         let q = m.get_mut(&p).unwrap();
         q.remove(i);
         if q.is_empty() {
@@ -395,11 +331,7 @@ impl Model {
         let Some((side, p, i)) = self.find(id) else {
             return false;
         };
-        let m = if side == 0 {
-            &mut self.bids
-        } else {
-            &mut self.asks
-        };
+        let m = if side == 0 { &mut self.bids } else { &mut self.asks };
         let o = &mut m.get_mut(&p).unwrap()[i];
         if nq >= o.1 {
             return false;
@@ -415,11 +347,7 @@ impl Model {
             .bids
             .iter()
             .map(|(p, q)| (*p, 0u8, q.iter().copied().collect()))
-            .chain(
-                self.asks
-                    .iter()
-                    .map(|(p, q)| (*p, 1u8, q.iter().copied().collect())),
-            )
+            .chain(self.asks.iter().map(|(p, q)| (*p, 1u8, q.iter().copied().collect())))
             .collect();
         out.sort_by_key(|x| x.0);
         out
@@ -467,20 +395,12 @@ fn main() {
         } else if r < 85 {
             let k = rng.below(live_ids.len() as u64) as usize;
             let id = live_ids.swap_remove(k);
-            assert_eq!(
-                book.cancel(id),
-                model.cancel(id),
-                "cancel differs at step {step}"
-            );
+            assert_eq!(book.cancel(id), model.cancel(id), "cancel differs at step {step}");
             n_can += 1;
         } else {
             let id = live_ids[rng.below(live_ids.len() as u64) as usize];
             let nq = rng.below(40) as u32;
-            assert_eq!(
-                book.reduce(id, nq),
-                model.reduce(id, nq),
-                "reduce differs at step {step}"
-            );
+            assert_eq!(book.reduce(id, nq), model.reduce(id, nq), "reduce differs at step {step}");
             n_red += 1;
         }
         if step % 64 == 0 {

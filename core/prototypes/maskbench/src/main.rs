@@ -21,10 +21,7 @@ struct Book100 {
 }
 impl Book100 {
     fn new(levels: &[usize]) -> Self {
-        let mut b = Book100 {
-            qty: [0; 100],
-            bits: 0,
-        };
+        let mut b = Book100 { qty: [0; 100], bits: 0 };
         for &l in levels {
             b.qty[l] = 100;
             b.bits |= 1u128 << l;
@@ -86,11 +83,7 @@ struct Book1000 {
 }
 impl Book1000 {
     fn new(levels: &[usize]) -> Self {
-        let mut b = Book1000 {
-            qty: [0; 1000],
-            words: [0; 16],
-            summary: 0,
-        };
+        let mut b = Book1000 { qty: [0; 1000], words: [0; 16], summary: 0 };
         for &l in levels {
             b.qty[l] = 100;
             b.words[l >> 6] |= 1u64 << (l & 63);
@@ -183,32 +176,17 @@ fn distinct(rng: &mut Rng, n: usize, lo: usize, hi: usize) -> Vec<usize> {
 }
 
 fn row(name: &str, scan: f64, bits: f64) {
-    println!(
-        "{:<46} {:>8.2} ns {:>8.2} ns {:>7.1}x",
-        name,
-        scan,
-        bits,
-        scan / bits
-    );
+    println!("{:<46} {:>8.2} ns {:>8.2} ns {:>7.1}x", name, scan, bits, scan / bits);
 }
 
 fn main() {
     let mut rng = Rng(0x9E3779B97F4A7C15);
-    println!(
-        "{:<46} {:>11} {:>11} {:>8}",
-        "operation / book shape", "array scan", "bitmap", "speedup"
-    );
+    println!("{:<46} {:>11} {:>11} {:>8}", "operation / book shape", "array scan", "bitmap", "speedup");
 
     // next best after the best level empties: query from every occupied level (walking down the book)
     let cases100: [(&str, Vec<usize>); 2] = [
-        (
-            "next best, 1c HOT (16 adjacent bid levels)",
-            (30..46).collect(),
-        ),
-        (
-            "next best, 1c COLD (6 scattered levels)",
-            distinct(&mut rng, 6, 1, 99),
-        ),
+        ("next best, 1c HOT (16 adjacent bid levels)", (30..46).collect()),
+        ("next best, 1c COLD (6 scattered levels)", distinct(&mut rng, 6, 1, 99)),
     ];
     for (name, lv) in cases100.iter() {
         let b = Book100::new(lv);
@@ -235,14 +213,8 @@ fn main() {
         row(name, s, t);
     }
     let cases1000: [(&str, Vec<usize>); 2] = [
-        (
-            "next best, 0.1c parlay (8 levels, deep OTM)",
-            distinct(&mut rng, 8, 1, 300),
-        ),
-        (
-            "next best, 0.1c thin (3 levels anywhere)",
-            distinct(&mut rng, 3, 1, 999),
-        ),
+        ("next best, 0.1c parlay (8 levels, deep OTM)", distinct(&mut rng, 8, 1, 300)),
+        ("next best, 0.1c thin (3 levels anywhere)", distinct(&mut rng, 3, 1, 999)),
     ];
     for (name, lv) in cases1000.iter() {
         let b = Book1000::new(lv);
@@ -269,16 +241,8 @@ fn main() {
     {
         let lv = vec![900usize];
         let b = Book1000::new(&lv);
-        let s = time_ns_per_op(1, || {
-            black_box(&b)
-                .next_below_scan(black_box(900))
-                .map_or(1, |x| x as u64)
-        });
-        let t = time_ns_per_op(1, || {
-            black_box(&b)
-                .next_below_bits(black_box(900))
-                .map_or(1, |x| x as u64)
-        });
+        let s = time_ns_per_op(1, || black_box(&b).next_below_scan(black_box(900)).map_or(1, |x| x as u64));
+        let t = time_ns_per_op(1, || black_box(&b).next_below_bits(black_box(900)).map_or(1, |x| x as u64));
         row("next best, 0.1c, last level just emptied", s, t);
     }
     // top-5 depth for a market-data snapshot

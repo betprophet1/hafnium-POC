@@ -62,11 +62,7 @@ impl IdMap {
                 break;
             }
             let h = self.home(self.keys[j]);
-            let in_range = if i <= j {
-                i < h && h <= j
-            } else {
-                i < h || h <= j
-            };
+            let in_range = if i <= j { i < h && h <= j } else { i < h || h <= j };
             if !in_range {
                 self.keys[i] = self.keys[j];
                 self.vals[i] = self.vals[j];
@@ -90,17 +86,7 @@ struct Book {
 }
 impl Book {
     fn new(cap: usize) -> Self {
-        let mut slab = vec![
-            Order {
-                id: 0,
-                qty: 0,
-                price: 0,
-                side: 0,
-                prev: NIL,
-                next: NIL
-            };
-            cap
-        ];
+        let mut slab = vec![Order { id: 0, qty: 0, price: 0, side: 0, prev: NIL, next: NIL }; cap];
         for i in 0..cap {
             slab[i].next = if i + 1 < cap { (i + 1) as u32 } else { NIL };
         } // free list threaded through `next`
@@ -134,14 +120,7 @@ impl Book {
         self.live += 1;
         let p = price as usize;
         let t = self.level_tail[p];
-        self.slab[s as usize] = Order {
-            id,
-            qty,
-            price,
-            side,
-            prev: t,
-            next: NIL,
-        };
+        self.slab[s as usize] = Order { id, qty, price, side, prev: t, next: NIL };
         if t != NIL {
             self.slab[t as usize].next = s;
         } else {
@@ -206,14 +185,7 @@ impl Book {
     }
     // match from the front of the best level, then rest any remainder
     // At capacity, reject before touching state if any remainder would need a slot; a fully marketable order needs none.
-    fn submit(
-        &mut self,
-        id: u64,
-        side: u8,
-        price: u8,
-        mut qty: u32,
-        fills: &mut Vec<(u64, u8, u32)>,
-    ) -> bool {
+    fn submit(&mut self, id: u64, side: u8, price: u8, mut qty: u32, fills: &mut Vec<(u64, u8, u32)>) -> bool {
         if self.free == NIL && self.fillable(side, price, qty) < qty {
             return false;
         }
@@ -302,32 +274,15 @@ impl Book {
             assert_eq!(self.level_tail[p], prev, "tail");
             assert_eq!(self.level_qty[p], sum, "level qty");
             let bit = |m: u128| (m >> p) & 1 == 1;
-            assert_eq!(
-                bit(self.bid_mask) || bit(self.ask_mask),
-                !v.is_empty(),
-                "mask vs list"
-            );
-            assert!(
-                !(bit(self.bid_mask) && bit(self.ask_mask)),
-                "tick holds both sides"
-            );
+            assert_eq!(bit(self.bid_mask) || bit(self.ask_mask), !v.is_empty(), "mask vs list");
+            assert!(!(bit(self.bid_mask) && bit(self.ask_mask)), "tick holds both sides");
             if !v.is_empty() {
-                assert_eq!(
-                    if side == 0 {
-                        bit(self.bid_mask)
-                    } else {
-                        bit(self.ask_mask)
-                    },
-                    true
-                );
+                assert_eq!(if side == 0 { bit(self.bid_mask) } else { bit(self.ask_mask) }, true);
                 out.push((p as u8, side, v));
             }
         }
         if self.bid_mask != 0 && self.ask_mask != 0 {
-            assert!(
-                127 - self.bid_mask.leading_zeros() < self.ask_mask.trailing_zeros(),
-                "crossed book"
-            );
+            assert!(127 - self.bid_mask.leading_zeros() < self.ask_mask.trailing_zeros(), "crossed book");
         }
         out
     }
@@ -357,16 +312,8 @@ impl Model {
             if qty == 0 {
                 return true;
             }
-            let opp = if side == 0 {
-                &mut self.asks
-            } else {
-                &mut self.bids
-            };
-            let best = if side == 0 {
-                opp.keys().next().copied()
-            } else {
-                opp.keys().next_back().copied()
-            };
+            let opp = if side == 0 { &mut self.asks } else { &mut self.bids };
+            let best = if side == 0 { opp.keys().next().copied() } else { opp.keys().next_back().copied() };
             let Some(b) = best else { break };
             if (side == 0 && b > price) || (side == 1 && b < price) {
                 break;
@@ -387,14 +334,7 @@ impl Model {
                 opp.remove(&b);
             }
         }
-        (if side == 0 {
-            &mut self.bids
-        } else {
-            &mut self.asks
-        })
-        .entry(price)
-        .or_default()
-        .push_back((id, qty));
+        (if side == 0 { &mut self.bids } else { &mut self.asks }).entry(price).or_default().push_back((id, qty));
         self.live += 1;
         true
     }
@@ -412,11 +352,7 @@ impl Model {
         let Some((side, p, i)) = self.find(id) else {
             return false;
         };
-        let m = if side == 0 {
-            &mut self.bids
-        } else {
-            &mut self.asks
-        };
+        let m = if side == 0 { &mut self.bids } else { &mut self.asks };
         let q = m.get_mut(&p).unwrap();
         q.remove(i);
         if q.is_empty() {
@@ -429,11 +365,7 @@ impl Model {
         let Some((side, p, i)) = self.find(id) else {
             return false;
         };
-        let m = if side == 0 {
-            &mut self.bids
-        } else {
-            &mut self.asks
-        };
+        let m = if side == 0 { &mut self.bids } else { &mut self.asks };
         let o = &mut m.get_mut(&p).unwrap()[i];
         if nq >= o.1 {
             return false;
@@ -474,11 +406,7 @@ impl Model {
             .bids
             .iter()
             .map(|(p, q)| (*p, 0u8, q.iter().copied().collect()))
-            .chain(
-                self.asks
-                    .iter()
-                    .map(|(p, q)| (*p, 1u8, q.iter().copied().collect())),
-            )
+            .chain(self.asks.iter().map(|(p, q)| (*p, 1u8, q.iter().copied().collect())))
             .collect();
         out.sort_by_key(|x| x.0);
         out
@@ -528,10 +456,7 @@ fn main() {
             assert_eq!((a1, &f1), (a2, &f2), "accept/fills differ at step {step}");
             if !a1 {
                 rejects += 1;
-                assert!(
-                    was_full && f1.is_empty(),
-                    "rejected without being full, or with side effects"
-                );
+                assert!(was_full && f1.is_empty(), "rejected without being full, or with side effects");
             }
             if a1 && was_full {
                 full_but_accepted += 1;
@@ -563,18 +488,11 @@ fn main() {
         assert!(b.submit(100 + i, 0, 30 + i as u8, 10, &mut f));
     }
     let before = b.dump();
-    println!(
-        "scenario: slab of 8 holds 8 resting bids (30c..37c), free list empty: {}",
-        b.free == NIL
-    );
+    println!("scenario: slab of 8 holds 8 resting bids (30c..37c), free list empty: {}", b.free == NIL);
     let ok = b.submit(200, 0, 29, 5, &mut f);
     println!(
         "  new resting bid 5 @ 29c        -> {} ; book unchanged: {}",
-        if ok {
-            "ACCEPTED"
-        } else {
-            "REJECTED (capacity)"
-        },
+        if ok { "ACCEPTED" } else { "REJECTED (capacity)" },
         b.dump() == before
     );
     let ok = b.submit(201, 1, 36, 12, &mut f);
@@ -592,21 +510,10 @@ fn main() {
     );
     f.clear();
     let ok = b.submit(203, 0, 29, 5, &mut f);
-    println!(
-        "  bid 5 @ 29c again               -> {}",
-        if ok {
-            "ACCEPTED"
-        } else {
-            "REJECTED (capacity)"
-        }
-    );
+    println!("  bid 5 @ 29c again               -> {}", if ok { "ACCEPTED" } else { "REJECTED (capacity)" });
     let c = b.cancel(100);
     let ok = b.submit(204, 0, 29, 5, &mut f);
-    println!(
-        "  cancel #100 ({}), then bid 5 @ 29c -> {}",
-        c,
-        if ok { "ACCEPTED" } else { "REJECTED" }
-    );
+    println!("  cancel #100 ({}), then bid 5 @ 29c -> {}", c, if ok { "ACCEPTED" } else { "REJECTED" });
     b.dump();
     println!("  invariants hold after scenario (links, totals, masks, id map, uncrossed)");
 }
