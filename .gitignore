@@ -11,3 +11,7 @@ target/
 *.png
 chrome-out/
 render-out/
+
+# Generated from interfaces/sbe by interfaces/tools/sbe.sh
+interfaces/generated/
+interfaces/rust-roundtrip/target/

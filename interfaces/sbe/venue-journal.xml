@@ -1,0 +1,627 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Venue journal schema: shared types, journal inputs and engine results.
+
+  Interfaces (see ../catalogue.toml): 7 gateways to sequencer group, 10 consensus to engine,
+  11 sequencer group to journal, 12 journal to readers, 14 services to sequencer group,
+  20 result log, 25 outbox confirmation.
+
+  Rules that are not expressible in SBE and are part of this specification:
+  - Every journal input starts with RecordHeader. A gateway or service sends it zeroed; the
+    sequencer stamps sequence, sequencedAt and sequencerGroup in place, so ingress bytes and
+    journal bytes are the same message.
+  - Every result starts with ResultHeader naming the input that produced it. Results of one
+    input are numbered from 0 in the order the engine emitted them. A reader's watermark is an
+    input sequence number, and it has applied an input only when it has applied all its results.
+  - Prices are tick ordinals into the instrument's tick table, always for YES. Quantities are
+    whole contracts on the instrument's lot step. Money is integer cents. Nothing is a float.
+  - Account identifiers are pseudonymous. No personal data enters this schema (blueprint §12).
+  - Additive only within a schema version: new fields go at the end of a block with sinceVersion,
+    nothing is removed, retyped or repurposed. Engine behaviour is gated separately by
+    ActivateProtocol, never by the schema version.
+-->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+                   package="venue_journal"
+                   id="7101"
+                   version="0"
+                   semanticVersion="0.1.0"
+                   description="Venue journal inputs and engine results, draft v0"
+                   byteOrder="littleEndian">
+  <types>
+    <composite name="messageHeader" description="SBE message header">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="templateId" primitiveType="uint16"/>
+      <type name="schemaId" primitiveType="uint16"/>
+      <type name="version" primitiveType="uint16"/>
+    </composite>
+    <composite name="groupSizeEncoding" description="Repeating group dimensions">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="numInGroup" primitiveType="uint16"/>
+    </composite>
+    <composite name="varDataEncoding" description="Variable-length opaque data">
+      <type name="length" primitiveType="uint32" maxValue="1073741824"/>
+      <type name="varData" primitiveType="uint8" length="0"/>
+    </composite>
+
+    <composite name="RecordHeader" description="Stamped by the sequencer in place; zero on ingress">
+      <type name="sequence" primitiveType="uint64" description="Per sequencer group, gap-free, from 1"/>
+      <type name="sequencedAt" primitiveType="uint64" description="Integer nanoseconds since the Unix epoch, UTC, never smeared; monotonic across elections (blueprint §5)"/>
+      <type name="sequencerGroup" primitiveType="uint16"/>
+    </composite>
+    <composite name="ResultHeader" description="Names the journal input that produced this result">
+      <type name="inputSequence" primitiveType="uint64"/>
+      <type name="resultIndex" primitiveType="uint32" description="0-based position among this input's results"/>
+      <type name="sequencedAt" primitiveType="uint64" description="The input's sequencedAt"/>
+      <type name="sequencerGroup" primitiveType="uint16"/>
+    </composite>
+
+    <type name="SequencerGroupId" primitiveType="uint16"/>
+    <type name="EpochNanos" primitiveType="uint64" description="Sequencer time: integer nanoseconds since the Unix epoch, UTC"/>
+    <type name="OptionalEpochNanos" primitiveType="uint64" presence="optional"/>
+    <type name="AccountId" primitiveType="uint64" description="Pseudonymous; the mapping to a person lives only in the accounts database"/>
+    <type name="SessionId" primitiveType="uint64"/>
+    <type name="InstrumentId" primitiveType="uint64" description="Exchange-assigned; for a parlay, the canonical hash of its sorted legs, collision-checked at listing"/>
+    <type name="EventId" primitiveType="uint64"/>
+    <type name="OrderId" primitiveType="uint64" description="Exchange-assigned, never derived from a slab slot"/>
+    <type name="OptionalOrderId" primitiveType="uint64" presence="optional"/>
+    <type name="TradeId" primitiveType="uint64"/>
+    <type name="CaseId" primitiveType="uint64" description="Resolution case in the resolution console"/>
+    <type name="ClientOrderId" primitiveType="uint8" length="32" description="Opaque client bytes, right-padded with zero; unique per account within the published window"/>
+    <type name="CommandId" primitiveType="uint8" length="16" description="Idempotency key from the issuing service's outbox"/>
+    <type name="BinaryHash" primitiveType="uint8" length="32" description="SHA-256 of the engine binary"/>
+    <type name="Tick" primitiveType="uint16" description="Ordinal into the instrument's tick table, for YES"/>
+    <type name="OptionalTick" primitiveType="uint16" presence="optional"/>
+    <type name="TickTableId" primitiveType="uint32"/>
+    <type name="Quantity" primitiveType="uint32" description="Whole contracts, a multiple of the lot step"/>
+    <type name="OptionalQuantity" primitiveType="uint32" presence="optional"/>
+    <type name="SignedContracts" primitiveType="int64" description="Positive YES, negative NO"/>
+    <type name="Cents" primitiveType="int64"/>
+    <type name="OptionalCents" primitiveType="int64" presence="optional"/>
+    <type name="OptionalGroupRef" primitiveType="uint32" presence="optional" description="Client order group"/>
+    <type name="ProtocolVersion" primitiveType="uint16"/>
+    <type name="NodeId" primitiveType="uint16"/>
+    <type name="StateMask" primitiveType="uint64" description="Bitmask over an event's states; at most 64 (blueprint §7)"/>
+    <type name="Seed" primitiveType="uint64"/>
+    <type name="Count" primitiveType="uint32"/>
+    <type name="Millis" primitiveType="uint32"/>
+    <type name="SmallCount" primitiveType="uint8"/>
+    <type name="Ratio" primitiveType="uint32" description="Integer numerator or denominator of an exact rational"/>
+    <type name="ScopeRef" primitiveType="uint64" description="Instrument, event or client order group, by scope; 0 when the scope needs none"/>
+
+    <enum name="BooleanType" encodingType="uint8">
+      <validValue name="FALSE">0</validValue>
+      <validValue name="TRUE">1</validValue>
+    </enum>
+    <enum name="Side" encodingType="uint8" description="Canonical side, always in YES">
+      <validValue name="BUY">0</validValue>
+      <validValue name="SELL">1</validValue>
+    </enum>
+    <enum name="Contract" encodingType="uint8" description="What the customer entered, before reflection to YES">
+      <validValue name="YES">0</validValue>
+      <validValue name="NO">1</validValue>
+    </enum>
+    <enum name="TimeInForce" encodingType="uint8" description="FOK fills in full at once or is rejected; it never rests or waits">
+      <validValue name="GTC">0</validValue>
+      <validValue name="GTD">1</validValue>
+      <validValue name="IOC">2</validValue>
+      <validValue name="FOK">3</validValue>
+    </enum>
+    <enum name="AtEventStart" encodingType="uint8">
+      <validValue name="CANCEL">0</validValue>
+      <validValue name="KEEP">1</validValue>
+      <validValue name="UNCHANGED" description="AmendOrder only">2</validValue>
+    </enum>
+    <set name="OrderFlags" encodingType="uint8">
+      <choice name="POST_ONLY">0</choice>
+      <choice name="REDUCE_ONLY">1</choice>
+    </set>
+    <enum name="MassCancelScope" encodingType="uint8">
+      <validValue name="SESSION">0</validValue>
+      <validValue name="ACCOUNT">1</validValue>
+      <validValue name="INSTRUMENT">2</validValue>
+      <validValue name="EVENT">3</validValue>
+      <validValue name="CLIENT_ORDER_GROUP">4</validValue>
+    </enum>
+    <enum name="MassCancelCause" encodingType="uint8">
+      <validValue name="CLIENT_REQUEST">0</validValue>
+      <validValue name="SESSION_DISCONNECT">1</validValue>
+      <validValue name="HEARTBEAT_MISSED">2</validValue>
+      <validValue name="OPERATOR_KILL_SWITCH">3</validValue>
+    </enum>
+    <enum name="BatchEntryType" encodingType="uint8">
+      <validValue name="NEW">0</validValue>
+      <validValue name="CANCEL">1</validValue>
+    </enum>
+    <enum name="BasketDirection" encodingType="uint8">
+      <validValue name="MINT">0</validValue>
+      <validValue name="REDEEM">1</validValue>
+    </enum>
+    <enum name="SeedPurpose" encodingType="uint8">
+      <validValue name="CLIENT_ORDER_ID_HASH">0</validValue>
+      <validValue name="PRNG">1</validValue>
+    </enum>
+    <enum name="InstrumentClass" encodingType="uint8">
+      <validValue name="BINARY">0</validValue>
+      <validValue name="CATEGORICAL_OUTCOME">1</validValue>
+      <validValue name="SCALAR_BAND">2</validValue>
+      <validValue name="PARLAY">3</validValue>
+    </enum>
+    <enum name="AllocationPolicy" encodingType="uint8">
+      <validValue name="PRICE_TIME">0</validValue>
+      <validValue name="PRO_RATA">1</validValue>
+    </enum>
+    <enum name="EventPhase" encodingType="uint8">
+      <validValue name="SCHEDULED">0</validValue>
+      <validValue name="STARTED">1</validValue>
+      <validValue name="SUSPENDED">2</validValue>
+      <validValue name="RESUMED">3</validValue>
+      <validValue name="ENDED">4</validValue>
+    </enum>
+    <enum name="PhaseSource" encodingType="uint8">
+      <validValue name="VENDOR_SIGNAL">0</validValue>
+      <validValue name="OPERATOR">1</validValue>
+      <validValue name="SCHEDULE_BACKSTOP">2</validValue>
+      <validValue name="DUMMY_ORACLE">3</validValue>
+    </enum>
+    <enum name="MarketState" encodingType="uint8">
+      <validValue name="LISTED">0</validValue>
+      <validValue name="OPEN">1</validValue>
+      <validValue name="HALTED">2</validValue>
+      <validValue name="CLOSED">3</validValue>
+      <validValue name="RESOLVING">4</validValue>
+      <validValue name="SETTLED">5</validValue>
+      <validValue name="VOIDED">6</validValue>
+    </enum>
+    <enum name="VenueMode" encodingType="uint8">
+      <validValue name="NORMAL">0</validValue>
+      <validValue name="NEW_ORDER_REJECT">1</validValue>
+      <validValue name="CANCEL_ONLY">2</validValue>
+      <validValue name="KILL_SWITCH">3</validValue>
+    </enum>
+    <enum name="ResolutionKind" encodingType="uint8">
+      <validValue name="RESOLVED">0</validValue>
+      <validValue name="VOID" description="Voids the whole event, never one book (blueprint §7)">1</validValue>
+    </enum>
+    <enum name="OutcomeValue" encodingType="uint8">
+      <validValue name="NO">0</validValue>
+      <validValue name="YES">1</validValue>
+    </enum>
+    <enum name="SleeveReason" encodingType="uint8">
+      <validValue name="GRANT">0</validValue>
+      <validValue name="RECLAIM">1</validValue>
+    </enum>
+    <enum name="SelfMatchPrevention" encodingType="uint8">
+      <validValue name="CANCEL_RESTING">0</validValue>
+      <validValue name="CANCEL_INCOMING">1</validValue>
+      <validValue name="CANCEL_BOTH">2</validValue>
+    </enum>
+    <enum name="LiquidityRole" encodingType="uint8">
+      <validValue name="MAKER">0</validValue>
+      <validValue name="TAKER">1</validValue>
+    </enum>
+    <enum name="ClearingOutcome" encodingType="uint8" description="The four rows of blueprint §7's clearing table">
+      <validValue name="TRANSFER_YES">0</validValue>
+      <validValue name="MINT">1</validValue>
+      <validValue name="BURN">2</validValue>
+      <validValue name="TRANSFER_NO">3</validValue>
+    </enum>
+    <enum name="ReleaseKind" encodingType="uint8">
+      <validValue name="SET_COLLAPSE">0</validValue>
+      <validValue name="EVENT_SET_BURN">1</validValue>
+    </enum>
+    <enum name="CommandOutcome" encodingType="uint8">
+      <validValue name="APPLIED">0</validValue>
+      <validValue name="REJECTED">1</validValue>
+      <validValue name="DUPLICATE" description="The command ID was already applied; nothing changed">2</validValue>
+    </enum>
+    <enum name="RejectReason" encodingType="uint8">
+      <validValue name="NONE">0</validValue>
+      <validValue name="MALFORMED">1</validValue>
+      <validValue name="UNKNOWN_INSTRUMENT">2</validValue>
+      <validValue name="UNKNOWN_ORDER">3</validValue>
+      <validValue name="MARKET_NOT_OPEN">4</validValue>
+      <validValue name="VENUE_MODE">5</validValue>
+      <validValue name="EVENT_STARTED">6</validValue>
+      <validValue name="TICK_NOT_ON_LADDER">7</validValue>
+      <validValue name="QUANTITY_NOT_ON_LOT_STEP">8</validValue>
+      <validValue name="EXPIRY_IN_PAST">9</validValue>
+      <validValue name="INSUFFICIENT_SLEEVE">10</validValue>
+      <validValue name="POST_ONLY_WOULD_TAKE">11</validValue>
+      <validValue name="FOK_NOT_FILLABLE">12</validValue>
+      <validValue name="REDUCE_ONLY_NO_POSITION">13</validValue>
+      <validValue name="CLOSED_ONLY_MODE">14</validValue>
+      <validValue name="SPEND_CAP_BELOW_ONE_CONTRACT">15</validValue>
+      <validValue name="DUPLICATE_CLIENT_ORDER_ID">16</validValue>
+      <validValue name="RULE_LIMIT">17</validValue>
+      <validValue name="POSITION_LIMIT">18</validValue>
+      <validValue name="ORDER_CAPACITY" description="Only for an order that would rest; never a fill, cancel or reduction (blueprint §6)">19</validValue>
+      <validValue name="PROTOCOL_VERSION">20</validValue>
+      <validValue name="INVALID_COMMAND">21</validValue>
+    </enum>
+    <enum name="CancelReason" encodingType="uint8">
+      <validValue name="CLIENT_REQUEST">0</validValue>
+      <validValue name="MASS_CANCEL">1</validValue>
+      <validValue name="SESSION_DISCONNECT">2</validValue>
+      <validValue name="HEARTBEAT_MISSED">3</validValue>
+      <validValue name="EVENT_START">4</validValue>
+      <validValue name="EXPIRED">5</validValue>
+      <validValue name="IOC_REMAINDER">6</validValue>
+      <validValue name="SELF_MATCH_PREVENTED">7</validValue>
+      <validValue name="MAKER_AUTO_PULL">8</validValue>
+      <validValue name="KILL_SWITCH">9</validValue>
+      <validValue name="MARKET_RESOLVED">10</validValue>
+    </enum>
+  </types>
+
+  <!-- ===== Client messages, via a gateway (interface 7) ===== -->
+
+  <sbe:message name="NewOrder" id="1" description="Normalised order. The gateway reflects NO to YES, converts stake to contracts and records what the customer entered">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="sessionId" id="2" type="SessionId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="clientOrderId" id="4" type="ClientOrderId"/>
+    <field name="instrumentId" id="5" type="InstrumentId"/>
+    <field name="side" id="6" type="Side"/>
+    <field name="enteredContract" id="7" type="Contract"/>
+    <field name="tick" id="8" type="Tick" description="Limit, in YES"/>
+    <field name="quantity" id="9" type="Quantity"/>
+    <field name="timeInForce" id="10" type="TimeInForce"/>
+    <field name="expiresAt" id="11" type="OptionalEpochNanos" description="GTD only"/>
+    <field name="atEventStart" id="12" type="AtEventStart"/>
+    <field name="flags" id="13" type="OrderFlags"/>
+    <field name="protectionTicks" id="14" type="SmallCount" description="0 for none; otherwise the engine caps the limit this many ticks through the touch on arrival"/>
+    <field name="spendCapCents" id="15" type="OptionalCents"/>
+    <field name="enteredStakeCents" id="16" type="OptionalCents" description="Stake as entered, for the audit trail"/>
+    <field name="clientOrderGroup" id="17" type="OptionalGroupRef"/>
+  </sbe:message>
+
+  <sbe:message name="CancelOrder" id="2" description="By exchange order ID, or by client order ID when orderId is null">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="sessionId" id="2" type="SessionId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="instrumentId" id="4" type="InstrumentId"/>
+    <field name="orderId" id="5" type="OptionalOrderId"/>
+    <field name="clientOrderId" id="6" type="ClientOrderId"/>
+  </sbe:message>
+
+  <sbe:message name="AmendOrder" id="3" description="A size reduction keeps priority; a price change or size increase loses it">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="sessionId" id="2" type="SessionId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="instrumentId" id="4" type="InstrumentId"/>
+    <field name="orderId" id="5" type="OrderId"/>
+    <field name="newTick" id="6" type="OptionalTick"/>
+    <field name="newQuantity" id="7" type="OptionalQuantity"/>
+    <field name="atEventStart" id="8" type="AtEventStart"/>
+  </sbe:message>
+
+  <sbe:message name="MassCancel" id="4" description="Never rate-limited (blueprint §12). Gateways also issue it for disconnects and missed heartbeats">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="sessionId" id="2" type="SessionId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="scope" id="4" type="MassCancelScope"/>
+    <field name="scopeRef" id="5" type="ScopeRef"/>
+    <field name="cause" id="6" type="MassCancelCause"/>
+  </sbe:message>
+
+  <sbe:message name="BatchOrders" id="5" description="Entries are sequenced as one input and applied individually, in order, each with its own results; never atomically">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="sessionId" id="2" type="SessionId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <group name="entries" id="10" dimensionType="groupSizeEncoding">
+      <field name="entryType" id="11" type="BatchEntryType"/>
+      <field name="clientOrderId" id="12" type="ClientOrderId"/>
+      <field name="instrumentId" id="13" type="InstrumentId"/>
+      <field name="orderId" id="14" type="OptionalOrderId" description="CANCEL by exchange order ID"/>
+      <field name="side" id="15" type="Side"/>
+      <field name="enteredContract" id="16" type="Contract"/>
+      <field name="tick" id="17" type="Tick"/>
+      <field name="quantity" id="18" type="Quantity"/>
+      <field name="timeInForce" id="19" type="TimeInForce"/>
+      <field name="expiresAt" id="20" type="OptionalEpochNanos"/>
+      <field name="atEventStart" id="21" type="AtEventStart"/>
+      <field name="flags" id="22" type="OrderFlags"/>
+      <field name="protectionTicks" id="23" type="SmallCount"/>
+      <field name="spendCapCents" id="24" type="OptionalCents"/>
+      <field name="enteredStakeCents" id="25" type="OptionalCents"/>
+      <field name="clientOrderGroup" id="26" type="OptionalGroupRef"/>
+    </group>
+  </sbe:message>
+
+  <sbe:message name="BasketMintRedeem" id="6" description="Explicit mint or redeem of one contract of every outcome of an event">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="sessionId" id="2" type="SessionId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="clientOrderId" id="4" type="ClientOrderId"/>
+    <field name="eventId" id="5" type="EventId"/>
+    <field name="quantity" id="6" type="Quantity"/>
+    <field name="direction" id="7" type="BasketDirection"/>
+  </sbe:message>
+
+  <!-- ===== Sequencer and node events ===== -->
+
+  <sbe:message name="TimeTick" id="50" description="Injected on a fixed cadence; the engine's only clock (blueprint §4)">
+    <field name="record" id="1" type="RecordHeader"/>
+  </sbe:message>
+
+  <sbe:message name="EngineStarted" id="51" description="Written at startup so the journal records which binary processed it">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="nodeId" id="2" type="NodeId"/>
+    <field name="protocolVersion" id="3" type="ProtocolVersion"/>
+    <field name="binaryHash" id="4" type="BinaryHash"/>
+  </sbe:message>
+
+  <sbe:message name="SeedSet" id="52" description="Keyed-hash and PRNG seeds arrive in the journal so hashing and randomness replay">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="purpose" id="2" type="SeedPurpose"/>
+    <field name="seedHigh" id="3" type="Seed"/>
+    <field name="seedLow" id="4" type="Seed"/>
+  </sbe:message>
+
+  <!-- ===== Service commands (interfaces 14 and 25); each yields one CommandApplied ===== -->
+
+  <sbe:message name="ActivateProtocol" id="80" description="Deploy dark, activate by event: behaviour changes at this log position on every replica">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="protocolVersion" id="3" type="ProtocolVersion"/>
+    <field name="requiredBinaryHash" id="4" type="BinaryHash"/>
+  </sbe:message>
+
+  <sbe:message name="SleeveAdjust" id="81" description="Treasury grant or reclaim of an account's buying power in this sequencer group">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="deltaCents" id="4" type="Cents"/>
+    <field name="reason" id="5" type="SleeveReason"/>
+  </sbe:message>
+
+  <sbe:message name="DefineTickTable" id="82" description="Exact rational YES probability per tick; rejected unless closed under p to 1 - p">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="tickTableId" id="3" type="TickTableId"/>
+    <group name="ticks" id="10" dimensionType="groupSizeEncoding">
+      <field name="tick" id="11" type="Tick"/>
+      <field name="numerator" id="12" type="Ratio"/>
+      <field name="denominator" id="13" type="Ratio"/>
+      <field name="complement" id="14" type="Tick" description="The tick whose probability is 1 - p"/>
+    </group>
+  </sbe:message>
+
+  <sbe:message name="DefineEvent" id="83">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="eventId" id="3" type="EventId"/>
+    <field name="stateCount" id="4" type="SmallCount" description="At most 64"/>
+    <field name="scheduledStart" id="5" type="EpochNanos"/>
+  </sbe:message>
+
+  <sbe:message name="ListInstrument" id="84" description="Legs are present for parlays only, in canonical order">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="instrumentId" id="3" type="InstrumentId"/>
+    <field name="eventId" id="4" type="EventId"/>
+    <field name="instrumentClass" id="5" type="InstrumentClass"/>
+    <field name="tickTableId" id="6" type="TickTableId"/>
+    <field name="lotStep" id="7" type="Quantity"/>
+    <field name="allocationPolicy" id="8" type="AllocationPolicy"/>
+    <field name="stateMask" id="9" type="StateMask"/>
+    <group name="legs" id="10" dimensionType="groupSizeEncoding">
+      <field name="legEventId" id="11" type="EventId"/>
+      <field name="legInstrumentId" id="12" type="InstrumentId"/>
+      <field name="legOutcome" id="13" type="OutcomeValue"/>
+    </group>
+  </sbe:message>
+
+  <sbe:message name="SetEventPhase" id="85" description="Event start cancels resting orders marked CANCEL at this log position">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="eventId" id="3" type="EventId"/>
+    <field name="phase" id="4" type="EventPhase"/>
+    <field name="source" id="5" type="PhaseSource"/>
+  </sbe:message>
+
+  <sbe:message name="SetMarketState" id="86">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="instrumentId" id="3" type="InstrumentId"/>
+    <field name="state" id="4" type="MarketState"/>
+  </sbe:message>
+
+  <sbe:message name="SetVenueMode" id="87">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="mode" id="3" type="VenueMode"/>
+  </sbe:message>
+
+  <sbe:message name="ResolveEvent" id="88" description="Issued only after two-of-three sign-off. Outcomes list every book of the event; empty for VOID">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="eventId" id="3" type="EventId"/>
+    <field name="kind" id="4" type="ResolutionKind"/>
+    <field name="caseId" id="5" type="CaseId"/>
+    <group name="outcomes" id="10" dimensionType="groupSizeEncoding">
+      <field name="instrumentId" id="11" type="InstrumentId"/>
+      <field name="value" id="12" type="OutcomeValue"/>
+    </group>
+  </sbe:message>
+
+  <sbe:message name="ExpireParlay" id="89" description="A leg resolved against the parlay; the contract is worth zero now">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="instrumentId" id="3" type="InstrumentId"/>
+    <field name="causingEventId" id="4" type="EventId"/>
+  </sbe:message>
+
+  <sbe:message name="SetRuleLimits" id="90" description="Rulebook limits held in sequenced state; accountId 0 sets the venue default">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="maxOrdersInFlight" id="4" type="Count"/>
+    <field name="maxRestingOrders" id="5" type="Count"/>
+    <field name="maxOrderToTradeRatioMilli" id="6" type="Count"/>
+  </sbe:message>
+
+  <sbe:message name="SetOrderCapacity" id="91" description="Active resting-order limit, beneath the reserved ceiling">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="activeOrderLimit" id="3" type="Count"/>
+  </sbe:message>
+
+  <sbe:message name="SetAccountControls" id="92">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="closedOnly" id="4" type="BooleanType"/>
+    <field name="selfMatchPrevention" id="5" type="SelfMatchPrevention"/>
+  </sbe:message>
+
+  <sbe:message name="SetMakerProtection" id="93" description="Rate-based auto-pull; eventId 0 applies to every event">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="eventId" id="4" type="EventId"/>
+    <field name="maxContractsFilledPerWindow" id="5" type="Count"/>
+    <field name="windowMillis" id="6" type="Millis"/>
+  </sbe:message>
+
+  <sbe:message name="TransferOut" id="94" description="Event migration, written in the source group after halt and drain">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="eventId" id="3" type="EventId"/>
+    <field name="destinationGroup" id="4" type="SequencerGroupId"/>
+  </sbe:message>
+
+  <sbe:message name="TransferIn" id="95" description="Event migration, carrying the event's canonical state into the destination group">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="eventId" id="3" type="EventId"/>
+    <field name="sourceGroup" id="4" type="SequencerGroupId"/>
+    <data name="state" id="5" type="varDataEncoding"/>
+  </sbe:message>
+
+  <!-- ===== Results (interface 20), read by every reader (interface 12) ===== -->
+
+  <sbe:message name="OrderAccepted" id="100">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="orderId" id="2" type="OrderId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="sessionId" id="4" type="SessionId"/>
+    <field name="clientOrderId" id="5" type="ClientOrderId"/>
+    <field name="instrumentId" id="6" type="InstrumentId"/>
+    <field name="side" id="7" type="Side"/>
+    <field name="tick" id="8" type="Tick" description="Effective limit, after any protection cap"/>
+    <field name="quantity" id="9" type="Quantity" description="After any reduce-only cut or spend cap"/>
+    <field name="reservedCents" id="10" type="Cents"/>
+  </sbe:message>
+
+  <sbe:message name="OrderRejected" id="101">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="accountId" id="2" type="AccountId"/>
+    <field name="sessionId" id="3" type="SessionId"/>
+    <field name="clientOrderId" id="4" type="ClientOrderId"/>
+    <field name="instrumentId" id="5" type="InstrumentId"/>
+    <field name="reason" id="6" type="RejectReason"/>
+  </sbe:message>
+
+  <sbe:message name="Fill" id="102" description="Cash deltas are stated so no reader re-implements clearing">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="tradeId" id="2" type="TradeId"/>
+    <field name="instrumentId" id="3" type="InstrumentId"/>
+    <field name="tick" id="4" type="Tick"/>
+    <field name="quantity" id="5" type="Quantity"/>
+    <field name="makerOrderId" id="6" type="OrderId"/>
+    <field name="makerAccountId" id="7" type="AccountId"/>
+    <field name="makerRemaining" id="8" type="Quantity"/>
+    <field name="takerOrderId" id="9" type="OrderId"/>
+    <field name="takerAccountId" id="10" type="AccountId"/>
+    <field name="takerRemaining" id="11" type="Quantity"/>
+    <field name="takerSide" id="12" type="Side"/>
+    <field name="clearing" id="13" type="ClearingOutcome"/>
+    <field name="buyerCashCents" id="14" type="Cents" description="Negative when paid"/>
+    <field name="sellerCashCents" id="15" type="Cents" description="Negative when paid"/>
+    <field name="openInterestDelta" id="16" type="SignedContracts"/>
+    <field name="makerFeeCents" id="17" type="Cents"/>
+    <field name="takerFeeCents" id="18" type="Cents"/>
+  </sbe:message>
+
+  <sbe:message name="OrderCancelled" id="103">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="orderId" id="2" type="OrderId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="instrumentId" id="4" type="InstrumentId"/>
+    <field name="cancelledQuantity" id="5" type="Quantity"/>
+    <field name="reason" id="6" type="CancelReason"/>
+  </sbe:message>
+
+  <sbe:message name="OrderAmended" id="104">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="orderId" id="2" type="OrderId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="instrumentId" id="4" type="InstrumentId"/>
+    <field name="tick" id="5" type="Tick"/>
+    <field name="quantity" id="6" type="Quantity"/>
+    <field name="atEventStart" id="7" type="AtEventStart"/>
+    <field name="priorityKept" id="8" type="BooleanType"/>
+  </sbe:message>
+
+  <sbe:message name="OrderReduced" id="105" description="A resting reduce-only order shrank because the position did">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="orderId" id="2" type="OrderId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="instrumentId" id="4" type="InstrumentId"/>
+    <field name="remainingQuantity" id="5" type="Quantity"/>
+  </sbe:message>
+
+  <sbe:message name="PositionChanged" id="106">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="accountId" id="2" type="AccountId"/>
+    <field name="instrumentId" id="3" type="InstrumentId"/>
+    <field name="position" id="4" type="SignedContracts"/>
+  </sbe:message>
+
+  <sbe:message name="SleeveChanged" id="107">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="accountId" id="2" type="AccountId"/>
+    <field name="availableCents" id="3" type="Cents"/>
+    <field name="reservedCents" id="4" type="Cents"/>
+  </sbe:message>
+
+  <sbe:message name="CollateralReleased" id="108">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="accountId" id="2" type="AccountId"/>
+    <field name="eventId" id="3" type="EventId"/>
+    <field name="cents" id="4" type="Cents"/>
+    <field name="kind" id="5" type="ReleaseKind"/>
+  </sbe:message>
+
+  <sbe:message name="BookLevelChanged" id="109" description="Aggregate at one level after this input; the source of market data (interface 8)">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="instrumentId" id="2" type="InstrumentId"/>
+    <field name="side" id="3" type="Side"/>
+    <field name="tick" id="4" type="Tick"/>
+    <field name="quantity" id="5" type="Quantity"/>
+    <field name="orderCount" id="6" type="Count"/>
+  </sbe:message>
+
+  <sbe:message name="MarketStateChanged" id="110">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="instrumentId" id="2" type="InstrumentId"/>
+    <field name="state" id="3" type="MarketState"/>
+  </sbe:message>
+
+  <sbe:message name="SettlementPayout" id="111" description="One per account holding a position when the event resolves, voids or a parlay expires">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="accountId" id="2" type="AccountId"/>
+    <field name="instrumentId" id="3" type="InstrumentId"/>
+    <field name="kind" id="4" type="ResolutionKind"/>
+    <field name="positionClosed" id="5" type="SignedContracts"/>
+    <field name="cents" id="6" type="Cents" description="Paid at $1.00 per winning contract, or returned against cost basis on a void"/>
+  </sbe:message>
+
+  <sbe:message name="CommandApplied" id="112" description="The outbox relay marks a command done only on seeing this for its command ID">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="outcome" id="3" type="CommandOutcome"/>
+    <field name="rejectReason" id="4" type="RejectReason"/>
+  </sbe:message>
+</sbe:messageSchema>

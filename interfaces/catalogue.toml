@@ -1,0 +1,329 @@
+# Interface catalogue. The blueprint's §18 tables are generated from this file:
+#   python3 interfaces/tools/catalogue.py render | check
+# Text fields are HTML fragments, as they appear in the blueprint.
+
+[[interface]]
+id = 1
+name = "Web and mobile apps &harr; REST &middot; WS gateway"
+drawn = true
+transport = "HTTPS and WebSocket via CloudFront and ALB"
+carries = "JSON orders and account calls on <code>/v4</code> paths; conflated market-data topics"
+guarantees = "Idempotent on client order ID (&sect;13); a reconnect resumes by sequence"
+format = "OpenAPI 3.1 and AsyncAPI 3"
+status = "planned"
+step = 6
+
+[[interface]]
+id = 2
+name = "Market maker &harr; binary gateway"
+drawn = true
+transport = "TCP in the same zone, no load balancer (&sect;15)"
+carries = "Fixed-layout binary orders and execution reports"
+guarantees = "Session sequence numbers; cancel-on-disconnect"
+format = "SBE, with a session layer"
+status = "after-mm-review"
+
+[[interface]]
+id = 3
+name = "Fan-out tier &rarr; market maker"
+drawn = true
+transport = "UDP unicast, plus a TCP gap-fill channel"
+carries = "Incremental book deltas and periodic snapshots"
+guarantees = "Sequence-numbered; a gap is recovered, never guessed"
+format = "SBE over UDP, with TCP gap fill"
+status = "after-mm-review"
+
+[[interface]]
+id = 4
+name = "Market maker &harr; FIX adapter"
+drawn = true
+transport = "TCP"
+carries = "FIX 4.4, translated to the canonical message"
+guarantees = "Session-layer resend and gap fill from the adopted engine (&sect;13)"
+format = "FIX 4.4 dictionary and rules of engagement"
+status = "after-mm-review"
+
+[[interface]]
+id = 5
+name = "Drop copy &rarr; market maker"
+drawn = true
+transport = "TCP"
+carries = "Every execution, independently of the order session"
+guarantees = "Replayable from any sequence number"
+format = "SBE, and FIX for firms that want it"
+status = "after-mm-review"
+
+[[interface]]
+id = 6
+name = "Gateways &harr; session &middot; auth"
+drawn = true
+transport = "Service call, cached in each gateway"
+carries = "Credentials, entitlements, limit settings"
+guarantees = "The service is the authority for settings only. Flood-limit counters live in gateway memory and rule-limit state in the sequencer group (&sect;12), never here."
+format = "OpenAPI 3.1, internal"
+status = "planned"
+step = 5
+
+[[interface]]
+id = 7
+name = "Gateways &harr; sequencer group"
+drawn = true
+transport = "Aeron UDP unicast to cluster ingress; replies on cluster egress"
+carries = "Canonical SBE order message in; execution reports out"
+guarantees = "Routed by the versioned group map (&sect;5); acknowledged only after replication; duplicates rejected on client order ID"
+format = "SBE: client messages and their results"
+status = "specified"
+spec = "interfaces/sbe/venue-journal.xml"
+messages = ["NewOrder", "CancelOrder", "AmendOrder", "MassCancel", "BatchOrders", "BasketMintRedeem", "OrderAccepted", "OrderRejected", "Fill", "OrderCancelled", "OrderAmended"]
+
+[[interface]]
+id = 8
+name = "Engine &rarr; fan-out and conflation"
+drawn = true
+transport = "Engine-owned Aeron streams, not cluster egress (&sect;5)"
+carries = "SBE book deltas and snapshots"
+guarantees = "Sequence-numbered; a lagging subscriber recovers from a snapshot rather than slowing the engine"
+format = "SBE; engine side is <code>BookLevelChanged</code>"
+status = "after-mm-review"
+
+[[interface]]
+id = 9
+name = "Leader &harr; followers"
+drawn = true
+transport = "Aeron Cluster consensus, UDP inside the placement group"
+carries = "The sequenced log"
+guarantees = "Replicate before ack to a zone-A quorum; the zone-B replica is asynchronous and outside quorum (&sect;9)"
+format = "Aeron Cluster protocol"
+status = "adopted"
+
+[[interface]]
+id = 10
+name = "Consensus &harr; service &harr; engine"
+drawn = true
+transport = "Aeron IPC over shared memory, on one socket (above)"
+carries = "SBE commands in, SBE results out"
+guarantees = "One logical node; the JVM and the engine share fate (&sect;5)"
+format = "SBE journal messages, plus snapshot fence and role change"
+status = "next"
+step = 3
+
+[[interface]]
+id = 11
+name = "Sequencer group &rarr; journal"
+drawn = true
+transport = "Local append"
+carries = "The sequenced inputs and canonical snapshots, in our own SBE encoding"
+guarantees = "The record of retention, not Aeron's segment format (&sect;12)"
+format = "SBE: journal inputs"
+status = "specified"
+spec = "interfaces/sbe/venue-journal.xml"
+messages = ["TimeTick", "EngineStarted", "SeedSet"]
+
+[[interface]]
+id = 12
+name = "Journal &rarr; every reader"
+drawn = true
+transport = "Replay by sequence number"
+carries = "Every sequenced input, and the results it produced (20)"
+guarantees = "Each reader is idempotent on sequence and rebuildable from zero; never a side-channel copy (&sect;14)"
+format = "SBE journal and results, plus the reader contract"
+status = "next"
+step = 3
+
+[[interface]]
+id = 13
+name = "Journal &rarr; archive"
+drawn = true
+transport = "Object storage"
+carries = "Journal segments and snapshots"
+guarantees = "Object lock, versioning and KMS, in its own account and state (&sect;15)"
+format = "Segment files and signed manifest"
+status = "planned"
+step = 7
+
+[[interface]]
+id = 14
+name = "Services &rarr; sequencer group"
+drawn = true
+transport = "Cluster ingress, as sequenced commands"
+carries = "Sleeve grants and adjustments, listings, resolutions, halts"
+guarantees = "By no other route (&sect;4), so every one of them replays"
+format = "SBE: service commands"
+status = "specified"
+spec = "interfaces/sbe/venue-journal.xml"
+messages = ["ActivateProtocol", "SleeveAdjust", "DefineTickTable", "DefineEvent", "ListInstrument", "SetEventPhase", "SetMarketState", "SetVenueMode", "ResolveEvent", "ExpireParlay", "SetRuleLimits", "SetOrderCapacity", "SetAccountControls", "SetMakerProtection", "TransferOut", "TransferIn"]
+
+[[interface]]
+id = 15
+name = "Oracle adapters &rarr; operations consoles"
+drawn = true
+transport = "The oracle interface (&sect;14)"
+carries = "Resolution proposals with evidence"
+guarantees = "A proposal only; it becomes a command on 14 after two-of-three sign-off"
+format = "Rust trait and conformance suite"
+status = "planned"
+step = 5
+
+[[interface]]
+id = 16
+name = "Treasury &harr; banks and rails"
+drawn = true
+transport = "Provider APIs and bank files"
+carries = "ACH, wire and card movements; FBO balances"
+guarantees = "Reconciled against the bank daily (&sect;11)"
+format = "Provider APIs and bank files"
+status = "outside"
+
+[[interface]]
+id = 17
+name = "Data vendor &rarr; oracle adapters"
+drawn = true
+transport = "Licensed feed"
+carries = "Scores, results and event state"
+guarantees = "Single-sourced, and a settlement dependency (below)"
+format = "Vendor feed"
+status = "outside"
+
+[[interface]]
+id = 18
+name = "Surveillance export &rarr; Nasdaq SMARTS"
+drawn = true
+transport = "Agreed file or feed"
+carries = "Order, quote, trade and reference records"
+guarantees = "Regenerable from the journal if a record is disputed (&sect;12)"
+format = "Agreed with Nasdaq"
+status = "outside"
+
+[[interface]]
+id = 19
+name = "Reporting &rarr; CFTC"
+drawn = true
+transport = "Required submissions"
+carries = "Volume, open interest, large positions"
+guarantees = "On the required cadences, and reproducible by replay"
+format = "Set by the CFTC"
+status = "outside"
+
+[[interface]]
+id = 20
+name = "Journal node &rarr; result log"
+drawn = false
+transport = "Replay on the journal and replay nodes"
+carries = "Engine results for every committed input: acceptances, rejections, fills, cancels, positions, sleeves, book levels, payouts, command outcomes"
+guarantees = "Each result names its input's sequence; regenerated exactly by replay and checked against the leader by rolling hash"
+format = "SBE: engine results"
+status = "specified"
+spec = "interfaces/sbe/venue-journal.xml"
+messages = ["OrderAccepted", "OrderRejected", "Fill", "OrderCancelled", "OrderAmended", "OrderReduced", "PositionChanged", "SleeveChanged", "CollateralReleased", "BookLevelChanged", "MarketStateChanged", "SettlementPayout", "CommandApplied"]
+
+[[interface]]
+id = 21
+name = "Treasury &harr; payment, banking and KYC adapters"
+drawn = false
+transport = "In-process trait or service call"
+carries = "Transfers, identity checks and their events, in the venue's terms"
+guarantees = "Integer cents, an idempotency key per instruction, outcome-unknown errors; one conformance suite (&sect;14)"
+format = "Rust trait and conformance suite"
+status = "planned"
+step = 5
+
+[[interface]]
+id = 22
+name = "Apps &rarr; environment manifest"
+drawn = false
+transport = "HTTPS, <code>/.well-known/venue-env.json</code>"
+carries = "Endpoints, identity issuer, feature flags, display name"
+guarantees = "Read at runtime; the production app pins its manifest (&sect;16)"
+format = "JSON Schema"
+status = "planned"
+step = 6
+
+[[interface]]
+id = 23
+name = "Tools &rarr; dummy oracle control API"
+drawn = false
+transport = "HTTPS, test environments only"
+carries = "Start, suspend, resolve, correct, postpone, abandon, go stale, schedule"
+guarantees = "Refuses to start in live oracle mode (&sect;16)"
+format = "OpenAPI 3.1"
+status = "planned"
+step = 5
+
+[[interface]]
+id = 24
+name = "Operators and auto-approver &rarr; resolution console API"
+drawn = false
+transport = "HTTPS"
+carries = "Proposals, evidence, sign-offs and disputes"
+guarantees = "Two-of-three; credentials from the environment's own issuer (&sect;11, &sect;16)"
+format = "OpenAPI 3.1"
+status = "planned"
+step = 5
+
+[[interface]]
+id = 25
+name = "Services &rarr; outbox relay &rarr; sequencer group"
+drawn = false
+transport = "Outbox table, then cluster ingress"
+carries = "Service commands with command IDs"
+guarantees = "Done only when <code>CommandApplied</code> for that ID appears in the result log"
+format = "SBE commands with command IDs, plus the outbox table contract"
+status = "next"
+step = 4
+spec = "interfaces/sbe/venue-journal.xml"
+messages = ["CommandApplied"]
+
+[[interface]]
+id = 26
+name = "Journal &rarr; history loader &rarr; ClickHouse"
+drawn = false
+transport = "Sequence-range batches"
+carries = "Order, fill and cancel events; ticks and candles"
+guarantees = "A deduplication token per range; watermark published after acknowledgement (below)"
+format = "ClickHouse DDL and loader contract"
+status = "planned"
+step = 3
+
+[[interface]]
+id = 27
+name = "Journal &rarr; live-state projection &rarr; Valkey"
+drawn = false
+transport = "An atomic script per account"
+carries = "Open orders, positions and recent fills"
+guarantees = "A per-account sequence check; rebuilt from a snapshot plus replay (below)"
+format = "Key layout and apply-script contract"
+status = "planned"
+step = 3
+
+[[interface]]
+id = 28
+name = "API and WebSocket &rarr; stores"
+drawn = false
+transport = "Queries carrying a minimum sequence"
+carries = "Account records, history and live state"
+guarantees = "Waits for the watermark to pass the customer's own order (below)"
+format = "Minimum-sequence parameter in OpenAPI and AsyncAPI"
+status = "planned"
+step = 6
+
+[[interface]]
+id = 29
+name = "Stores &rarr; retention archive"
+drawn = false
+transport = "Append-only exports to object storage"
+carries = "Every regulatory record"
+guarantees = "Compliance-mode Object Lock; signed, chained manifests (&sect;12)"
+format = "Export and manifest format"
+status = "planned"
+step = 7
+
+[[interface]]
+id = 30
+name = "Hold register &rarr; deletion jobs"
+drawn = false
+transport = "A lookup before every deletion"
+carries = "Legal holds by account or matter"
+guarantees = "A hold outranks every retention period and TTL (&sect;12)"
+format = "Internal contract"
+status = "planned"
+step = 7
