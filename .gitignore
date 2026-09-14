@@ -1,0 +1,13 @@
+# Reinstall with `npm ci` in pw-tool/ and render-tool/
+node_modules/
+
+# Compiled prototypes (sources are prototypes/**/*.rs)
+prototypes/l3book/l3
+prototypes/l3book/l3cap
+prototypes/maskbench/maskbench
+target/
+
+# Check output
+*.png
+chrome-out/
+render-out/
