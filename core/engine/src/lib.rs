@@ -288,8 +288,8 @@ impl<'a> Engine<'a> {
         let second = self.now / orders::NS_PER_SECOND;
         if second != self.duplicates_purged_second {
             self.duplicates_purged_second = second;
-            let (now, window) = (self.now, u64::from(self.client_order_id_window_seconds) * orders::NS_PER_SECOND);
-            self.duplicates.retain(|_, d| now - d.recorded_at < window);
+            let now = self.now;
+            self.duplicates.retain(|_, d| now < d.expires_at);
         }
         self.end_unit(sink)
     }

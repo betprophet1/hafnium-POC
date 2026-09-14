@@ -157,7 +157,8 @@ pub struct WindowCounter {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Duplicate {
-    pub recorded_at: u64,
+    /// When the entry stops making orders duplicates: recorded under the window in force then (E-9.2).
+    pub expires_at: u64,
     pub order_id: Option<u64>,
 }
 

@@ -251,11 +251,12 @@ impl<'a> Engine<'a> {
         }
         let key = (account_id, *client_order_id);
         if let Some(entry) = self.duplicates.get(&key).copied() {
-            if self.now - entry.recorded_at < self.duplicate_window() {
+            if self.now < entry.expires_at {
                 return Ok(Err((R::DUPLICATE_CLIENT_ORDER_ID, entry.order_id)));
             }
         }
-        let entry = Duplicate { recorded_at: self.now, order_id: None };
+        let expires_at = self.now.checked_add(self.duplicate_window()).ok_or(FailStop::Overflow)?;
+        let entry = Duplicate { expires_at, order_id: None };
         self.duplicates.insert(key, entry).map_err(|_| FailStop::Capacity)?;
         let event = match self.events.get(&event_id).copied() {
             Some(e) if !e.resolved && self.is_partition(&e) => e,
