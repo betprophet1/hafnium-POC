@@ -1,0 +1,5 @@
+# The engine's binary hash goes into the journal (blueprint §4), so every machine builds with the same toolchain.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

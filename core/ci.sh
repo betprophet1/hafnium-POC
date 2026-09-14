@@ -46,6 +46,9 @@ fi
 deps="$(cd "$CORE" && cargo tree -p venue-engine -e normal --prefix none | sed 's/ .*//' | sort -u | tr '\n' ' ')"
 [[ "$deps" == "venue-engine venue_journal " ]] || fail "the engine may depend only on venue_journal, found: $deps"
 
+step "Dependencies: bans, licenses and sources"
+(cd "$CORE" && cargo deny check bans licenses sources)
+
 step "Rust: format and lints on handwritten crates; build and test the workspace"
 (cd "$CORE" && cargo fmt --check "${HANDWRITTEN[@]}" -p proto-l3book -p proto-maskbench)
 (cd "$CORE" && cargo clippy "${HANDWRITTEN[@]}" --all-targets -- -D warnings)
