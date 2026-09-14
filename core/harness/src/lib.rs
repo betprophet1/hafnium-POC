@@ -8,10 +8,13 @@
 
 #[rustfmt::skip]
 pub mod codec;
+pub mod memory;
 
+use memory::OwnedMemory;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
+use venue_engine::state::Capacities;
 use venue_engine::{Engine, EngineConfig, FailStop, ResultSink};
 
 /// Collects encoded results.
@@ -30,10 +33,14 @@ pub fn run_file(path: &Path) -> Result<usize, String> {
     let scenario: Value =
         serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let group = scenario["group"].as_u64().unwrap_or(1) as u16;
-    let mut engine = Engine::new(EngineConfig {
+    let mut owned = OwnedMemory::new(&Capacities::small());
+    let config = EngineConfig {
         sequencer_group: group,
         binary_hash: [0; 32],
-    });
+        table_seed: 0x5eed,
+    };
+    let mut engine =
+        Engine::new(config, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
     let mut buf = vec![0u8; 1 << 16];
     let steps = scenario["steps"].as_array().ok_or("no steps")?;
     for (n, step) in steps.iter().enumerate() {

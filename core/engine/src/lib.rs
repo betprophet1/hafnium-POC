@@ -1,15 +1,13 @@
 //! One sequencer group's engine: a deterministic state machine from journal inputs to results.
 //!
 //! The behaviour is normative in `spec/engine/engine-spec.md`, which this crate implements rule by rule;
-//! cite rule numbers (`E-10.6`) in comments where code implements them. The encoding is
+//! rule numbers (`E-10.6`) in comments point at the sentence the code implements. The encoding is
 //! `interfaces/sbe/venue-journal.xml`. The acceptance tests are the scenarios in `spec/engine/scenarios`
-//! and the differential vectors from the reference model, both run by `core/ci.sh`.
-//!
-//! Work is split into packages in `core/WORK_PACKAGES.md`. Until they land, [`Engine::apply`] reports
-//! [`FailStop::NotImplemented`] and every scenario fails.
+//! and the differential vectors from the reference model, both run by `./check`.
 //!
 //! Constraints that are not negotiable (blueprint §4, spec E-1.1):
-//! - `no_std`, no allocation after construction, no clock, no I/O, no randomness of its own;
+//! - `no_std`, no allocation: every table lives in caller-provided [`state::Memory`];
+//! - no clock, no I/O, no randomness of its own;
 //! - no floating point: money is integer cents, prices are tick ordinals, ratios are exact rationals;
 //! - no hash-ordered iteration: anything iterated is ordered by an explicit key;
 //! - overflow is a fail-stop, never a wrap.
@@ -19,12 +17,28 @@
 
 pub use venue_journal;
 
+mod commands;
+pub mod emit;
+pub mod fixed;
+pub mod frame;
+pub mod state;
+pub mod unit;
+
+use emit::{Emitter, Out, Side};
+use fixed::FixedMap;
+use frame::Kind;
+use state::*;
+use unit::Touches;
+use venue_journal::seed_purpose::SeedPurpose;
+use venue_journal::self_match_prevention::SelfMatchPrevention;
+use venue_journal::venue_mode::VenueMode;
+
 /// Why the engine stopped (spec §18). Every replica stops at the same input for the same reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailStop {
     /// E-4.1: the input's sequence is not the next one, or its time is earlier than the engine's.
     SequenceOrTime,
-    /// E-4.3: a command or sequencer event could not be decoded, or names another group.
+    /// E-4.3: an input could not be decoded, or a command or sequencer event names another group.
     MalformedCommand,
     /// E-2.2: arithmetic on money or quantities overflowed.
     Overflow,
@@ -36,10 +50,12 @@ pub enum FailStop {
     Conservation,
     /// E-7.7: activation of a protocol version or binary this engine does not implement.
     UnsupportedProtocol,
-    /// A result did not fit the sink's buffer, or an internal capacity was exceeded.
+    /// A table sized at construction is full, or its storage is unusable.
     Capacity,
-    /// The engine does not implement this yet.
+    /// The engine does not implement this input yet.
     NotImplemented,
+    /// An earlier input already stopped the engine.
+    Stopped,
 }
 
 /// Receives each encoded result, in order (spec §5). The engine never allocates to emit a result.
@@ -54,23 +70,124 @@ pub struct EngineConfig {
     pub sequencer_group: u16,
     /// SHA-256 of this engine binary, checked by `ActivateProtocol` (E-7.7).
     pub binary_hash: [u8; 32],
+    /// Seed for tables keyed by exchange-assigned IDs. Not observable in results.
+    pub table_seed: u64,
 }
 
-/// The engine's entire state (spec §3). Every table is sized at construction (work package WP-2).
-pub struct Engine {
+/// The highest protocol version this build implements (E-7.7).
+pub const PROTOCOL_VERSION: u16 = 1;
+
+/// The engine's entire state (spec §3).
+pub struct Engine<'a> {
     config: EngineConfig,
+    stopped: bool,
     last_sequence: u64,
     now: u64,
+    protocol_version: u16,
+    venue_mode: VenueMode,
+    active_order_limit: u32,
+    client_order_id_window_seconds: u32,
+    default_limits: Option<RuleLimits>,
+    next_order: u64,
+    next_trade: u64,
+
+    tick_tables: FixedMap<'a, u32, TickTable>,
+    tick_rows: &'a mut [TickRow],
+    tick_rows_used: usize,
+    events: FixedMap<'a, u64, Event>,
+    instruments: &'a mut [Instrument],
+    instruments_used: usize,
+    instrument_index: FixedMap<'a, u64, u32>,
+    levels: &'a mut [Level],
+    levels_used: usize,
+    level_bits: &'a mut [u64],
+    level_bits_used: usize,
+    accounts: &'a mut [Account],
+    accounts_used: usize,
+    account_index: FixedMap<'a, u64, u32>,
+    holdings: FixedMap<'a, HoldingKey, Holding>,
+    orders: &'a mut [Order],
+    free_order: u32,
+    order_index: FixedMap<'a, u64, u32>,
+    resting_orders: u32,
+    duplicates: FixedMap<'a, (u64, [u8; 32]), Duplicate>,
+    commands: FixedMap<'a, [u8; 16], ()>,
+    order_groups: FixedMap<'a, (u64, u32), OrderGroup>,
+    maker_settings: FixedMap<'a, HoldingKey, MakerSetting>,
+    maker_counters: FixedMap<'a, HoldingKey, WindowCounter>,
+
+    position_touches: Touches<'a, HoldingKey, i64>,
+    sleeve_touches: Touches<'a, u64, (i64, i64)>,
+    level_touches: Touches<'a, LevelKey, (u64, u32)>,
+    scratch: &'a mut [(u64, u64)],
+    emitter: Emitter,
 }
 
-impl Engine {
-    /// Creates an engine in the initial state of E-3.1.
-    pub const fn new(config: EngineConfig) -> Self {
-        Self {
+#[inline]
+fn cap<T>(r: Result<T, fixed::Full>) -> Result<T, FailStop> {
+    r.map_err(|_| FailStop::Capacity)
+}
+
+impl<'a> Engine<'a> {
+    /// Creates an engine in the initial state of E-3.1 over the given storage.
+    pub fn new(config: EngineConfig, memory: Memory<'a>) -> Result<Self, FailStop> {
+        let seed = config.table_seed;
+        let orders = memory.orders;
+        let order_count = orders.len();
+        for (i, o) in orders.iter_mut().enumerate() {
+            *o = Order::default();
+            o.account_next = if i + 1 < order_count {
+                i as u32 + 1
+            } else {
+                NONE
+            };
+        }
+        let free_order = if orders.is_empty() { NONE } else { 0 };
+        if memory.scratch.len() < orders.len() {
+            return Err(FailStop::Capacity);
+        }
+        Ok(Self {
             config,
+            stopped: false,
             last_sequence: 0,
             now: 0,
-        }
+            protocol_version: 1,
+            venue_mode: VenueMode::NORMAL,
+            active_order_limit: 0,
+            client_order_id_window_seconds: 86_400,
+            default_limits: None,
+            next_order: 1,
+            next_trade: 1,
+            tick_tables: cap(FixedMap::new(memory.tick_tables, seed))?,
+            tick_rows: memory.tick_rows,
+            tick_rows_used: 0,
+            events: cap(FixedMap::new(memory.events, seed))?,
+            instruments: memory.instruments,
+            instruments_used: 0,
+            instrument_index: cap(FixedMap::new(memory.instrument_index, seed))?,
+            levels: memory.levels,
+            levels_used: 0,
+            level_bits: memory.level_bits,
+            level_bits_used: 0,
+            accounts: memory.accounts,
+            accounts_used: 0,
+            account_index: cap(FixedMap::new(memory.account_index, seed))?,
+            holdings: cap(FixedMap::new(memory.holdings, seed))?,
+            orders,
+            free_order,
+            order_index: cap(FixedMap::new(memory.order_index, seed))?,
+            resting_orders: 0,
+            duplicates: cap(FixedMap::new(memory.duplicates, seed))?,
+            commands: cap(FixedMap::new(memory.commands, seed))?,
+            order_groups: cap(FixedMap::new(memory.order_groups, seed))?,
+            maker_settings: cap(FixedMap::new(memory.maker_settings, seed))?,
+            maker_counters: cap(FixedMap::new(memory.maker_counters, seed))?,
+            position_touches: Touches::new(memory.position_touches),
+            sleeve_touches: Touches::new(memory.sleeve_touches),
+            level_touches: Touches::new(memory.level_touches),
+            scratch: memory.scratch,
+            emitter: Emitter::new(config.sequencer_group),
+        })
     }
 
     /// The configuration this engine was created with.
@@ -85,10 +202,267 @@ impl Engine {
 
     /// Applies one journal input, given as SBE bytes, and emits its results to `sink` in order.
     ///
-    /// Returns `Err` exactly when the specification requires a fail-stop; after one, the engine must not
-    /// be used again.
+    /// Returns `Err` exactly when the specification requires a fail-stop; the engine then refuses every
+    /// later input.
     pub fn apply<S: ResultSink>(&mut self, input: &[u8], sink: &mut S) -> Result<(), FailStop> {
-        let _ = (input, sink);
-        Err(FailStop::NotImplemented)
+        if self.stopped {
+            return Err(FailStop::Stopped);
+        }
+        let outcome = self.apply_inner(input, sink);
+        if outcome.is_err() {
+            self.stopped = true;
+        }
+        outcome
     }
+
+    fn apply_inner<S: ResultSink>(&mut self, input: &[u8], sink: &mut S) -> Result<(), FailStop> {
+        let frame = frame::check(input).map_err(|_| FailStop::MalformedCommand)?;
+        let record = RecordHeader::read(input);
+        // E-4.1
+        if record.sequence != self.last_sequence.wrapping_add(1) || record.sequenced_at < self.now {
+            return Err(FailStop::SequenceOrTime);
+        }
+        self.last_sequence = record.sequence;
+        self.now = record.sequenced_at;
+        self.emitter.begin(record.sequence, record.sequenced_at);
+        // E-4.3: another group's input
+        let foreign = record.sequencer_group != self.config.sequencer_group;
+        if foreign && frame.kind != Kind::Client {
+            return Err(FailStop::MalformedCommand);
+        }
+        self.dispatch(frame.template_id, foreign, input, sink)
+    }
+
+    fn dispatch<S: ResultSink>(
+        &mut self,
+        template: u16,
+        foreign: bool,
+        input: &[u8],
+        sink: &mut S,
+    ) -> Result<(), FailStop> {
+        use venue_journal::*;
+        let _ = foreign;
+        match template {
+            time_tick_codec::SBE_TEMPLATE_ID => self.on_time_tick(sink),
+            engine_started_codec::SBE_TEMPLATE_ID => Ok(()),
+            seed_set_codec::SBE_TEMPLATE_ID => self.on_seed_set(input),
+            t if frame::kind_of(t) == Some(Kind::Command) => self.on_command(t, input, sink),
+            _ => Err(FailStop::NotImplemented),
+        }
+    }
+
+    // ------------------------------------------------------------------ sequencer events (§8)
+
+    fn on_time_tick<S: ResultSink>(&mut self, sink: &mut S) -> Result<(), FailStop> {
+        // E-8.1: expiry arrives with resting orders (work package WP-3).
+        self.end_unit(sink)
+    }
+
+    fn on_seed_set(&mut self, input: &[u8]) -> Result<(), FailStop> {
+        use venue_journal::message_header_codec::MessageHeaderDecoder;
+        use venue_journal::seed_set_codec::SeedSetDecoder;
+        let header = MessageHeaderDecoder::default().wrap(venue_journal::ReadBuf::new(input), 0);
+        let dec = SeedSetDecoder::default().header(header, 0);
+        match dec.purpose() {
+            // E-8.3. Hashing is not observable; a table already holding entries keeps its seed.
+            SeedPurpose::CLIENT_ORDER_ID_HASH | SeedPurpose::PRNG => Ok(()),
+            SeedPurpose::NullVal => Err(FailStop::MalformedCommand),
+        }
+    }
+
+    // ------------------------------------------------------------------ order removal (WP-3)
+
+    fn cancel_instrument_orders<S: ResultSink>(
+        &mut self,
+        _instrument_slot: u32,
+        _reason: emit::CancelReason,
+        _sink: &mut S,
+    ) -> Result<(), FailStop> {
+        if self.resting_orders == 0 { Ok(()) } else { Err(FailStop::NotImplemented) }
+    }
+
+    fn cancel_at_event_start<S: ResultSink>(&mut self, _event_id: u64, _sink: &mut S) -> Result<(), FailStop> {
+        if self.resting_orders == 0 { Ok(()) } else { Err(FailStop::NotImplemented) }
+    }
+
+    fn cancel_all_orders<S: ResultSink>(&mut self, _reason: emit::CancelReason, _sink: &mut S) -> Result<(), FailStop> {
+        if self.resting_orders == 0 { Ok(()) } else { Err(FailStop::NotImplemented) }
+    }
+
+    // ------------------------------------------------------------------ accounts
+
+    /// The slot of an account, creating it with the initial values of E-3.1 on first mention (E-3.2).
+    fn account_slot(&mut self, id: u64) -> Result<u32, FailStop> {
+        if let Some(&slot) = self.account_index.get(&id) {
+            return Ok(slot);
+        }
+        let slot = self.accounts_used;
+        if slot >= self.accounts.len() {
+            return Err(FailStop::Capacity);
+        }
+        self.accounts[slot] = Account {
+            id,
+            self_match_prevention: SelfMatchPrevention::CANCEL_INCOMING,
+            first_order: NONE,
+            ..Account::default()
+        };
+        cap(self.account_index.insert(id, slot as u32))?;
+        self.accounts_used += 1;
+        Ok(slot as u32)
+    }
+
+    fn holding(&self, account_id: u64, instrument_id: u64) -> Holding {
+        self.holdings
+            .get(&(account_id, instrument_id))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    // ------------------------------------------------------------------ units (§5)
+
+    /// Records a position's value before it changes (E-5.2 block 3).
+    fn touch_position(&mut self, account_id: u64, instrument_id: u64) -> Result<(), FailStop> {
+        let value = self.holding(account_id, instrument_id).position;
+        self.position_touches
+            .touch((account_id, instrument_id), value)
+            .map_err(|_| FailStop::Capacity)
+    }
+
+    /// Records a sleeve's values before they change (E-5.2 block 4).
+    fn touch_sleeve(&mut self, account_slot: u32) -> Result<(), FailStop> {
+        let a = &self.accounts[account_slot as usize];
+        let value = (a.balance, a.reserved);
+        self.sleeve_touches
+            .touch(a.id, value)
+            .map_err(|_| FailStop::Capacity)
+    }
+
+    /// Records a book level's aggregates before they change (E-5.2 block 5).
+    fn touch_level(&mut self, instrument_slot: u32, side: Side, tick: u16) -> Result<(), FailStop> {
+        let inst = &self.instruments[instrument_slot as usize];
+        let level = self.levels[level_index(inst, side, tick)];
+        let key = (inst.id, side_rank(side), tick);
+        self.level_touches
+            .touch(key, (level.quantity, level.count))
+            .map_err(|_| FailStop::Capacity)
+    }
+
+    /// Emits blocks 3 to 5 of E-5.2 for the unit that just ended.
+    fn end_unit<S: ResultSink>(&mut self, sink: &mut S) -> Result<(), FailStop> {
+        let Self {
+            position_touches,
+            sleeve_touches,
+            level_touches,
+            holdings,
+            accounts,
+            account_index,
+            instruments,
+            instrument_index,
+            levels,
+            emitter,
+            ..
+        } = self;
+        position_touches.finish(
+            |k| holdings.get(k).map_or(0, |h| h.position),
+            |k, position| {
+                emitter.emit(
+                    sink,
+                    &Out::PositionChanged {
+                        account_id: k.0,
+                        instrument_id: k.1,
+                        position,
+                    },
+                )
+            },
+        )?;
+        sleeve_touches.finish(
+            |id| {
+                account_index.get(id).map_or((0, 0), |&s| {
+                    (accounts[s as usize].balance, accounts[s as usize].reserved)
+                })
+            },
+            |id, (balance, reserved)| {
+                let available = balance.checked_sub(reserved).ok_or(FailStop::Overflow)?;
+                emitter.emit(
+                    sink,
+                    &Out::SleeveChanged {
+                        account_id: *id,
+                        available_cents: available,
+                        reserved_cents: reserved,
+                    },
+                )
+            },
+        )?;
+        level_touches.finish(
+            |k| {
+                instrument_index.get(&k.0).map_or((0, 0), |&slot| {
+                    let inst = &instruments[slot as usize];
+                    let l = levels[level_index(inst, side_of_rank(k.1), k.2)];
+                    (l.quantity, l.count)
+                })
+            },
+            |k, (quantity, count)| {
+                let quantity = u32::try_from(quantity).map_err(|_| FailStop::Overflow)?;
+                emitter.emit(
+                    sink,
+                    &Out::BookLevelChanged {
+                        instrument_id: k.0,
+                        side: side_of_rank(k.1),
+                        tick: k.2,
+                        quantity,
+                        order_count: count,
+                    },
+                )
+            },
+        )
+    }
+}
+
+/// The record header every journal input starts with, read at its fixed offset (E-4.1).
+struct RecordHeader {
+    sequence: u64,
+    sequenced_at: u64,
+    sequencer_group: u16,
+}
+
+impl RecordHeader {
+    fn read(input: &[u8]) -> Self {
+        // frame::check guarantees the fixed block, which starts with this header, is present.
+        let at = venue_journal::message_header_codec::ENCODED_LENGTH;
+        let u64_at = |i: usize| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&input[i..i + 8]);
+            u64::from_le_bytes(b)
+        };
+        Self {
+            sequence: u64_at(at),
+            sequenced_at: u64_at(at + 8),
+            sequencer_group: u16::from_le_bytes([input[at + 16], input[at + 17]]),
+        }
+    }
+}
+
+/// BUY sorts before SELL (E-5.2 block 5).
+#[inline]
+const fn side_rank(side: Side) -> u8 {
+    match side {
+        Side::BUY => 0,
+        _ => 1,
+    }
+}
+
+#[inline]
+const fn side_of_rank(rank: u8) -> Side {
+    if rank == 0 {
+        Side::BUY
+    } else {
+        Side::SELL
+    }
+}
+
+/// The level pool index of one tick on one side of a book.
+#[inline]
+fn level_index(inst: &Instrument, side: Side, tick: u16) -> usize {
+    let per_side = usize::from(inst.table.len);
+    inst.levels_start as usize + usize::from(side_rank(side)) * per_side + usize::from(tick)
 }
