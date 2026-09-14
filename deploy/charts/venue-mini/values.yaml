@@ -1,0 +1,28 @@
+# The mini venue (blueprint §16): one chart for the laptop and for ephemeral namespaces.
+# It runs the core only so far. The gateway, bots, dummy oracle and environment manifest join as they are built.
+
+image:
+  repository: venue-node
+  tag: dev
+  pullPolicy: IfNotPresent
+
+core:
+  # One sequencer group, one node. Order and trade IDs carry the group (spec E-2.8).
+  group: 1
+  nodeId: 1
+  # TimeTick cadence (spec E-17.3). Production uses 1 ms; an idle laptop does not need a thousand records a second.
+  tickMs: 100
+  # fsync the journal after every input. Off on laptops; the journal is still flushed before each input applies.
+  fsync: false
+  storage:
+    size: 1Gi
+    # Empty uses the cluster's default class (k3d: local-path).
+    className: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+fullnameOverride: ""

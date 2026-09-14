@@ -1,0 +1,7 @@
+.git
+.claude
+**/target
+**/node_modules
+blueprint
+spec
+interfaces/generated

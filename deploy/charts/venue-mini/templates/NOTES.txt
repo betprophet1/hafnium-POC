@@ -1,0 +1,9 @@
+The core of {{ .Release.Name }} listens on {{ include "venue-mini.fullname" . }}-core:7101 (spec §17 sequencer, one group).
+
+  helm test {{ .Release.Name }} --logs
+  kubectl port-forward svc/{{ include "venue-mini.fullname" . }}-core 7101:7101
+  venue-node send 127.0.0.1:7101 inputs.jsonl
+
+The pod updates only when deleted (OnDelete); a new pod replays the journal before it is ready:
+
+  kubectl delete pod {{ include "venue-mini.fullname" . }}-core-0

@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "venue-mini.fullname" . }}-core
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: core
+spec:
+  selector:
+    {{- include "venue-mini.coreSelector" . | nindent 4 }}
+  ports:
+    - name: ingress
+      port: 7101
+      targetPort: ingress
+---
+# The core in Kubernetes is for mini venues only; production runs it on dedicated hosts (blueprint §16).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "venue-mini.fullname" . }}-core
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: core
+spec:
+  serviceName: {{ include "venue-mini.fullname" . }}-core
+  replicas: 1
+  # A sequencer group has one writer, and a restart replays the whole journal. Replace the pod deliberately.
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      {{- include "venue-mini.coreSelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" . | nindent 8 }}
+        app.kubernetes.io/component: core
+    spec:
+      securityContext:
+        {{- include "venue-mini.podSecurity" . | nindent 8 }}
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: core
+          image: {{ include "venue-mini.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve"{{ if .Values.core.fsync }}, "--fsync"{{ end }}]
+          env:
+            - name: VENUE_LISTEN
+              value: "0.0.0.0:7101"
+            - name: VENUE_DATA
+              value: /var/lib/venue
+            - name: VENUE_GROUP
+              value: {{ .Values.core.group | quote }}
+            - name: VENUE_NODE_ID
+              value: {{ .Values.core.nodeId | quote }}
+            - name: VENUE_TICK_MS
+              value: {{ .Values.core.tickMs | quote }}
+          ports:
+            - name: ingress
+              containerPort: 7101
+          # Ready once the journal has replayed and the ingress listens. No liveness probe: a fail-stop exits the
+          # process, and a restart replays to the same stop (spec E-18.2), which shows as CrashLoopBackOff.
+          readinessProbe:
+            tcpSocket:
+              port: ingress
+            periodSeconds: 2
+          resources:
+            {{- toYaml .Values.core.resources | nindent 12 }}
+          securityContext:
+            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: journal
+              mountPath: /var/lib/venue
+  volumeClaimTemplates:
+    - metadata:
+        name: journal
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.core.storage.className }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.core.storage.size }}

@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "venue-mini.fullname" . }}-smoke
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+data:
+  inputs.jsonl: |
+    {{- .Files.Get "files/smoke.jsonl" | nindent 4 }}
+---
+# helm test: sends the smoke inputs through the core's ingress and fails if the node does not answer each one.
+# A second run gets DUPLICATE outcomes for the same command and client order IDs, which is still an answer.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "venue-mini.fullname" . }}-smoke
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  restartPolicy: Never
+  securityContext:
+    {{- include "venue-mini.podSecurity" . | nindent 4 }}
+  containers:
+    - name: smoke
+      image: {{ include "venue-mini.image" . | quote }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      args: ["send", "{{ include "venue-mini.fullname" . }}-core:7101", "/smoke/inputs.jsonl"]
+      securityContext:
+        {{- include "venue-mini.containerSecurity" . | nindent 8 }}
+      volumeMounts:
+        - name: inputs
+          mountPath: /smoke
+  volumes:
+    - name: inputs
+      configMap:
+        name: {{ include "venue-mini.fullname" . }}-smoke
