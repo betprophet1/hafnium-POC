@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 venue-engine = { path = "../engine" }
-venue_journal = { path = "../../interfaces/generated/rust/venue_journal" }
+venue_journal = { path = "../journal" }
 serde_json = "1"
 
 [[bin]]

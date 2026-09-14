@@ -50,11 +50,21 @@ firms have reviewed them.
 - **Not yet in the schema.** RFQ requests, quotes and acceptances; the snapshot fence and role-change
   messages on interface 10; order-level (L3) market data.
 
+## Generated code
+
+- **Rust:** `interfaces/tools/sbe.sh` regenerates `core/journal`, the codec crate the engine and harness use. It is
+  committed, so building the core needs no Java. `core/journal/SCHEMA.sha256` records the schema it was generated
+  from, and `./check` fails if the schema has changed since.
+- **Java:** generated into `interfaces/generated/java` for the future Aeron clustered service; not committed.
+- **JSON codec for the harness:** `interfaces/tools/gen_rust_json_codec.py` writes `core/harness/src/codec.rs`.
+- **Round-trip tests** of the generated codec live in `core/harness/tests/journal_roundtrip.rs`.
+
 ## Checks
 
 ```sh
-python3 interfaces/tools/catalogue.py check          # catalogue against the blueprint and the schema
-JAVA=/path/to/java SBE_JAR=/path/to/sbe-all-1.40.1.jar interfaces/tools/sbe.sh   # SBE validation, Rust codegen, round-trip tests
+./check                                                                  # every gate in the repository
+python3 interfaces/tools/catalogue.py check                              # catalogue against blueprint and schema
+JAVA=/path/to/java SBE_JAR=/path/to/sbe-all-1.40.1.jar interfaces/tools/sbe.sh   # after changing the schema
 ```
 
 `sbe.sh` needs a JDK 17 or later and `uk.co.real-logic:sbe-all:1.40.1` from Maven Central

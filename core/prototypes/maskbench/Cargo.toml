@@ -1,0 +1,8 @@
+[package]
+name = "proto-maskbench"
+version = "0.1.0"
+description = "Prototype: occupancy bitmaps against scanning the level array, for blueprint §6"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true

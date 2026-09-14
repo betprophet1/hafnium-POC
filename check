@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Every gate in the repository, in order:
+#   1. blueprint: structure, consistency, figure geometry, Chromium widths (when installed)
+#   2. separation: no change touches core/engine/ together with the specification or schema (AGENTS.md)
+#   3. core/ci.sh: interfaces, reference model, test vectors, engine guardrails, Rust, engine results
+#
+# Environment: JAVA and SBE_JAR revalidate the schema and regenerate core/journal; ENGINE_REQUIRED=1 makes engine
+# results fatal; CHECK_RANGE=base..head checks those commits for separation (default: main..HEAD off main);
+# ALLOW_SPEC_AND_ENGINE=1 skips the separation gate for a reviewed change that must touch both.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+step() { printf '\n== %s\n' "$*"; }
+fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+step "Blueprint"
+python3 "$ROOT/blueprint/tools/validate.py"
+python3 "$ROOT/blueprint/tools/verify_sweep.py"
+python3 "$ROOT/blueprint/tools/figure_geometry.py" | tail -1
+if [[ -d "$ROOT/blueprint/tools/node_modules/playwright" ]]; then
+  node "$ROOT/blueprint/tools/chrome-widths.js"
+else
+  echo "skipping Chromium widths: run (cd blueprint/tools && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci)"
+fi
+
+step "Specification and engine change separately"
+touches_both() {
+  local paths
+  paths="$(cat)"
+  grep -qE '^core/engine/' <<<"$paths" && grep -qE '^(spec/|interfaces/sbe/)' <<<"$paths"
+}
+if [[ "${ALLOW_SPEC_AND_ENGINE:-0}" == "1" ]]; then
+  echo "ALLOW_SPEC_AND_ENGINE=1: skipped"
+elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  if { git -C "$ROOT" diff --name-only HEAD; git -C "$ROOT" ls-files --others --exclude-standard; } | touches_both; then
+    fail "uncommitted changes touch core/engine/ and the specification or schema together"
+  fi
+  range="${CHECK_RANGE:-}"
+  if [[ -z "$range" && "$(git -C "$ROOT" branch --show-current)" != "main" ]] \
+      && git -C "$ROOT" rev-parse -q --verify main >/dev/null; then
+    range="main..HEAD"
+  fi
+  if [[ -n "$range" ]]; then
+    for commit in $(git -C "$ROOT" rev-list "$range"); do
+      if git -C "$ROOT" diff-tree --no-commit-id --name-only -r "$commit" | touches_both; then
+        fail "commit $(git -C "$ROOT" log --oneline -1 "$commit") touches core/engine/ and the specification or schema together"
+      fi
+    done
+    echo "ok: working tree and $range"
+  else
+    echo "ok: working tree"
+  fi
+else
+  echo "not a git checkout: skipped"
+fi
+
+"$ROOT/core/ci.sh"

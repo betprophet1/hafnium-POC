@@ -1,23 +1,18 @@
-# Reinstall with `npm ci` in pw-tool/ and render-tool/
+# Node packages for blueprint/tools (PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci there)
 node_modules/
 
-# Compiled prototypes (sources are prototypes/**/*.rs)
-prototypes/l3book/l3
-prototypes/l3book/l3cap
-prototypes/maskbench/maskbench
+# Rust build output, and the test vectors core/ci.sh writes into core/target
 target/
 
-# Check output
+# Screenshots and renders from blueprint/tools
+blueprint/tools/out/
 *.png
-chrome-out/
-render-out/
 
-# Generated from interfaces/sbe by interfaces/tools/sbe.sh
+# Java codecs from interfaces/tools/sbe.sh (the Rust codec is committed as core/journal)
 interfaces/generated/
-interfaces/rust-roundtrip/target/
+
+# Python bytecode
+__pycache__/
 
 # Claude Code worktrees and local state
 .claude/
-
-# Python bytecode from the reference model and tools
-__pycache__/

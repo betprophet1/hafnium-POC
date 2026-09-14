@@ -1,33 +1,28 @@
-# Prediction Exchange Blueprint
+# Prediction exchange
 
-Architecture spec for the new ProphetX prediction-markets exchange.
+Architecture, specifications and the core prototype for the new ProphetX prediction-markets exchange.
 
-- **Published:** https://claude.ai/code/artifact/5e4d2278-46dd-4f2c-a617-da87c3ae0831 (private; every published version is kept there)
-- **Source:** `prediction-exchange.html` is the file that page is published from. Edit this, then republish to the same URL.
+| Path | What it is | Changed by |
+|---|---|---|
+| [`blueprint/`](blueprint/) | The architecture blueprint: why the system is shaped the way it is, and the tools that check the document | People |
+| [`interfaces/`](interfaces/) | The contracts between components: a catalogue of every interface and the journal schema | People, as reviewed specification changes |
+| [`spec/engine/`](spec/engine/) | What one sequencer group's engine does: numbered rules, decisions, hand-computed scenarios, a reference model | People, as reviewed specification changes |
+| [`core/`](core/) | The Rust core: engine, test harness, generated codec, prototypes, CI gates and the work packages that build it | People and coding agents, against the gates |
+| [`AGENTS.md`](AGENTS.md) | How to work here, including what an implementation may never change | — |
 
-## Contents
+The published blueprint is at https://claude.ai/code/artifact/5e4d2278-46dd-4f2c-a617-da87c3ae0831.
 
-| Path | What it is |
-|---|---|
-| `prediction-exchange.html` | The blueprint, 23 sections, 18 figures |
-| `validate.py` | Structure check: sections, rail, markers, SVG markers, tag balance. Must print PASS |
-| `verify_sweep.py` | Consistency sweep: table columns, classes, quotes, dangling section refs, stray characters |
-| `geom16.py`, `rename_check.py` | Figure label geometry checks (edit the `(section, figure)` tuple to choose figures) |
-| `chrome-widths.js`, `chrome-check.js` | Real-Chromium checks: sideways overflow at 1280/400/360px, screenshots |
-| `render-figs.js`, `font-plex-ttf/`, `entities.json` | resvg figure renderer, the IBM Plex Mono fonts and the HTML entity table it uses |
-| `prototypes/maskbench/` | Benchmark of bid/ask occupancy masks vs signed quantities |
-| `prototypes/l3book/` | L3 order book with a pre-sized slab, differential and capacity tests |
-| `history/` | The HTML before each major revision, oldest first |
-
-## Running the checks
+## Checking everything
 
 ```sh
-python3 validate.py && python3 verify_sweep.py
-(cd pw-tool && npm ci)        # Playwright, for the Chromium checks
-(cd render-tool && npm ci)    # resvg, for render-figs.js
-node chrome-widths.js
-node render-figs.js font-plex-ttf   # figures to PNG; reads entities.json
+./check
 ```
 
-The Chromium scripts expect Playwright's Chromium build 1228 at
-`~/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome`.
+That runs, in order: the blueprint's structure, consistency and figure checks; a gate that no change touches the
+engine together with the specification; the interface catalogue and a check that the committed codec matches the
+schema; the reference model against every scenario and on random sequences; the Rust formatting, lints and tests;
+and the Rust engine against the scenarios, which fails until the work packages in `core/WORK_PACKAGES.md` land.
+
+**Needed:** Python 3.11+, Rust with `rustfmt` and `clippy`. **Optional:** Node, for the Chromium checks
+(`cd blueprint/tools && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci`); a JDK 17+ and sbe-all 1.40.1, only when the
+journal schema changes (see `interfaces/README.md`).

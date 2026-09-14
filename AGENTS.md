@@ -1,20 +1,24 @@
 # Working in this repository
 
-This repository holds the blueprint for a regulated prediction-markets exchange and the specifications a
-coding agent needs to build its core. Read this before changing anything.
+This repository holds the blueprint for a regulated prediction-markets exchange, the specifications a coding
+agent needs to build its core, and the core itself. Read this before changing anything.
 
 ## What is where
 
 | Path | What it is |
 |---|---|
-| `prediction-exchange.html` | The architecture blueprint. Explains why; not an implementation contract. |
+| `blueprint/prediction-exchange.html` | The architecture blueprint. Explains why; not an implementation contract. |
 | `interfaces/` | One specification per interface between components, and the catalogue of all of them. The journal schema is `interfaces/sbe/venue-journal.xml`. |
 | `spec/engine/engine-spec.md` | The normative behaviour of one sequencer group's engine, in numbered rules (`E-10.6`). |
 | `spec/engine/decisions.md` | Defaults chosen to complete the specification, some awaiting review. |
 | `spec/engine/scenarios/` | Acceptance tests: inputs and exact expected results, computed by hand from the specification. |
 | `spec/engine/reference/` | The reference model (an executable second statement of the specification), its scenario runner and its random-sequence tester. |
-| `core/` | The Rust workspace for the engine, the test harness and the CI gates. |
+| `core/engine/` | The engine. The only code an implementation work package changes. |
+| `core/harness/` | Runs scenarios and differential vectors against the engine; the JSON codec in `src/codec.rs` is generated. |
+| `core/journal/` | The Rust codec generated from the schema. Never edited by hand. |
+| `core/prototypes/` | Experiments behind blueprint claims. Learn from them; nothing depends on them. |
 | `core/WORK_PACKAGES.md` | The order in which the core is built, and what "done" means for each piece. |
+| `check` | Every gate in the repository. |
 
 ## Order of authority
 
@@ -30,14 +34,17 @@ A disagreement is a bug in one of them. Decide which from the specification, and
 ## Rules for implementing the core
 
 - **Never change the specification, the schema, a scenario or the reference model in the same change as
-  engine code.** If the engine and a scenario disagree and you believe the scenario is wrong, stop and write
-  the case up in `spec/engine/questions/` — the input, the result you believe is right, the rule, and why —
+  engine code.** `./check` fails any commit that touches `core/engine/` together with `spec/` or `interfaces/sbe/`.
+  If the engine and a scenario disagree and you believe the scenario is wrong, stop and write the case up in
+  `spec/engine/questions/` in a separate change — the input, the result you believe is right, the rule, and why —
   for a person to review. Tests that are edited to match an implementation stop being tests.
 - **Never regenerate expected results from an implementation.** The compiled vectors in `core/target` are
   derived and disposable; the scenarios are hand-computed and normative.
+- **Never edit generated code:** `core/journal/` comes from `interfaces/tools/sbe.sh`, and
+  `core/harness/src/codec.rs` from `interfaces/tools/gen_rust_json_codec.py`.
 - **The engine is a pure function of its journal** (blueprint §4, spec E-1.1): `no_std`, no allocation after
   construction, no clock, no I/O, no randomness, no floating point, no hash-ordered iteration, checked
-  arithmetic with overflow as a fail-stop. `core/ci.sh` enforces what it can; review enforces the rest.
+  arithmetic with overflow as a fail-stop. `./check` enforces what it can; review enforces the rest.
 - **Cite rules.** Code that implements a rule names it in a comment (`// E-11.4`), so a reviewer can check the
   code against the sentence.
 - **Emit results in exactly the order of spec §5.** Order is part of the contract; readers depend on it.
@@ -47,18 +54,19 @@ A disagreement is a bug in one of them. Decide which from the specification, and
 ## Running the gates
 
 ```sh
-JAVA=/path/to/java SBE_JAR=/path/to/sbe-all-1.40.1.jar core/ci.sh    # everything, in order
+./check                                                                # everything, in order
 python3 spec/engine/reference/run_scenarios.py                         # reference model against scenarios
 python3 spec/engine/reference/fuzz.py --seeds 50 --steps 300           # invariants on random sequences
 (cd core && cargo run -p venue-harness --bin run-scenarios -- target/compiled target/differential)
 ```
 
-`core/ci.sh` must pass before a change is proposed. Set `ENGINE_REQUIRED=1` once work package WP-5 has landed.
+`./check` must pass before a change is proposed. Set `ENGINE_REQUIRED=1` once work package WP-5 has landed.
 
 ## Changing the specification
 
-Specification changes are made by people, or by an agent explicitly asked to make one, never as a side
-effect of implementation. A specification change updates, in one change: the rule in `engine-spec.md`, the
-decision in `decisions.md` if a default moved, the reference model, at least one scenario that fails before
-the change and passes after, and the schema and catalogue if the encoding moved. Run
-`python3 interfaces/tools/catalogue.py check` and `python3 interfaces/tools/gen_rust_json_codec.py --check`.
+Specification changes are made by people, or by an agent explicitly asked to make one, never as a side effect of
+implementation. A specification change updates, in one change: the rule in `engine-spec.md`, the decision in
+`decisions.md` if a default moved, the reference model, at least one scenario that fails before the change and
+passes after, and the schema, `core/journal` (via `interfaces/tools/sbe.sh`), the JSON codec and the catalogue if
+the encoding moved. If the engine must change in the same commit, that commit is reviewed as such and checked with
+`ALLOW_SPEC_AND_ENGINE=1`.

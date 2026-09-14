@@ -1,0 +1,8 @@
+[package]
+name = "proto-l3book"
+version = "0.1.0"
+description = "Prototype: the blueprint §6 book and slab layout, differential-tested against an ordered-map model"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true

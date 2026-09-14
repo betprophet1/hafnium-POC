@@ -12,4 +12,4 @@ workspace = true
 
 # The engine may depend on nothing but the generated journal codecs (blueprint §4; checked by core/ci.sh).
 [dependencies]
-venue_journal = { path = "../../interfaces/generated/rust/venue_journal" }
+venue_journal = { path = "../journal" }

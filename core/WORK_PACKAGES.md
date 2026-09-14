@@ -1,11 +1,11 @@
 # Work packages for the core
 
 The engine is built in the order below. Each package is sized for one agent working in one change, names
-the specification rules it implements, and is done only when its acceptance criteria hold and `core/ci.sh`
+the specification rules it implements, and is done only when its acceptance criteria hold and `./check`
 passes. Read `AGENTS.md` first.
 
 Scenario numbers refer to `spec/engine/scenarios/NN-*.json`. "Differential" means the vectors exported by
-`fuzz.py --export`, which `core/ci.sh` writes to `core/target/differential`.
+`fuzz.py --export`, which `./check` writes to `core/target/differential`.
 
 | WP | Package | Depends on | Spec rules | Scenarios that must pass |
 |---|---|---|---|---|
@@ -25,13 +25,13 @@ Scenario numbers refer to `spec/engine/scenarios/NN-*.json`. "Differential" mean
 
 ## WP-0 Toolchain and CI baseline
 
-**Goal.** `core/ci.sh` passes with the engine stub.
+**Goal.** `./check` passes with the engine stub.
 
 - Pin the toolchain in `core/rust-toolchain.toml` to the version CI uses, with `rustfmt` and `clippy`.
 - Run `cargo deny check bans licenses sources` in CI and make it pass.
 - Confirm the codec round trip covers every message the scenarios and differential vectors use.
 
-**Done when** `core/ci.sh` passes, the engine stub reports every scenario as failing with `NotImplemented`,
+**Done when** `./check` passes, the engine stub reports every scenario as failing with `NotImplemented`,
 and the pinned toolchain builds identically on two machines (compare the engine library's hash).
 
 ## WP-1 Processing loop and results
@@ -58,6 +58,8 @@ changed key in the specified order.
 
 - `EngineConfig` gains capacities: tick tables and rows, events, instruments, accounts, positions, resting
   orders (the slab ceiling of blueprint §6), duplicate-table entries, command IDs, order groups.
+- Start from `core/prototypes/l3book`, which already implements this layout and is differential-tested against an
+  ordered-map model; it is a prototype to learn from, not code to depend on.
 - Books as blueprint §6 describes: per-tick aggregate quantity, head and tail slot, occupancy bitmap per side
   (two-level above 128 ticks), orders in one slab with intrusive FIFO links and a second link list per
   session, an ID map with open addressing sized from the ceiling and kept at most half full.
@@ -106,7 +108,7 @@ changed key in the specified order.
 - §15 resolution, void weights, flooring, the settlement reserve, parlay expiry.
 
 **Done when** every scenario and every differential vector passes, and `ENGINE_REQUIRED=1` is set in
-`core/ci.sh`. From here on, run at least 300 differential seeds before proposing a change.
+`./check`. From here on, run at least 300 differential seeds before proposing a change.
 
 ## WP-6 Invariants inside the engine
 
@@ -161,10 +163,10 @@ changed key in the specified order.
 
 ## Handing a package to an agent
 
-Give it `AGENTS.md`, this file, the package's section, and the instruction to finish with `core/ci.sh`
+Give it `AGENTS.md`, this file, the package's section, and the instruction to finish with `./check`
 passing. A useful opening prompt:
 
 > Implement work package WP-N from `core/WORK_PACKAGES.md` in `core/engine`. The normative rules are in
 > `spec/engine/engine-spec.md`; cite rule numbers in comments. Do not modify anything under `spec/`,
 > `interfaces/` or the scenarios. If you believe a scenario or rule is wrong, stop and write it up in
-> `spec/engine/questions/`. Finish when `core/ci.sh` passes and the package's scenarios pass.
+> `spec/engine/questions/`. Finish when `./check` passes and the package's scenarios pass.

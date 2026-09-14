@@ -1,0 +1,11 @@
+[package]
+publish = false
+name = "venue_journal"
+version = "0.1.0"
+authors = ["sbetool"]
+description = "Venue journal inputs and engine results, draft v0"
+edition = "2021"
+
+[lib]
+name = "venue_journal"
+path = "src/lib.rs"

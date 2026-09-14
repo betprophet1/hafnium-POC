@@ -1,9 +1,0 @@
-[package]
-name = "interfaces-roundtrip"
-version = "0.1.0"
-edition = "2021"
-publish = false
-description = "Round-trip tests for the code generated from interfaces/sbe"
-
-[dependencies]
-venue_journal = { path = "../generated/rust/venue_journal" }

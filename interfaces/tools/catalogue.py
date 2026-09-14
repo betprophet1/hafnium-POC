@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CATALOGUE = ROOT / "interfaces" / "catalogue.toml"
-BLUEPRINT = ROOT / "prediction-exchange.html"
+BLUEPRINT = ROOT / "blueprint" / "prediction-exchange.html"
 
 STATUS_LABEL = {
     "specified": "Specified, draft v0",

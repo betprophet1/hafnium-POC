@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "description": "Rendering and Chromium checks for the blueprint. Install with PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci; the scripts use Playwright's Chromium build 1228 from ~/.cache/ms-playwright.",
+  "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "playwright": "^1.63.0"
+  }
+}
