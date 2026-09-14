@@ -15,6 +15,14 @@ for schema in "$ROOT"/interfaces/sbe/*.xml; do
   done
   echo "valid: ${schema#$ROOT/}"
 done
+# The engine is no_std (blueprint §4). sbe-tool 1.40.1's Rust output uses two std paths with core equivalents;
+# rewrite them, mark the crate no_std and unpublished, and fail if any std path remains.
+for crate in "$OUT"/rust/*/; do
+  sed -i 's/std::iter::repeat/core::iter::repeat/g; s/impl std::error::Error for SbeErr/impl core::error::Error for SbeErr/' "$crate"src/*.rs
+  sed -i '1i #![no_std]' "$crate"src/lib.rs
+  sed -i 's/^\[package\]$/[package]\npublish = false/' "$crate"Cargo.toml
+  if grep -rn 'std::' "$crate"src; then echo "generated Rust in $crate still uses std" >&2; exit 1; fi
+done
 if [ -f "$ROOT/interfaces/rust-roundtrip/Cargo.toml" ]; then
   (cd "$ROOT/interfaces/rust-roundtrip" && cargo test --quiet)
 fi

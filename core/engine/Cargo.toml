@@ -1,0 +1,15 @@
+[package]
+name = "venue-engine"
+version = "0.1.0"
+description = "One sequencer group's deterministic matching, clearing and risk state machine"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# The engine may depend on nothing but the generated journal codecs (blueprint §4; checked by core/ci.sh).
+[dependencies]
+venue_journal = { path = "../../interfaces/generated/rust/venue_journal" }

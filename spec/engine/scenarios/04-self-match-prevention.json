@@ -1,0 +1,39 @@
+{
+  "name": "Self-match prevention: the default cancels the incoming order; CANCEL_RESTING cancels the resting one",
+  "rules": ["E-13.1", "E-7.5", "E-5.2"],
+  "notes": [
+    "A offers 5 at 60c: reservation noCost(59, 5) = 200.",
+    "Step 2: A bids 5 at 60c. Accepted with reservation yesCost(59, 5) = 300; the walk meets A's own offer, and under the default CANCEL_INCOMING the bid is cancelled. The sleeve ends where it started, so no SleeveChanged.",
+    "Step 4: under CANCEL_RESTING the offer is cancelled and the bid rests: reserved 300, available 9700."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000},
+    {"op": "fund", "accountId": 1, "cents": 10000}
+  ],
+  "steps": [
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a1", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 5},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O1", "accountId": 1, "clientOrderId": "a1", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 5, "reservedCents": 200},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9800, "reservedCents": 200},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 5, "orderCount": 1}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a2", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 5},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O2", "accountId": 1, "clientOrderId": "a2", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 5, "reservedCents": 300},
+       {"msg": "OrderCancelled", "orderId": "O2", "accountId": 1, "instrumentId": 1000, "cancelledQuantity": 5, "reason": "SELF_MATCH_PREVENTED"}
+     ]},
+    {"input": {"msg": "SetAccountControls", "commandId": "ctl1", "accountId": 1, "closedOnly": "FALSE", "selfMatchPrevention": "CANCEL_RESTING"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "ctl1", "outcome": "APPLIED"}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a3", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 5},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O3", "accountId": 1, "clientOrderId": "a3", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 5, "reservedCents": 300},
+       {"msg": "OrderCancelled", "orderId": "O1", "accountId": 1, "instrumentId": 1000, "cancelledQuantity": 5, "reason": "SELF_MATCH_PREVENTED"},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9700, "reservedCents": 300},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 5, "orderCount": 1},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 0, "orderCount": 0}
+     ]}
+  ]
+}

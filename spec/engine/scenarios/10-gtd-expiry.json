@@ -1,0 +1,29 @@
+{
+  "name": "A GTD order expires on the first tick at or after its expiry",
+  "rules": ["E-8.1", "E-9.3"],
+  "notes": [
+    "A bids 1 at 10c GTD, expiring 5 ms after it is entered.",
+    "A tick 1 ms later does nothing and emits nothing.",
+    "A tick 10 ms after that is past the expiry: the order is cancelled EXPIRED."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000},
+    {"op": "fund", "accountId": 1, "cents": 10000}
+  ],
+  "steps": [
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a1", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1, "timeInForce": "GTD", "expiresAfterNs": 5000000},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O1", "accountId": 1, "clientOrderId": "a1", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1, "reservedCents": 10},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9990, "reservedCents": 10},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1, "orderCount": 1}
+     ]},
+    {"input": {"msg": "TimeTick"}, "expect": []},
+    {"input": {"msg": "TimeTick"}, "advanceNs": 10000000,
+     "expect": [
+       {"msg": "OrderCancelled", "orderId": "O1", "accountId": 1, "instrumentId": 1000, "cancelledQuantity": 1, "reason": "EXPIRED"},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 10000, "reservedCents": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 0, "orderCount": 0}
+     ]}
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "name": "Command IDs are applied once; reclaims cannot exceed available cash; invalid transitions are refused",
+  "rules": ["E-7.1", "E-7.2", "E-16.1"],
+  "notes": [
+    "Grant 500 to account 5. Resending the same command ID changes nothing and says DUPLICATE.",
+    "Reclaiming 1000 from 500 available is rejected; reclaiming 200 leaves 300.",
+    "A zero delta is invalid. Moving a market straight to SETTLED is not a permitted transition."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000}
+  ],
+  "steps": [
+    {"input": {"msg": "SleeveAdjust", "commandId": "g1", "accountId": 5, "deltaCents": 500, "reason": "GRANT"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "g1", "outcome": "APPLIED"},
+       {"msg": "SleeveChanged", "accountId": 5, "availableCents": 500, "reservedCents": 0}
+     ]},
+    {"input": {"msg": "SleeveAdjust", "commandId": "g1", "accountId": 5, "deltaCents": 500, "reason": "GRANT"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "g1", "outcome": "DUPLICATE"}
+     ]},
+    {"input": {"msg": "SleeveAdjust", "commandId": "g2", "accountId": 5, "deltaCents": 1000, "reason": "RECLAIM"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "g2", "outcome": "REJECTED", "rejectReason": "INSUFFICIENT_SLEEVE"}
+     ]},
+    {"input": {"msg": "SleeveAdjust", "commandId": "g3", "accountId": 5, "deltaCents": 200, "reason": "RECLAIM"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "g3", "outcome": "APPLIED"},
+       {"msg": "SleeveChanged", "accountId": 5, "availableCents": 300, "reservedCents": 0}
+     ]},
+    {"input": {"msg": "SleeveAdjust", "commandId": "g4", "accountId": 5, "deltaCents": 0, "reason": "GRANT"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "g4", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}
+     ]},
+    {"input": {"msg": "SetMarketState", "commandId": "m1", "instrumentId": 1000, "state": "SETTLED"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "m1", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}
+     ]}
+  ]
+}

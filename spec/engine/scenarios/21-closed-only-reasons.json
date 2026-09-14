@@ -1,0 +1,25 @@
+{
+  "name": "Closed-only accounts are told why an opening order was refused",
+  "rules": ["E-9.3", "E-9.5", "E-7.5"],
+  "notes": [
+    "Account 1 is closed-only and holds nothing.",
+    "An unflagged bid would open a position: rejected CLOSED_ONLY_MODE.",
+    "The same bid explicitly flagged REDUCE_ONLY: rejected REDUCE_ONLY_NO_POSITION, because the customer asked for reduce-only themselves."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000},
+    {"op": "fund", "accountId": 1, "cents": 10000},
+    {"msg": "SetAccountControls", "accountId": 1, "closedOnly": "TRUE", "selfMatchPrevention": "CANCEL_INCOMING"}
+  ],
+  "steps": [
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a1", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1},
+     "expect": [
+       {"msg": "OrderRejected", "accountId": 1, "clientOrderId": "a1", "instrumentId": 1000, "reason": "CLOSED_ONLY_MODE"}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a2", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1, "flags": ["REDUCE_ONLY"]},
+     "expect": [
+       {"msg": "OrderRejected", "accountId": 1, "clientOrderId": "a2", "instrumentId": 1000, "reason": "REDUCE_ONLY_NO_POSITION"}
+     ]}
+  ]
+}

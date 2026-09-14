@@ -1,0 +1,24 @@
+{
+  "name": "Event start cancels orders marked CANCEL and keeps orders marked KEEP",
+  "rules": ["E-16.3", "E-12.1"],
+  "notes": [
+    "A bids 1 at 10c (cancel at start, reserves 10) and 1 at 11c (keep, reserves 11): reserved 21.",
+    "STARTED removes the 10c bid; reserved falls to 11, available 9989."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000},
+    {"op": "fund", "accountId": 1, "cents": 10000}
+  ],
+  "steps": [
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a1", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a2", "instrumentId": 1000, "side": "BUY", "tick": 10, "quantity": 1, "atEventStart": "KEEP"}, "expect": null},
+    {"input": {"msg": "SetEventPhase", "commandId": "ph1", "eventId": 100, "phase": "STARTED", "source": "OPERATOR"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "ph1", "outcome": "APPLIED"},
+       {"msg": "OrderCancelled", "orderId": "O1", "accountId": 1, "instrumentId": 1000, "cancelledQuantity": 1, "reason": "EVENT_START"},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9989, "reservedCents": 11},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 0, "orderCount": 0}
+     ]}
+  ]
+}

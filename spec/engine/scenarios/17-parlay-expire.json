@@ -1,0 +1,31 @@
+{
+  "name": "Expiring a parlay settles its event to the losing state at once",
+  "rules": ["E-15.7", "E-15.5", "E-6.3"],
+  "notes": [
+    "The parlay 3000 is listed under its own two-state event 300; YES pays in state 1.",
+    "Prelude: A buys 10 at 5c from B (A pays 50; B posts 1000 - 50 = 950, balance 9050).",
+    "ExpireParlay resolves event 300 to state 0, the lowest state outside the parlay's mask.",
+    "A's 10 YES pay 0; B's 10 NO pay 1000. A's balance is unchanged, so no SleeveChanged for A; B ends at 10050."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000},
+    {"op": "parlay", "eventId": 300, "instrumentId": 3000, "legs": [{"legEventId": 100, "legInstrumentId": 1000, "legOutcome": "YES"}]},
+    {"op": "fund", "accountId": 1, "cents": 10000},
+    {"op": "fund", "accountId": 2, "cents": 10000}
+  ],
+  "steps": [
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a1", "instrumentId": 3000, "side": "BUY", "tick": 4, "quantity": 10}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 2, "clientOrderId": "b1", "instrumentId": 3000, "side": "SELL", "tick": 4, "quantity": 10}, "expect": null},
+    {"input": {"msg": "ExpireParlay", "commandId": "x1", "instrumentId": 3000, "causingEventId": 100},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "x1", "outcome": "APPLIED"},
+       {"msg": "MarketStateChanged", "instrumentId": 3000, "state": "SETTLED"},
+       {"msg": "SettlementPayout", "accountId": 1, "instrumentId": 3000, "kind": "RESOLVED", "positionClosed": 10, "cents": 0},
+       {"msg": "SettlementPayout", "accountId": 2, "instrumentId": 3000, "kind": "RESOLVED", "positionClosed": -10, "cents": 1000},
+       {"msg": "PositionChanged", "accountId": 1, "instrumentId": 3000, "position": 0},
+       {"msg": "PositionChanged", "accountId": 2, "instrumentId": 3000, "position": 0},
+       {"msg": "SleeveChanged", "accountId": 2, "availableCents": 10050, "reservedCents": 0}
+     ]}
+  ]
+}

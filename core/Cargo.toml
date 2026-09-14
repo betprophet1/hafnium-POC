@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["engine", "harness"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.96"
+publish = false
+license = "UNLICENSED"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+float_arithmetic = "deny"
+float_cmp = "deny"
+disallowed_types = "deny"
+disallowed_methods = "deny"
+
+# Overflow is a fail-stop (spec E-2.2), never a wrap, in every profile. The engine should also use checked
+# arithmetic on money and quantities so a fail-stop is reported rather than a panic.
+[profile.dev]
+overflow-checks = true
+
+[profile.release]
+overflow-checks = true
+debug = 1

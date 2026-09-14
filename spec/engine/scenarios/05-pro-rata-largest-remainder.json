@@ -1,0 +1,40 @@
+{
+  "name": "Pro-rata allocation with largest remainder and order ID tie-break",
+  "rules": ["E-10.5", "E-10.6", "E-11.2"],
+  "notes": [
+    "Three offers at 60c from flat accounts: 30, 50 and 20 contracts (total M = 100). Each reserves 40c per contract.",
+    "An IOC bid for Q = 25 at 60c. Shares: floor(25*30/100) = 7 remainder 50; floor(25*50/100) = 12 remainder 50; floor(25*20/100) = 5 remainder 0.",
+    "One lot is left over; the largest remainders tie at 50, so it goes to the lower order ID, O1. Allocation 8, 12, 5.",
+    "Fills are emitted in time order. Each is a mint: buyer pays 60c, seller posts 40c per contract.",
+    "Remaining reservations: O1 22*40 = 880, O2 38*40 = 1520, O3 15*40 = 600."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000, "allocationPolicy": "PRO_RATA"},
+    {"op": "fund", "accountId": 1, "cents": 10000},
+    {"op": "fund", "accountId": 2, "cents": 10000},
+    {"op": "fund", "accountId": 3, "cents": 10000},
+    {"op": "fund", "accountId": 4, "cents": 10000}
+  ],
+  "steps": [
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "m1", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 30}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 2, "clientOrderId": "m2", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 50}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 3, "clientOrderId": "m3", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 20}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 4, "clientOrderId": "t1", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 25, "timeInForce": "IOC"},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O4", "accountId": 4, "clientOrderId": "t1", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 25, "reservedCents": 1500},
+       {"msg": "Fill", "tradeId": "T1", "instrumentId": 1000, "tick": 59, "quantity": 8, "makerOrderId": "O1", "makerAccountId": 1, "makerRemaining": 22, "takerOrderId": "O4", "takerAccountId": 4, "takerRemaining": 17, "takerSide": "BUY", "mintedPairs": 8, "burnedPairs": 0, "buyerCashCents": -480, "sellerCashCents": -320},
+       {"msg": "Fill", "tradeId": "T2", "instrumentId": 1000, "tick": 59, "quantity": 12, "makerOrderId": "O2", "makerAccountId": 2, "makerRemaining": 38, "takerOrderId": "O4", "takerAccountId": 4, "takerRemaining": 5, "takerSide": "BUY", "mintedPairs": 12, "burnedPairs": 0, "buyerCashCents": -720, "sellerCashCents": -480},
+       {"msg": "Fill", "tradeId": "T3", "instrumentId": 1000, "tick": 59, "quantity": 5, "makerOrderId": "O3", "makerAccountId": 3, "makerRemaining": 15, "takerOrderId": "O4", "takerAccountId": 4, "takerRemaining": 0, "takerSide": "BUY", "mintedPairs": 5, "burnedPairs": 0, "buyerCashCents": -300, "sellerCashCents": -200},
+       {"msg": "PositionChanged", "accountId": 1, "instrumentId": 1000, "position": -8},
+       {"msg": "PositionChanged", "accountId": 2, "instrumentId": 1000, "position": -12},
+       {"msg": "PositionChanged", "accountId": 3, "instrumentId": 1000, "position": -5},
+       {"msg": "PositionChanged", "accountId": 4, "instrumentId": 1000, "position": 25},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 8800, "reservedCents": 880},
+       {"msg": "SleeveChanged", "accountId": 2, "availableCents": 8000, "reservedCents": 1520},
+       {"msg": "SleeveChanged", "accountId": 3, "availableCents": 9200, "reservedCents": 600},
+       {"msg": "SleeveChanged", "accountId": 4, "availableCents": 8500, "reservedCents": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 75, "orderCount": 3}
+     ]}
+  ]
+}

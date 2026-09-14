@@ -1,0 +1,46 @@
+{
+  "name": "A fill that uses locked holdings shrinks a reduce-only order",
+  "rules": ["E-9.5", "E-11.1", "E-11.2", "E-11.4", "E-10.6"],
+  "notes": [
+    "Prelude: A buys 10 at 50c from B, so A holds 10 YES with balance 9500.",
+    "Step 1: reduce-only offer of 10 at 80c locks all 10 YES; reservation 0.",
+    "Step 2: normal offer of 4 at 70c finds no unlocked YES: lock 0, reservation noCost(69, 4) = 400 - 280 = 120.",
+    "Step 3: C buys the 4 at 70c. A's position is 10 YES, so sReduce 4, minted 0: a transfer, sellerCash +280.",
+    "A now holds 6 YES but yesLocked is 10: lock restoration takes 4 from the newest locked order, the reduce-only one, which shrinks to 6.",
+    "A's balance 9500 + 280 = 9780; the 120 reservation is released."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000},
+    {"op": "fund", "accountId": 1, "cents": 10000},
+    {"op": "fund", "accountId": 2, "cents": 10000},
+    {"op": "fund", "accountId": 3, "cents": 10000}
+  ],
+  "steps": [
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a1", "instrumentId": 1000, "side": "BUY", "tick": 49, "quantity": 10}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 2, "clientOrderId": "b1", "instrumentId": 1000, "side": "SELL", "tick": 49, "quantity": 10}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a2", "instrumentId": 1000, "side": "SELL", "tick": 79, "quantity": 10, "flags": ["REDUCE_ONLY"]},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O3", "accountId": 1, "clientOrderId": "a2", "instrumentId": 1000, "side": "SELL", "tick": 79, "quantity": 10, "reservedCents": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "SELL", "tick": 79, "quantity": 10, "orderCount": 1}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a3", "instrumentId": 1000, "side": "SELL", "tick": 69, "quantity": 4},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O4", "accountId": 1, "clientOrderId": "a3", "instrumentId": 1000, "side": "SELL", "tick": 69, "quantity": 4, "reservedCents": 120},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9380, "reservedCents": 120},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "SELL", "tick": 69, "quantity": 4, "orderCount": 1}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 3, "clientOrderId": "c1", "instrumentId": 1000, "side": "BUY", "tick": 69, "quantity": 4},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O5", "accountId": 3, "clientOrderId": "c1", "instrumentId": 1000, "side": "BUY", "tick": 69, "quantity": 4, "reservedCents": 280},
+       {"msg": "Fill", "tradeId": "T2", "instrumentId": 1000, "tick": 69, "quantity": 4, "makerOrderId": "O4", "makerAccountId": 1, "makerRemaining": 0, "takerOrderId": "O5", "takerAccountId": 3, "takerRemaining": 0, "takerSide": "BUY", "mintedPairs": 0, "burnedPairs": 0, "buyerCashCents": -280, "sellerCashCents": 280},
+       {"msg": "OrderReduced", "orderId": "O3", "accountId": 1, "instrumentId": 1000, "remainingQuantity": 6},
+       {"msg": "PositionChanged", "accountId": 1, "instrumentId": 1000, "position": 6},
+       {"msg": "PositionChanged", "accountId": 3, "instrumentId": 1000, "position": 4},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9780, "reservedCents": 0},
+       {"msg": "SleeveChanged", "accountId": 3, "availableCents": 9720, "reservedCents": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "SELL", "tick": 69, "quantity": 0, "orderCount": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "SELL", "tick": 79, "quantity": 6, "orderCount": 1}
+     ]}
+  ]
+}

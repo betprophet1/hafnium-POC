@@ -1,0 +1,10 @@
+# Determinism leaks the compiler can catch (blueprint §4, spec E-1.1). The engine is no_std, so most of these
+# are unreachable there anyway; they also keep the harness honest.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "randomised iteration order; use an ordered structure" },
+    { path = "std::collections::HashSet", reason = "randomised iteration order; use an ordered structure" },
+]
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "the engine's only clock is the journal (E-4.1)" },
+    { path = "std::time::SystemTime::now", reason = "the engine's only clock is the journal (E-4.1)" },
+]

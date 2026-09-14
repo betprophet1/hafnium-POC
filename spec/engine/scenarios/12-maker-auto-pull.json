@@ -1,0 +1,37 @@
+{
+  "name": "Maker auto-pull cancels the maker's remaining quotes in the event after the walk",
+  "rules": ["E-13.2", "E-13.4", "E-7.6"],
+  "notes": [
+    "Account 1 is protected at 5 contracts per 1000 ms for every event.",
+    "It offers 3 at 60c (reserve 120), 3 at 61c (reserve 117) and 4 at 70c (reserve 120).",
+    "Account 2 bids 6 at 61c: reservation yesCost(60, 6) = 366. Fills 3 at 60c (buyer -180, seller -120) and 3 at 61c (buyer -183, seller -117).",
+    "Maker fills total 6 >= 5, so at the end of the unit account 1's remaining offer of 4 at 70c is pulled.",
+    "Account 1 balance 10000 - 120 - 117 = 9763; account 2 10000 - 363 = 9637."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000},
+    {"op": "fund", "accountId": 1, "cents": 10000},
+    {"op": "fund", "accountId": 2, "cents": 10000},
+    {"msg": "SetMakerProtection", "accountId": 1, "eventId": 0, "maxContractsFilledPerWindow": 5, "windowMillis": 1000}
+  ],
+  "steps": [
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a1", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 3}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a2", "instrumentId": 1000, "side": "SELL", "tick": 60, "quantity": 3}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a3", "instrumentId": 1000, "side": "SELL", "tick": 69, "quantity": 4}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 2, "clientOrderId": "b1", "instrumentId": 1000, "side": "BUY", "tick": 60, "quantity": 6},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O4", "accountId": 2, "clientOrderId": "b1", "instrumentId": 1000, "side": "BUY", "tick": 60, "quantity": 6, "reservedCents": 366},
+       {"msg": "Fill", "tradeId": "T1", "instrumentId": 1000, "tick": 59, "quantity": 3, "makerOrderId": "O1", "makerAccountId": 1, "makerRemaining": 0, "takerOrderId": "O4", "takerAccountId": 2, "takerRemaining": 3, "takerSide": "BUY", "mintedPairs": 3, "burnedPairs": 0, "buyerCashCents": -180, "sellerCashCents": -120},
+       {"msg": "Fill", "tradeId": "T2", "instrumentId": 1000, "tick": 60, "quantity": 3, "makerOrderId": "O2", "makerAccountId": 1, "makerRemaining": 0, "takerOrderId": "O4", "takerAccountId": 2, "takerRemaining": 0, "takerSide": "BUY", "mintedPairs": 3, "burnedPairs": 0, "buyerCashCents": -183, "sellerCashCents": -117},
+       {"msg": "OrderCancelled", "orderId": "O3", "accountId": 1, "instrumentId": 1000, "cancelledQuantity": 4, "reason": "MAKER_AUTO_PULL"},
+       {"msg": "PositionChanged", "accountId": 1, "instrumentId": 1000, "position": -6},
+       {"msg": "PositionChanged", "accountId": 2, "instrumentId": 1000, "position": 6},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9763, "reservedCents": 0},
+       {"msg": "SleeveChanged", "accountId": 2, "availableCents": 9637, "reservedCents": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 0, "orderCount": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "SELL", "tick": 60, "quantity": 0, "orderCount": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "SELL", "tick": 69, "quantity": 0, "orderCount": 0}
+     ]}
+  ]
+}

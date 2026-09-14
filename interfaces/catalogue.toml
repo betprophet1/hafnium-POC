@@ -74,7 +74,7 @@ guarantees = "Routed by the versioned group map (&sect;5); acknowledged only aft
 format = "SBE: client messages and their results"
 status = "specified"
 spec = "interfaces/sbe/venue-journal.xml"
-messages = ["NewOrder", "CancelOrder", "AmendOrder", "MassCancel", "BatchOrders", "BasketMintRedeem", "OrderAccepted", "OrderRejected", "Fill", "OrderCancelled", "OrderAmended"]
+messages = ["NewOrder", "CancelOrder", "AmendOrder", "MassCancel", "BatchOrders", "BasketMintRedeem", "SetOrderGroup", "ResetOrderGroup", "OrderAccepted", "OrderRejected", "Fill", "OrderCancelled", "OrderAmended", "BasketApplied", "OrderGroupUpdated"]
 
 [[interface]]
 id = 8
@@ -151,7 +151,7 @@ guarantees = "By no other route (&sect;4), so every one of them replays"
 format = "SBE: service commands"
 status = "specified"
 spec = "interfaces/sbe/venue-journal.xml"
-messages = ["ActivateProtocol", "SleeveAdjust", "DefineTickTable", "DefineEvent", "ListInstrument", "SetEventPhase", "SetMarketState", "SetVenueMode", "ResolveEvent", "ExpireParlay", "SetRuleLimits", "SetOrderCapacity", "SetAccountControls", "SetMakerProtection", "TransferOut", "TransferIn"]
+messages = ["ActivateProtocol", "SleeveAdjust", "DefineTickTable", "DefineEvent", "ListInstrument", "SetEventPhase", "SetMarketState", "SetVenueMode", "ResolveEvent", "ExpireParlay", "SetRuleLimits", "SetGroupParameters", "SetAccountControls", "SetMakerProtection", "TransferOut", "TransferIn"]
 
 [[interface]]
 id = 15
@@ -214,7 +214,7 @@ guarantees = "Each result names its input's sequence; regenerated exactly by rep
 format = "SBE: engine results"
 status = "specified"
 spec = "interfaces/sbe/venue-journal.xml"
-messages = ["OrderAccepted", "OrderRejected", "Fill", "OrderCancelled", "OrderAmended", "OrderReduced", "PositionChanged", "SleeveChanged", "CollateralReleased", "BookLevelChanged", "MarketStateChanged", "SettlementPayout", "CommandApplied"]
+messages = ["OrderAccepted", "OrderRejected", "Fill", "OrderCancelled", "OrderAmended", "OrderReduced", "PositionChanged", "SleeveChanged", "CollateralReleased", "BookLevelChanged", "MarketStateChanged", "SettlementPayout", "BasketApplied", "OrderGroupUpdated", "CommandApplied"]
 
 [[interface]]
 id = 21

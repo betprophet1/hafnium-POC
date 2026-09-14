@@ -1,0 +1,19 @@
+# cargo deny check bans licenses sources
+# The engine's own dependency rule (nothing but venue_journal) is enforced by core/ci.sh with cargo tree.
+
+[graph]
+all-features = true
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+confidence-threshold = 0.9
+private = { ignore = true }
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -16,6 +16,8 @@
   - Prices are tick ordinals into the instrument's tick table, always for YES. Quantities are
     whole contracts on the instrument's lot step. Money is integer cents. Nothing is a float.
   - Account identifiers are pseudonymous. No personal data enters this schema (blueprint §12).
+    AccountId 0 is reserved for the settlement reserve, which receives rounding remainders.
+  - Behaviour is specified in spec/engine/engine-spec.md; this file fixes only the encoding.
   - Additive only within a schema version: new fields go at the end of a block with sinceVersion,
     nothing is removed, retyped or repurposed. Engine behaviour is gated separately by
     ActivateProtocol, never by the schema version.
@@ -58,7 +60,7 @@
     <type name="SequencerGroupId" primitiveType="uint16"/>
     <type name="EpochNanos" primitiveType="uint64" description="Sequencer time: integer nanoseconds since the Unix epoch, UTC"/>
     <type name="OptionalEpochNanos" primitiveType="uint64" presence="optional"/>
-    <type name="AccountId" primitiveType="uint64" description="Pseudonymous; the mapping to a person lives only in the accounts database"/>
+    <type name="AccountId" primitiveType="uint64" description="Pseudonymous; the mapping to a person lives only in the accounts database. 0 is the settlement reserve"/>
     <type name="SessionId" primitiveType="uint64"/>
     <type name="InstrumentId" primitiveType="uint64" description="Exchange-assigned; for a parlay, the canonical hash of its sorted legs, collision-checked at listing"/>
     <type name="EventId" primitiveType="uint64"/>
@@ -85,6 +87,8 @@
     <type name="Count" primitiveType="uint32"/>
     <type name="Millis" primitiveType="uint32"/>
     <type name="SmallCount" primitiveType="uint8"/>
+    <type name="StateIndex" primitiveType="uint8" description="0-based state of an event, below its stateCount"/>
+    <type name="GroupRef" primitiveType="uint32" description="Client order group, chosen by the account"/>
     <type name="Ratio" primitiveType="uint32" description="Integer numerator or denominator of an exact rational"/>
     <type name="ScopeRef" primitiveType="uint64" description="Instrument, event or client order group, by scope; 0 when the scope needs none"/>
 
@@ -195,19 +199,9 @@
       <validValue name="CANCEL_INCOMING">1</validValue>
       <validValue name="CANCEL_BOTH">2</validValue>
     </enum>
-    <enum name="LiquidityRole" encodingType="uint8">
-      <validValue name="MAKER">0</validValue>
-      <validValue name="TAKER">1</validValue>
-    </enum>
-    <enum name="ClearingOutcome" encodingType="uint8" description="The four rows of blueprint §7's clearing table">
-      <validValue name="TRANSFER_YES">0</validValue>
-      <validValue name="MINT">1</validValue>
-      <validValue name="BURN">2</validValue>
-      <validValue name="TRANSFER_NO">3</validValue>
-    </enum>
-    <enum name="ReleaseKind" encodingType="uint8">
-      <validValue name="SET_COLLAPSE">0</validValue>
-      <validValue name="EVENT_SET_BURN">1</validValue>
+    <enum name="ReleaseKind" encodingType="uint8" description="Automatic burns across the books of a partition event">
+      <validValue name="YES_SET_BURN" description="One YES of every book pays $1.00 in every state">0</validValue>
+      <validValue name="NO_SET_BURN" description="One NO of every book pays $1.00 times (books - 1) in every state">1</validValue>
     </enum>
     <enum name="CommandOutcome" encodingType="uint8">
       <validValue name="APPLIED">0</validValue>
@@ -221,7 +215,7 @@
       <validValue name="UNKNOWN_ORDER">3</validValue>
       <validValue name="MARKET_NOT_OPEN">4</validValue>
       <validValue name="VENUE_MODE">5</validValue>
-      <validValue name="EVENT_STARTED">6</validValue>
+      <validValue name="EVENT_STARTED" description="Reserved for in-play restrictions; not emitted in v0">6</validValue>
       <validValue name="TICK_NOT_ON_LADDER">7</validValue>
       <validValue name="QUANTITY_NOT_ON_LOT_STEP">8</validValue>
       <validValue name="EXPIRY_IN_PAST">9</validValue>
@@ -237,6 +231,8 @@
       <validValue name="ORDER_CAPACITY" description="Only for an order that would rest; never a fill, cancel or reduction (blueprint §6)">19</validValue>
       <validValue name="PROTOCOL_VERSION">20</validValue>
       <validValue name="INVALID_COMMAND">21</validValue>
+      <validValue name="ORDER_GROUP_TRIGGERED">22</validValue>
+      <validValue name="INSUFFICIENT_POSITION" description="A basket redeem without enough unlocked contracts in every book">23</validValue>
     </enum>
     <enum name="CancelReason" encodingType="uint8">
       <validValue name="CLIENT_REQUEST">0</validValue>
@@ -250,6 +246,10 @@
       <validValue name="MAKER_AUTO_PULL">8</validValue>
       <validValue name="KILL_SWITCH">9</validValue>
       <validValue name="MARKET_RESOLVED">10</validValue>
+      <validValue name="POSITION_CLOSED" description="A reduce-only order had nothing left to reduce">11</validValue>
+      <validValue name="MARKET_CLOSED">12</validValue>
+      <validValue name="ORDER_GROUP_TRIGGERED">13</validValue>
+      <validValue name="SPEND_CAP_REACHED" description="A spend-capped order cannot afford another lot">14</validValue>
     </enum>
   </types>
 
@@ -338,6 +338,22 @@
     <field name="direction" id="7" type="BasketDirection"/>
   </sbe:message>
 
+  <sbe:message name="SetOrderGroup" id="7" description="Creates or changes a client order group's fill limit; a limit of 0 removes it">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="sessionId" id="2" type="SessionId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="clientOrderGroup" id="4" type="GroupRef"/>
+    <field name="maxContractsFilledPerWindow" id="5" type="Count"/>
+    <field name="windowMillis" id="6" type="Millis"/>
+  </sbe:message>
+
+  <sbe:message name="ResetOrderGroup" id="8" description="Lets a triggered group accept orders again">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="sessionId" id="2" type="SessionId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="clientOrderGroup" id="4" type="GroupRef"/>
+  </sbe:message>
+
   <!-- ===== Sequencer and node events ===== -->
 
   <sbe:message name="TimeTick" id="50" description="Injected on a fixed cadence; the engine's only clock (blueprint §4)">
@@ -404,7 +420,8 @@
     <field name="tickTableId" id="6" type="TickTableId"/>
     <field name="lotStep" id="7" type="Quantity"/>
     <field name="allocationPolicy" id="8" type="AllocationPolicy"/>
-    <field name="stateMask" id="9" type="StateMask"/>
+    <field name="stateMask" id="9" type="StateMask" description="States in which a YES of this book pays $1.00"/>
+    <field name="positionLimit" id="15" type="Count" description="Largest absolute position per account, in contracts; 0 for none"/>
     <group name="legs" id="10" dimensionType="groupSizeEncoding">
       <field name="legEventId" id="11" type="EventId"/>
       <field name="legInstrumentId" id="12" type="InstrumentId"/>
@@ -433,15 +450,16 @@
     <field name="mode" id="3" type="VenueMode"/>
   </sbe:message>
 
-  <sbe:message name="ResolveEvent" id="88" description="Issued only after two-of-three sign-off. Outcomes list every book of the event; empty for VOID">
+  <sbe:message name="ResolveEvent" id="88" description="Issued only after two-of-three sign-off. RESOLVED names the state that occurred; VOID settles every contract at its value under the given state weights, equal weights when the group is empty">
     <field name="record" id="1" type="RecordHeader"/>
     <field name="commandId" id="2" type="CommandId"/>
     <field name="eventId" id="3" type="EventId"/>
     <field name="kind" id="4" type="ResolutionKind"/>
     <field name="caseId" id="5" type="CaseId"/>
-    <group name="outcomes" id="10" dimensionType="groupSizeEncoding">
-      <field name="instrumentId" id="11" type="InstrumentId"/>
-      <field name="value" id="12" type="OutcomeValue"/>
+    <field name="winningState" id="6" type="StateIndex" description="RESOLVED only"/>
+    <group name="voidWeights" id="10" dimensionType="groupSizeEncoding">
+      <field name="state" id="11" type="StateIndex"/>
+      <field name="weight" id="12" type="Count"/>
     </group>
   </sbe:message>
 
@@ -452,19 +470,21 @@
     <field name="causingEventId" id="4" type="EventId"/>
   </sbe:message>
 
-  <sbe:message name="SetRuleLimits" id="90" description="Rulebook limits held in sequenced state; accountId 0 sets the venue default">
+  <sbe:message name="SetRuleLimits" id="90" description="Rulebook limits held in sequenced state; accountId 0 sets the default for accounts without their own. Every limit uses 0 for none">
     <field name="record" id="1" type="RecordHeader"/>
     <field name="commandId" id="2" type="CommandId"/>
     <field name="accountId" id="3" type="AccountId"/>
-    <field name="maxOrdersInFlight" id="4" type="Count"/>
-    <field name="maxRestingOrders" id="5" type="Count"/>
-    <field name="maxOrderToTradeRatioMilli" id="6" type="Count"/>
+    <field name="maxRestingOrders" id="4" type="Count"/>
+    <field name="maxNewOrdersPerSecond" id="5" type="Count" description="Per whole second of sequencer time"/>
+    <field name="maxOrderToTradeRatioMilli" id="6" type="Count" description="New orders per fill, times 1000, per whole second of sequencer time"/>
+    <field name="ratioFreeOrdersPerSecond" id="7" type="Count" description="New orders per second exempt from the ratio"/>
   </sbe:message>
 
-  <sbe:message name="SetOrderCapacity" id="91" description="Active resting-order limit, beneath the reserved ceiling">
+  <sbe:message name="SetGroupParameters" id="91" description="Sequencer-group-wide settings">
     <field name="record" id="1" type="RecordHeader"/>
     <field name="commandId" id="2" type="CommandId"/>
-    <field name="activeOrderLimit" id="3" type="Count"/>
+    <field name="activeOrderLimit" id="3" type="Count" description="Resting orders in the group, beneath the reserved ceiling"/>
+    <field name="clientOrderIdWindowSeconds" id="4" type="Count" description="How long a client order ID is remembered for duplicate detection"/>
   </sbe:message>
 
   <sbe:message name="SetAccountControls" id="92">
@@ -521,6 +541,7 @@
     <field name="clientOrderId" id="4" type="ClientOrderId"/>
     <field name="instrumentId" id="5" type="InstrumentId"/>
     <field name="reason" id="6" type="RejectReason"/>
+    <field name="originalOrderId" id="7" type="OptionalOrderId" description="For DUPLICATE_CLIENT_ORDER_ID: the order the client order ID first created, if it was accepted"/>
   </sbe:message>
 
   <sbe:message name="Fill" id="102" description="Cash deltas are stated so no reader re-implements clearing">
@@ -536,10 +557,10 @@
     <field name="takerAccountId" id="10" type="AccountId"/>
     <field name="takerRemaining" id="11" type="Quantity"/>
     <field name="takerSide" id="12" type="Side"/>
-    <field name="clearing" id="13" type="ClearingOutcome"/>
-    <field name="buyerCashCents" id="14" type="Cents" description="Negative when paid"/>
-    <field name="sellerCashCents" id="15" type="Cents" description="Negative when paid"/>
-    <field name="openInterestDelta" id="16" type="SignedContracts"/>
+    <field name="mintedPairs" id="13" type="Quantity" description="New YES and NO pairs created; open interest rises by mintedPairs - burnedPairs"/>
+    <field name="burnedPairs" id="14" type="Quantity" description="Complete sets destroyed"/>
+    <field name="buyerCashCents" id="15" type="Cents" description="Change to the buyer's sleeve balance; negative when paid"/>
+    <field name="sellerCashCents" id="16" type="Cents" description="Change to the seller's sleeve balance; negative when paid"/>
     <field name="makerFeeCents" id="17" type="Cents"/>
     <field name="takerFeeCents" id="18" type="Cents"/>
   </sbe:message>
@@ -609,13 +630,33 @@
     <field name="state" id="3" type="MarketState"/>
   </sbe:message>
 
-  <sbe:message name="SettlementPayout" id="111" description="One per account holding a position when the event resolves, voids or a parlay expires">
+  <sbe:message name="SettlementPayout" id="111" description="One per account with a position in the event when it resolves or voids, plus the settlement reserve (account 0) for rounding remainders">
     <field name="result" id="1" type="ResultHeader"/>
     <field name="accountId" id="2" type="AccountId"/>
     <field name="instrumentId" id="3" type="InstrumentId"/>
     <field name="kind" id="4" type="ResolutionKind"/>
     <field name="positionClosed" id="5" type="SignedContracts"/>
-    <field name="cents" id="6" type="Cents" description="Paid at $1.00 per winning contract, or returned against cost basis on a void"/>
+    <field name="cents" id="6" type="Cents" description="$1.00 per contract paying in the winning state; on VOID, the state-weighted value, floored to a cent per account per event"/>
+  </sbe:message>
+
+  <sbe:message name="BasketApplied" id="113" description="A basket mint or redeem was carried out">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="accountId" id="2" type="AccountId"/>
+    <field name="sessionId" id="3" type="SessionId"/>
+    <field name="clientOrderId" id="4" type="ClientOrderId"/>
+    <field name="eventId" id="5" type="EventId"/>
+    <field name="quantity" id="6" type="Quantity"/>
+    <field name="direction" id="7" type="BasketDirection"/>
+    <field name="cashCents" id="8" type="Cents"/>
+  </sbe:message>
+
+  <sbe:message name="OrderGroupUpdated" id="114" description="A client order group was set, reset or triggered">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="accountId" id="2" type="AccountId"/>
+    <field name="clientOrderGroup" id="3" type="GroupRef"/>
+    <field name="maxContractsFilledPerWindow" id="4" type="Count"/>
+    <field name="windowMillis" id="5" type="Millis"/>
+    <field name="triggered" id="6" type="BooleanType"/>
   </sbe:message>
 
   <sbe:message name="CommandApplied" id="112" description="The outbox relay marks a command done only on seeing this for its command ID">

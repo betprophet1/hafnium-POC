@@ -15,3 +15,9 @@ render-out/
 # Generated from interfaces/sbe by interfaces/tools/sbe.sh
 interfaces/generated/
 interfaces/rust-roundtrip/target/
+
+# Claude Code worktrees and local state
+.claude/
+
+# Python bytecode from the reference model and tools
+__pycache__/

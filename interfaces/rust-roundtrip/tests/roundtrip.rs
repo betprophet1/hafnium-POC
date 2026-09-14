@@ -5,7 +5,7 @@ use venue_journal::batch_orders_codec::{encoder::EntriesEncoder, BatchOrdersDeco
 use venue_journal::fill_codec::{FillDecoder, FillEncoder};
 use venue_journal::message_header_codec::{self, MessageHeaderDecoder};
 use venue_journal::new_order_codec::{NewOrderDecoder, NewOrderEncoder};
-use venue_journal::resolve_event_codec::{encoder::OutcomesEncoder, ResolveEventDecoder, ResolveEventEncoder};
+use venue_journal::resolve_event_codec::{encoder::VoidWeightsEncoder, ResolveEventDecoder, ResolveEventEncoder};
 use venue_journal::transfer_in_codec::{TransferInDecoder, TransferInEncoder};
 use venue_journal::*;
 
@@ -162,34 +162,30 @@ fn batch_entries_decode_in_the_order_given() {
 }
 
 #[test]
-fn resolve_event_carries_every_book_of_the_event() {
+fn resolve_event_names_a_state_or_carries_void_weights() {
     let mut buf = vec![0u8; 256];
     let mut enc = ResolveEventEncoder::default().wrap(WriteBuf::new(&mut buf), HDR);
     enc = enc.header(0).parent().unwrap();
-    enc.command_id_zero_padded(b"cmd-resolve-01");
-    enc.event_id(900).kind(resolution_kind::ResolutionKind::RESOLVED).case_id(31);
-    let mut outcomes = enc.outcomes_encoder(3, OutcomesEncoder::default());
-    for (instrument, value) in [(901u64, outcome_value::OutcomeValue::NO),
-                                (902, outcome_value::OutcomeValue::YES),
-                                (903, outcome_value::OutcomeValue::NO)] {
-        outcomes.advance().unwrap();
-        outcomes.instrument_id(instrument).value(value);
+    enc.command_id_zero_padded(b"cmd-void-900");
+    enc.event_id(900).kind(resolution_kind::ResolutionKind::VOID).case_id(31).winning_state(0);
+    let mut weights = enc.void_weights_encoder(3, VoidWeightsEncoder::default());
+    for (state, weight) in [(0u8, 1u32), (1, 1), (2, 2)] {
+        weights.advance().unwrap();
+        weights.state(state).weight(weight);
     }
-    let enc = outcomes.parent().unwrap();
+    let enc = weights.parent().unwrap();
     let len = enc.get_limit();
 
     let header = header_of(&buf[..len]);
     assert_eq!(header.template_id(), 88);
     let dec = ResolveEventDecoder::default().header(header, 0);
-    assert_eq!(dec.kind(), resolution_kind::ResolutionKind::RESOLVED);
-    let mut outcomes = dec.outcomes_decoder();
-    let mut winners = Vec::new();
-    while outcomes.advance().unwrap().is_some() {
-        if outcomes.value() == outcome_value::OutcomeValue::YES {
-            winners.push(outcomes.instrument_id());
-        }
+    assert_eq!(dec.kind(), resolution_kind::ResolutionKind::VOID);
+    let mut weights = dec.void_weights_decoder();
+    let mut total = 0u32;
+    while weights.advance().unwrap().is_some() {
+        total += weights.weight();
     }
-    assert_eq!(winners, vec![902]);
+    assert_eq!(total, 4);
 }
 
 #[test]
@@ -213,8 +209,8 @@ fn transfer_in_carries_opaque_state() {
 
 #[test]
 fn a_mint_fill_states_cash_that_backs_each_new_pair_with_one_dollar() {
-    // 10 contracts at 62 cents where the seller is flat: a mint. The buyer posts 62c and the
-    // seller 38c per contract, so the pool receives exactly $1.00 per new pair (blueprint §7).
+    // 10 contracts at 62 cents between two flat accounts: every unit mints a pair. The buyer pays
+    // 62c and the seller posts 38c per contract, so the pool receives $1.00 per pair (blueprint §7).
     let (quantity, price_cents) = (10i64, 62i64);
     let mut buf = vec![0u8; 256];
     let mut enc = FillEncoder::default().wrap(WriteBuf::new(&mut buf), HDR);
@@ -223,10 +219,10 @@ fn a_mint_fill_states_cash_that_backs_each_new_pair_with_one_dollar() {
         .maker_order_id(10).maker_account_id(1).maker_remaining(0)
         .taker_order_id(11).taker_account_id(2).taker_remaining(0)
         .taker_side(side::Side::BUY)
-        .clearing(clearing_outcome::ClearingOutcome::MINT)
+        .minted_pairs(quantity as u32)
+        .burned_pairs(0)
         .buyer_cash_cents(-quantity * price_cents)
         .seller_cash_cents(-quantity * (100 - price_cents))
-        .open_interest_delta(quantity)
         .maker_fee_cents(0)
         .taker_fee_cents(0);
     let len = enc.get_limit();
@@ -234,7 +230,6 @@ fn a_mint_fill_states_cash_that_backs_each_new_pair_with_one_dollar() {
     let header = header_of(&buf[..len]);
     assert_eq!(header.template_id(), 102);
     let dec = FillDecoder::default().header(header, 0);
-    assert_eq!(dec.clearing(), clearing_outcome::ClearingOutcome::MINT);
-    assert_eq!(dec.buyer_cash_cents() + dec.seller_cash_cents(), -100 * quantity);
-    assert_eq!(dec.open_interest_delta(), quantity);
+    let pool_change = -(dec.buyer_cash_cents() + dec.seller_cash_cents());
+    assert_eq!(pool_change, 100 * (dec.minted_pairs() as i64 - dec.burned_pairs() as i64));
 }

@@ -1,0 +1,44 @@
+{
+  "name": "Duplicate client order IDs return the original outcome within the window",
+  "rules": ["E-9.2", "E-9.3", "E-7.4"],
+  "notes": [
+    "The window is set to 1 second. Tick 9 is 10c; a bid for 1 reserves 10.",
+    "Step 2: a resend of x names the order it created.",
+    "Step 3: account 2 is unfunded, so y is rejected INSUFFICIENT_SLEEVE; its ID is still consumed (D-12).",
+    "Step 4: a resend of y is a duplicate with no original order.",
+    "Step 5: two seconds later x is outside the window and creates a second order."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000},
+    {"msg": "SetGroupParameters", "activeOrderLimit": 0, "clientOrderIdWindowSeconds": 1},
+    {"op": "fund", "accountId": 1, "cents": 10000}
+  ],
+  "steps": [
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "x", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O1", "accountId": 1, "clientOrderId": "x", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1, "reservedCents": 10},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9990, "reservedCents": 10},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1, "orderCount": 1}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "x", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1},
+     "expect": [
+       {"msg": "OrderRejected", "accountId": 1, "clientOrderId": "x", "instrumentId": 1000, "reason": "DUPLICATE_CLIENT_ORDER_ID", "originalOrderId": "O1"}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 2, "clientOrderId": "y", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1},
+     "expect": [
+       {"msg": "OrderRejected", "accountId": 2, "clientOrderId": "y", "instrumentId": 1000, "reason": "INSUFFICIENT_SLEEVE"}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 2, "clientOrderId": "y", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1},
+     "expect": [
+       {"msg": "OrderRejected", "accountId": 2, "clientOrderId": "y", "instrumentId": 1000, "reason": "DUPLICATE_CLIENT_ORDER_ID"}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "x", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1},
+     "advanceNs": 2000000000,
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O2", "accountId": 1, "clientOrderId": "x", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1, "reservedCents": 10},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9980, "reservedCents": 20},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 2, "orderCount": 2}
+     ]}
+  ]
+}
