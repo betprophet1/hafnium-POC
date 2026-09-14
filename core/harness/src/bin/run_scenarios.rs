@@ -16,7 +16,7 @@ fn main() -> ExitCode {
             Ok(_) => println!("ok   {}", path.display()),
             Err(e) => {
                 failures += 1;
-                println!("FAIL {}", path.display());
+                println!("FAIL {}: {}", path.display(), e.lines().next().unwrap_or(""));
                 if first_failure.is_none() {
                     first_failure = Some(e);
                 }

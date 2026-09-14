@@ -16,6 +16,15 @@ enum Verdict {
 
 use Verdict::{Applied, Rejected};
 
+/// Commands whose only rejection is `INVALID_COMMAND`.
+const fn valid(ok: bool) -> Verdict {
+    if ok {
+        Applied
+    } else {
+        Rejected(RejectReason::INVALID_COMMAND)
+    }
+}
+
 pub(crate) fn header(input: &[u8]) -> MessageHeaderDecoder<ReadBuf<'_>> {
     MessageHeaderDecoder::default().wrap(ReadBuf::new(input), 0)
 }
@@ -55,7 +64,11 @@ impl<'a> Engine<'a> {
         if self.commands.contains(&id) {
             self.emitter.emit(
                 sink,
-                &Out::CommandApplied { command_id: id, outcome: CommandOutcome::DUPLICATE, reject_reason: RejectReason::NONE },
+                &Out::CommandApplied {
+                    command_id: id,
+                    outcome: CommandOutcome::DUPLICATE,
+                    reject_reason: RejectReason::NONE,
+                },
             )?;
             return self.end_unit(sink);
         }
@@ -73,6 +86,8 @@ impl<'a> Engine<'a> {
             set_rule_limits_codec::SBE_TEMPLATE_ID
             | set_account_controls_codec::SBE_TEMPLATE_ID
             | set_maker_protection_codec::SBE_TEMPLATE_ID => self.check_account_settings(template, input)?,
+            resolve_event_codec::SBE_TEMPLATE_ID => valid(self.resolution(input)?.is_some()),
+            expire_parlay_codec::SBE_TEMPLATE_ID => valid(self.parlay_expiry(input)?.is_some()),
             // §19: not in v0.
             transfer_out_codec::SBE_TEMPLATE_ID | transfer_in_codec::SBE_TEMPLATE_ID => {
                 Rejected(RejectReason::INVALID_COMMAND)
@@ -89,7 +104,11 @@ impl<'a> Engine<'a> {
             Applied => {
                 self.emitter.emit(
                     sink,
-                    &Out::CommandApplied { command_id: id, outcome: CommandOutcome::APPLIED, reject_reason: RejectReason::NONE },
+                    &Out::CommandApplied {
+                        command_id: id,
+                        outcome: CommandOutcome::APPLIED,
+                        reject_reason: RejectReason::NONE,
+                    },
                 )?;
                 self.apply_command(template, input, sink)?;
             }
@@ -118,6 +137,8 @@ impl<'a> Engine<'a> {
             set_market_state_codec::SBE_TEMPLATE_ID => self.apply_market_state(input, sink),
             set_event_phase_codec::SBE_TEMPLATE_ID => self.apply_event_phase(input, sink),
             set_venue_mode_codec::SBE_TEMPLATE_ID => self.apply_venue_mode(input, sink),
+            resolve_event_codec::SBE_TEMPLATE_ID => self.apply_resolution(input, sink),
+            expire_parlay_codec::SBE_TEMPLATE_ID => self.apply_parlay_expiry(input, sink),
             _ => self.apply_account_settings(template, input),
         }
     }
@@ -163,7 +184,8 @@ impl<'a> Engine<'a> {
             let Some(c) = table.get(usize::from(r.complement)) else {
                 return Ok(Rejected(RejectReason::INVALID_COMMAND));
             };
-            let lhs = u128::from(r.numerator) * u128::from(c.denominator) + u128::from(c.numerator) * u128::from(r.denominator);
+            let lhs = u128::from(r.numerator) * u128::from(c.denominator)
+                + u128::from(c.numerator) * u128::from(r.denominator);
             if lhs != u128::from(r.denominator) * u128::from(c.denominator) || usize::from(c.complement) != t {
                 return Ok(Rejected(RejectReason::INVALID_COMMAND));
             }
@@ -353,7 +375,8 @@ impl<'a> Engine<'a> {
         use venue_journal::self_match_prevention::SelfMatchPrevention;
         if template == set_account_controls_codec::SBE_TEMPLATE_ID {
             let dec = set_account_controls_codec::SetAccountControlsDecoder::default().header(header(input), 0);
-            if dec.closed_only() == BooleanType::NullVal || dec.self_match_prevention() == SelfMatchPrevention::NullVal {
+            if dec.closed_only() == BooleanType::NullVal || dec.self_match_prevention() == SelfMatchPrevention::NullVal
+            {
                 return Err(FailStop::MalformedCommand);
             }
         }

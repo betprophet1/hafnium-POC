@@ -161,6 +161,36 @@ pub struct Duplicate {
     pub order_id: Option<u64>,
 }
 
+/// A value a dry run (E-10.9) overwrote, restored when the dry run ends.
+#[derive(Clone, Copy, Debug)]
+pub enum Undo {
+    Order(u32, Order),
+    Level(u32, Level),
+    Bits(u32, u64),
+    Account(u32, Account),
+    Holding(HoldingKey, Option<Holding>),
+    OrderIndex(u64, Option<u32>),
+    Collateral(u64, i64),
+    MakerCounter(HoldingKey, Option<WindowCounter>),
+    Group((u64, u32), Option<OrderGroup>),
+    Scalars { next_trade: u64, free_order: u32, resting_orders: u32 },
+}
+
+impl Default for Undo {
+    fn default() -> Self {
+        Self::Bits(0, 0)
+    }
+}
+
+/// Work a fill leaves for the end of its unit, as `(kind, a, b)`. Sorting gives the order of E-13.4 and E-14.3.
+pub type Mark = (u8, u64, u64);
+/// `(MARK_PULL, accountId, eventId)`: maker auto-pull (E-13.2).
+pub const MARK_PULL: u8 = 0;
+/// `(MARK_TRIGGER, accountId, clientOrderGroup)`: an order group trigger (E-13.3).
+pub const MARK_TRIGGER: u8 = 1;
+/// `(MARK_FILLED, eventId, accountId)`: a set burn candidate (E-14.3).
+pub const MARK_FILLED: u8 = 2;
+
 pub type Slot<K, V> = Option<(K, V)>;
 pub type HoldingKey = (u64, u64);
 pub type LevelKey = (u64, u8, u16);
@@ -182,8 +212,10 @@ pub struct Capacities {
     pub order_groups: usize,
     pub maker_settings: usize,
     pub maker_counters: usize,
-    /// Positions, sleeves and levels one unit may touch.
+    /// Positions, sleeves and levels one unit may touch; also the end-of-unit marks.
     pub touches: usize,
+    /// Writes one dry run may log.
+    pub undo: usize,
 }
 
 impl Capacities {
@@ -209,6 +241,7 @@ impl Capacities {
             maker_settings: 4_096,
             maker_counters: 16_384,
             touches: 65_536,
+            undo: 65_536,
         }
     }
 }
@@ -237,6 +270,10 @@ pub struct Memory<'a> {
     pub position_touches: &'a mut [(HoldingKey, u32, i64)],
     pub sleeve_touches: &'a mut [(u64, u32, (i64, i64))],
     pub level_touches: &'a mut [(LevelKey, u32, (u64, u32))],
-    /// Working space for collecting order IDs to act on in ID order; as long as `orders`.
+    /// Working space for collecting keys to act on in order; as long as `orders` and half the `holdings` slots.
     pub scratch: &'a mut [(u64, u64)],
+    /// `touches` entries.
+    pub marks: &'a mut [Mark],
+    /// `undo` entries.
+    pub undo: &'a mut [Undo],
 }

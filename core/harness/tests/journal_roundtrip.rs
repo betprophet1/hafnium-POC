@@ -1,15 +1,11 @@
 //! Round trips through the code generated from interfaces/sbe/venue-journal.xml, and the
 //! schema rules that SBE itself cannot express.
 
-use venue_journal::batch_orders_codec::{
-    encoder::EntriesEncoder, BatchOrdersDecoder, BatchOrdersEncoder,
-};
+use venue_journal::batch_orders_codec::{encoder::EntriesEncoder, BatchOrdersDecoder, BatchOrdersEncoder};
 use venue_journal::fill_codec::{FillDecoder, FillEncoder};
 use venue_journal::message_header_codec::{self, MessageHeaderDecoder};
 use venue_journal::new_order_codec::{NewOrderDecoder, NewOrderEncoder};
-use venue_journal::resolve_event_codec::{
-    encoder::VoidWeightsEncoder, ResolveEventDecoder, ResolveEventEncoder,
-};
+use venue_journal::resolve_event_codec::{encoder::VoidWeightsEncoder, ResolveEventDecoder, ResolveEventEncoder};
 use venue_journal::transfer_in_codec::{TransferInDecoder, TransferInEncoder};
 use venue_journal::*;
 
@@ -47,10 +43,7 @@ fn encode_new_order(buf: &mut [u8]) -> usize {
 fn stamp(buf: &mut [u8], sequence: u64, sequenced_at: u64, group: u16) {
     let enc = NewOrderEncoder::default().wrap(WriteBuf::new(buf), HDR);
     let mut record = enc.record_encoder();
-    record
-        .sequence(sequence)
-        .sequenced_at(sequenced_at)
-        .sequencer_group(group);
+    record.sequence(sequence).sequenced_at(sequenced_at).sequencer_group(group);
     let _ = record.parent().unwrap();
 }
 
@@ -92,9 +85,7 @@ fn sequencer_stamps_the_record_header_in_place_and_changes_nothing_else() {
     let ingress = buf[..len].to_vec();
 
     // On ingress the record header, directly after the message header, is all zero.
-    assert!(ingress[HDR..HDR + RECORD_HEADER_LEN]
-        .iter()
-        .all(|b| *b == 0));
+    assert!(ingress[HDR..HDR + RECORD_HEADER_LEN].iter().all(|b| *b == 0));
 
     stamp(&mut buf, 123_456, 1_789_000_000_123_456_789, 2);
     let journal = &buf[..len];
@@ -159,25 +150,13 @@ fn batch_entries_decode_in_the_order_given() {
     assert_eq!(entries.count(), 2);
     let mut seen = Vec::new();
     while entries.advance().unwrap().is_some() {
-        seen.push((
-            entries.entry_type(),
-            entries.order_id(),
-            entries.at_event_start(),
-        ));
+        seen.push((entries.entry_type(), entries.order_id(), entries.at_event_start()));
     }
     assert_eq!(
         seen,
         vec![
-            (
-                batch_entry_type::BatchEntryType::NEW,
-                None,
-                at_event_start::AtEventStart::KEEP
-            ),
-            (
-                batch_entry_type::BatchEntryType::CANCEL,
-                Some(555),
-                at_event_start::AtEventStart::CANCEL
-            ),
+            (batch_entry_type::BatchEntryType::NEW, None, at_event_start::AtEventStart::KEEP),
+            (batch_entry_type::BatchEntryType::CANCEL, Some(555), at_event_start::AtEventStart::CANCEL),
         ]
     );
 }
@@ -188,10 +167,7 @@ fn resolve_event_names_a_state_or_carries_void_weights() {
     let mut enc = ResolveEventEncoder::default().wrap(WriteBuf::new(&mut buf), HDR);
     enc = enc.header(0).parent().unwrap();
     enc.command_id_zero_padded(b"cmd-void-900");
-    enc.event_id(900)
-        .kind(resolution_kind::ResolutionKind::VOID)
-        .case_id(31)
-        .winning_state(0);
+    enc.event_id(900).kind(resolution_kind::ResolutionKind::VOID).case_id(31).winning_state(0);
     let mut weights = enc.void_weights_encoder(3, VoidWeightsEncoder::default());
     for (state, weight) in [(0u8, 1u32), (1, 1), (2, 2)] {
         weights.advance().unwrap();
@@ -262,8 +238,5 @@ fn a_mint_fill_states_cash_that_backs_each_new_pair_with_one_dollar() {
     assert_eq!(header.template_id(), 102);
     let dec = FillDecoder::default().header(header, 0);
     let pool_change = -(dec.buyer_cash_cents() + dec.seller_cash_cents());
-    assert_eq!(
-        pool_change,
-        100 * (dec.minted_pairs() as i64 - dec.burned_pairs() as i64)
-    );
+    assert_eq!(pool_change, 100 * (dec.minted_pairs() as i64 - dec.burned_pairs() as i64));
 }

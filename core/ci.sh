@@ -2,8 +2,8 @@
 # The core's gates, in order: interfaces, reference model, test vectors, engine guardrails, Rust, engine results.
 # ./check at the repository root runs this after the blueprint and separation gates.
 #
-# With JAVA and SBE_JAR set, the schema is revalidated and core/journal regenerated first. ENGINE_REQUIRED=1 makes
-# the engine's scenario and differential results fatal; leave it unset until work package WP-5 has landed.
+# With JAVA and SBE_JAR set, the schema is revalidated and core/journal regenerated first. The engine's scenario and
+# differential results are fatal; ENGINE_REQUIRED=0 reports them without failing, for work on the engine itself.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CORE="$ROOT/core"
@@ -57,8 +57,8 @@ step "Rust: format and lints on handwritten crates; build and test the workspace
 step "Rust engine against normative scenarios and differential vectors"
 if (cd "$CORE" && cargo run -q --release -p venue-harness --bin run-scenarios -- target/compiled target/differential); then
   echo "engine: PASS"
-elif [[ "${ENGINE_REQUIRED:-0}" == "1" ]]; then
+elif [[ "${ENGINE_REQUIRED:-1}" == "1" ]]; then
   fail "the engine does not pass its scenarios"
 else
-  echo "engine: not passing yet (expected until WP-5; set ENGINE_REQUIRED=1 to make this fatal)"
+  echo "engine: not passing (ENGINE_REQUIRED=0 made this non-fatal)"
 fi

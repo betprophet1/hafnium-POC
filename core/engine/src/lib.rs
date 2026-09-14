@@ -17,10 +17,13 @@
 
 pub use venue_journal;
 
+mod book;
 mod commands;
 pub mod emit;
 pub mod fixed;
 pub mod frame;
+mod orders;
+mod settle;
 pub mod state;
 pub mod unit;
 
@@ -52,6 +55,8 @@ pub enum FailStop {
     UnsupportedProtocol,
     /// A table sized at construction is full, or its storage is unusable.
     Capacity,
+    /// An internal invariant broke. The rules are constructed so a correct engine never stops for this.
+    Inconsistent,
     /// The engine does not implement this input yet.
     NotImplemented,
     /// An earlier input already stopped the engine.
@@ -111,6 +116,7 @@ pub struct Engine<'a> {
     order_index: FixedMap<'a, u64, u32>,
     resting_orders: u32,
     duplicates: FixedMap<'a, (u64, [u8; 32]), Duplicate>,
+    duplicates_purged_second: u64,
     commands: FixedMap<'a, [u8; 16], ()>,
     order_groups: FixedMap<'a, (u64, u32), OrderGroup>,
     maker_settings: FixedMap<'a, HoldingKey, MakerSetting>,
@@ -119,7 +125,12 @@ pub struct Engine<'a> {
     position_touches: Touches<'a, HoldingKey, i64>,
     sleeve_touches: Touches<'a, u64, (i64, i64)>,
     level_touches: Touches<'a, LevelKey, (u64, u32)>,
+    marks: &'a mut [Mark],
+    marks_len: usize,
     scratch: &'a mut [(u64, u64)],
+    dry: bool,
+    undo: &'a mut [Undo],
+    undo_len: usize,
     emitter: Emitter,
 }
 
@@ -134,18 +145,18 @@ impl<'a> Engine<'a> {
         let seed = config.table_seed;
         let orders = memory.orders;
         let order_count = orders.len();
+        if order_count >= NONE as usize || memory.scratch.len() < order_count.max(memory.holdings.len() / 2) {
+            return Err(FailStop::Capacity);
+        }
         for (i, o) in orders.iter_mut().enumerate() {
-            *o = Order::default();
-            o.account_next = if i + 1 < order_count {
-                i as u32 + 1
-            } else {
-                NONE
+            *o = Order {
+                prev: NONE,
+                next: NONE,
+                account_next: if i + 1 < order_count { i as u32 + 1 } else { NONE },
+                ..Order::default()
             };
         }
         let free_order = if orders.is_empty() { NONE } else { 0 };
-        if memory.scratch.len() < orders.len() {
-            return Err(FailStop::Capacity);
-        }
         Ok(Self {
             config,
             stopped: false,
@@ -178,6 +189,7 @@ impl<'a> Engine<'a> {
             order_index: cap(FixedMap::new(memory.order_index, seed))?,
             resting_orders: 0,
             duplicates: cap(FixedMap::new(memory.duplicates, seed))?,
+            duplicates_purged_second: 0,
             commands: cap(FixedMap::new(memory.commands, seed))?,
             order_groups: cap(FixedMap::new(memory.order_groups, seed))?,
             maker_settings: cap(FixedMap::new(memory.maker_settings, seed))?,
@@ -185,7 +197,12 @@ impl<'a> Engine<'a> {
             position_touches: Touches::new(memory.position_touches),
             sleeve_touches: Touches::new(memory.sleeve_touches),
             level_touches: Touches::new(memory.level_touches),
+            marks: memory.marks,
+            marks_len: 0,
             scratch: memory.scratch,
+            dry: false,
+            undo: memory.undo,
+            undo_len: 0,
             emitter: Emitter::new(config.sequencer_group),
         })
     }
@@ -225,6 +242,7 @@ impl<'a> Engine<'a> {
         self.last_sequence = record.sequence;
         self.now = record.sequenced_at;
         self.emitter.begin(record.sequence, record.sequenced_at);
+        self.marks_len = 0;
         // E-4.3: another group's input
         let foreign = record.sequencer_group != self.config.sequencer_group;
         if foreign && frame.kind != Kind::Client {
@@ -241,28 +259,44 @@ impl<'a> Engine<'a> {
         sink: &mut S,
     ) -> Result<(), FailStop> {
         use venue_journal::*;
-        let _ = foreign;
         match template {
             time_tick_codec::SBE_TEMPLATE_ID => self.on_time_tick(sink),
             engine_started_codec::SBE_TEMPLATE_ID => Ok(()),
             seed_set_codec::SBE_TEMPLATE_ID => self.on_seed_set(input),
-            t if frame::kind_of(t) == Some(Kind::Command) => self.on_command(t, input, sink),
-            _ => Err(FailStop::NotImplemented),
+            t => match frame::kind_of(t) {
+                Some(Kind::Command) => self.on_command(t, input, sink),
+                Some(Kind::Client) => self.on_client(t, foreign, input, sink),
+                _ => Err(FailStop::MalformedCommand),
+            },
         }
     }
 
     // ------------------------------------------------------------------ sequencer events (§8)
 
     fn on_time_tick<S: ResultSink>(&mut self, sink: &mut S) -> Result<(), FailStop> {
-        // E-8.1: expiry arrives with resting orders (work package WP-3).
+        // E-8.1
+        if self.resting_orders > 0 {
+            let now = self.now;
+            let n = self.collect(|o, _| o.expires_at.is_some_and(|at| at <= now), |o| o.expires_at.unwrap_or(0));
+            for i in 0..n {
+                let id = self.scratch[i].1;
+                let slot = *self.order_index.get(&id).ok_or(FailStop::Inconsistent)?;
+                self.remove(slot, emit::CancelReason::EXPIRED, sink)?;
+            }
+        }
+        // E-8.2, at most once a second of sequencer time.
+        let second = self.now / orders::NS_PER_SECOND;
+        if second != self.duplicates_purged_second {
+            self.duplicates_purged_second = second;
+            let (now, window) = (self.now, u64::from(self.client_order_id_window_seconds) * orders::NS_PER_SECOND);
+            self.duplicates.retain(|_, d| now - d.recorded_at < window);
+        }
         self.end_unit(sink)
     }
 
     fn on_seed_set(&mut self, input: &[u8]) -> Result<(), FailStop> {
-        use venue_journal::message_header_codec::MessageHeaderDecoder;
         use venue_journal::seed_set_codec::SeedSetDecoder;
-        let header = MessageHeaderDecoder::default().wrap(venue_journal::ReadBuf::new(input), 0);
-        let dec = SeedSetDecoder::default().header(header, 0);
+        let dec = SeedSetDecoder::default().header(commands::header(input), 0);
         match dec.purpose() {
             // E-8.3. Hashing is not observable; a table already holding entries keeps its seed.
             SeedPurpose::CLIENT_ORDER_ID_HASH | SeedPurpose::PRNG => Ok(()),
@@ -270,23 +304,25 @@ impl<'a> Engine<'a> {
         }
     }
 
-    // ------------------------------------------------------------------ order removal (WP-3)
+    // ------------------------------------------------------------------ order removal by commands (§15, §16)
 
     fn cancel_instrument_orders<S: ResultSink>(
         &mut self,
-        _instrument_slot: u32,
-        _reason: emit::CancelReason,
-        _sink: &mut S,
+        instrument_slot: u32,
+        reason: emit::CancelReason,
+        sink: &mut S,
     ) -> Result<(), FailStop> {
-        if self.resting_orders == 0 { Ok(()) } else { Err(FailStop::NotImplemented) }
+        self.remove_where(|o, _| o.instrument_slot == instrument_slot, reason, sink)
     }
 
-    fn cancel_at_event_start<S: ResultSink>(&mut self, _event_id: u64, _sink: &mut S) -> Result<(), FailStop> {
-        if self.resting_orders == 0 { Ok(()) } else { Err(FailStop::NotImplemented) }
+    fn cancel_at_event_start<S: ResultSink>(&mut self, event_id: u64, sink: &mut S) -> Result<(), FailStop> {
+        let keep =
+            |o: &Order, inst: &Instrument| inst.event_id == event_id && o.at_event_start == emit::AtEventStart::CANCEL;
+        self.remove_where(keep, emit::CancelReason::EVENT_START, sink)
     }
 
-    fn cancel_all_orders<S: ResultSink>(&mut self, _reason: emit::CancelReason, _sink: &mut S) -> Result<(), FailStop> {
-        if self.resting_orders == 0 { Ok(()) } else { Err(FailStop::NotImplemented) }
+    fn cancel_all_orders<S: ResultSink>(&mut self, reason: emit::CancelReason, sink: &mut S) -> Result<(), FailStop> {
+        self.remove_where(|_, _| true, reason, sink)
     }
 
     // ------------------------------------------------------------------ accounts
@@ -312,43 +348,51 @@ impl<'a> Engine<'a> {
     }
 
     fn holding(&self, account_id: u64, instrument_id: u64) -> Holding {
-        self.holdings
-            .get(&(account_id, instrument_id))
-            .copied()
-            .unwrap_or_default()
+        self.holdings.get(&(account_id, instrument_id)).copied().unwrap_or_default()
     }
 
     // ------------------------------------------------------------------ units (§5)
 
-    /// Records a position's value before it changes (E-5.2 block 3).
+    /// Records a position's value before it changes (E-5.2 block 3). Not during a dry run.
     fn touch_position(&mut self, account_id: u64, instrument_id: u64) -> Result<(), FailStop> {
+        if self.dry {
+            return Ok(());
+        }
         let value = self.holding(account_id, instrument_id).position;
-        self.position_touches
-            .touch((account_id, instrument_id), value)
-            .map_err(|_| FailStop::Capacity)
+        self.position_touches.touch((account_id, instrument_id), value).map_err(|_| FailStop::Capacity)
     }
 
-    /// Records a sleeve's values before they change (E-5.2 block 4).
+    /// Records a sleeve's values before they change (E-5.2 block 4). Not during a dry run.
     fn touch_sleeve(&mut self, account_slot: u32) -> Result<(), FailStop> {
+        if self.dry {
+            return Ok(());
+        }
         let a = &self.accounts[account_slot as usize];
         let value = (a.balance, a.reserved);
-        self.sleeve_touches
-            .touch(a.id, value)
-            .map_err(|_| FailStop::Capacity)
+        self.sleeve_touches.touch(a.id, value).map_err(|_| FailStop::Capacity)
     }
 
-    /// Records a book level's aggregates before they change (E-5.2 block 5).
+    /// Records a book level's aggregates before they change (E-5.2 block 5). Not during a dry run.
     fn touch_level(&mut self, instrument_slot: u32, side: Side, tick: u16) -> Result<(), FailStop> {
+        if self.dry {
+            return Ok(());
+        }
         let inst = &self.instruments[instrument_slot as usize];
         let level = self.levels[level_index(inst, side, tick)];
         let key = (inst.id, side_rank(side), tick);
-        self.level_touches
-            .touch(key, (level.quantity, level.count))
-            .map_err(|_| FailStop::Capacity)
+        self.level_touches.touch(key, (level.quantity, level.count)).map_err(|_| FailStop::Capacity)
     }
 
-    /// Emits blocks 3 to 5 of E-5.2 for the unit that just ended.
+    /// Checks E-10.10 on every book the unit touched, then emits blocks 3 to 5 of E-5.2.
     fn end_unit<S: ResultSink>(&mut self, sink: &mut S) -> Result<(), FailStop> {
+        for &((instrument_id, _, _), _, _) in self.level_touches.entries() {
+            let slot = *self.instrument_index.get(&instrument_id).ok_or(FailStop::Inconsistent)?;
+            if let (Some(bid), Some(ask)) = (self.best(slot, Side::BUY), self.best(slot, Side::SELL)) {
+                if bid >= ask {
+                    return Err(FailStop::CrossedBook);
+                }
+            }
+        }
         let Self {
             position_touches,
             sleeve_touches,
@@ -364,32 +408,21 @@ impl<'a> Engine<'a> {
         } = self;
         position_touches.finish(
             |k| holdings.get(k).map_or(0, |h| h.position),
-            |k, position| {
-                emitter.emit(
-                    sink,
-                    &Out::PositionChanged {
-                        account_id: k.0,
-                        instrument_id: k.1,
-                        position,
-                    },
-                )
-            },
+            |k, position| emitter.emit(sink, &Out::PositionChanged { account_id: k.0, instrument_id: k.1, position }),
         )?;
         sleeve_touches.finish(
             |id| {
-                account_index.get(id).map_or((0, 0), |&s| {
-                    (accounts[s as usize].balance, accounts[s as usize].reserved)
-                })
+                account_index.get(id).map_or((0, 0), |&s| (accounts[s as usize].balance, accounts[s as usize].reserved))
             },
             |id, (balance, reserved)| {
+                // E-3.3
                 let available = balance.checked_sub(reserved).ok_or(FailStop::Overflow)?;
+                if available < 0 {
+                    return Err(FailStop::NegativeAvailable);
+                }
                 emitter.emit(
                     sink,
-                    &Out::SleeveChanged {
-                        account_id: *id,
-                        available_cents: available,
-                        reserved_cents: reserved,
-                    },
+                    &Out::SleeveChanged { account_id: *id, available_cents: available, reserved_cents: reserved },
                 )
             },
         )?;

@@ -164,13 +164,7 @@ pub struct Emitter {
 
 impl Emitter {
     pub const fn new(group: u16) -> Self {
-        Self {
-            buf: [0; 256],
-            input_sequence: 0,
-            sequenced_at: 0,
-            group,
-            index: 0,
-        }
+        Self { buf: [0; 256], input_sequence: 0, sequenced_at: 0, group, index: 0 }
     }
 
     /// Starts a new input: indices restart at 0 (E-5.1).
@@ -187,21 +181,13 @@ impl Emitter {
 
     /// Encodes `out` and hands it to `sink`.
     pub fn emit<S: ResultSink>(&mut self, sink: &mut S, out: &Out) -> Result<(), FailStop> {
-        let (seq, at, group, index) = (
-            self.input_sequence,
-            self.sequenced_at,
-            self.group,
-            self.index,
-        );
+        let (seq, at, group, index) = (self.input_sequence, self.sequenced_at, self.group, self.index);
         macro_rules! begin {
             ($codec:ident, $encoder:ident) => {{
                 let mut enc = $codec::$encoder::default().wrap(WriteBuf::new(&mut self.buf), HDR);
                 enc = sbe(enc.header(0).parent())?;
                 let mut h = enc.result_encoder();
-                h.input_sequence(seq)
-                    .result_index(index)
-                    .sequenced_at(at)
-                    .sequencer_group(group);
+                h.input_sequence(seq).result_index(index).sequenced_at(at).sequencer_group(group);
                 sbe(h.parent())?
             }};
         }
@@ -218,15 +204,9 @@ impl Emitter {
                 reserved_cents,
             } => {
                 let mut e = begin!(order_accepted_codec, OrderAcceptedEncoder);
-                e.order_id(order_id)
-                    .account_id(account_id)
-                    .session_id(session_id);
+                e.order_id(order_id).account_id(account_id).session_id(session_id);
                 e.client_order_id(&client_order_id);
-                e.instrument_id(instrument_id)
-                    .side(side)
-                    .tick(tick)
-                    .quantity(quantity)
-                    .reserved_cents(reserved_cents);
+                e.instrument_id(instrument_id).side(side).tick(tick).quantity(quantity).reserved_cents(reserved_cents);
                 e.get_limit()
             }
             Out::OrderRejected {
@@ -240,9 +220,7 @@ impl Emitter {
                 let mut e = begin!(order_rejected_codec, OrderRejectedEncoder);
                 e.account_id(account_id).session_id(session_id);
                 e.client_order_id(&client_order_id);
-                e.instrument_id(instrument_id)
-                    .reason(reason)
-                    .original_order_id_opt(original_order_id);
+                e.instrument_id(instrument_id).reason(reason).original_order_id_opt(original_order_id);
                 e.get_limit()
             }
             Out::Fill {
@@ -263,35 +241,17 @@ impl Emitter {
                 seller_cash_cents,
             } => {
                 let mut e = begin!(fill_codec, FillEncoder);
-                e.trade_id(trade_id)
-                    .instrument_id(instrument_id)
-                    .tick(tick)
-                    .quantity(quantity);
-                e.maker_order_id(maker_order_id)
-                    .maker_account_id(maker_account_id)
-                    .maker_remaining(maker_remaining);
-                e.taker_order_id(taker_order_id)
-                    .taker_account_id(taker_account_id)
-                    .taker_remaining(taker_remaining);
-                e.taker_side(taker_side)
-                    .minted_pairs(minted_pairs)
-                    .burned_pairs(burned_pairs);
-                e.buyer_cash_cents(buyer_cash_cents)
-                    .seller_cash_cents(seller_cash_cents);
+                e.trade_id(trade_id).instrument_id(instrument_id).tick(tick).quantity(quantity);
+                e.maker_order_id(maker_order_id).maker_account_id(maker_account_id).maker_remaining(maker_remaining);
+                e.taker_order_id(taker_order_id).taker_account_id(taker_account_id).taker_remaining(taker_remaining);
+                e.taker_side(taker_side).minted_pairs(minted_pairs).burned_pairs(burned_pairs);
+                e.buyer_cash_cents(buyer_cash_cents).seller_cash_cents(seller_cash_cents);
                 e.maker_fee_cents(0).taker_fee_cents(0);
                 e.get_limit()
             }
-            Out::OrderCancelled {
-                order_id,
-                account_id,
-                instrument_id,
-                cancelled_quantity,
-                reason,
-            } => {
+            Out::OrderCancelled { order_id, account_id, instrument_id, cancelled_quantity, reason } => {
                 let mut e = begin!(order_cancelled_codec, OrderCancelledEncoder);
-                e.order_id(order_id)
-                    .account_id(account_id)
-                    .instrument_id(instrument_id);
+                e.order_id(order_id).account_id(account_id).instrument_id(instrument_id);
                 e.cancelled_quantity(cancelled_quantity).reason(reason);
                 e.get_limit()
             }
@@ -305,97 +265,44 @@ impl Emitter {
                 priority_kept,
             } => {
                 let mut e = begin!(order_amended_codec, OrderAmendedEncoder);
-                e.order_id(order_id)
-                    .account_id(account_id)
-                    .instrument_id(instrument_id)
-                    .tick(tick)
-                    .quantity(quantity);
-                e.at_event_start(at_event_start)
-                    .priority_kept(boolean(priority_kept));
+                e.order_id(order_id).account_id(account_id).instrument_id(instrument_id).tick(tick).quantity(quantity);
+                e.at_event_start(at_event_start).priority_kept(boolean(priority_kept));
                 e.get_limit()
             }
-            Out::OrderReduced {
-                order_id,
-                account_id,
-                instrument_id,
-                remaining_quantity,
-            } => {
+            Out::OrderReduced { order_id, account_id, instrument_id, remaining_quantity } => {
                 let mut e = begin!(order_reduced_codec, OrderReducedEncoder);
-                e.order_id(order_id)
-                    .account_id(account_id)
-                    .instrument_id(instrument_id);
+                e.order_id(order_id).account_id(account_id).instrument_id(instrument_id);
                 e.remaining_quantity(remaining_quantity);
                 e.get_limit()
             }
-            Out::PositionChanged {
-                account_id,
-                instrument_id,
-                position,
-            } => {
+            Out::PositionChanged { account_id, instrument_id, position } => {
                 let mut e = begin!(position_changed_codec, PositionChangedEncoder);
-                e.account_id(account_id)
-                    .instrument_id(instrument_id)
-                    .position(position);
+                e.account_id(account_id).instrument_id(instrument_id).position(position);
                 e.get_limit()
             }
-            Out::SleeveChanged {
-                account_id,
-                available_cents,
-                reserved_cents,
-            } => {
+            Out::SleeveChanged { account_id, available_cents, reserved_cents } => {
                 let mut e = begin!(sleeve_changed_codec, SleeveChangedEncoder);
-                e.account_id(account_id)
-                    .available_cents(available_cents)
-                    .reserved_cents(reserved_cents);
+                e.account_id(account_id).available_cents(available_cents).reserved_cents(reserved_cents);
                 e.get_limit()
             }
-            Out::CollateralReleased {
-                account_id,
-                event_id,
-                cents,
-                kind,
-            } => {
+            Out::CollateralReleased { account_id, event_id, cents, kind } => {
                 let mut e = begin!(collateral_released_codec, CollateralReleasedEncoder);
-                e.account_id(account_id)
-                    .event_id(event_id)
-                    .cents(cents)
-                    .kind(kind);
+                e.account_id(account_id).event_id(event_id).cents(cents).kind(kind);
                 e.get_limit()
             }
-            Out::BookLevelChanged {
-                instrument_id,
-                side,
-                tick,
-                quantity,
-                order_count,
-            } => {
+            Out::BookLevelChanged { instrument_id, side, tick, quantity, order_count } => {
                 let mut e = begin!(book_level_changed_codec, BookLevelChangedEncoder);
-                e.instrument_id(instrument_id)
-                    .side(side)
-                    .tick(tick)
-                    .quantity(quantity)
-                    .order_count(order_count);
+                e.instrument_id(instrument_id).side(side).tick(tick).quantity(quantity).order_count(order_count);
                 e.get_limit()
             }
-            Out::MarketStateChanged {
-                instrument_id,
-                state,
-            } => {
+            Out::MarketStateChanged { instrument_id, state } => {
                 let mut e = begin!(market_state_changed_codec, MarketStateChangedEncoder);
                 e.instrument_id(instrument_id).state(state);
                 e.get_limit()
             }
-            Out::SettlementPayout {
-                account_id,
-                instrument_id,
-                kind,
-                position_closed,
-                cents,
-            } => {
+            Out::SettlementPayout { account_id, instrument_id, kind, position_closed, cents } => {
                 let mut e = begin!(settlement_payout_codec, SettlementPayoutEncoder);
-                e.account_id(account_id)
-                    .instrument_id(instrument_id)
-                    .kind(kind);
+                e.account_id(account_id).instrument_id(instrument_id).kind(kind);
                 e.position_closed(position_closed).cents(cents);
                 e.get_limit()
             }
@@ -411,10 +318,7 @@ impl Emitter {
                 let mut e = begin!(basket_applied_codec, BasketAppliedEncoder);
                 e.account_id(account_id).session_id(session_id);
                 e.client_order_id(&client_order_id);
-                e.event_id(event_id)
-                    .quantity(quantity)
-                    .direction(direction)
-                    .cash_cents(cash_cents);
+                e.event_id(event_id).quantity(quantity).direction(direction).cash_cents(cash_cents);
                 e.get_limit()
             }
             Out::OrderGroupUpdated {
@@ -425,18 +329,12 @@ impl Emitter {
                 triggered,
             } => {
                 let mut e = begin!(order_group_updated_codec, OrderGroupUpdatedEncoder);
-                e.account_id(account_id)
-                    .client_order_group(client_order_group);
-                e.max_contracts_filled_per_window(max_contracts_filled_per_window)
-                    .window_millis(window_millis);
+                e.account_id(account_id).client_order_group(client_order_group);
+                e.max_contracts_filled_per_window(max_contracts_filled_per_window).window_millis(window_millis);
                 e.triggered(boolean(triggered));
                 e.get_limit()
             }
-            Out::CommandApplied {
-                command_id,
-                outcome,
-                reject_reason,
-            } => {
+            Out::CommandApplied { command_id, outcome, reject_reason } => {
                 let mut e = begin!(command_applied_codec, CommandAppliedEncoder);
                 e.command_id(&command_id);
                 e.outcome(outcome).reject_reason(reject_reason);
@@ -495,24 +393,9 @@ mod tests {
         assert_eq!(header.template_id(), fill_codec::SBE_TEMPLATE_ID);
         let dec = FillDecoder::default().header(header, 0);
         let mut h = dec.result_decoder();
-        assert_eq!(
-            (
-                h.input_sequence(),
-                h.result_index(),
-                h.sequenced_at(),
-                h.sequencer_group()
-            ),
-            (41, 1, 1_800, 3)
-        );
+        assert_eq!((h.input_sequence(), h.result_index(), h.sequenced_at(), h.sequencer_group()), (41, 1, 1_800, 3));
         let dec = h.parent().unwrap();
-        assert_eq!(
-            (
-                dec.buyer_cash_cents(),
-                dec.seller_cash_cents(),
-                dec.minted_pairs()
-            ),
-            (-300, -200, 5)
-        );
+        assert_eq!((dec.buyer_cash_cents(), dec.seller_cash_cents(), dec.minted_pairs()), (-300, -200, 5));
         e.begin(42, 1_801);
         assert_eq!(e.count(), 0);
     }

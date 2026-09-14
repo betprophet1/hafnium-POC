@@ -85,11 +85,7 @@ impl<'a, K: MapKey, V> FixedMap<'a, K, V> {
         for s in slots.iter_mut() {
             *s = None;
         }
-        Ok(Self {
-            slots,
-            len: 0,
-            seed,
-        })
+        Ok(Self { slots, len: 0, seed })
     }
 
     #[inline]
@@ -134,8 +130,7 @@ impl<'a, K: MapKey, V> FixedMap<'a, K, V> {
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {
-        self.find(key)
-            .and_then(|i| self.slots[i].as_ref().map(|(_, v)| v))
+        self.find(key).and_then(|i| self.slots[i].as_ref().map(|(_, v)| v))
     }
 
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
@@ -175,11 +170,7 @@ impl<'a, K: MapKey, V> FixedMap<'a, K, V> {
                 Some((k, _)) => self.home(k),
             };
             // Move the entry at j into the hole unless its home lies cyclically in (hole, j].
-            let stays = if hole <= j {
-                hole < home && home <= j
-            } else {
-                hole < home || home <= j
-            };
+            let stays = if hole <= j { hole < home && home <= j } else { hole < home || home <= j };
             if !stays {
                 self.slots[hole] = self.slots[j].take();
                 hole = j;
@@ -231,11 +222,7 @@ mod tests {
         assert_eq!(m.remove(&3000), Some(33));
         assert_eq!(m.get(&3000), None);
         for k in [0u64, 1, 2, 4, 5, 6, 7] {
-            assert_eq!(
-                m.get(&(k * 1000)),
-                Some(&(k as u32)),
-                "key {k} lost after removal"
-            );
+            assert_eq!(m.get(&(k * 1000)), Some(&(k as u32)), "key {k} lost after removal");
         }
     }
 

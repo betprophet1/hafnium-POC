@@ -25,6 +25,8 @@ pub struct OwnedMemory {
     sleeve_touches: Vec<(u64, u32, (i64, i64))>,
     level_touches: Vec<(LevelKey, u32, (u64, u32))>,
     scratch: Vec<(u64, u64)>,
+    marks: Vec<Mark>,
+    undo: Vec<Undo>,
 }
 
 impl OwnedMemory {
@@ -51,7 +53,9 @@ impl OwnedMemory {
             position_touches: vec![((0, 0), 0, 0); c.touches],
             sleeve_touches: vec![(0, 0, (0, 0)); c.touches],
             level_touches: vec![((0, 0, 0), 0, (0, 0)); c.touches],
-            scratch: vec![(0, 0); c.orders],
+            scratch: vec![(0, 0); c.orders.max(s(c.holdings) / 2)],
+            marks: vec![(0, 0, 0); c.touches],
+            undo: vec![Undo::default(); c.undo],
         }
     }
 
@@ -79,6 +83,8 @@ impl OwnedMemory {
             sleeve_touches: &mut self.sleeve_touches,
             level_touches: &mut self.level_touches,
             scratch: &mut self.scratch,
+            marks: &mut self.marks,
+            undo: &mut self.undo,
         }
     }
 }

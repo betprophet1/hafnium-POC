@@ -27,6 +27,11 @@ impl<'a, K: Ord + Copy, V: Copy + PartialEq> Touches<'a, K, V> {
         self.len == 0
     }
 
+    /// The records so far, in the order they were made.
+    pub fn entries(&self) -> &[(K, u32, V)] {
+        &self.log[..self.len]
+    }
+
     /// Records `key` with its value before a change. Repeated touches are harmless.
     pub fn touch(&mut self, key: K, value: V) -> Result<(), LogFull> {
         if self.len > 0 && self.log[self.len - 1].0 == key {
@@ -46,7 +51,7 @@ impl<'a, K: Ord + Copy, V: Copy + PartialEq> Touches<'a, K, V> {
         mut changed: impl FnMut(&K, V) -> Result<(), E>,
     ) -> Result<(), E> {
         let log = &mut self.log[..self.len];
-        log.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        log.sort_unstable_by_key(|e| (e.0, e.1));
         let mut i = 0;
         while i < log.len() {
             let (key, _, start) = log[i];

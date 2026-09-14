@@ -30,17 +30,11 @@ impl ResultSink for Collect {
 /// Runs one compiled scenario file. `Err` describes the first difference.
 pub fn run_file(path: &Path) -> Result<usize, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let scenario: Value =
-        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let scenario: Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let group = scenario["group"].as_u64().unwrap_or(1) as u16;
     let mut owned = OwnedMemory::new(&Capacities::small());
-    let config = EngineConfig {
-        sequencer_group: group,
-        binary_hash: [0; 32],
-        table_seed: 0x5eed,
-    };
-    let mut engine =
-        Engine::new(config, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
+    let config = EngineConfig { sequencer_group: group, binary_hash: [0; 32], table_seed: 0x5eed };
+    let mut engine = Engine::new(config, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
     let mut buf = vec![0u8; 1 << 16];
     let steps = scenario["steps"].as_array().ok_or("no steps")?;
     for (n, step) in steps.iter().enumerate() {
@@ -52,9 +46,7 @@ pub fn run_file(path: &Path) -> Result<usize, String> {
         match (outcome, expect_fail_stop) {
             (Err(_), true) => return Ok(n + 1),
             (Ok(()), true) => return Err(format!("step {n}: expected a fail-stop")),
-            (Err(stop), false) => {
-                return Err(format!("step {n} ({}): fail-stop {stop:?}", input["msg"]))
-            }
+            (Err(stop), false) => return Err(format!("step {n} ({}): fail-stop {stop:?}", input["msg"])),
             (Ok(()), false) => {}
         }
         let got = decode_results(n, input, &sink)?;
@@ -78,8 +70,7 @@ fn decode_results(n: usize, input: &Value, sink: &Collect) -> Result<Vec<Value>,
     let record = &input["record"];
     let mut out = Vec::with_capacity(sink.0.len());
     for (index, bytes) in sink.0.iter().enumerate() {
-        let mut result =
-            codec::decode(bytes).map_err(|e| format!("step {n}: decode result {index}: {e}"))?;
+        let mut result = codec::decode(bytes).map_err(|e| format!("step {n}: decode result {index}: {e}"))?;
         let header = result
             .as_object_mut()
             .and_then(|m| m.remove("result"))
@@ -91,9 +82,7 @@ fn decode_results(n: usize, input: &Value, sink: &Collect) -> Result<Vec<Value>,
             "sequencerGroup": record["sequencerGroup"],
         });
         if header != want {
-            return Err(format!(
-                "step {n}: result {index} header {header} should be {want}"
-            ));
+            return Err(format!("step {n}: result {index} header {header} should be {want}"));
         }
         out.push(result);
     }
@@ -106,19 +95,10 @@ fn describe_difference(n: usize, input: &Value, got: &[Value], expect: &[Value])
         let g = got.get(k);
         let w = expect.get(k);
         if g == w {
-            s.push_str(&format!(
-                "     [{k}] {}\n",
-                g.map_or(Value::Null, Clone::clone)
-            ));
+            s.push_str(&format!("     [{k}] {}\n", g.map_or(Value::Null, Clone::clone)));
         } else {
-            s.push_str(&format!(
-                "  !! [{k}] engine:   {}\n",
-                g.map_or(Value::Null, Clone::clone)
-            ));
-            s.push_str(&format!(
-                "  !! [{k}] expected: {}\n",
-                w.map_or(Value::Null, Clone::clone)
-            ));
+            s.push_str(&format!("  !! [{k}] engine:   {}\n", g.map_or(Value::Null, Clone::clone)));
+            s.push_str(&format!("  !! [{k}] expected: {}\n", w.map_or(Value::Null, Clone::clone)));
         }
     }
     s
@@ -130,9 +110,8 @@ pub fn collect_paths(args: &[String]) -> Vec<std::path::PathBuf> {
     for a in args {
         let p = Path::new(a);
         if p.is_dir() {
-            let mut files: Vec<_> = fs::read_dir(p)
-                .map(|d| d.filter_map(Result::ok).map(|e| e.path()).collect())
-                .unwrap_or_default();
+            let mut files: Vec<_> =
+                fs::read_dir(p).map(|d| d.filter_map(Result::ok).map(|e| e.path()).collect()).unwrap_or_default();
             files.retain(|f| f.extension().is_some_and(|x| x == "json"));
             files.sort();
             out.extend(files);
