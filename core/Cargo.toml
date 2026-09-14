@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["engine", "harness", "journal", "prototypes/l3book", "prototypes/maskbench"]
+members = ["engine", "harness", "journal", "node", "prototypes/l3book", "prototypes/maskbench"]
 
 [workspace.package]
 edition = "2021"

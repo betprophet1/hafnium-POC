@@ -1,0 +1,18 @@
+[package]
+name = "venue-node"
+version = "0.1.0"
+description = "Single-member node for laptops and test environments: simulated sequencer, journal, result log, TCP ingress"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+venue-engine = { path = "../engine" }
+venue_journal = { path = "../journal" }
+venue-harness = { path = "../harness" }
+serde_json = "1"
+sha2 = "0.10"

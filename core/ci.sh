@@ -7,7 +7,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CORE="$ROOT/core"
-HANDWRITTEN=(-p venue-engine -p venue-harness)
+HANDWRITTEN=(-p venue-engine -p venue-harness -p venue-node)
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
@@ -62,3 +62,14 @@ elif [[ "${ENGINE_REQUIRED:-1}" == "1" ]]; then
 else
   echo "engine: not passing (ENGINE_REQUIRED=0 made this non-fatal)"
 fi
+
+step "Node: golden replay of a differential vector (WP-8)"
+(cd "$CORE" && cargo build -q --release -p venue-node)
+node="$CORE/target/release/venue-node"
+vector="$(find "$CORE/target/differential" -name '*.json' | sort | head -1)"
+"$node" import "$vector" "$CORE/target/golden.journal"
+"$node" replay "$CORE/target/golden.journal" "$CORE/target/golden-1.results"
+"$node" replay "$CORE/target/golden.journal" "$CORE/target/golden-2.results"
+cmp "$CORE/target/golden-1.results" "$CORE/target/golden-2.results" \
+  || fail "replaying one journal twice gave different result logs"
+echo "golden replay: identical result logs"

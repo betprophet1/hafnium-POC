@@ -16,6 +16,7 @@ agent needs to build its core, and the core itself. Read this before changing an
 | `core/engine/` | The engine. The only code an implementation work package changes. |
 | `core/harness/` | Runs scenarios and differential vectors against the engine; the JSON codec in `src/codec.rs` is generated. |
 | `core/journal/` | The Rust codec generated from the schema. Never edited by hand. |
+| `core/node/` | The single-member node for laptops and test environments: simulated sequencer, journal, result log, TCP ingress. Never on the production path. |
 | `core/prototypes/` | Experiments behind blueprint claims. Learn from them; nothing depends on them. |
 | `core/WORK_PACKAGES.md` | The order in which the core is built, and what "done" means for each piece. |
 | `check` | Every gate in the repository. |
