@@ -739,9 +739,13 @@ class Engine:
 
     def duplicate_of(self, account_id, coid):                            # E-9.2
         entry = self.duplicates.get((account_id, coid))
-        if entry and self.now - entry[0] < self.client_order_id_window_seconds * NS_PER_SECOND:
+        if entry and self.now < entry[0]:
             return entry
         return None
+
+    def duplicate_expiry(self):
+        """E-9.2: an entry recorded now expires under the window in force now (E-7.4)."""
+        return self.now + self.client_order_id_window_seconds * NS_PER_SECOND
 
     def unlocked_holding(self, account_id, inst, side):                  # E-9.5
         p = self.position(account_id, inst.instrument_id)
@@ -787,7 +791,7 @@ class Engine:
         dup = self.duplicate_of(account_id, coid)
         if dup:
             return rejected("DUPLICATE_CLIENT_ORDER_ID", dup[1])
-        self.duplicates[(account_id, coid)] = (self.now, None)
+        self.duplicates[(account_id, coid)] = (self.duplicate_expiry(), None)
         try:
             order = self.check_and_build(e, session_id, account_id)
         except Reject as r:
@@ -1269,7 +1273,7 @@ class Engine:
         dup = self.duplicate_of(a, coid)
         if dup:
             return rejected("DUPLICATE_CLIENT_ORDER_ID", dup[1])
-        self.duplicates[(a, coid)] = (self.now, None)
+        self.duplicates[(a, coid)] = (self.duplicate_expiry(), None)
         ev = self.events.get(inp["eventId"])
         if ev is None or ev.resolved or not self.is_partition(ev):
             return rejected("UNKNOWN_INSTRUMENT")

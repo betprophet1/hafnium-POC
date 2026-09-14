@@ -95,7 +95,7 @@ orders and for trades within the group *(D-13)*.
 | Rule limits | by `accountId` (0 is the default for accounts without their own): the four fields of `SetRuleLimits` [all 0 = none]; per account, per second of sequencer time, counts of new orders and of fills |
 | Maker protection | by `(accountId, eventId)` with `eventId` 0 as the account's default: threshold and window; per `(accountId, eventId)` a counter and window start |
 | Order groups | by `(accountId, clientOrderGroup)`: threshold, window, counter, window start, `triggered` |
-| Duplicates | by `(accountId, clientOrderId)`: time recorded, and the order ID it created or none |
+| Duplicates | by `(accountId, clientOrderId)`: expiry, and the order ID it created or none |
 | Commands | the set of every `commandId` processed |
 | Counters | next order number and next trade number [1] |
 
@@ -199,7 +199,8 @@ to `balance`. `RECLAIM` subtracts it if it does not exceed available cash, else 
 **E-7.3 `SetRuleLimits`.** Replaces the limits for `accountId` (0 for the default).
 
 **E-7.4 `SetGroupParameters`.** Replaces `activeOrderLimit` and `clientOrderIdWindowSeconds`; the window
-must be positive, else rejected.
+must be positive, else rejected. A new window applies to duplicate entries recorded from then on; entries already
+recorded keep their expiry (E-9.2).
 
 **E-7.5 `SetAccountControls`.** Replaces the account's `closedOnly` and `selfMatchPrevention`. Resting
 orders are not changed *(D-18)*.
@@ -222,8 +223,8 @@ version applies from the next input.
 `EXPIRED`, in ascending `(expiresAt, orderId)` order (E-12.1 applies to each). Expiry happens only on a
 tick, so its precision is the tick interval *(D-5)*.
 
-**E-8.2** Duplicate-table entries recorded at or before `now − clientOrderIdWindowSeconds · 10⁹` may be
-removed on a tick. Removal is not observable, because E-9.2 compares times.
+**E-8.2** Duplicate-table entries whose expiry is at or before `now` may be removed on a tick. Removal is not
+observable, because E-9.2 compares `now` with the expiry recorded, which a later change of window does not move.
 
 **E-8.3 `EngineStarted`, `SeedSet`.** No state change visible in results. `SeedSet` seeds the keyed hash
 or PRNG; no rule in v0 draws randomness.
@@ -236,10 +237,11 @@ or PRNG; no rule in v0 draws randomness.
 The first failing check rejects the order with the reason given, and nothing changes except as E-5.3 allows.
 
 **E-9.2 Duplicates.** A client order ID is the 32 bytes of `clientOrderId`. An entry `(accountId,
-clientOrderId)` recorded less than `clientOrderIdWindowSeconds · 10⁹` nanoseconds before `now` makes the
-order a duplicate: rejected `DUPLICATE_CLIENT_ORDER_ID` with `originalOrderId` set to the order it created,
-or null if it created none. Otherwise, from check 3 on, the entry is recorded at `now` whatever the outcome,
-and updated with the order ID if the order is accepted *(D-12)*.
+clientOrderId)` whose expiry is later than `now` makes the order a duplicate: rejected
+`DUPLICATE_CLIENT_ORDER_ID` with `originalOrderId` set to the order it created, or null if it created none.
+Otherwise, from check 3 on, the entry is recorded whatever the outcome, with expiry
+`now + clientOrderIdWindowSeconds · 10⁹` under the window in force at this input, and updated with the order ID
+if the order is accepted *(D-12)*.
 
 **E-9.3 Checks.**
 
