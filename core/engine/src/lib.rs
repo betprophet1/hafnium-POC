@@ -116,7 +116,10 @@ pub struct Engine<'a> {
     order_index: FixedMap<'a, u64, u32>,
     resting_orders: u32,
     duplicates: FixedMap<'a, (u64, [u8; 32]), Duplicate>,
-    duplicates_purged_second: u64,
+    /// `(expiresAt, key)` for every recorded client order ID, oldest first (E-8.2).
+    expiry: &'a mut [(u64, (u64, [u8; 32]))],
+    expiry_head: usize,
+    expiry_len: usize,
     commands: FixedMap<'a, [u8; 16], ()>,
     order_groups: FixedMap<'a, (u64, u32), OrderGroup>,
     maker_settings: FixedMap<'a, HoldingKey, MakerSetting>,
@@ -193,7 +196,9 @@ impl<'a> Engine<'a> {
             order_index: cap(FixedMap::new(memory.order_index, seed))?,
             resting_orders: 0,
             duplicates: cap(FixedMap::new(memory.duplicates, seed))?,
-            duplicates_purged_second: 0,
+            expiry: memory.expiry,
+            expiry_head: 0,
+            expiry_len: 0,
             commands: cap(FixedMap::new(memory.commands, seed))?,
             order_groups: cap(FixedMap::new(memory.order_groups, seed))?,
             maker_settings: cap(FixedMap::new(memory.maker_settings, seed))?,
@@ -291,12 +296,21 @@ impl<'a> Engine<'a> {
                 self.remove(slot, emit::CancelReason::EXPIRED, sink)?;
             }
         }
-        // E-8.2, at most once a second of sequencer time.
-        let second = self.now / orders::NS_PER_SECOND;
-        if second != self.duplicates_purged_second {
-            self.duplicates_purged_second = second;
-            let now = self.now;
-            self.duplicates.retain(|_, d| now < d.expires_at);
+        // E-8.2: the expiry queue is in recording order, so expired entries are always at its front and the work
+        // is what actually expired, never the size of the table.
+        let now = self.now;
+        while self.expiry_len > 0 {
+            let (expires_at, key) = self.expiry[self.expiry_head];
+            if now < expires_at {
+                break;
+            }
+            // The ID may have been recorded again under a later expiry; that recording is its own, later queue
+            // record, so only an entry that has itself expired goes.
+            if self.duplicates.get(&key).is_some_and(|d| d.expires_at <= now) {
+                self.duplicates.remove(&key);
+            }
+            self.expiry_head = (self.expiry_head + 1) % self.expiry.len();
+            self.expiry_len -= 1;
         }
         self.end_unit(sink)
     }
@@ -352,6 +366,18 @@ impl<'a> Engine<'a> {
         cap(self.account_index.insert(id, slot as u32))?;
         self.accounts_used += 1;
         Ok(slot as u32)
+    }
+
+    /// Records a client order ID (E-9.2) and queues its expiry for E-8.2.
+    pub(crate) fn record_duplicate(&mut self, key: (u64, [u8; 32]), entry: Duplicate) -> Result<(), FailStop> {
+        if self.expiry_len >= self.expiry.len() {
+            return Err(FailStop::Capacity);
+        }
+        cap(self.duplicates.insert(key, entry))?;
+        let at = (self.expiry_head + self.expiry_len) % self.expiry.len();
+        self.expiry[at] = (entry.expires_at, key);
+        self.expiry_len += 1;
+        Ok(())
     }
 
     fn holding(&self, account_id: u64, instrument_id: u64) -> Holding {

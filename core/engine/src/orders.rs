@@ -332,7 +332,7 @@ impl<'a> Engine<'a> {
         }
         let expires_at = self.now.checked_add(self.duplicate_window()).ok_or(FailStop::Overflow)?;
         let entry = Duplicate { expires_at, order_id: None };
-        self.duplicates.insert(key, entry).map_err(|_| FailStop::Capacity)?;
+        self.record_duplicate(key, entry)?;
         match self.check_and_build(f, sink)? {
             Err(reason) => self.out(sink, &reject(reason, None)),
             Ok(slot) => self.accept_and_match(slot, sink),
