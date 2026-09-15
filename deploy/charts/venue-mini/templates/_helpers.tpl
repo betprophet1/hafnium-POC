@@ -20,6 +20,12 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: core
 {{- end -}}
 
+{{- define "venue-mini.selector" -}}
+app.kubernetes.io/name: venue-mini
+app.kubernetes.io/instance: {{ .ctx.Release.Name }}
+app.kubernetes.io/component: {{ .component }}
+{{- end -}}
+
 {{- define "venue-mini.podSecurity" -}}
 runAsNonRoot: true
 runAsUser: 10001

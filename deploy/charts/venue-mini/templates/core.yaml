@@ -12,6 +12,9 @@ spec:
     - name: ingress
       port: 7101
       targetPort: ingress
+    - name: feed
+      port: 7102
+      targetPort: feed
 ---
 # The core in Kubernetes is for mini venues only; production runs it on dedicated hosts (blueprint §16).
 apiVersion: apps/v1
@@ -47,6 +50,8 @@ spec:
           env:
             - name: VENUE_LISTEN
               value: "0.0.0.0:7101"
+            - name: VENUE_FEED
+              value: "0.0.0.0:7102"
             - name: VENUE_DATA
               value: /var/lib/venue
             - name: VENUE_GROUP
@@ -58,6 +63,8 @@ spec:
           ports:
             - name: ingress
               containerPort: 7101
+            - name: feed
+              containerPort: 7102
           # Ready once the journal has replayed and the ingress listens. No liveness probe: a fail-stop exits the
           # process, and a restart replays to the same stop (spec E-18.2), which shows as CrashLoopBackOff.
           readinessProbe:

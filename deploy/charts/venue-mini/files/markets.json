@@ -1,0 +1,32 @@
+{
+  "accounts": [
+    {"id": 1, "name": "Market maker", "tab": "maker", "cents": 5000000},
+    {"id": 2, "name": "Retail customer", "tab": "retail", "cents": 50000},
+    {"id": 10, "name": "Synthetic maker", "tab": null, "cents": 100000000},
+    {"id": 20, "name": "Synthetic taker", "tab": null, "cents": 20000000}
+  ],
+  "markets": [
+    {
+      "template": 1,
+      "title": "Will it rain in London tomorrow?",
+      "states": ["No rain", "Rain"],
+      "instruments": [{"label": "Rain", "class": "BINARY", "mask": 2}]
+    },
+    {
+      "template": 2,
+      "title": "Arsenal v Chelsea",
+      "states": ["Arsenal", "Draw", "Chelsea"],
+      "instruments": [
+        {"label": "Arsenal", "class": "CATEGORICAL_OUTCOME", "mask": 1},
+        {"label": "Draw", "class": "CATEGORICAL_OUTCOME", "mask": 2},
+        {"label": "Chelsea", "class": "CATEGORICAL_OUTCOME", "mask": 4}
+      ]
+    },
+    {
+      "template": 3,
+      "title": "Bitcoin above $150,000 on 31 December?",
+      "states": ["No", "Yes"],
+      "instruments": [{"label": "Above $150k", "class": "BINARY", "mask": 2}]
+    }
+  ]
+}

@@ -1,8 +1,10 @@
 # The mini venue (blueprint §16): one chart for the laptop and for ephemeral namespaces.
-# It runs the core only so far. The gateway, bots, dummy oracle and environment manifest join as they are built.
+# It runs the core, the demo markets, synthetic traders, the dummy oracle and a web page. The gateway and the
+# environment manifest join as they are built.
 
 image:
-  repository: venue-node
+  # One image holds venue-node and venue-sim.
+  repository: venue
   tag: dev
   pullPolicy: IfNotPresent
 
@@ -24,5 +26,29 @@ core:
       memory: 256Mi
     limits:
       memory: 512Mi
+
+# The order book, market maker, retail customer and settlement tabs. Reach it with deploy/laptop.sh web.
+web:
+  enabled: true
+
+bots:
+  maker:
+    enabled: true
+    account: 10
+    # Contracts quoted on each side, in lots.
+    size: 10
+    # Ticks from fair value to each quote.
+    spread: 1
+    intervalMs: 700
+    seed: 1
+  taker:
+    enabled: true
+    account: 20
+    maxQuantity: 5
+    # Chance per market per interval of an order, and of that order being a sweep, in thousandths.
+    chance: 250
+    sweepChance: 30
+    intervalMs: 1000
+    seed: 2
 
 fullnameOverride: ""

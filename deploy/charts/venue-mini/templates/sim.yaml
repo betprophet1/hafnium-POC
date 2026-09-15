@@ -1,0 +1,176 @@
+{{- $name := include "venue-mini.fullname" . }}
+{{- $core := printf "%s-core" $name }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-catalogue
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+data:
+  markets.json: |
+    {{- .Files.Get "files/markets.json" | nindent 4 }}
+---
+# Lists the demo markets and funds the accounts after every install and upgrade. The commands carry fixed IDs, so a
+# second run is answered DUPLICATE (spec E-7.1) and changes nothing.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}-seed
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: seed
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" . | nindent 8 }}
+        app.kubernetes.io/component: seed
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        {{- include "venue-mini.podSecurity" . | nindent 8 }}
+      containers:
+        - name: seed
+          image: {{ include "venue-mini.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["venue-sim", "seed"]
+          env:
+            - name: VENUE_INGRESS
+              value: "{{ $core }}:7101"
+            - name: VENUE_CATALOGUE
+              value: /catalogue/markets.json
+          securityContext:
+            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: catalogue
+              mountPath: /catalogue
+      volumes:
+        - name: catalogue
+          configMap:
+            name: {{ $name }}-catalogue
+{{- if .Values.web.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-web
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  selector:
+    {{- include "venue-mini.selector" (dict "ctx" . "component" "web") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# The web page and the dummy oracle's controls. No authentication: reach it only through a port-forward.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-web
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "web") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" . | nindent 8 }}
+        app.kubernetes.io/component: web
+    spec:
+      securityContext:
+        {{- include "venue-mini.podSecurity" . | nindent 8 }}
+      containers:
+        - name: web
+          image: {{ include "venue-mini.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["venue-sim", "web"]
+          env:
+            - name: VENUE_LISTEN
+              value: "0.0.0.0:8080"
+            - name: VENUE_INGRESS
+              value: "{{ $core }}:7101"
+            - name: VENUE_FEED
+              value: "{{ $core }}:7102"
+            - name: VENUE_CATALOGUE
+              value: /catalogue/markets.json
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /api/state
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+          securityContext:
+            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: catalogue
+              mountPath: /catalogue
+      volumes:
+        - name: catalogue
+          configMap:
+            name: {{ $name }}-catalogue
+{{- end }}
+{{- range $bot, $cfg := .Values.bots }}
+{{- if $cfg.enabled }}
+---
+# A synthetic {{ $bot }} (blueprint §16): an ordinary client of the core's ingress.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-{{ $bot }}
+  labels:
+    {{- include "venue-mini.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $bot }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" $ "component" $bot) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: {{ $bot }}
+    spec:
+      securityContext:
+        {{- include "venue-mini.podSecurity" $ | nindent 8 }}
+      containers:
+        - name: {{ $bot }}
+          image: {{ include "venue-mini.image" $ | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command: ["venue-sim", {{ $bot | quote }}]
+          env:
+            - name: VENUE_INGRESS
+              value: "{{ $core }}:7101"
+            - name: VENUE_FEED
+              value: "{{ $core }}:7102"
+            {{- range $key, $value := $cfg }}
+            {{- if ne $key "enabled" }}
+            - name: VENUE_{{ $key | snakecase | upper }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+          securityContext:
+            {{- include "venue-mini.containerSecurity" $ | nindent 12 }}
+{{- end }}
+{{- end }}
