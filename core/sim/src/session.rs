@@ -4,15 +4,28 @@
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket};
 use venue_link::wire::Error;
+
+/// How long connecting, or any one read or write outside the poll loop, may take before the gateway counts as gone.
+const PATIENCE: Duration = Duration::from_secs(10);
 
 /// The bot's own pacing clock. Nothing it measures reaches the journal.
 #[allow(clippy::disallowed_methods)]
 pub fn monotonic() -> Instant {
     Instant::now()
+}
+
+/// Connects to the gateway with every wait bounded. Without that, a gateway that vanishes mid-connection (its pod
+/// deleted, its node gone) leaves the socket established and the client blocked on it for ever.
+pub fn connect(addr: &str) -> Result<TcpStream, Error> {
+    let resolved = addr.to_socket_addrs()?.next().ok_or_else(|| format!("{addr} resolves to nothing"))?;
+    let stream = TcpStream::connect_timeout(&resolved, PATIENCE)?;
+    stream.set_read_timeout(Some(PATIENCE))?;
+    stream.set_write_timeout(Some(PATIENCE))?;
+    Ok(stream)
 }
 
 pub struct Session {
@@ -27,7 +40,7 @@ impl Session {
     /// Connects and logs in. The gateway cancels this session's resting orders when it ends, and when it has been
     /// silent for `heartbeat_seconds` (interfaces/gateway/README.md, sessions).
     pub fn open(gateway: &str, token: &str, heartbeat_seconds: u64) -> Result<(Self, Value), Error> {
-        let stream = TcpStream::connect(gateway)?;
+        let stream = connect(gateway)?;
         stream.set_nodelay(true)?;
         let (socket, _) = tungstenite::client(format!("ws://{gateway}/v4/ws"), stream)
             .map_err(|e| format!("websocket handshake: {e}"))?;

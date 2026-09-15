@@ -38,7 +38,7 @@ spec:
         - name: seed
           image: {{ include "venue-mini.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["venue-sim", "seed"]
+          command: ["tini", "--", "venue-sim", "seed"]
           env:
             - name: VENUE_INGRESS
               value: "{{ $core }}:7101"
@@ -95,7 +95,7 @@ spec:
         - name: web
           image: {{ include "venue-mini.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["venue-sim", "web"]
+          command: ["tini", "--", "venue-sim", "web"]
           env:
             - name: VENUE_LISTEN
               value: "0.0.0.0:8080"
@@ -157,7 +157,8 @@ spec:
         - name: {{ $bot }}
           image: {{ include "venue-mini.image" $ | quote }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
-          command: ["venue-sim", {{ $bot | quote }}]
+          # tini as PID 1 (see the Dockerfile): deleting the maker's pod ends its session, and its quotes, at once.
+          command: ["tini", "--", "venue-sim", {{ $bot | quote }}]
           env:
             - name: VENUE_GATEWAY
               value: "{{ $gateway }}"

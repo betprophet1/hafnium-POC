@@ -3,8 +3,6 @@
 
 use serde_json::Value;
 use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
 use venue_link::wire::Error;
 
 pub struct Api {
@@ -47,8 +45,7 @@ impl Api {
     }
 
     fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Response, Error> {
-        let mut stream = TcpStream::connect(&self.addr)?;
-        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+        let mut stream = crate::session::connect(&self.addr)?;
         let body = body.map(Value::to_string).unwrap_or_default();
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: gateway\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

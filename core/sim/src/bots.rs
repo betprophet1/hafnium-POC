@@ -366,7 +366,8 @@ impl Stream {
 }
 
 /// The maker's loop over a WebSocket session. Books and its own orders arrive as messages and actions go out as session
-/// ops. When the session ends the gateway cancels its quotes, and the loop logs in again from a fresh snapshot.
+/// ops. When the session ends the gateway cancels its quotes, and the loop logs in again, cancels whatever an earlier
+/// session left resting, and starts from a fresh snapshot.
 fn run_session(api: &Api, gateway: &str, token: &str, interval: Duration, who: &str, plan: &mut Plan<'_>) -> ! {
     loop {
         if let Err(e) = session_pass(api, gateway, token, interval, who, plan) {
@@ -386,9 +387,18 @@ fn session_pass(
 ) -> Result<(), Error> {
     let (mut session, welcome) = Session::open(gateway, token, HEARTBEAT_SECONDS)?;
     eprintln!("{who}: session {} logged in", welcome["sessionId"].as_str().unwrap_or("?"));
+    let mut markets = markets(api)?;
+    // Cancel-on-disconnect covers one session's orders, and only while its gateway lives to send the MassCancel: a
+    // gateway that died took an earlier session's orders' cover with it (interface 1 README, sessions). Cancelling
+    // them here puts every resting order under this session.
+    let events: BTreeSet<u64> = markets.iter().map(|m| m.event).collect();
+    for event in events {
+        if let Outcome::Throttled(wait) = perform_on(&mut session, who, Action::CancelEvent(event))? {
+            thread::sleep(wait);
+        }
+    }
     let mut stream = Stream { sequence: id(&welcome["sequence"]), ..Stream::default() };
     stream.restart(account(api)?);
-    let mut markets = markets(api)?;
     session.send(&json!({"op": "subscribe", "topics": ["markets"]}))?;
     let mut followed: BTreeSet<u64> = BTreeSet::new();
     let (mut sent, mut waited) = (0u64, 0u32);

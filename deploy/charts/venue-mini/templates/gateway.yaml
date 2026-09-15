@@ -40,7 +40,7 @@ spec:
         - name: gateway
           image: {{ include "venue-mini.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["venue-gateway"]
+          command: ["tini", "--", "venue-gateway"]
           env:
             - name: VENUE_LISTEN
               value: "0.0.0.0:8081"

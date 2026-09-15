@@ -3,7 +3,7 @@
 # environment manifest join as they are built.
 
 image:
-  # One image holds venue-node and venue-sim.
+  # One image holds venue-node, venue-gateway and venue-sim, each run under tini.
   repository: venue
   tag: dev
   pullPolicy: IfNotPresent
