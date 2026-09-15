@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use venue_link::catalogue::Catalogue;
-use venue_link::wire::{self, Error, Ingress};
+use venue_link::submit::Submit;
+use venue_link::wire::{self, Error};
 
 const USAGE: &str = "usage:
   venue-gateway --ingress ADDR --feed ADDR --catalogue FILE [--listen 127.0.0.1:8081]
@@ -74,7 +75,7 @@ fn run(args: &Args) -> Result<(), Error> {
         burst: args.number("burst", 400)?,
         logons_per_minute: args.number("logons-per-minute", 30)?,
     };
-    let gateway = Arc::new(Gateway::new(Hub::new(catalogue), Ingress::new(&args.get("ingress", None)?), limits));
+    let gateway = Arc::new(Gateway::new(Hub::new(catalogue), Submit::spawn(&args.get("ingress", None)?), limits));
     let feed = args.get("feed", None)?;
     let follower = Arc::clone(&gateway);
     thread::spawn(move || {

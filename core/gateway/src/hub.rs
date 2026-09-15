@@ -14,6 +14,10 @@ use venue_link::wire::Unit;
 /// Private messages kept per account for sessions resuming by sequence.
 const HISTORY: usize = 2_000;
 
+/// Accepted orders remembered while the feed catches up. A bound, not a working size: entries leave as soon as the
+/// feed passes them, so this only matters if the feed stalls.
+const ACCEPTED: usize = 65_536;
+
 pub fn id(v: u64) -> Value {
     Value::String(v.to_string())
 }
@@ -138,6 +142,12 @@ pub struct Hub {
     history: BTreeMap<u64, History>,
     connected: bool,
     last_unit: Option<(Instant, u64)>,
+    /// Orders the node has accepted but the feed has not delivered yet: order id to (sequence, account, instrument).
+    accepted: BTreeMap<u64, (u64, u64, u64)>,
+    /// The same order ids in sequence order, so the oldest can be dropped without scanning the map.
+    accepted_order: VecDeque<u64>,
+    /// The highest input sequence the view has applied.
+    last_sequence: u64,
 }
 
 impl Hub {
@@ -157,6 +167,9 @@ impl Hub {
             history: BTreeMap::new(),
             connected: false,
             last_unit: None,
+            accepted: BTreeMap::new(),
+            accepted_order: VecDeque::new(),
+            last_sequence: 0,
         }
     }
 
@@ -170,6 +183,8 @@ impl Hub {
         self.dirty.clear();
         self.connected = true;
         self.last_unit = None;
+        // The replay starts from the beginning, so accepted orders stay remembered until it reaches them again.
+        self.last_sequence = 0;
     }
 
     /// The feed has caught up: its last input is recent, or nothing has arrived for a moment.
@@ -186,9 +201,33 @@ impl Hub {
         Some((self.view.ladders.get(&i.table)?.clone(), i.lot))
     }
 
-    /// The owner and instrument of a resting order.
+    /// The owner and instrument of a resting order, from the feed or, until the feed catches up, from what the node
+    /// itself said when it accepted the order.
     pub fn order(&self, order: u64) -> Option<(u64, u64)> {
-        self.view.orders.get(&order).map(|o| (o.account, o.instrument))
+        self.view
+            .orders
+            .get(&order)
+            .map(|o| (o.account, o.instrument))
+            .or_else(|| self.accepted.get(&order).map(|&(_, account, instrument)| (account, instrument)))
+    }
+
+    /// Remembers an order the node has just accepted. A client learns its order id from the node's reply, which
+    /// comes straight back, while the feed arrives separately; without this it could amend or cancel an order the
+    /// gateway has not heard of yet and be told there is no such order. The entry is consulted only until the view
+    /// has applied that sequence, after which the feed is authoritative again, so an order that has since been
+    /// cancelled or filled is never resurrected.
+    pub fn accept(&mut self, order: u64, sequence: u64, account: u64, instrument: u64) {
+        if sequence <= self.last_sequence {
+            return;
+        }
+        if self.accepted.insert(order, (sequence, account, instrument)).is_none() {
+            self.accepted_order.push_back(order);
+        }
+        while self.accepted_order.len() > ACCEPTED {
+            if let Some(oldest) = self.accepted_order.pop_front() {
+                self.accepted.remove(&oldest);
+            }
+        }
     }
 
     fn quote(&self, instrument: u64, tick: u64) -> Value {
@@ -201,6 +240,15 @@ impl Hub {
         let executions = executions(&self.view, &unit.results, sequence);
         self.view.apply(unit);
         self.last_unit = Some((monotonic(), u(&input["record"]["sequencedAt"])));
+        // The view has now applied this unit, so every order accepted at or before it can be forgotten here.
+        self.last_sequence = self.last_sequence.max(sequence);
+        while let Some(&oldest) = self.accepted_order.front() {
+            if self.accepted.get(&oldest).is_some_and(|&(at, _, _)| at > self.last_sequence) {
+                break;
+            }
+            self.accepted_order.pop_front();
+            self.accepted.remove(&oldest);
+        }
         for (account, execution) in executions {
             self.send_to_account(account, sequence, json!({"type": "execution", "execution": execution}).to_string());
         }

@@ -3,5 +3,6 @@
 //! the mini venue's tools use it; nothing on the engine's side of interface 7 does.
 
 pub mod catalogue;
+pub mod submit;
 pub mod view;
 pub mod wire;

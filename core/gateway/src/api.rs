@@ -8,7 +8,8 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use venue_link::wire::{self, Ingress};
+use venue_link::submit::Submit;
+use venue_link::wire;
 
 pub struct Limits {
     pub per_second: u32,
@@ -153,17 +154,18 @@ const MAX_CENTS: u64 = i64::MAX as u64;
 
 pub struct Gateway {
     hub: Mutex<Hub>,
-    ingress: Mutex<Ingress>,
+    /// Pipelined, so no client waits on another's round trip to the node.
+    ingress: Submit,
     pub limits: Limits,
     rest_buckets: Mutex<BTreeMap<u64, Bucket>>,
     logon_buckets: Mutex<BTreeMap<u64, Bucket>>,
 }
 
 impl Gateway {
-    pub fn new(hub: Hub, ingress: Ingress, limits: Limits) -> Self {
+    pub fn new(hub: Hub, ingress: Submit, limits: Limits) -> Self {
         Self {
             hub: Mutex::new(hub),
-            ingress: Mutex::new(ingress),
+            ingress,
             limits,
             rest_buckets: Mutex::new(BTreeMap::new()),
             logon_buckets: Mutex::new(BTreeMap::new()),
@@ -194,7 +196,7 @@ impl Gateway {
     }
 
     fn send(&self, input: Value) -> Result<Vec<Value>, ApiError> {
-        locked(&self.ingress).send(input).map_err(|e| {
+        self.ingress.send(input).map_err(|e| {
             eprintln!("gateway: ingress: {e}");
             ApiError::unavailable(
                 "the sequencer group did not answer; the outcome is unknown, so resend with the same client order ID",
@@ -383,13 +385,18 @@ impl Gateway {
 
     /// An `OrderResult` from one input's results.
     fn result(&self, account: u64, results: &[Value]) -> Value {
-        let hub = self.hub();
+        let mut hub = self.hub();
         let sequence = results.iter().find_map(|r| r["result"]["inputSequence"].as_u64()).unwrap_or(0);
         let executions: Vec<Value> = hub::executions(&hub.view, results, sequence)
             .into_iter()
             .filter(|(a, _)| *a == account)
             .map(|(_, e)| e)
             .collect();
+        // The client can amend or cancel as soon as it has this reply, which reaches it before the feed does.
+        for r in results.iter().filter(|r| r["msg"] == "OrderAccepted") {
+            let field = |name: &str| r[name].as_u64().unwrap_or(0);
+            hub.accept(field("orderId"), sequence, field("accountId"), field("instrumentId"));
+        }
         let outcome = results.iter().find_map(|r| {
             let order = || id(r["orderId"].as_u64().unwrap_or(0));
             match r["msg"].as_str()? {
