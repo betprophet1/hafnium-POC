@@ -1,12 +1,14 @@
-//! The mini venue's web page, its API and the dummy oracle's controls. Development only: there is no
-//! authentication, so never expose it outside a laptop or a test cluster.
+//! The mini venue's web page. Development only: nothing here is authenticated, so never expose it outside a laptop
+//! or a test cluster.
 //!
-//! The oracle here sequences commands directly. Blueprint §16 routes a dummy resolution through a proposal, the
-//! resolution console and an auto-approver; those do not exist yet.
+//! Trading goes through the gateway: this server passes `/v4` through to it untouched, WebSocket upgrades included,
+//! and hands the page the dev tokens of the accounts it shows. Settlement and grants are operator actions, sequenced
+//! as commands through the core's ingress. The dummy oracle here sequences directly; blueprint §16 routes a dummy
+//! resolution through a proposal, the resolution console and an auto-approver, which do not exist yet.
 
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -20,6 +22,7 @@ pub struct Web {
     catalogue: Catalogue,
     live: Arc<Live>,
     ingress: Mutex<(Ingress, Ids)>,
+    gateway: String,
 }
 
 fn poisoned<T>(_: T) -> Error {
@@ -27,45 +30,35 @@ fn poisoned<T>(_: T) -> Error {
 }
 
 impl Web {
-    pub fn new(catalogue: Catalogue, live: Arc<Live>, ingress: Ingress, ids: Ids) -> Self {
-        Self { catalogue, live, ingress: Mutex::new((ingress, ids)) }
+    pub fn new(catalogue: Catalogue, live: Arc<Live>, ingress: Ingress, ids: Ids, gateway: String) -> Self {
+        Self { catalogue, live, ingress: Mutex::new((ingress, ids)), gateway }
     }
 
     fn snapshot(&self) -> Result<Value, Error> {
         Ok(self.live.view.lock().map_err(poisoned)?.snapshot(&self.catalogue))
     }
 
+    /// The accounts the page's trading tabs act as, with their dev tokens.
+    fn config(&self) -> Value {
+        let accounts: Vec<Value> = self
+            .catalogue
+            .accounts()
+            .iter()
+            .filter(|a| !a["tab"].is_null())
+            .map(|a| json!({"id": a["id"], "name": a["name"], "tab": a["tab"], "token": a["token"]}))
+            .collect();
+        json!({"accounts": accounts})
+    }
+
+    /// Operator actions: funding an account, and the dummy oracle.
     fn action(&self, name: &str, r: &Value) -> Result<Value, Error> {
-        let account = r["account"].as_u64().unwrap_or(0);
         let mut guard = self.ingress.lock().map_err(poisoned)?;
         let (ingress, ids) = &mut *guard;
         let inputs = match name {
-            "order" => {
-                let flags = if r["postOnly"] == true { json!(["POST_ONLY"]) } else { json!([]) };
-                vec![wire::order(
-                    account,
-                    ids.fresh(),
-                    json!({
-                        "instrumentId": r["instrument"], "side": r["side"], "tick": r["tick"], "quantity": r["quantity"],
-                        "enteredContract": r.get("contract").cloned().unwrap_or(json!("YES")),
-                        "timeInForce": r.get("tif").cloned().unwrap_or(json!("GTC")),
-                        "protectionTicks": r.get("protectionTicks").cloned().unwrap_or(json!(0)), "flags": flags
-                    }),
-                )]
-            }
-            "cancel" => vec![wire::cancel(
-                account,
-                r["instrument"].as_u64().ok_or("an instrument is required")?,
-                r["orderId"].as_u64().ok_or("an order ID is required")?,
-            )],
-            "cancel-all" => vec![json!({
-                "msg": "MassCancel", "sessionId": account * 10, "accountId": account, "scope": "ACCOUNT", "scopeRef": 0,
-                "cause": "CLIENT_REQUEST"
-            })],
             "grant" => vec![wire::command(
                 "SleeveAdjust",
                 ids.fresh(),
-                json!({"accountId": account, "deltaCents": r["cents"], "reason": "GRANT"}),
+                json!({"accountId": r["account"], "deltaCents": r["cents"], "reason": "GRANT"}),
             )],
             "oracle" => self.oracle(r, ids)?,
             _ => return Err(format!("no action {name}").into()),
@@ -123,7 +116,7 @@ impl Web {
 
 pub fn serve(listen: &str, web: Arc<Web>) -> Result<(), Error> {
     let listener = TcpListener::bind(listen)?;
-    eprintln!("web page on http://{}", listener.local_addr()?);
+    eprintln!("web page on http://{}, gateway at {}", listener.local_addr()?, web.gateway);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let web = Arc::clone(&web);
@@ -138,14 +131,20 @@ pub fn serve(listen: &str, web: Arc<Web>) -> Result<(), Error> {
 
 fn handle(web: &Web, stream: TcpStream) -> Result<(), Error> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let mut parts = line.split_whitespace();
-    let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or("/"));
+    let mut head = String::new();
+    reader.read_line(&mut head)?;
+    let (method, path) = {
+        let mut parts = head.split_whitespace();
+        (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("/").to_string())
+    };
     let mut length = 0usize;
-    loop {
+    for _ in 0..100 {
         let mut header = String::new();
-        if reader.read_line(&mut header)? == 0 || header.trim_end().is_empty() {
+        if reader.read_line(&mut header)? == 0 {
+            break;
+        }
+        head.push_str(&header);
+        if header.trim_end().is_empty() {
             break;
         }
         if let Some((name, value)) = header.split_once(':') {
@@ -154,13 +153,17 @@ fn handle(web: &Web, stream: TcpStream) -> Result<(), Error> {
             }
         }
     }
+    if path.starts_with("/v4") {
+        return proxy(&web.gateway, &head, reader, stream);
+    }
     if length > 1 << 20 {
         return respond(stream, 413, "text/plain", b"too large");
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
-    match (method, path) {
+    match (method.as_str(), path.as_str()) {
         ("GET", "/") => respond(stream, 200, "text/html; charset=utf-8", INDEX.as_bytes()),
+        ("GET", "/api/config") => respond(stream, 200, "application/json", web.config().to_string().as_bytes()),
         ("GET", "/api/state") => respond(stream, 200, "application/json", web.snapshot()?.to_string().as_bytes()),
         ("GET", "/api/events") => events(web, stream),
         ("POST", p) if p.starts_with("/api/") => {
@@ -176,12 +179,42 @@ fn handle(web: &Web, stream: TcpStream) -> Result<(), Error> {
     }
 }
 
+/// Passes a request and everything after it through to the gateway, in both directions, until either side closes.
+fn proxy(
+    gateway: &str,
+    head: &str,
+    mut from_client: BufReader<TcpStream>,
+    mut to_client: TcpStream,
+) -> Result<(), Error> {
+    let upstream = match TcpStream::connect(gateway) {
+        Ok(s) => s,
+        Err(e) => {
+            let body =
+                json!({"error": {"code": "UNAVAILABLE", "message": format!("the gateway is not reachable: {e}")}});
+            return respond(to_client, 502, "application/json", body.to_string().as_bytes());
+        }
+    };
+    let _ = upstream.set_nodelay(true);
+    let mut from_gateway = upstream.try_clone()?;
+    let mut to_gateway = upstream;
+    to_gateway.write_all(head.as_bytes())?;
+    let forward = thread::spawn(move || {
+        let _ = io::copy(&mut from_client, &mut to_gateway);
+        let _ = to_gateway.shutdown(Shutdown::Write);
+    });
+    let _ = io::copy(&mut from_gateway, &mut to_client);
+    let _ = to_client.shutdown(Shutdown::Both);
+    let _ = forward.join();
+    Ok(())
+}
+
 fn respond(mut stream: TcpStream, status: u16, content_type: &str, body: &[u8]) -> Result<(), Error> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
         413 => "Payload Too Large",
+        502 => "Bad Gateway",
         _ => "Error",
     };
     write!(
@@ -193,8 +226,8 @@ fn respond(mut stream: TcpStream, status: u16, content_type: &str, body: &[u8]) 
     Ok(())
 }
 
-/// Server-sent events: a snapshot whenever the view changes, at most five a second, and a comment every 15 s
-/// otherwise so proxies keep the connection open.
+/// Server-sent events for the settlement tab: a snapshot whenever the view changes, at most five a second, and a
+/// comment every 15 s otherwise so proxies keep the connection open.
 fn events(web: &Web, mut stream: TcpStream) -> Result<(), Error> {
     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n\r\n")?;
     let mut seen = u64::MAX;

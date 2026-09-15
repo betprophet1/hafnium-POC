@@ -1,6 +1,7 @@
 //! `venue-sim`: the mini venue's actors. See `core/sim/README.md`.
 
 mod bots;
+mod client;
 mod web;
 
 use std::collections::BTreeMap;
@@ -9,18 +10,19 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use venue_link::catalogue::Catalogue;
-use venue_link::{view, wire};
-use wire::{Error, Ids, Ingress};
+use venue_link::view;
+use venue_link::wire::{Error, Ids, Ingress};
 
 const USAGE: &str = "usage:
   venue-sim seed  --ingress ADDR --catalogue FILE
-  venue-sim web   --ingress ADDR --feed ADDR --catalogue FILE [--listen 127.0.0.1:8080]
-  venue-sim maker --ingress ADDR --feed ADDR [--account 10] [--size 10] [--levels 3] [--spread 1]
+  venue-sim web   --ingress ADDR --feed ADDR --gateway ADDR --catalogue FILE [--listen 127.0.0.1:8080]
+  venue-sim maker --gateway ADDR [--token dev-synthetic-maker] [--size 10] [--levels 3] [--spread 1]
                   [--interval-ms 700] [--seed 1]
-  venue-sim taker --ingress ADDR --feed ADDR [--account 20] [--max-quantity 5] [--chance 250] [--sweep-chance 30]
-                  [--interval-ms 1000] [--seed 2]
+  venue-sim taker --gateway ADDR [--token dev-synthetic-taker] [--max-quantity 5] [--chance 250]
+                  [--sweep-chance 30] [--interval-ms 1000] [--seed 2]
 
-Every flag can also be given as VENUE_<FLAG> in the environment, for example VENUE_INGRESS or VENUE_INTERVAL_MS.";
+The bots are clients of the gateway. seed and the web page's settlement tab are operator tools and use the core's
+ingress and feed. Every flag can also be given as VENUE_<FLAG> in the environment, for example VENUE_GATEWAY.";
 
 struct Args(BTreeMap<String, String>);
 
@@ -104,32 +106,31 @@ fn seed(args: &Args) -> Result<(), Error> {
 fn web(args: &Args) -> Result<(), Error> {
     let catalogue = Catalogue::load(&args.get("catalogue", None)?)?;
     let live = view::Live::follow(&args.get("feed", None)?);
-    let app = web::Web::new(catalogue, live, Ingress::new(&args.get("ingress", None)?), Ids::new('w')?);
+    let ingress = Ingress::new(&args.get("ingress", None)?);
+    let app = web::Web::new(catalogue, live, ingress, Ids::new('w')?, args.get("gateway", Some("127.0.0.1:8081"))?);
     web::serve(&args.get("listen", Some("127.0.0.1:8080"))?, Arc::new(app))
 }
 
 fn maker(args: &Args) -> Result<(), Error> {
     let config = bots::Maker {
-        account: args.number("account", 10)?,
         size: args.number("size", 10)?,
         levels: args.number("levels", 3)?,
         half_spread: args.number("spread", 1)?,
         interval: Duration::from_millis(args.number("interval-ms", 700)?),
         seed: args.number("seed", 1)?,
     };
-    let live = view::Live::follow(&args.get("feed", None)?);
-    bots::maker(&args.get("ingress", None)?, &live, &config, Ids::new('m')?)
+    let api = client::Api::new(&args.get("gateway", None)?, &args.get("token", Some("dev-synthetic-maker"))?);
+    bots::maker(&api, &config, Ids::new('m')?)
 }
 
 fn taker(args: &Args) -> Result<(), Error> {
     let config = bots::Taker {
-        account: args.number("account", 20)?,
         max_quantity: args.number("max-quantity", 5)?,
         per_mille: args.number("chance", 250)?,
         sweep_per_mille: args.number("sweep-chance", 30)?,
         interval: Duration::from_millis(args.number("interval-ms", 1000)?),
         seed: args.number("seed", 2)?,
     };
-    let live = view::Live::follow(&args.get("feed", None)?);
-    bots::taker(&args.get("ingress", None)?, &live, &config, Ids::new('t')?)
+    let api = client::Api::new(&args.get("gateway", None)?, &args.get("token", Some("dev-synthetic-taker"))?);
+    bots::taker(&api, &config, Ids::new('t')?)
 }

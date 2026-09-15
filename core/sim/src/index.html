@@ -23,9 +23,9 @@ body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 syste
 .num, .px, table, .kv b { font-variant-numeric: tabular-nums; }
 header { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--card); }
 .brand { font-weight: 650; letter-spacing: .01em; }
-.status { margin-left: auto; color: var(--muted); display: flex; align-items: center; gap: 8px; font-size: 12px; }
-#dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
-#dot.on { background: var(--ok); }
+.status { margin-left: auto; color: var(--muted); display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; font-size: 12px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); margin-right: 5px; }
+.dot.on { background: var(--ok); }
 nav.markets { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 20px; }
 nav.markets select { max-width: 100%; }
 select, input { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
@@ -103,7 +103,7 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
 <header>
   <div class="brand">Mini venue</div>
   <span class="muted small">development environment · fake money</span>
-  <div class="status"><span id="dot"></span><span id="seq">connecting…</span></div>
+  <div class="status" id="status"></div>
 </header>
 <nav class="markets">
   <select id="event" aria-label="Event"></select>
@@ -143,7 +143,7 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
         <button id="cancelAll" class="ghost">Cancel all</button>
         <button data-grant="maker" class="ghost">Add $10,000</button>
       </div>
-      <p class="note">Click a level in the book to copy its price. A dot marks your own orders.</p>
+      <p class="note">Orders go through the gateway's WebSocket as this account. Click a level in the book to copy its price; a dot marks your own orders.</p>
       <h3>Open orders</h3><div id="makerOrders"></div>
       <h3>Positions</h3><div id="makerPositions"></div>
     </div>
@@ -155,20 +155,21 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
         <button id="pickNo" class="big no">Buy NO <span id="noPx">—</span></button>
       </div>
       <div class="row">
-        <label>Contracts<input id="rQty" type="number" min="1" value="10"></label>
         <label>Order type<select id="rType"><option value="market">Market</option><option value="limit">Limit</option></select></label>
         <label id="rPxWrap" hidden>Limit price (¢)<input id="rPx" type="number" min="1" max="99"></label>
+        <label>Amount<select id="rUnit"><option value="contracts">Contracts</option><option value="stake">Spend ($)</option></select></label>
+        <label id="rQtyLabel">Contracts<input id="rQty" type="number" min="1" value="10"></label>
         <button data-grant="retail" class="ghost">Add $100</button>
       </div>
       <p id="rCost" class="note"></p>
       <button id="rPlace" class="primary wide">Place order</button>
-      <p class="muted small">A contract pays $1 if its outcome happens. Buying NO while holding YES closes the YES position. Market orders fill up to five ticks through the best price, and any remainder is cancelled.</p>
+      <p class="muted small">A contract pays $1 if its outcome happens. Buying NO while holding YES closes the YES position. Market orders fill up to five ticks through the best price and cancel any remainder. Spending an amount needs a limit price, and the gateway refuses an amount that does not buy whole contracts.</p>
       <h3>Your positions</h3><div id="retailPositions"></div>
       <h3>Open orders</h3><div id="retailOrders"></div>
     </div>
 
     <div id="tab-settle" hidden>
-      <p class="note">The dummy oracle sequences these commands straight to the core. The proposal, sign-off and dispute path of the real resolution console is not built yet.</p>
+      <p class="note">The dummy oracle sequences these commands straight to the core as an operator. The proposal, sign-off and dispute path of the real resolution console is not built yet.</p>
       <div id="events"></div>
       <h3>Payouts</h3><div id="payouts"></div>
     </div>
@@ -178,151 +179,277 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
 
 <script>
 const $ = s => document.querySelector(s);
-let S = null, tab = 'maker', selEvent = null, selInst = null, retailSide = 'YES';
-const winning = {};
+let C = null, M = null, S = null;
+let tab = 'maker', selEvent = null, selInst = null, retailSide = 'yes';
+const books = {}, trades = {}, sessions = {}, winning = {}, announced = new Set();
+let orderCount = 0;
 
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
 const money = c => (c < 0 ? '−' : '') + '$' + (Math.abs(c) / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
-const fmtBp = b => b == null ? '—' : ((b % 100) ? (b / 100).toFixed(1) : String(b / 100)) + '¢';
 const words = s => String(s).replaceAll('_', ' ').toLowerCase();
+const later = (a, b) => (a == null || BigInt(b) > BigInt(a)) ? b : a;
 function setHTML(el, html) { if (el._h !== html) { el.innerHTML = html; el._h = html; } }
-function rows(i) { return (S && S.tables[i.table]) || []; }
-const bp = (i, t) => rows(i)[t];
-const cents = (i, t) => fmtBp(bp(i, t));
-const noCents = (i, t) => fmtBp(bp(i, t) == null ? null : 10000 - bp(i, t));
-function tickFor(i, target) { let best = 0, d = Infinity; rows(i).forEach((b, k) => { const x = Math.abs(b - target); if (x < d) { d = x; best = k; } }); return best; }
-function find(id) { for (const e of S.events) for (const i of e.instruments) if (i.id === id) return [e, i]; return [null, null]; }
-const current = () => selInst == null ? [null, null] : find(selInst);
-const account = name => S && S.accounts.find(a => a.tab === name);
-
 function toast(msg, kind) { const d = document.createElement('div'); d.className = 'toast ' + (kind || ''); d.textContent = msg; $('#toasts').append(d); setTimeout(() => d.remove(), 4500); }
 
-async function act(name, body) {
+// ------------------------------------------------------------------------------------------ gateway market data
+
+function find(instrumentId) {
+  for (const e of (M ? M.events : [])) for (const m of e.markets) if (m.instrumentId === instrumentId) return [e, m];
+  return [null, null];
+}
+const current = () => selInst == null ? [null, null] : find(selInst);
+const cents = (m, t) => m && m.ladder[t] ? m.ladder[t].cents + '¢' : '—';
+const noCents = (m, t) => m && m.ladder[m.ladder.length - 1 - t] ? m.ladder[m.ladder.length - 1 - t].cents + '¢' : '—';
+
+async function loadMarkets() {
   try {
-    const r = await fetch('/api/' + name, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-    const j = await r.json();
-    if (!r.ok) return toast(j.error || r.statusText, 'bad');
-    report(j.results || []);
-  } catch (e) { toast(String(e), 'bad'); }
+    const r = await fetch('/v4/markets');
+    if (!r.ok) return;
+    M = await r.json();
+    if (!M.events.some(e => e.eventId === selEvent)) selEvent = (M.events.find(e => !e.resolved && e.markets.some(m => m.state === 'open')) || M.events[0] || {}).eventId ?? null;
+    const ev = M.events.find(e => e.eventId === selEvent);
+    if (ev && !ev.markets.some(m => m.instrumentId === selInst)) selInst = ev.markets[0] ? ev.markets[0].instrumentId : null;
+    subscribeMarket();
+    render();
+  } catch (e) { /* the gateway may be starting; the next poll retries */ }
 }
 
-function report(results) {
-  let filled = 0;
-  for (const x of results) {
-    const [, i] = x.instrumentId ? find(x.instrumentId) : [null, null];
-    const at = t => i ? cents(i, t) : 'tick ' + t;
-    if (x.msg === 'OrderRejected') toast('Rejected: ' + words(x.reason), 'bad');
-    else if (x.msg === 'CommandApplied' && x.outcome !== 'APPLIED') toast(`${words(x.outcome)}: ${words(x.rejectReason)}`, 'bad');
-    else if (x.msg === 'Fill') filled += x.quantity;
-    else if (x.msg === 'OrderAccepted') toast(`Order accepted: ${x.quantity} at ${at(x.tick)}`, 'ok');
-    else if (x.msg === 'OrderCancelled' && x.reason === 'IOC_REMAINDER') toast(`${x.cancelledQuantity} unfilled and cancelled`);
-    else if (x.msg === 'OrderCancelled') toast(`Cancelled ${x.cancelledQuantity}`);
-    else if (x.msg === 'SettlementPayout' && x.accountId === 0) toast(`Rounding remainder of ${money(x.cents)} to the settlement reserve`);
+function wantedTopics() {
+  const ev = M && M.events.find(e => e.eventId === selEvent);
+  const topics = new Set(['markets']);
+  for (const m of (ev ? ev.markets : [])) topics.add('book.' + m.instrumentId);
+  if (selInst) topics.add('trades.' + selInst);
+  return topics;
+}
+
+/// Market data rides on the market maker's session: the book and trades of the selected market, and market states.
+function subscribeMarket() {
+  const s = sessions.maker;
+  if (!s || !s.open) return;
+  const want = wantedTopics();
+  const drop = [...s.topics].filter(t => !want.has(t)), add = [...want].filter(t => !s.topics.has(t));
+  if (drop.length) s.ws.send(JSON.stringify({op: 'unsubscribe', topics: drop}));
+  if (add.length) s.ws.send(JSON.stringify({op: 'subscribe', topics: add, depth: 20}));
+  s.topics = want;
+}
+
+// ------------------------------------------------------------------------------------------ sessions
+
+function openSession(name) {
+  const account = C.accounts.find(a => a.tab === name);
+  if (!account) return;
+  const s = sessions[name] = {name, token: account.token, label: account.name, id: String(account.id), ws: null, open: false, account: null, topics: new Set(), last: null, refresh: 0};
+  const connect = () => {
+    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/v4/ws');
+    s.ws = ws;
+    ws.onopen = () => {
+      const login = {op: 'login', id: 'login', token: s.token};
+      if (s.last) login.resumeFrom = s.last;
+      ws.send(JSON.stringify(login));
+    };
+    ws.onmessage = m => onMessage(s, JSON.parse(m.data));
+    ws.onclose = () => { s.open = false; s.topics = new Set(); renderStatus(); setTimeout(connect, 1500); };
+  };
+  connect();
+}
+
+async function refreshAccount(s) {
+  try {
+    const r = await fetch('/v4/account', {headers: {Authorization: 'Bearer ' + s.token}});
+    if (r.ok) { s.account = await r.json(); render(); }
+  } catch (e) { /* retried on the next message */ }
+}
+function soon(s) { clearTimeout(s.refresh); s.refresh = setTimeout(() => refreshAccount(s), 150); }
+
+function onMessage(s, msg) {
+  if (msg.sequence && msg.type !== 'book') s.last = later(s.last, msg.sequence);
+  switch (msg.type) {
+    case 'welcome':
+      s.open = true;
+      renderStatus();
+      refreshAccount(s);
+      if (s.name === 'maker') subscribeMarket();
+      break;
+    case 'resync': refreshAccount(s); break;
+    case 'reply': report(msg.result); soon(s); break;
+    case 'error': toast(`${words(msg.error.code)}: ${msg.error.message}`, 'bad'); break;
+    case 'execution': {
+      const e = msg.execution;
+      const key = e.tradeId + ':' + e.orderId;
+      if (e.type === 'fill' && !announced.has(key)) {
+        announced.add(key);
+        const [, m] = find(e.instrumentId);
+        toast(`${s.label}: ${e.role === 'maker' ? 'resting order' : 'order'} filled ${e.quantity} at ${e.price.cents}¢ (YES ${e.side})`, 'ok');
+        if (!m) loadMarkets();
+      }
+      soon(s);
+      break;
+    }
+    case 'account': soon(s); break;
+    case 'payout': toast(`${s.label}: paid ${money(msg.cents)} for ${Math.abs(msg.positionClosed)} contracts`, 'ok'); soon(s); break;
+    case 'book': books[msg.instrumentId] = msg; if (msg.instrumentId === selInst) renderBook(); renderPills(); renderRetail(); break;
+    case 'trade': {
+      const list = trades[msg.instrumentId] = trades[msg.instrumentId] || [];
+      list.unshift(msg);
+      list.length = Math.min(list.length, 40);
+      if (msg.instrumentId === selInst) renderTrades();
+      break;
+    }
+    case 'market': loadMarkets(); break;
   }
-  if (filled) toast(`Filled ${filled}`, 'ok');
+}
+
+function report(result) {
+  const [, m] = result.executions && result.executions[0] ? find(result.executions[0].instrumentId) : [null, null];
+  let filled = 0;
+  for (const e of result.executions || []) {
+    if (e.type === 'fill') { filled += e.quantity; announced.add(e.tradeId + ':' + e.orderId); }
+  }
+  const first = (result.executions || [])[0];
+  if (result.status === 'accepted') toast(`Order accepted: ${first.quantity} at ${first.price.cents}¢ (YES ${first.side})${filled ? `, ${filled} filled` : ''}`, 'ok');
+  else if (result.status === 'rejected') toast('Rejected: ' + words(result.rejectReason), 'bad');
+  else if (result.status === 'duplicate') toast('Duplicate client order ID', 'bad');
+  else if (result.status === 'cancelled') toast(`Cancelled ${first ? first.quantity : ''}`);
+  else if (result.status === 'amended') toast('Amended');
+  else if (!result.status) toast(`Cancelled ${(result.executions || []).length} orders`);
+  if (m == null) return;
+}
+
+function send(name, op, body) {
+  const s = sessions[name];
+  if (!s || !s.open) return toast('Not connected to the gateway yet', 'bad');
+  s.ws.send(JSON.stringify({op, id: `${op}-${++orderCount}`, ...body}));
+}
+const clientOrderId = () => `${tab}-${Date.now().toString(36)}-${++orderCount}`;
+
+// ------------------------------------------------------------------------------------------ rendering
+
+function renderStatus() {
+  setHTML($('#status'), Object.values(sessions).map(s => `<span><span class="dot ${s.open ? 'on' : ''}"></span>${esc(s.label)}</span>`).join('')
+    + (M ? `<span>sequence ${M.sequence}</span>` : ''));
+}
+
+function renderPills() {
+  const ev = M && M.events.find(e => e.eventId === selEvent);
+  setHTML($('#instruments'), ev ? ev.markets.map(m => {
+    const b = books[m.instrumentId];
+    const touch = b ? `${b.bids[0] ? b.bids[0].price.cents + '¢' : '—'} / ${b.asks[0] ? b.asks[0].price.cents + '¢' : '—'}` : '';
+    return `<button class="pill ${m.instrumentId === selInst ? 'on' : ''}" data-pick="${m.instrumentId}">${esc(m.label)}<span>${touch}</span></button>`;
+  }).join('') : '');
 }
 
 function render() {
-  if (!S) return;
-  $('#seq').textContent = 'sequence ' + S.sequence;
-  if (!S.events.some(e => e.id === selEvent)) selEvent = (S.events.find(e => !e.resolved && e.template) || S.events[0] || {}).id ?? null;
-  setHTML($('#event'), S.events.map(e => `<option value="${e.id}" ${e.id === selEvent ? 'selected' : ''}>${esc(e.title)}${e.resolved ? ' — settled' : ''}</option>`).join(''));
-  const ev = S.events.find(e => e.id === selEvent);
-  if (ev && !ev.instruments.some(i => i.id === selInst)) selInst = ev.instruments[0] ? ev.instruments[0].id : null;
-  setHTML($('#instruments'), ev ? ev.instruments.map(i => `<button class="pill ${i.id === selInst ? 'on' : ''}" data-pick="${i.id}">${esc(i.label)}<span>${i.bids[0] ? cents(i, i.bids[0][0]) : '—'} / ${i.asks[0] ? cents(i, i.asks[0][0]) : '—'}</span></button>`).join('') : '');
-  renderBook(); renderTrades(); renderMaker(); renderRetail(); renderSettle();
+  renderStatus();
+  if (!M) return;
+  setHTML($('#event'), M.events.map(e => `<option value="${e.eventId}" ${e.eventId === selEvent ? 'selected' : ''}>${esc(e.title)}${e.resolved ? ' — settled' : ''}</option>`).join(''));
+  renderPills(); renderBook(); renderTrades(); renderMaker(); renderRetail(); renderSettle();
 }
 
 function renderBook() {
-  const [e, i] = current();
-  if (!i) { $('#bookTitle').textContent = ''; return setHTML($('#ladder'), '<p class="muted">No markets yet. The seed job lists the demo markets.</p>'); }
-  $('#bookTitle').textContent = `${i.label} · ${words(i.state)}${e.started ? ' · in play' : ''}`;
-  const n = rows(i).length, bids = new Map(i.bids.map(([t, q, c]) => [t, q])), asks = new Map(i.asks.map(([t, q, c]) => [t, q]));
-  const bb = i.bids[0] ? i.bids[0][0] : null, ba = i.asks[0] ? i.asks[0][0] : null;
-  const mid = bb != null && ba != null ? Math.round((bb + ba) / 2) : (bb ?? ba ?? i.last ?? Math.floor(n / 2));
+  const [e, m] = current();
+  if (!m) { $('#bookTitle').textContent = ''; return setHTML($('#ladder'), '<p class="muted">No markets yet. The seed job lists the demo markets.</p>'); }
+  $('#bookTitle').textContent = `${m.label} · ${words(m.state)}${e.started ? ' · in play' : ''}`;
+  const b = books[m.instrumentId] || {bids: [], asks: [], last: null};
+  const n = m.ladder.length;
+  const bids = new Map(b.bids.map(l => [l.price.tick, l.quantity])), asks = new Map(b.asks.map(l => [l.price.tick, l.quantity]));
+  const bb = b.bids[0] ? b.bids[0].price.tick : null, ba = b.asks[0] ? b.asks[0].price.tick : null, last = b.last ? b.last.tick : null;
+  const mid = bb != null && ba != null ? Math.round((bb + ba) / 2) : (bb ?? ba ?? last ?? Math.floor(n / 2));
   const hi = Math.min(n - 1, mid + 9), lo = Math.max(0, mid - 9);
-  const maxQ = Math.max(1, ...i.bids.map(b => b[1]), ...i.asks.map(a => a[1]));
-  const who = account(tab === 'retail' ? 'retail' : 'maker');
-  const mine = new Set(((who && who.orders) || []).filter(o => o.instrument === i.id).map(o => o.side + o.tick));
+  const maxQ = Math.max(1, ...b.bids.map(l => l.quantity), ...b.asks.map(l => l.quantity));
+  const s = sessions[tab === 'retail' ? 'retail' : 'maker'];
+  const mine = new Set(((s && s.account && s.account.orders) || []).filter(o => o.instrumentId === m.instrumentId).map(o => o.side + o.price.tick));
   let html = '<div class="lvl head"><span>Bids</span><span class="px">YES price</span><span>Asks</span></div>';
   for (let t = hi; t >= lo; t--) {
-    const b = bids.get(t), a = asks.get(t);
-    html += `<div class="lvl ${t === i.last ? 'last' : ''}" data-tick="${t}">`
-      + `<span class="q bid" data-side="BUY">${mine.has('BUY' + t) ? '<em>●</em>' : ''}${b ? `<i style="width:${(100 * b / maxQ).toFixed(1)}%"></i><b>${b}</b>` : ''}</span>`
-      + `<span class="px">${cents(i, t)}</span>`
-      + `<span class="q ask" data-side="SELL">${a ? `<i style="width:${(100 * a / maxQ).toFixed(1)}%"></i><b>${a}</b>` : ''}${mine.has('SELL' + t) ? '<em>●</em>' : ''}</span></div>`;
+    const q = bids.get(t), a = asks.get(t);
+    html += `<div class="lvl ${t === last ? 'last' : ''}" data-tick="${t}">`
+      + `<span class="q bid" data-side="buy">${mine.has('buy' + t) ? '<em>●</em>' : ''}${q ? `<i style="width:${(100 * q / maxQ).toFixed(1)}%"></i><b>${q}</b>` : ''}</span>`
+      + `<span class="px">${cents(m, t)}</span>`
+      + `<span class="q ask" data-side="sell">${a ? `<i style="width:${(100 * a / maxQ).toFixed(1)}%"></i><b>${a}</b>` : ''}${mine.has('sell' + t) ? '<em>●</em>' : ''}</span></div>`;
   }
   setHTML($('#ladder'), html);
 }
 
 function renderTrades() {
-  const [, i] = current();
-  const list = i ? S.trades.filter(t => t.instrument === i.id).slice(0, 30) : [];
-  const name = id => (S.accounts.find(a => a.id === id) || {name: '#' + id}).name;
+  const list = (selInst && trades[selInst]) || [];
   setHTML($('#trades'), list.length ? '<table><thead><tr><th>Time</th><th class="r">Price</th><th class="r">Qty</th><th>Taker</th></tr></thead><tbody>'
-    + list.map(t => `<tr><td class="muted">${new Date(t.atMs).toLocaleTimeString()}</td><td class="r ${t.takerSide === 'BUY' ? 'pos' : 'neg'}">${cents(i, t.tick)}</td><td class="r">${t.quantity}</td><td class="muted">${esc(name(t.taker))} ${t.takerSide === 'BUY' ? 'bought' : 'sold'}</td></tr>`).join('')
-    + '</tbody></table>' : '<p class="muted">No trades yet.</p>');
+    + list.map(t => `<tr><td class="muted">${new Date(t.at).toLocaleTimeString()}</td><td class="r ${t.takerSide === 'buy' ? 'pos' : 'neg'}">${t.price.cents}¢</td><td class="r">${t.quantity}</td><td class="muted">${t.takerSide === 'buy' ? 'bought' : 'sold'} YES</td></tr>`).join('')
+    + '</tbody></table>' : '<p class="muted">No trades since this page opened.</p>');
 }
 
-function acctHtml(a) {
-  if (!a) return '<p class="muted">This account is not in the catalogue.</p>';
-  return `<div class="kv"><span>${esc(a.name)} · #${a.id}</span><span>Available<b>${money(a.available)}</b></span><span>Reserved<b>${money(a.reserved)}</b></span></div>`;
+function acctHtml(s) {
+  if (!s) return '<p class="muted">This account is not in the catalogue.</p>';
+  const a = s.account;
+  return `<div class="kv"><span>${esc(s.label)} · #${s.id}</span><span>Available<b>${a ? money(a.availableCents) : '—'}</b></span><span>Reserved<b>${a ? money(a.reservedCents) : '—'}</b></span></div>`;
 }
 
-function ordersHtml(a, retail) {
-  if (!a || !a.orders.length) return '<p class="muted">None.</p>';
+function ordersHtml(s, retail) {
+  const orders = (s && s.account && s.account.orders) || [];
+  if (!orders.length) return '<p class="muted">None.</p>';
   return '<table><thead><tr><th>Market</th><th>Side</th><th class="r">Price</th><th class="r">Remaining</th><th></th></tr></thead><tbody>'
-    + a.orders.map(o => {
-      const [, i] = find(o.instrument);
-      const buy = o.side === 'BUY';
+    + orders.map(o => {
+      const [, m] = find(o.instrumentId);
+      const buy = o.side === 'buy';
       const side = retail ? (buy ? 'YES' : 'NO') : (buy ? 'Bid' : 'Ask');
-      const px = i ? (retail && !buy ? noCents(i, o.tick) : cents(i, o.tick)) : o.tick;
-      return `<tr><td>${esc(i ? i.label : o.instrument)}</td><td class="${buy ? 'pos' : 'neg'}">${side}</td><td class="r">${px}</td><td class="r">${o.remaining}</td><td class="r"><button class="link" data-cancel="${o.orderId}" data-inst="${o.instrument}" data-acct="${a.id}">Cancel</button></td></tr>`;
+      const px = retail && !buy ? noCents(m, o.price.tick) : o.price.cents + '¢';
+      return `<tr><td>${esc(m ? m.label : o.instrumentId)}</td><td class="${buy ? 'pos' : 'neg'}">${side}</td><td class="r">${px}</td><td class="r">${o.remaining}</td><td class="r"><button class="link" data-cancel="${o.orderId}" data-session="${s.name}">Cancel</button></td></tr>`;
     }).join('') + '</tbody></table>';
 }
 
-function positionsHtml(a) {
-  if (!a || !a.positions.length) return '<p class="muted">None.</p>';
+function positionsHtml(s) {
+  const positions = (s && s.account && s.account.positions) || [];
+  if (!positions.length) return '<p class="muted">None.</p>';
   return '<table><thead><tr><th>Market</th><th>Holding</th><th class="r">Best bid / ask</th></tr></thead><tbody>'
-    + a.positions.map(p => {
-      const [e, i] = find(p.instrument);
-      const label = i ? `${esc(e.title)} · ${esc(i.label)}` : p.instrument;
+    + positions.map(p => {
+      const [e, m] = find(p.instrumentId);
+      const b = books[p.instrumentId];
       const hold = p.position > 0 ? `<span class="pos">YES × ${p.position}</span>` : `<span class="neg">NO × ${-p.position}</span>`;
-      const touch = i ? `${i.bids[0] ? cents(i, i.bids[0][0]) : '—'} / ${i.asks[0] ? cents(i, i.asks[0][0]) : '—'}` : '';
-      return `<tr><td>${label}</td><td>${hold}</td><td class="r muted">${touch}</td></tr>`;
+      const touch = b ? `${b.bids[0] ? b.bids[0].price.cents + '¢' : '—'} / ${b.asks[0] ? b.asks[0].price.cents + '¢' : '—'}` : '';
+      return `<tr><td>${m ? esc(e.title + ' · ' + m.label) : p.instrumentId}</td><td>${hold}</td><td class="r muted">${touch}</td></tr>`;
     }).join('') + '</tbody></table>';
 }
 
 function renderMaker() {
-  const a = account('maker'), [, i] = current();
-  setHTML($('#makerAcct'), acctHtml(a));
-  setHTML($('#makerOrders'), ordersHtml(a, false));
-  setHTML($('#makerPositions'), positionsHtml(a));
-  const off = !i || i.state !== 'OPEN';
-  for (const id of ['#placeBid', '#placeAsk', '#placeBoth']) $(id).disabled = off;
+  const s = sessions.maker, [, m] = current();
+  setHTML($('#makerAcct'), acctHtml(s));
+  setHTML($('#makerOrders'), ordersHtml(s, false));
+  setHTML($('#makerPositions'), positionsHtml(s));
+  for (const id of ['#placeBid', '#placeAsk', '#placeBoth']) $(id).disabled = !m || m.state !== 'open';
+}
+
+function retailPrices(m) {
+  const b = m && books[m.instrumentId];
+  const yes = b && b.asks[0] ? b.asks[0].price : null;
+  const no = b && b.bids[0] ? m.ladder[m.ladder.length - 1 - b.bids[0].price.tick] : null;
+  return {yes, no};
 }
 
 function renderRetail() {
-  const a = account('retail'), [, i] = current();
-  setHTML($('#retailAcct'), acctHtml(a));
-  setHTML($('#retailOrders'), ordersHtml(a, true));
-  setHTML($('#retailPositions'), positionsHtml(a));
-  const yesAsk = i && i.asks[0] ? bp(i, i.asks[0][0]) : null, noAsk = i && i.bids[0] ? 10000 - bp(i, i.bids[0][0]) : null;
-  $('#yesPx').textContent = fmtBp(yesAsk);
-  $('#noPx').textContent = fmtBp(noAsk);
-  $('#pickYes').classList.toggle('on', retailSide === 'YES');
-  $('#pickNo').classList.toggle('on', retailSide === 'NO');
-  const market = $('#rType').value === 'market';
+  const s = sessions.retail, [, m] = current();
+  setHTML($('#retailAcct'), acctHtml(s));
+  setHTML($('#retailOrders'), ordersHtml(s, true));
+  setHTML($('#retailPositions'), positionsHtml(s));
+  const {yes, no} = retailPrices(m);
+  $('#yesPx').textContent = yes ? yes.cents + '¢' : '—';
+  $('#noPx').textContent = no ? no.cents + '¢' : '—';
+  $('#pickYes').classList.toggle('on', retailSide === 'yes');
+  $('#pickNo').classList.toggle('on', retailSide === 'no');
+  const market = $('#rType').value === 'market', stake = $('#rUnit').value === 'stake';
   $('#rPxWrap').hidden = market;
-  const qty = +$('#rQty').value;
-  const price = market ? (retailSide === 'YES' ? yesAsk : noAsk) : (+$('#rPx').value * 100 || null);
-  $('#rCost').textContent = !i ? 'Pick a market.' : i.state !== 'OPEN' ? `This market is ${words(i.state)}.`
-    : price == null ? 'Nobody is offering that side yet.'
-    : qty > 0 ? `About ${money(Math.round(qty * price / 100))} for ${qty} ${retailSide} contracts, paying ${money(qty * 100)} if ${esc(i.label)} ${retailSide === 'YES' ? 'happens' : 'does not happen'}.` : 'Enter a number of contracts.';
-  $('#rPlace').disabled = !i || i.state !== 'OPEN';
+  $('#rQtyLabel').firstChild.textContent = stake ? 'Spend ($)' : 'Contracts';
+  const amount = +$('#rQty').value;
+  const price = market ? (retailSide === 'yes' ? yes : no) : null;
+  const pxCents = market ? (price ? +price.cents : null) : +$('#rPx').value || null;
+  $('#rCost').textContent = !m ? 'Pick a market.' : m.state !== 'open' ? `This market is ${words(m.state)}.`
+    : market && stake ? 'Spending an amount needs a limit price.'
+    : pxCents == null ? 'Nobody is offering that side yet.'
+    : !(amount > 0) ? 'Enter an amount.'
+    : stake ? `${money(amount * 100)} at ${pxCents}¢ buys ${(amount * 100 / pxCents).toFixed(2).replace(/\.00$/, '')} ${retailSide.toUpperCase()} contracts, if that is a whole number.`
+    : `About ${money(Math.round(amount * pxCents))} for ${amount} ${retailSide.toUpperCase()} contracts, paying ${money(amount * 100)} if ${esc(m.label)} ${retailSide === 'yes' ? 'happens' : 'does not happen'}.`;
+  $('#rPlace').disabled = !m || m.state !== 'open';
 }
 
 function renderSettle() {
+  if (!S) return setHTML($('#events'), '<p class="muted">Connecting…</p>');
   setHTML($('#events'), S.events.map(e => {
     const flags = [e.resolved ? 'settled' : e.ended ? 'ended' : e.started ? 'in play' : 'not started', e.suspended && !e.resolved ? 'suspended' : null].filter(Boolean);
     const open = e.instruments.some(i => i.state === 'OPEN' || i.state === 'HALTED');
@@ -337,32 +464,48 @@ function renderSettle() {
       + '</div>';
   }).join('') || '<p class="muted">No events yet.</p>');
   const name = id => (S.accounts.find(a => a.id === id) || {name: id === 0 ? 'Settlement reserve' : '#' + id}).name;
+  const label = id => { for (const e of S.events) for (const i of e.instruments) if (i.id === id) return e.title + ' · ' + i.label; return '—'; };
   setHTML($('#payouts'), S.payouts.length ? '<table><thead><tr><th>Account</th><th>Market</th><th>Kind</th><th class="r">Closed</th><th class="r">Paid</th></tr></thead><tbody>'
-    + S.payouts.map(p => { const [e, i] = find(p.instrument); return `<tr><td>${esc(name(p.account))}</td><td>${i ? esc(e.title + ' · ' + i.label) : '—'}</td><td class="muted">${words(p.kind)}</td><td class="r">${p.positionClosed}</td><td class="r">${money(p.cents)}</td></tr>`; }).join('')
+    + S.payouts.map(p => `<tr><td>${esc(name(p.account))}</td><td>${esc(label(p.instrument))}</td><td class="muted">${words(p.kind)}</td><td class="r">${p.positionClosed}</td><td class="r">${money(p.cents)}</td></tr>`).join('')
     + '</tbody></table>' : '<p class="muted">None yet.</p>');
 }
 
+// ------------------------------------------------------------------------------------------ actions
+
+async function operator(name, body) {
+  try {
+    const r = await fetch('/api/' + name, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) return toast(j.error || r.statusText, 'bad');
+    for (const x of j.results || []) if (x.msg === 'CommandApplied' && x.outcome !== 'APPLIED') toast(`${words(x.outcome)}: ${words(x.rejectReason)}`, 'bad');
+    loadMarkets();
+  } catch (e) { toast(String(e), 'bad'); }
+}
+
 function placeMaker(side) {
-  const [, i] = current(), a = account('maker');
-  if (!i || !a) return;
-  const px = +$(side === 'BUY' ? '#bidPx' : '#askPx').value, qty = +$(side === 'BUY' ? '#bidQty' : '#askQty').value;
-  if (!(px > 0 && px < 100 && qty > 0)) return toast('Enter a price between 1¢ and 99¢ and a size', 'bad');
-  return act('order', {account: a.id, instrument: i.id, side, tick: tickFor(i, Math.round(px * 100)), quantity: qty * i.lot, tif: 'GTC', postOnly: $('#postOnly').checked});
+  const [, m] = current();
+  if (!m) return;
+  const px = $(side === 'buy' ? '#bidPx' : '#askPx').value, qty = +$(side === 'buy' ? '#bidQty' : '#askQty').value;
+  if (!(+px > 0 && +px < 100 && qty > 0)) return toast('Enter a price between 1¢ and 99¢ and a size', 'bad');
+  send('maker', 'order', {clientOrderId: clientOrderId(), instrumentId: m.instrumentId, action: side, outcome: 'yes', price: {cents: String(+px)}, quantity: qty * m.lotStep, postOnly: $('#postOnly').checked});
 }
 
 function placeRetail() {
-  const [, i] = current(), a = account('retail');
-  if (!i || !a) return;
-  const qty = +$('#rQty').value, yes = retailSide === 'YES';
-  if (!(qty > 0)) return toast('Enter a number of contracts', 'bad');
-  const body = {account: a.id, instrument: i.id, side: yes ? 'BUY' : 'SELL', contract: yes ? 'YES' : 'NO', quantity: qty * i.lot};
-  if ($('#rType').value === 'market') Object.assign(body, {tick: yes ? rows(i).length - 1 : 0, tif: 'IOC', protectionTicks: 5});
-  else {
+  const [, m] = current();
+  if (!m) return;
+  const amount = +$('#rQty').value, stake = $('#rUnit').value === 'stake', market = $('#rType').value === 'market';
+  if (!(amount > 0)) return toast('Enter an amount', 'bad');
+  const body = {clientOrderId: clientOrderId(), instrumentId: m.instrumentId, action: 'buy', outcome: retailSide};
+  if (market) {
+    if (stake) return toast('Spending an amount needs a limit price', 'bad');
+    // The worst price on the ladder, bounded to five ticks through the best by price protection.
+    Object.assign(body, {price: {tick: m.ladder.length - 1}, protectionTicks: 5, timeInForce: 'IOC', quantity: amount * m.lotStep});
+  } else {
     const px = +$('#rPx').value;
     if (!(px > 0 && px < 100)) return toast('Enter a limit price between 1¢ and 99¢', 'bad');
-    Object.assign(body, {tick: tickFor(i, yes ? px * 100 : 10000 - px * 100), tif: 'GTC'});
+    Object.assign(body, {price: {cents: String(px)}, timeInForce: 'GTC'}, stake ? {stakeCents: Math.round(amount * 100)} : {quantity: amount * m.lotStep});
   }
-  return act('order', body);
+  send('retail', 'order', body);
 }
 
 function showTab(name) {
@@ -375,11 +518,11 @@ function showTab(name) {
 document.addEventListener('click', ev => {
   const t = ev.target.closest('button, .q');
   if (!t || t.disabled) return;
-  const [, i] = S ? current() : [null, null];
+  const [, m] = current();
   if (t.dataset.tab) return showTab(t.dataset.tab);
-  if (t.dataset.pick) { selInst = +t.dataset.pick; return render(); }
-  if (t.dataset.cancel) return act('cancel', {account: +t.dataset.acct, instrument: +t.dataset.inst, orderId: +t.dataset.cancel});
-  if (t.dataset.grant) { const a = account(t.dataset.grant); return a && act('grant', {account: a.id, cents: t.dataset.grant === 'maker' ? 1000000 : 10000}); }
+  if (t.dataset.pick) { selInst = t.dataset.pick; subscribeMarket(); return render(); }
+  if (t.dataset.cancel) return send(t.dataset.session, 'cancel', {orderId: t.dataset.cancel});
+  if (t.dataset.grant) { const a = C.accounts.find(x => x.tab === t.dataset.grant); return a && operator('grant', {account: a.id, cents: t.dataset.grant === 'maker' ? 1000000 : 10000}); }
   if (t.dataset.oracle) {
     const action = t.dataset.oracle, event = +t.dataset.event, e = S.events.find(x => x.id === event), body = {action, event};
     if (action === 'resolve') {
@@ -387,41 +530,43 @@ document.addEventListener('click', ev => {
       if (!confirm(`Resolve “${e.title}” as ${e.states[body.state]}? Resting orders are cancelled and every position pays out.`)) return;
     }
     if (action === 'void' && !confirm(`Void “${e.title}”? Every contract settles at its equal-weight value.`)) return;
-    return act('oracle', body);
+    return operator('oracle', body);
   }
-  if (t.classList.contains('q') && i) {
+  if (t.classList.contains('q') && m) {
     const lvl = t.closest('.lvl'); if (!lvl || lvl.dataset.tick == null) return;
-    const px = bp(i, +lvl.dataset.tick) / 100;
-    if (tab === 'retail') { $('#rType').value = 'limit'; $('#rPx').value = retailSide === 'YES' ? px : 100 - px; return render(); }
-    $(t.dataset.side === 'BUY' ? '#bidPx' : '#askPx').value = px;
+    const px = +m.ladder[+lvl.dataset.tick].cents;
+    if (tab === 'retail') { $('#rType').value = 'limit'; $('#rPx').value = retailSide === 'yes' ? px : 100 - px; return render(); }
+    $(t.dataset.side === 'buy' ? '#bidPx' : '#askPx').value = px;
     return;
   }
   switch (t.id) {
-    case 'placeBid': return placeMaker('BUY');
-    case 'placeAsk': return placeMaker('SELL');
-    case 'placeBoth': placeMaker('BUY'); return placeMaker('SELL');
-    case 'cancelAll': { const a = account('maker'); return a && act('cancel-all', {account: a.id}); }
-    case 'pickYes': retailSide = 'YES'; return render();
-    case 'pickNo': retailSide = 'NO'; return render();
+    case 'placeBid': return placeMaker('buy');
+    case 'placeAsk': return placeMaker('sell');
+    case 'placeBoth': placeMaker('buy'); return placeMaker('sell');
+    case 'cancelAll': return send('maker', 'cancelAll', {});
+    case 'pickYes': retailSide = 'yes'; return render();
+    case 'pickNo': retailSide = 'no'; return render();
     case 'rPlace': return placeRetail();
   }
 });
 
 document.addEventListener('change', ev => {
   const t = ev.target;
-  if (t.id === 'event') { selEvent = +t.value; selInst = null; render(); }
+  if (t.id === 'event') { selEvent = t.value; selInst = null; loadMarkets(); }
   else if (t.dataset.win) winning[+t.dataset.win] = +t.value;
-  else if (t.id === 'rType') render();
+  else if (t.id === 'rType' || t.id === 'rUnit') render();
 });
-document.addEventListener('input', ev => { if (ev.target.id === 'rQty' || ev.target.id === 'rPx') render(); });
+document.addEventListener('input', ev => { if (ev.target.id === 'rQty' || ev.target.id === 'rPx') renderRetail(); });
 
-function connect() {
+(async function start() {
+  C = await (await fetch('/api/config')).json();
+  openSession('maker');
+  openSession('retail');
+  await loadMarkets();
+  setInterval(loadMarkets, 5000);
   const es = new EventSource('/api/events');
-  es.onopen = () => $('#dot').classList.add('on');
-  es.onmessage = m => { S = JSON.parse(m.data); render(); };
-  es.onerror = () => { $('#dot').classList.remove('on'); $('#seq').textContent = 'reconnecting…'; };
-}
-connect();
+  es.onmessage = m => { S = JSON.parse(m.data); if (tab === 'settle') renderSettle(); };
+})();
 </script>
 </body>
 </html>

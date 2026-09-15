@@ -1,11 +1,13 @@
-//! Synthetic makers and takers (blueprint §16). Ordinary clients of the ingress that decide only from the feed.
+//! Synthetic makers and takers (blueprint §16). Ordinary clients of the gateway with dev tokens: they decide only from
+//! what the gateway publishes and act only through its REST API, so they exercise the same edge customers use,
+//! including its price forms, stakes and NO orders.
 
+use crate::client::{Api, Response};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::thread;
 use std::time::Duration;
-use venue_link::view::{InstrumentView, Live, OrderView, View};
-use venue_link::wire::{amend, cancel, order, Ids, Ingress};
+use venue_link::wire::{Error, Ids};
 
 /// A small seeded generator (splitmix64), so a run can be repeated.
 pub struct Rng(u64);
@@ -36,55 +38,178 @@ impl Rng {
     }
 }
 
-/// Plans inputs from the view every `interval` and sends them. It plans again only once the feed has shown the
-/// effects of everything it sent, so it never acts on a picture older than its own last action.
-fn run(ingress: &str, live: &Live, interval: Duration, who: &str, mut plan: impl FnMut(&View) -> Vec<Value>) -> ! {
-    let mut ingress = Ingress::new(ingress);
-    let mut sent = 0u64;
+fn id(v: &Value) -> u64 {
+    v.as_str().and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+/// A market as `GET /v4/markets` lists it.
+struct Market {
+    id: u64,
+    event: u64,
+    state: String,
+    lot: u64,
+    /// Each ladder row's probability in basis points.
+    bp: Vec<u64>,
+    started: bool,
+    suspended: bool,
+    ended: bool,
+    resolved: bool,
+}
+
+fn basis_points(quote: &Value) -> u64 {
+    let parts = quote["probability"].as_str().and_then(|p| p.split_once('/'));
+    parts.and_then(|(n, d)| Some(10_000 * n.parse::<u64>().ok()? / d.parse::<u64>().ok()?.max(1))).unwrap_or(0)
+}
+
+fn ok(response: Response) -> Result<Value, Error> {
+    if response.status == 200 {
+        Ok(response.body)
+    } else {
+        Err(response.refusal().into())
+    }
+}
+
+fn markets(api: &Api) -> Result<Vec<Market>, Error> {
+    let body = ok(api.get("/v4/markets")?)?;
+    let mut out = Vec::new();
+    for e in body["events"].as_array().into_iter().flatten() {
+        for m in e["markets"].as_array().into_iter().flatten() {
+            out.push(Market {
+                id: id(&m["instrumentId"]),
+                event: id(&e["eventId"]),
+                state: m["state"].as_str().unwrap_or("").to_string(),
+                lot: m["lotStep"].as_u64().unwrap_or(1).max(1),
+                bp: m["ladder"].as_array().into_iter().flatten().map(basis_points).collect(),
+                started: e["started"] == true,
+                suspended: e["suspended"] == true,
+                ended: e["ended"] == true,
+                resolved: e["resolved"] == true,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// A book's levels as `(tick, quantity)`, best first.
+struct Book {
+    bids: Vec<(u64, u64)>,
+    asks: Vec<(u64, u64)>,
+}
+
+fn book(api: &Api, instrument: u64) -> Result<Book, Error> {
+    let body = ok(api.get(&format!("/v4/markets/{instrument}/book?depth=10"))?)?;
+    let levels = |side: &str| -> Vec<(u64, u64)> {
+        body[side]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|l| (l["price"]["tick"].as_u64().unwrap_or(0), l["quantity"].as_u64().unwrap_or(0)))
+            .collect()
+    };
+    Ok(Book { bids: levels("bids"), asks: levels("asks") })
+}
+
+struct Resting {
+    id: u64,
+    instrument: u64,
+    side: String,
+    tick: u64,
+    remaining: u64,
+}
+
+struct Account {
+    sequence: u64,
+    orders: Vec<Resting>,
+}
+
+fn account(api: &Api) -> Result<Account, Error> {
+    let body = ok(api.get("/v4/account")?)?;
+    let orders = body["orders"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|o| Resting {
+            id: id(&o["orderId"]),
+            instrument: id(&o["instrumentId"]),
+            side: o["side"].as_str().unwrap_or("").to_string(),
+            tick: o["price"]["tick"].as_u64().unwrap_or(0),
+            remaining: o["remaining"].as_u64().unwrap_or(0),
+        })
+        .collect();
+    Ok(Account { sequence: id(&body["sequence"]), orders })
+}
+
+enum Action {
+    Place(Value),
+    Amend(u64, Value),
+    Cancel(u64),
+    CancelEvent(u64),
+}
+
+/// Performs one action and returns the input sequence it produced, logging refusals and rejections.
+fn perform(api: &Api, who: &str, action: Action) -> Option<u64> {
+    let response = match action {
+        Action::Place(body) => api.post("/v4/orders", &body),
+        Action::Amend(order, body) => api.patch(&format!("/v4/orders/{order}"), &body),
+        Action::Cancel(order) => api.delete(&format!("/v4/orders/{order}")),
+        Action::CancelEvent(event) => api.delete(&format!("/v4/orders?eventId={event}")),
+    };
+    match response {
+        Ok(r) if r.status == 200 => {
+            if r.body["status"] == "rejected" {
+                eprintln!("{who}: rejected: {}", r.body["rejectReason"]);
+            }
+            r.body["sequence"].as_str().and_then(|s| s.parse().ok())
+        }
+        Ok(r) => {
+            eprintln!("{who}: refused: {}", r.refusal());
+            None
+        }
+        Err(e) => {
+            eprintln!("{who}: {e}");
+            None
+        }
+    }
+}
+
+type Plan<'a> = dyn FnMut(&[Market], &Account, &dyn Fn(u64) -> Option<Book>) -> Vec<Action> + 'a;
+
+/// Every `interval`, reads the markets and the account and performs what `plan` decides. It plans again only once the
+/// account shows the effects of everything it sent, so it never acts on a picture older than its own last action.
+fn run(api: &Api, interval: Duration, who: &str, plan: &mut Plan<'_>) -> ! {
+    let (mut sent, mut stale) = (0u64, 0u32);
     loop {
         thread::sleep(interval);
-        let inputs = {
-            let Ok(view) = live.view.lock() else { continue };
-            if view.sequence < sent || view.events.is_empty() {
+        let (markets, account) = match (markets(api), account(api)) {
+            (Ok(m), Ok(a)) => (m, a),
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("{who}: {e}");
                 continue;
             }
-            plan(&view)
         };
-        for input in inputs {
-            match ingress.send(input) {
-                Ok(results) => {
-                    for r in &results {
-                        sent = sent.max(r["result"]["inputSequence"].as_u64().unwrap_or(0));
-                        if r["msg"] == "OrderRejected" {
-                            eprintln!("{who}: rejected: {}", r["reason"]);
-                        }
-                    }
-                }
-                Err(e) => {
-                    // The node may have restarted on a fresh journal; start watching from its sequence again.
-                    eprintln!("{who}: {e}");
-                    sent = 0;
-                    break;
-                }
+        if account.sequence < sent {
+            // A gateway that restarted on a fresh journal never reaches the old sequence; stop waiting for it.
+            stale += 1;
+            if stale < 50 {
+                continue;
+            }
+            sent = 0;
+        }
+        stale = 0;
+        let books = |instrument: u64| book(api, instrument).ok();
+        for action in plan(&markets, &account, &books) {
+            if let Some(sequence) = perform(api, who, action) {
+                sent = sent.max(sequence);
             }
         }
     }
 }
 
-fn mine<'v>(view: &'v View, account: u64, instrument: u64, side: Option<&str>) -> Vec<(u64, &'v OrderView)> {
-    view.orders
-        .iter()
-        .filter(|(_, o)| o.account == account && o.instrument == instrument && side.is_none_or(|s| o.side == s))
-        .map(|(id, o)| (*id, o))
-        .collect()
-}
-
-fn nearest_tick(rows: &[u64], target: u64) -> u64 {
-    rows.iter().enumerate().min_by_key(|(_, bp)| bp.abs_diff(target)).map_or(0, |(t, _)| t as u64)
+fn nearest_tick(bp: &[u64], target: u64) -> u64 {
+    bp.iter().enumerate().min_by_key(|(_, b)| b.abs_diff(target)).map_or(0, |(t, _)| t as u64)
 }
 
 pub struct Maker {
-    pub account: u64,
     /// Contracts quoted at the touch on each side, in lots; each level further out quotes one more multiple.
     pub size: u64,
     /// Price levels quoted on each side.
@@ -95,101 +220,97 @@ pub struct Maker {
     pub seed: u64,
 }
 
-/// Quotes both sides of every open market around a seeded random-walk fair value. In an event with several
-/// outcomes the fair values are rescaled to sum to 100¢. Quotes are pulled when an event ends or is suspended.
-pub fn maker(ingress: &str, live: &Live, config: &Maker, mut ids: Ids) -> ! {
+/// Quotes several levels on both sides of every open market around a seeded random-walk fair value, rescaled to sum
+/// to 100¢ across an event's outcomes. Pulls its quotes when an event ends or is suspended.
+pub fn maker(api: &Api, config: &Maker, mut ids: Ids) -> ! {
     let mut rng = Rng::new(config.seed);
     let mut fair: BTreeMap<u64, u64> = BTreeMap::new();
-    let account = config.account;
-    run(ingress, live, config.interval, "maker", |view| {
+    run(api, config.interval, "maker", &mut |markets, account, books| {
         let mut out = Vec::new();
-        for event in view.events.values() {
-            let open: Vec<(u64, &InstrumentView)> = event
-                .instruments
-                .iter()
-                .filter_map(|id| Some((*id, view.instruments.get(id)?)))
-                .filter(|(_, i)| i.state == "OPEN")
-                .collect();
-            if open.is_empty() || event.resolved {
+        let mut by_event: BTreeMap<u64, Vec<&Market>> = BTreeMap::new();
+        for m in markets.iter().filter(|m| m.state == "open") {
+            by_event.entry(m.event).or_default().push(m);
+        }
+        for (event, open) in by_event {
+            let first = open[0];
+            if first.resolved {
                 continue;
             }
-            if event.ended || event.suspended {
-                for (id, _) in &open {
-                    for (oid, _) in mine(view, account, *id, None) {
-                        out.push(cancel(account, *id, oid));
-                    }
+            if first.ended || first.suspended {
+                if account.orders.iter().any(|o| open.iter().any(|m| m.id == o.instrument)) {
+                    out.push(Action::CancelEvent(event));
                 }
                 continue;
             }
-            let spread = if event.started { config.half_spread * 2 } else { config.half_spread };
-            let mut quotes = Vec::with_capacity(open.len());
-            for (id, inst) in &open {
-                let Some(rows) = view.tables.get(&inst.table) else { continue };
-                let n = rows.len() as u64;
+            let spread = if first.started { config.half_spread * 2 } else { config.half_spread };
+            let mut quotes: Vec<(&Market, u64)> = Vec::new();
+            for m in &open {
+                let n = m.bp.len() as u64;
                 if n < 2 * spread + 3 {
                     continue;
                 }
-                let f = fair.entry(*id).or_insert_with(|| n / 4 + rng.below(n / 2));
+                let f = fair.entry(m.id).or_insert_with(|| n / 4 + rng.below(n / 2));
                 match rng.below(3) {
                     0 => *f = f.saturating_sub(1),
                     1 => *f += 1,
                     _ => {}
                 }
                 *f = (*f).clamp(spread + 1, n - 2 - spread);
-                quotes.push((*id, *inst, rows, *f));
+                quotes.push((m, *f));
             }
             if quotes.len() > 1 {
-                let total = quotes.iter().map(|(_, _, rows, f)| rows[*f as usize]).sum::<u64>().max(1);
-                for (id, _, rows, f) in &mut quotes {
-                    let target = rows[*f as usize] * 10_000 / total;
-                    *f = nearest_tick(rows, target).clamp(spread + 1, rows.len() as u64 - 2 - spread);
-                    fair.insert(*id, *f);
+                let total = quotes.iter().map(|(m, f)| m.bp[*f as usize]).sum::<u64>().max(1);
+                for (m, f) in &mut quotes {
+                    let target = m.bp[*f as usize] * 10_000 / total;
+                    *f = nearest_tick(&m.bp, target).clamp(spread + 1, m.bp.len() as u64 - 2 - spread);
+                    fair.insert(m.id, *f);
                 }
             }
-            for (id, inst, rows, f) in quotes {
-                let top = rows.len() as u64 - 1;
-                for side in ["BUY", "SELL"] {
-                    // Level k sits k ticks behind the touch and carries k + 1 times the size. A level that would
-                    // cross someone else's order is left out, since post-only would reject it.
+            for (m, f) in quotes {
+                let Some(book) = books(m.id) else { continue };
+                let top = m.bp.len() as u64 - 1;
+                let (best_bid, best_ask) = (book.bids.first().map(|l| l.0), book.asks.first().map(|l| l.0));
+                for side in ["buy", "sell"] {
+                    // Level k sits k ticks behind the touch with k + 1 times the size. A level that would cross
+                    // someone else's order is left out, since post-only would refuse it.
                     let desired: Vec<(u64, u64)> = (0..config.levels.max(1))
                         .filter_map(|k| {
-                            let tick = if side == "BUY" {
+                            let tick = if side == "buy" {
                                 f.checked_sub(spread + k)?
                             } else {
                                 (f + spread + k <= top).then_some(f + spread + k)?
                             };
-                            Some((tick, config.size * (k + 1) * inst.lot.max(1)))
+                            Some((tick, config.size * (k + 1) * m.lot))
                         })
                         .filter(|(tick, _)| {
-                            if side == "BUY" {
-                                inst.best_ask().is_none_or(|a| *tick < a)
+                            if side == "buy" {
+                                best_ask.is_none_or(|a| *tick < a)
                             } else {
-                                inst.best_bid().is_none_or(|b| *tick > b)
+                                best_bid.is_none_or(|b| *tick > b)
                             }
                         })
                         .collect();
-                    // Existing orders nearest the touch first, paired with the desired levels in the same order.
-                    let mut orders = mine(view, account, id, Some(side));
-                    if side == "BUY" {
-                        orders.sort_by_key(|o| std::cmp::Reverse(o.1.tick));
+                    let mut mine: Vec<&Resting> =
+                        account.orders.iter().filter(|o| o.instrument == m.id && o.side == side).collect();
+                    if side == "buy" {
+                        mine.sort_by_key(|o| std::cmp::Reverse(o.tick));
                     } else {
-                        orders.sort_by_key(|o| o.1.tick);
+                        mine.sort_by_key(|o| o.tick);
                     }
-                    for (k, &(oid, o)) in orders.iter().enumerate() {
+                    for (k, o) in mine.iter().enumerate() {
                         match desired.get(k) {
                             Some(&(tick, size)) if o.tick != tick || o.remaining < size => {
-                                out.push(amend(account, id, oid, tick, size));
+                                out.push(Action::Amend(o.id, json!({"price": {"tick": tick}, "quantity": size})));
                             }
                             Some(_) => {}
-                            None => out.push(cancel(account, id, oid)),
+                            None => out.push(Action::Cancel(o.id)),
                         }
                     }
-                    for &(tick, size) in desired.iter().skip(orders.len()) {
-                        out.push(order(
-                            account,
-                            ids.fresh(),
-                            json!({"instrumentId": id, "side": side, "tick": tick, "quantity": size, "flags": ["POST_ONLY"]}),
-                        ));
+                    for &(tick, size) in desired.iter().skip(mine.len()) {
+                        out.push(Action::Place(json!({
+                            "clientOrderId": ids.fresh(), "instrumentId": m.id.to_string(), "action": side,
+                            "outcome": "yes", "price": {"tick": tick}, "quantity": size, "postOnly": true
+                        })));
                     }
                 }
             }
@@ -199,7 +320,6 @@ pub fn maker(ingress: &str, live: &Live, config: &Maker, mut ids: Ids) -> ! {
 }
 
 pub struct Taker {
-    pub account: u64,
     /// The largest ordinary order, in lots; a sweep is four times this.
     pub max_quantity: u64,
     /// Chance per market per interval of sending an order, in thousandths.
@@ -210,34 +330,56 @@ pub struct Taker {
     pub seed: u64,
 }
 
-/// Sends immediate-or-cancel orders at the touch at random, with retail-sized quantities and the occasional sweep.
-pub fn taker(ingress: &str, live: &Live, config: &Taker, mut ids: Ids) -> ! {
+/// Sends immediate-or-cancel orders at the touch at random, as retail arrives: buying YES, buying NO or selling YES,
+/// with prices as ticks or cents and buys often as stakes, and the occasional sweep.
+pub fn taker(api: &Api, config: &Taker, mut ids: Ids) -> ! {
     let mut rng = Rng::new(config.seed);
-    let account = config.account;
-    run(ingress, live, config.interval, "taker", |view| {
+    run(api, config.interval, "taker", &mut |markets, _account, books| {
         let mut out = Vec::new();
-        for (&id, inst) in &view.instruments {
-            let trading =
-                inst.state == "OPEN" && view.events.get(&inst.event).is_some_and(|e| !e.suspended && !e.resolved);
-            if !trading || !rng.chance(config.per_mille) {
+        for m in markets.iter().filter(|m| m.state == "open" && !m.suspended && !m.resolved) {
+            if !rng.chance(config.per_mille) {
                 continue;
             }
-            let n = view.tables.get(&inst.table).map_or(0, |rows| rows.len() as u64);
-            let buy = rng.below(2) == 0;
-            let Some(best) = (if buy { inst.best_ask() } else { inst.best_bid() }) else { continue };
+            let Some(book) = books(m.id) else { continue };
+            let n = m.bp.len() as u64;
             let sweep = rng.chance(config.sweep_per_mille);
             let lots = if sweep { config.max_quantity * 4 } else { 1 + rng.below(config.max_quantity.max(1)) };
-            let tick = match (buy, sweep) {
-                (true, true) => (best + 3).min(n.saturating_sub(1)),
-                (false, true) => best.saturating_sub(3),
-                _ => best,
+            let (action, outcome, yes_tick) = match rng.below(3) {
+                0 => {
+                    let Some(&(ask, _)) = book.asks.first() else { continue };
+                    ("buy", "yes", if sweep { (ask + 3).min(n - 1) } else { ask })
+                }
+                1 => {
+                    let Some(&(bid, _)) = book.bids.first() else { continue };
+                    ("buy", "no", if sweep { bid.saturating_sub(3) } else { bid })
+                }
+                _ => {
+                    let Some(&(bid, _)) = book.bids.first() else { continue };
+                    ("sell", "yes", if sweep { bid.saturating_sub(3) } else { bid })
+                }
             };
-            let side = if buy { "BUY" } else { "SELL" };
-            out.push(order(
-                account,
-                ids.fresh(),
-                json!({"instrumentId": id, "side": side, "tick": tick, "quantity": lots * inst.lot.max(1), "timeInForce": "IOC"}),
-            ));
+            // A ladder closed under complement reverses: the NO price at YES tick t is row n - 1 - t.
+            let (outcome_tick, outcome_bp) = if outcome == "yes" {
+                (yes_tick, m.bp[yes_tick as usize])
+            } else {
+                (n - 1 - yes_tick, 10_000 - m.bp[yes_tick as usize])
+            };
+            let whole_cents = outcome_bp % 100 == 0;
+            let mut body = json!({
+                "clientOrderId": ids.fresh(), "instrumentId": m.id.to_string(), "action": action, "outcome": outcome,
+                "timeInForce": "IOC"
+            });
+            body["price"] = if whole_cents && rng.below(2) == 0 {
+                json!({"cents": (outcome_bp / 100).to_string()})
+            } else {
+                json!({"tick": outcome_tick})
+            };
+            if action == "buy" && whole_cents && m.lot == 1 && rng.below(2) == 0 {
+                body["stakeCents"] = json!(lots * outcome_bp / 100);
+            } else {
+                body["quantity"] = json!(lots * m.lot);
+            }
+            out.push(Action::Place(body));
         }
         out
     })
