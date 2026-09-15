@@ -1,0 +1,16 @@
+[package]
+name = "venue-sim"
+version = "0.1.0"
+description = "The mini venue's actors: synthetic makers and takers, the dummy oracle, demo markets and a web page"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+venue-harness = { path = "../harness" }
+venue-node = { path = "../node" }
+serde_json = "1"

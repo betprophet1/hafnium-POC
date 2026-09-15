@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini venue</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --ink: #16181d; --muted: #6b7280; --line: #e3e6eb;
+  --bid: #0f8a5f; --bid-soft: rgba(15,138,95,.14); --ask: #c2410c; --ask-soft: rgba(194,65,12,.14);
+  --accent: #2554d8; --accent-ink: #ffffff; --warn: #b45309; --bad: #b91c1c; --ok: #0f8a5f;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1116; --card: #161a21; --ink: #e7eaf0; --muted: #8b93a1; --line: #262c36;
+    --bid: #34d399; --bid-soft: rgba(52,211,153,.14); --ask: #fb923c; --ask-soft: rgba(251,146,60,.14);
+    --accent: #6d8dff; --accent-ink: #0e1116; --warn: #fbbf24; --bad: #f87171; --ok: #34d399;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.num, .px, table, .kv b { font-variant-numeric: tabular-nums; }
+header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--card); }
+.brand { font-weight: 650; letter-spacing: .01em; }
+.status { margin-left: auto; color: var(--muted); display: flex; align-items: center; gap: 8px; font-size: 12px; }
+#dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
+#dot.on { background: var(--ok); }
+nav.markets { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 20px; }
+select, input { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+input[type=number] { width: 7em; }
+button { font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--ink); padding: 6px 12px; }
+button:hover { border-color: var(--muted); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.buy { color: var(--bid); border-color: var(--bid); }
+button.sell { color: var(--ask); border-color: var(--ask); }
+button.ghost { background: transparent; }
+button.link { border: 0; background: none; color: var(--accent); padding: 0; }
+.pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill { border-radius: 999px; padding: 4px 12px; }
+.pill span { color: var(--muted); margin-left: 6px; font-size: 12px; }
+.pill.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+main { display: grid; grid-template-columns: minmax(300px, 420px) 1fr; gap: 16px; padding: 0 20px 20px; }
+@media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+h2 { font-size: 15px; margin: 0 0 10px; }
+h2 small { color: var(--muted); font-weight: 400; margin-left: 6px; }
+h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 18px 0 8px; }
+.ladder { font-size: 13px; }
+.lvl { display: grid; grid-template-columns: 1fr 76px 1fr; align-items: stretch; border-top: 1px solid var(--line); }
+.lvl.head { border-top: 0; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; padding-bottom: 4px; }
+.lvl.head span:first-child { text-align: right; padding-right: 8px; }
+.lvl.head span:last-child { padding-left: 8px; }
+.lvl .px { text-align: center; padding: 3px 0; color: var(--muted); }
+.lvl.last .px { color: var(--ink); font-weight: 600; }
+.q { position: relative; cursor: pointer; padding: 3px 8px; min-height: 22px; }
+.q i { position: absolute; top: 2px; bottom: 2px; }
+.q.bid { text-align: right; } .q.bid i { right: 0; background: var(--bid-soft); }
+.q.ask i { left: 0; background: var(--ask-soft); }
+.q b { position: relative; font-weight: 500; }
+.q.bid b { color: var(--bid); } .q.ask b { color: var(--ask); }
+.q em { position: relative; font-style: normal; font-size: 9px; color: var(--accent); margin: 0 4px; }
+.q:hover { outline: 1px solid var(--line); }
+.trades { max-height: 220px; overflow: auto; font-size: 12px; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-weight: 500; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+td { padding: 5px 6px; border-bottom: 1px solid var(--line); }
+.r { text-align: right; }
+.pos { color: var(--bid); } .neg { color: var(--ask); }
+.muted { color: var(--muted); } .small { font-size: 12px; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: -4px -16px 14px; padding: 0 12px; }
+.tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 8px 12px; color: var(--muted); }
+.tabs button.on { color: var(--ink); border-bottom-color: var(--accent); }
+.kv { display: flex; flex-wrap: wrap; gap: 6px 22px; padding: 8px 0 2px; color: var(--muted); }
+.kv b { color: var(--ink); font-weight: 600; margin-left: 4px; }
+.row { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin: 10px 0; }
+label { display: grid; gap: 3px; color: var(--muted); font-size: 12px; }
+label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink); }
+.quote { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 520px) { .quote { grid-template-columns: 1fr; } }
+.qside { border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
+.qside.bid { border-left: 3px solid var(--bid); } .qside.ask { border-left: 3px solid var(--ask); }
+.outcome { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 12px 0; }
+.big { padding: 14px; font-size: 15px; font-weight: 600; display: grid; gap: 2px; text-align: left; }
+.big span { font-size: 22px; font-weight: 650; }
+.big.yes { color: var(--bid); } .big.no { color: var(--ask); }
+.big.on.yes { background: var(--bid-soft); border-color: var(--bid); }
+.big.on.no { background: var(--ask-soft); border-color: var(--ask); }
+.wide { width: 100%; padding: 10px; font-weight: 600; }
+.note { background: var(--bg); border-radius: 6px; padding: 8px 10px; color: var(--muted); font-size: 12px; }
+.event { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+.event.done { opacity: .75; }
+.ehead { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; }
+.badge { font-size: 11px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; color: var(--muted); }
+#toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 5; }
+.toast { background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--muted); border-radius: 6px; padding: 8px 12px; box-shadow: 0 4px 16px rgba(0,0,0,.12); max-width: 360px; }
+.toast.bad { border-left-color: var(--bad); } .toast.ok { border-left-color: var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Mini venue</div>
+  <span class="muted small">development environment · fake money</span>
+  <div class="status"><span id="dot"></span><span id="seq">connecting…</span></div>
+</header>
+<nav class="markets">
+  <select id="event" aria-label="Event"></select>
+  <div id="instruments" class="pills"></div>
+</nav>
+<main>
+  <section class="card">
+    <h2>Order book <small id="bookTitle"></small></h2>
+    <div class="ladder" id="ladder"></div>
+    <h3>Trades</h3>
+    <div class="trades" id="trades"></div>
+  </section>
+  <section class="card">
+    <div class="tabs" role="tablist">
+      <button data-tab="maker" class="on">Market maker</button>
+      <button data-tab="retail">Retail customer</button>
+      <button data-tab="settle">Settlement</button>
+    </div>
+
+    <div id="tab-maker">
+      <div id="makerAcct"></div>
+      <div class="quote">
+        <div class="qside bid">
+          <label>Bid price (¢)<input id="bidPx" type="number" min="1" max="99"></label>
+          <label>Size<input id="bidQty" type="number" min="1" value="10"></label>
+          <button id="placeBid" class="buy">Place bid</button>
+        </div>
+        <div class="qside ask">
+          <label>Ask price (¢)<input id="askPx" type="number" min="1" max="99"></label>
+          <label>Size<input id="askQty" type="number" min="1" value="10"></label>
+          <button id="placeAsk" class="sell">Place ask</button>
+        </div>
+      </div>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="postOnly" checked> Post only</label>
+        <button id="placeBoth">Place both</button>
+        <button id="cancelAll" class="ghost">Cancel all</button>
+        <button data-grant="maker" class="ghost">Add $10,000</button>
+      </div>
+      <p class="note">Click a level in the book to copy its price. A dot marks your own orders.</p>
+      <h3>Open orders</h3><div id="makerOrders"></div>
+      <h3>Positions</h3><div id="makerPositions"></div>
+    </div>
+
+    <div id="tab-retail" hidden>
+      <div id="retailAcct"></div>
+      <div class="outcome">
+        <button id="pickYes" class="big yes on">Buy YES <span id="yesPx">—</span></button>
+        <button id="pickNo" class="big no">Buy NO <span id="noPx">—</span></button>
+      </div>
+      <div class="row">
+        <label>Contracts<input id="rQty" type="number" min="1" value="10"></label>
+        <label>Order type<select id="rType"><option value="market">Market</option><option value="limit">Limit</option></select></label>
+        <label id="rPxWrap" hidden>Limit price (¢)<input id="rPx" type="number" min="1" max="99"></label>
+        <button data-grant="retail" class="ghost">Add $100</button>
+      </div>
+      <p id="rCost" class="note"></p>
+      <button id="rPlace" class="primary wide">Place order</button>
+      <p class="muted small">A contract pays $1 if its outcome happens. Buying NO while holding YES closes the YES position. Market orders fill up to five ticks through the best price, and any remainder is cancelled.</p>
+      <h3>Your positions</h3><div id="retailPositions"></div>
+      <h3>Open orders</h3><div id="retailOrders"></div>
+    </div>
+
+    <div id="tab-settle" hidden>
+      <p class="note">The dummy oracle sequences these commands straight to the core. The proposal, sign-off and dispute path of the real resolution console is not built yet.</p>
+      <div id="events"></div>
+      <h3>Payouts</h3><div id="payouts"></div>
+    </div>
+  </section>
+</main>
+<div id="toasts" aria-live="polite"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let S = null, tab = 'maker', selEvent = null, selInst = null, retailSide = 'YES';
+const winning = {};
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+const money = c => (c < 0 ? '−' : '') + '$' + (Math.abs(c) / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const fmtBp = b => b == null ? '—' : ((b % 100) ? (b / 100).toFixed(1) : String(b / 100)) + '¢';
+const words = s => String(s).replaceAll('_', ' ').toLowerCase();
+function setHTML(el, html) { if (el._h !== html) { el.innerHTML = html; el._h = html; } }
+function rows(i) { return (S && S.tables[i.table]) || []; }
+const bp = (i, t) => rows(i)[t];
+const cents = (i, t) => fmtBp(bp(i, t));
+const noCents = (i, t) => fmtBp(bp(i, t) == null ? null : 10000 - bp(i, t));
+function tickFor(i, target) { let best = 0, d = Infinity; rows(i).forEach((b, k) => { const x = Math.abs(b - target); if (x < d) { d = x; best = k; } }); return best; }
+function find(id) { for (const e of S.events) for (const i of e.instruments) if (i.id === id) return [e, i]; return [null, null]; }
+const current = () => selInst == null ? [null, null] : find(selInst);
+const account = name => S && S.accounts.find(a => a.tab === name);
+
+function toast(msg, kind) { const d = document.createElement('div'); d.className = 'toast ' + (kind || ''); d.textContent = msg; $('#toasts').append(d); setTimeout(() => d.remove(), 4500); }
+
+async function act(name, body) {
+  try {
+    const r = await fetch('/api/' + name, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) return toast(j.error || r.statusText, 'bad');
+    report(j.results || []);
+  } catch (e) { toast(String(e), 'bad'); }
+}
+
+function report(results) {
+  let filled = 0;
+  for (const x of results) {
+    const [, i] = x.instrumentId ? find(x.instrumentId) : [null, null];
+    const at = t => i ? cents(i, t) : 'tick ' + t;
+    if (x.msg === 'OrderRejected') toast('Rejected: ' + words(x.reason), 'bad');
+    else if (x.msg === 'CommandApplied' && x.outcome !== 'APPLIED') toast(`${words(x.outcome)}: ${words(x.rejectReason)}`, 'bad');
+    else if (x.msg === 'Fill') filled += x.quantity;
+    else if (x.msg === 'OrderAccepted') toast(`Order accepted: ${x.quantity} at ${at(x.tick)}`, 'ok');
+    else if (x.msg === 'OrderCancelled' && x.reason === 'IOC_REMAINDER') toast(`${x.cancelledQuantity} unfilled and cancelled`);
+    else if (x.msg === 'OrderCancelled') toast(`Cancelled ${x.cancelledQuantity}`);
+    else if (x.msg === 'SettlementPayout' && x.accountId === 0) toast(`Rounding remainder of ${money(x.cents)} to the settlement reserve`);
+  }
+  if (filled) toast(`Filled ${filled}`, 'ok');
+}
+
+function render() {
+  if (!S) return;
+  $('#seq').textContent = 'sequence ' + S.sequence;
+  if (!S.events.some(e => e.id === selEvent)) selEvent = (S.events.find(e => !e.resolved && e.template) || S.events[0] || {}).id ?? null;
+  setHTML($('#event'), S.events.map(e => `<option value="${e.id}" ${e.id === selEvent ? 'selected' : ''}>${esc(e.title)}${e.resolved ? ' — settled' : ''}</option>`).join(''));
+  const ev = S.events.find(e => e.id === selEvent);
+  if (ev && !ev.instruments.some(i => i.id === selInst)) selInst = ev.instruments[0] ? ev.instruments[0].id : null;
+  setHTML($('#instruments'), ev ? ev.instruments.map(i => `<button class="pill ${i.id === selInst ? 'on' : ''}" data-pick="${i.id}">${esc(i.label)}<span>${i.bids[0] ? cents(i, i.bids[0][0]) : '—'} / ${i.asks[0] ? cents(i, i.asks[0][0]) : '—'}</span></button>`).join('') : '');
+  renderBook(); renderTrades(); renderMaker(); renderRetail(); renderSettle();
+}
+
+function renderBook() {
+  const [e, i] = current();
+  if (!i) { $('#bookTitle').textContent = ''; return setHTML($('#ladder'), '<p class="muted">No markets yet. The seed job lists the demo markets.</p>'); }
+  $('#bookTitle').textContent = `${i.label} · ${words(i.state)}${e.started ? ' · in play' : ''}`;
+  const n = rows(i).length, bids = new Map(i.bids.map(([t, q, c]) => [t, q])), asks = new Map(i.asks.map(([t, q, c]) => [t, q]));
+  const bb = i.bids[0] ? i.bids[0][0] : null, ba = i.asks[0] ? i.asks[0][0] : null;
+  const mid = bb != null && ba != null ? Math.round((bb + ba) / 2) : (bb ?? ba ?? i.last ?? Math.floor(n / 2));
+  const hi = Math.min(n - 1, mid + 9), lo = Math.max(0, mid - 9);
+  const maxQ = Math.max(1, ...i.bids.map(b => b[1]), ...i.asks.map(a => a[1]));
+  const who = account(tab === 'retail' ? 'retail' : 'maker');
+  const mine = new Set(((who && who.orders) || []).filter(o => o.instrument === i.id).map(o => o.side + o.tick));
+  let html = '<div class="lvl head"><span>Bids</span><span class="px">YES price</span><span>Asks</span></div>';
+  for (let t = hi; t >= lo; t--) {
+    const b = bids.get(t), a = asks.get(t);
+    html += `<div class="lvl ${t === i.last ? 'last' : ''}" data-tick="${t}">`
+      + `<span class="q bid" data-side="BUY">${mine.has('BUY' + t) ? '<em>●</em>' : ''}${b ? `<i style="width:${(100 * b / maxQ).toFixed(1)}%"></i><b>${b}</b>` : ''}</span>`
+      + `<span class="px">${cents(i, t)}</span>`
+      + `<span class="q ask" data-side="SELL">${a ? `<i style="width:${(100 * a / maxQ).toFixed(1)}%"></i><b>${a}</b>` : ''}${mine.has('SELL' + t) ? '<em>●</em>' : ''}</span></div>`;
+  }
+  setHTML($('#ladder'), html);
+}
+
+function renderTrades() {
+  const [, i] = current();
+  const list = i ? S.trades.filter(t => t.instrument === i.id).slice(0, 30) : [];
+  const name = id => (S.accounts.find(a => a.id === id) || {name: '#' + id}).name;
+  setHTML($('#trades'), list.length ? '<table><thead><tr><th>Time</th><th class="r">Price</th><th class="r">Qty</th><th>Taker</th></tr></thead><tbody>'
+    + list.map(t => `<tr><td class="muted">${new Date(t.atMs).toLocaleTimeString()}</td><td class="r ${t.takerSide === 'BUY' ? 'pos' : 'neg'}">${cents(i, t.tick)}</td><td class="r">${t.quantity}</td><td class="muted">${esc(name(t.taker))} ${t.takerSide === 'BUY' ? 'bought' : 'sold'}</td></tr>`).join('')
+    + '</tbody></table>' : '<p class="muted">No trades yet.</p>');
+}
+
+function acctHtml(a) {
+  if (!a) return '<p class="muted">This account is not in the catalogue.</p>';
+  return `<div class="kv"><span>${esc(a.name)} · #${a.id}</span><span>Available<b>${money(a.available)}</b></span><span>Reserved<b>${money(a.reserved)}</b></span></div>`;
+}
+
+function ordersHtml(a, retail) {
+  if (!a || !a.orders.length) return '<p class="muted">None.</p>';
+  return '<table><thead><tr><th>Market</th><th>Side</th><th class="r">Price</th><th class="r">Remaining</th><th></th></tr></thead><tbody>'
+    + a.orders.map(o => {
+      const [, i] = find(o.instrument);
+      const buy = o.side === 'BUY';
+      const side = retail ? (buy ? 'YES' : 'NO') : (buy ? 'Bid' : 'Ask');
+      const px = i ? (retail && !buy ? noCents(i, o.tick) : cents(i, o.tick)) : o.tick;
+      return `<tr><td>${esc(i ? i.label : o.instrument)}</td><td class="${buy ? 'pos' : 'neg'}">${side}</td><td class="r">${px}</td><td class="r">${o.remaining}</td><td class="r"><button class="link" data-cancel="${o.orderId}" data-inst="${o.instrument}" data-acct="${a.id}">Cancel</button></td></tr>`;
+    }).join('') + '</tbody></table>';
+}
+
+function positionsHtml(a) {
+  if (!a || !a.positions.length) return '<p class="muted">None.</p>';
+  return '<table><thead><tr><th>Market</th><th>Holding</th><th class="r">Best bid / ask</th></tr></thead><tbody>'
+    + a.positions.map(p => {
+      const [e, i] = find(p.instrument);
+      const label = i ? `${esc(e.title)} · ${esc(i.label)}` : p.instrument;
+      const hold = p.position > 0 ? `<span class="pos">YES × ${p.position}</span>` : `<span class="neg">NO × ${-p.position}</span>`;
+      const touch = i ? `${i.bids[0] ? cents(i, i.bids[0][0]) : '—'} / ${i.asks[0] ? cents(i, i.asks[0][0]) : '—'}` : '';
+      return `<tr><td>${label}</td><td>${hold}</td><td class="r muted">${touch}</td></tr>`;
+    }).join('') + '</tbody></table>';
+}
+
+function renderMaker() {
+  const a = account('maker'), [, i] = current();
+  setHTML($('#makerAcct'), acctHtml(a));
+  setHTML($('#makerOrders'), ordersHtml(a, false));
+  setHTML($('#makerPositions'), positionsHtml(a));
+  const off = !i || i.state !== 'OPEN';
+  for (const id of ['#placeBid', '#placeAsk', '#placeBoth']) $(id).disabled = off;
+}
+
+function renderRetail() {
+  const a = account('retail'), [, i] = current();
+  setHTML($('#retailAcct'), acctHtml(a));
+  setHTML($('#retailOrders'), ordersHtml(a, true));
+  setHTML($('#retailPositions'), positionsHtml(a));
+  const yesAsk = i && i.asks[0] ? bp(i, i.asks[0][0]) : null, noAsk = i && i.bids[0] ? 10000 - bp(i, i.bids[0][0]) : null;
+  $('#yesPx').textContent = fmtBp(yesAsk);
+  $('#noPx').textContent = fmtBp(noAsk);
+  $('#pickYes').classList.toggle('on', retailSide === 'YES');
+  $('#pickNo').classList.toggle('on', retailSide === 'NO');
+  const market = $('#rType').value === 'market';
+  $('#rPxWrap').hidden = market;
+  const qty = +$('#rQty').value;
+  const price = market ? (retailSide === 'YES' ? yesAsk : noAsk) : (+$('#rPx').value * 100 || null);
+  $('#rCost').textContent = !i ? 'Pick a market.' : i.state !== 'OPEN' ? `This market is ${words(i.state)}.`
+    : price == null ? 'Nobody is offering that side yet.'
+    : qty > 0 ? `About ${money(Math.round(qty * price / 100))} for ${qty} ${retailSide} contracts, paying ${money(qty * 100)} if ${esc(i.label)} ${retailSide === 'YES' ? 'happens' : 'does not happen'}.` : 'Enter a number of contracts.';
+  $('#rPlace').disabled = !i || i.state !== 'OPEN';
+}
+
+function renderSettle() {
+  setHTML($('#events'), S.events.map(e => {
+    const flags = [e.resolved ? 'settled' : e.ended ? 'ended' : e.started ? 'in play' : 'not started', e.suspended && !e.resolved ? 'suspended' : null].filter(Boolean);
+    const open = e.instruments.some(i => i.state === 'OPEN' || i.state === 'HALTED');
+    const b = (action, label, cls = '') => `<button class="${cls}" data-oracle="${action}" data-event="${e.id}">${label}</button>`;
+    const k = winning[e.id] ?? 0;
+    return `<div class="event ${e.resolved ? 'done' : ''}"><div class="ehead"><strong>${esc(e.title)}</strong><span>${flags.map(f => `<span class="badge">${f}</span>`).join(' ')}</span></div>`
+      + `<div class="muted small">${e.instruments.map(i => `${esc(i.label)}: ${words(i.state)}`).join(' · ')}</div>`
+      + (e.resolved
+        ? `<div class="row">${e.template ? b('relist', 'List a new round') : ''}</div>`
+        : `<div class="row">${e.started ? '' : b('start', 'Start')}${e.suspended ? b('resume', 'Resume') : b('suspend', 'Suspend')}${e.ended ? '' : b('end', 'End')}${open ? b('close', 'Close markets') : ''}</div>`
+          + `<div class="row"><label>Outcome<select data-win="${e.id}">${e.states.map((s, n) => `<option value="${n}" ${n === k ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select></label>${b('resolve', 'Resolve', 'primary')}${b('void', 'Void', 'ghost')}</div>`)
+      + '</div>';
+  }).join('') || '<p class="muted">No events yet.</p>');
+  const name = id => (S.accounts.find(a => a.id === id) || {name: id === 0 ? 'Settlement reserve' : '#' + id}).name;
+  setHTML($('#payouts'), S.payouts.length ? '<table><thead><tr><th>Account</th><th>Market</th><th>Kind</th><th class="r">Closed</th><th class="r">Paid</th></tr></thead><tbody>'
+    + S.payouts.map(p => { const [e, i] = find(p.instrument); return `<tr><td>${esc(name(p.account))}</td><td>${i ? esc(e.title + ' · ' + i.label) : '—'}</td><td class="muted">${words(p.kind)}</td><td class="r">${p.positionClosed}</td><td class="r">${money(p.cents)}</td></tr>`; }).join('')
+    + '</tbody></table>' : '<p class="muted">None yet.</p>');
+}
+
+function placeMaker(side) {
+  const [, i] = current(), a = account('maker');
+  if (!i || !a) return;
+  const px = +$(side === 'BUY' ? '#bidPx' : '#askPx').value, qty = +$(side === 'BUY' ? '#bidQty' : '#askQty').value;
+  if (!(px > 0 && px < 100 && qty > 0)) return toast('Enter a price between 1¢ and 99¢ and a size', 'bad');
+  return act('order', {account: a.id, instrument: i.id, side, tick: tickFor(i, Math.round(px * 100)), quantity: qty * i.lot, tif: 'GTC', postOnly: $('#postOnly').checked});
+}
+
+function placeRetail() {
+  const [, i] = current(), a = account('retail');
+  if (!i || !a) return;
+  const qty = +$('#rQty').value, yes = retailSide === 'YES';
+  if (!(qty > 0)) return toast('Enter a number of contracts', 'bad');
+  const body = {account: a.id, instrument: i.id, side: yes ? 'BUY' : 'SELL', contract: yes ? 'YES' : 'NO', quantity: qty * i.lot};
+  if ($('#rType').value === 'market') Object.assign(body, {tick: yes ? rows(i).length - 1 : 0, tif: 'IOC', protectionTicks: 5});
+  else {
+    const px = +$('#rPx').value;
+    if (!(px > 0 && px < 100)) return toast('Enter a limit price between 1¢ and 99¢', 'bad');
+    Object.assign(body, {tick: tickFor(i, yes ? px * 100 : 10000 - px * 100), tif: 'GTC'});
+  }
+  return act('order', body);
+}
+
+function showTab(name) {
+  tab = name;
+  for (const b of document.querySelectorAll('[data-tab]')) b.classList.toggle('on', b.dataset.tab === name);
+  for (const t of ['maker', 'retail', 'settle']) $('#tab-' + t).hidden = t !== name;
+  render();
+}
+
+document.addEventListener('click', ev => {
+  const t = ev.target.closest('button, .q');
+  if (!t || t.disabled) return;
+  const [, i] = S ? current() : [null, null];
+  if (t.dataset.tab) return showTab(t.dataset.tab);
+  if (t.dataset.pick) { selInst = +t.dataset.pick; return render(); }
+  if (t.dataset.cancel) return act('cancel', {account: +t.dataset.acct, instrument: +t.dataset.inst, orderId: +t.dataset.cancel});
+  if (t.dataset.grant) { const a = account(t.dataset.grant); return a && act('grant', {account: a.id, cents: t.dataset.grant === 'maker' ? 1000000 : 10000}); }
+  if (t.dataset.oracle) {
+    const action = t.dataset.oracle, event = +t.dataset.event, e = S.events.find(x => x.id === event), body = {action, event};
+    if (action === 'resolve') {
+      body.state = winning[event] ?? 0;
+      if (!confirm(`Resolve “${e.title}” as ${e.states[body.state]}? Resting orders are cancelled and every position pays out.`)) return;
+    }
+    if (action === 'void' && !confirm(`Void “${e.title}”? Every contract settles at its equal-weight value.`)) return;
+    return act('oracle', body);
+  }
+  if (t.classList.contains('q') && i) {
+    const lvl = t.closest('.lvl'); if (!lvl || lvl.dataset.tick == null) return;
+    const px = bp(i, +lvl.dataset.tick) / 100;
+    if (tab === 'retail') { $('#rType').value = 'limit'; $('#rPx').value = retailSide === 'YES' ? px : 100 - px; return render(); }
+    $(t.dataset.side === 'BUY' ? '#bidPx' : '#askPx').value = px;
+    return;
+  }
+  switch (t.id) {
+    case 'placeBid': return placeMaker('BUY');
+    case 'placeAsk': return placeMaker('SELL');
+    case 'placeBoth': placeMaker('BUY'); return placeMaker('SELL');
+    case 'cancelAll': { const a = account('maker'); return a && act('cancel-all', {account: a.id}); }
+    case 'pickYes': retailSide = 'YES'; return render();
+    case 'pickNo': retailSide = 'NO'; return render();
+    case 'rPlace': return placeRetail();
+  }
+});
+
+document.addEventListener('change', ev => {
+  const t = ev.target;
+  if (t.id === 'event') { selEvent = +t.value; selInst = null; render(); }
+  else if (t.dataset.win) winning[+t.dataset.win] = +t.value;
+  else if (t.id === 'rType') render();
+});
+document.addEventListener('input', ev => { if (ev.target.id === 'rQty' || ev.target.id === 'rPx') render(); });
+
+function connect() {
+  const es = new EventSource('/api/events');
+  es.onopen = () => $('#dot').classList.add('on');
+  es.onmessage = m => { S = JSON.parse(m.data); render(); };
+  es.onerror = () => { $('#dot').classList.remove('on'); $('#seq').textContent = 'reconnecting…'; };
+}
+connect();
+</script>
+</body>
+</html>

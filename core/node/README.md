@@ -18,6 +18,10 @@ Production puts the engine behind Aeron Cluster instead (WP-10). This node never
 - **Fail-stop (spec §18).** The process exits. Restarting replays the journal and stops at the same input,
   which is what E-18.2 requires; recovery is an operator decision.
 
+- **Feed.** `--feed` (default `0.0.0.0:7102`), a development stand-in for interface 12. A reader receives every
+  input with its results, from the start of the journal, then live, as units: the input frame, its result frames,
+  an empty frame. `TimeTick`s that changed nothing are left out. The web page and the bots in `core/sim` read it.
+
 ## Framing
 
 Journal files, result logs and the TCP ingress all use one framing: a little-endian `u32` length, then that many
@@ -39,7 +43,7 @@ venue-node replay ./venue-data/journal.sbe out.sbe && cmp out.sbe ./venue-data/r
 venue-node import core/target/differential/fuzz-90000.json golden.journal
 ```
 
-`serve` also reads `VENUE_LISTEN`, `VENUE_DATA`, `VENUE_GROUP`, `VENUE_NODE_ID` and `VENUE_TICK_MS`.
+`serve` also reads `VENUE_LISTEN`, `VENUE_FEED`, `VENUE_DATA`, `VENUE_GROUP`, `VENUE_NODE_ID` and `VENUE_TICK_MS`.
 
 A replay on another architecture yields the same result log, but its `EngineStarted` names a different binary hash.
 Build with the release profile to compare against a release node (overflow checks are on in both, blueprint §16).

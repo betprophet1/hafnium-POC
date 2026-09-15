@@ -1,0 +1,135 @@
+//! `venue-sim`: the mini venue's actors. See `core/sim/README.md`.
+
+mod bots;
+mod catalogue;
+mod view;
+mod web;
+mod wire;
+
+use catalogue::Catalogue;
+use std::collections::BTreeMap;
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+use wire::{Error, Ids, Ingress};
+
+const USAGE: &str = "usage:
+  venue-sim seed  --ingress ADDR --catalogue FILE
+  venue-sim web   --ingress ADDR --feed ADDR --catalogue FILE [--listen 127.0.0.1:8080]
+  venue-sim maker --ingress ADDR --feed ADDR [--account 10] [--size 10] [--spread 1] [--interval-ms 700] [--seed 1]
+  venue-sim taker --ingress ADDR --feed ADDR [--account 20] [--max-quantity 5] [--chance 250] [--sweep-chance 30]
+                  [--interval-ms 1000] [--seed 2]
+
+Every flag can also be given as VENUE_<FLAG> in the environment, for example VENUE_INGRESS or VENUE_INTERVAL_MS.";
+
+struct Args(BTreeMap<String, String>);
+
+impl Args {
+    fn parse(args: &[String]) -> Result<Self, Error> {
+        let mut values = BTreeMap::new();
+        let mut it = args.iter();
+        while let Some(flag) = it.next() {
+            let key = flag.strip_prefix("--").ok_or_else(|| format!("unexpected argument {flag}\n{USAGE}"))?;
+            let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
+            values.insert(key.to_string(), value.clone());
+        }
+        Ok(Self(values))
+    }
+
+    /// A flag, else `VENUE_<FLAG>` from the environment, else the default.
+    fn get(&self, key: &str, default: Option<&str>) -> Result<String, Error> {
+        if let Some(v) = self.0.get(key) {
+            return Ok(v.clone());
+        }
+        let env = format!("VENUE_{}", key.to_uppercase().replace('-', "_"));
+        std::env::var(&env)
+            .ok()
+            .or_else(|| default.map(str::to_string))
+            .ok_or_else(|| Error::from(format!("--{key} (or {env}) is required")))
+    }
+
+    fn number(&self, key: &str, default: u64) -> Result<u64, Error> {
+        Ok(self.get(key, Some(default.to_string().as_str()))?.parse()?)
+    }
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(command) = args.first() else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(64);
+    };
+    let outcome = Args::parse(&args[1..]).and_then(|a| match command.as_str() {
+        "seed" => seed(&a),
+        "web" => web(&a),
+        "maker" => maker(&a),
+        "taker" => taker(&a),
+        _ => Err(USAGE.into()),
+    });
+    match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("venue-sim: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Lists the demo markets and funds the accounts, waiting up to two minutes for the core to accept connections.
+fn seed(args: &Args) -> Result<(), Error> {
+    let catalogue = Catalogue::load(&args.get("catalogue", None)?)?;
+    let mut ingress = Ingress::new(&args.get("ingress", None)?);
+    let mut inputs = catalogue.seed()?.into_iter().peekable();
+    let mut attempts = 0;
+    while let Some(input) = inputs.peek() {
+        match ingress.send(input.clone()) {
+            Ok(results) => {
+                for r in results.iter().filter(|r| r["msg"] == "CommandApplied") {
+                    println!("{} {}", r["commandId"].as_str().unwrap_or(""), r["outcome"].as_str().unwrap_or(""));
+                }
+                inputs.next();
+            }
+            // Resending an input the core already took is answered DUPLICATE, so a retry is safe.
+            Err(e) if attempts < 60 => {
+                attempts += 1;
+                eprintln!("waiting for the core: {e}");
+                thread::sleep(Duration::from_secs(2));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn web(args: &Args) -> Result<(), Error> {
+    let catalogue = Catalogue::load(&args.get("catalogue", None)?)?;
+    let live = view::Live::follow(&args.get("feed", None)?);
+    let app = web::Web::new(catalogue, live, Ingress::new(&args.get("ingress", None)?), Ids::new('w')?);
+    web::serve(&args.get("listen", Some("127.0.0.1:8080"))?, Arc::new(app))
+}
+
+fn maker(args: &Args) -> Result<(), Error> {
+    let config = bots::Maker {
+        account: args.number("account", 10)?,
+        size: args.number("size", 10)?,
+        half_spread: args.number("spread", 1)?,
+        interval: Duration::from_millis(args.number("interval-ms", 700)?),
+        seed: args.number("seed", 1)?,
+    };
+    let live = view::Live::follow(&args.get("feed", None)?);
+    bots::maker(&args.get("ingress", None)?, &live, &config, Ids::new('m')?)
+}
+
+fn taker(args: &Args) -> Result<(), Error> {
+    let config = bots::Taker {
+        account: args.number("account", 20)?,
+        max_quantity: args.number("max-quantity", 5)?,
+        per_mille: args.number("chance", 250)?,
+        sweep_per_mille: args.number("sweep-chance", 30)?,
+        interval: Duration::from_millis(args.number("interval-ms", 1000)?),
+        seed: args.number("seed", 2)?,
+    };
+    let live = view::Live::follow(&args.get("feed", None)?);
+    bots::taker(&args.get("ingress", None)?, &live, &config, Ids::new('t')?)
+}

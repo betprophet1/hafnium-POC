@@ -204,6 +204,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "venue-sim"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "venue-harness",
+ "venue-node",
+]
+
+[[package]]
 name = "venue_journal"
 version = "0.1.0"
 

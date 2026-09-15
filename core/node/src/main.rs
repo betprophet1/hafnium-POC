@@ -12,14 +12,14 @@ use venue_node::frames::{read_frame, write_frame, MAX_FRAME};
 use venue_node::node::{self, Config, Error};
 
 const USAGE: &str = "usage:
-  venue-node serve [--listen ADDR] [--data DIR] [--group N] [--node-id N] [--tick-ms N] [--fsync]
+  venue-node serve [--listen ADDR] [--feed ADDR] [--data DIR] [--group N] [--node-id N] [--tick-ms N] [--fsync]
   venue-node send ADDR [INPUTS]            JSON inputs (an array, or one per line; stdin without a file);
                                            prints each result as a JSON line
   venue-node replay JOURNAL RESULTS        runs a journal through a fresh engine and writes its result log
   venue-node dump FILE                     prints a journal or result log as JSON lines
   venue-node import VECTORS JOURNAL        writes a compiled scenario's inputs, as stamped, as a journal
 
-serve reads VENUE_LISTEN, VENUE_DATA, VENUE_GROUP, VENUE_NODE_ID and VENUE_TICK_MS; flags override them.";
+serve reads VENUE_LISTEN, VENUE_FEED, VENUE_DATA, VENUE_GROUP, VENUE_NODE_ID and VENUE_TICK_MS; flags override them.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -48,6 +48,7 @@ fn main() -> ExitCode {
 fn serve(args: &[String]) -> Result<(), Error> {
     let env = |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.to_string());
     let mut listen = env("VENUE_LISTEN", "0.0.0.0:7101");
+    let mut feed = env("VENUE_FEED", "0.0.0.0:7102");
     let mut data = env("VENUE_DATA", "./venue-data");
     let mut group = env("VENUE_GROUP", "1");
     let mut node_id = env("VENUE_NODE_ID", "1");
@@ -58,6 +59,7 @@ fn serve(args: &[String]) -> Result<(), Error> {
         let mut value = || it.next().cloned().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
             "--listen" => listen = value()?,
+            "--feed" => feed = value()?,
             "--data" => data = value()?,
             "--group" => group = value()?,
             "--node-id" => node_id = value()?,
@@ -68,6 +70,7 @@ fn serve(args: &[String]) -> Result<(), Error> {
     }
     let config = Config {
         listen: listen.parse()?,
+        feed: feed.parse()?,
         data_dir: PathBuf::from(data),
         group: group.parse()?,
         node_id: node_id.parse()?,
