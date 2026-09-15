@@ -230,6 +230,15 @@ impl Hub {
                     });
                     self.send_to_account(u(&r["accountId"]), sequence, payout.to_string());
                 }
+                // A set burn: complete sets the account held went back as cash (spec E-14.3), which would
+                // otherwise show only as positions falling and cash rising.
+                "CollateralReleased" => {
+                    let release = json!({
+                        "type": "release", "sequence": id(sequence), "eventId": id(u(&r["eventId"])),
+                        "kind": lower(&r["kind"]), "cents": r["cents"]
+                    });
+                    self.send_to_account(u(&r["accountId"]), sequence, release.to_string());
+                }
                 "Fill" => {
                     let trade = json!({
                         "type": "trade", "sequence": id(sequence), "instrumentId": id(instrument),

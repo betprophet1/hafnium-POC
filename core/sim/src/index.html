@@ -292,6 +292,7 @@ function onMessage(s, msg) {
         : `${s.label}: paid ${money(msg.cents)} for ${Math.abs(msg.positionClosed)} contracts`, msg.cents < 0 ? 'bad' : 'ok');
       soon(s);
       break;
+    case 'release': toast(`${s.label}: complete sets returned ${money(msg.cents)}`, 'ok'); soon(s); break;
     case 'book': books[msg.instrumentId] = msg; if (msg.instrumentId === selInst) renderBook(); renderPills(); renderRetail(); break;
     case 'trade': {
       const list = trades[msg.instrumentId] = trades[msg.instrumentId] || [];

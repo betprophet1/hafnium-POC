@@ -37,6 +37,7 @@ channels:
       execution: { $ref: '#/components/messages/execution' }
       account: { $ref: '#/components/messages/account' }
       payout: { $ref: '#/components/messages/payout' }
+      release: { $ref: '#/components/messages/release' }
       resync: { $ref: '#/components/messages/resync' }
 operations:
   receiveLogin:
@@ -120,6 +121,11 @@ operations:
     channel: { $ref: '#/channels/session' }
     summary: After login, settlement payouts to the account.
     messages: [{ $ref: '#/channels/session/messages/payout' }]
+  sendRelease:
+    action: send
+    channel: { $ref: '#/channels/session' }
+    summary: After login, complete sets of the account's contracts returned as cash after a fill.
+    messages: [{ $ref: '#/channels/session/messages/release' }]
   sendResync:
     action: send
     channel: { $ref: '#/channels/session' }
@@ -326,6 +332,20 @@ components:
           kind: { type: string, enum: [resolved, void] }
           positionClosed: { type: integer, description: 0 for a void; positions close through the account message. }
           cents: { type: integer, description: Negative when a void takes back more than it returns. }
+    release:
+      summary: >-
+        After a fill, complete sets the account holds and has not offered for sale are returned as cash (spec
+        E-14.3): one YES on every outcome of an event pays $1.00 in any outcome, one NO on every outcome of an
+        N-outcome event pays $(N − 1). The matching positions fall in the account message of the same sequence.
+      payload:
+        type: object
+        required: [type, sequence, eventId, kind, cents]
+        properties:
+          type: { const: release }
+          sequence: { $ref: './openapi.yaml#/components/schemas/Id' }
+          eventId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          kind: { type: string, enum: [yes_set_burn, no_set_burn] }
+          cents: { type: integer, minimum: 1 }
     resync:
       payload:
         type: object
