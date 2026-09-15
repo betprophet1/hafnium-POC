@@ -1,0 +1,49 @@
+{
+  "name": "Orders expiring together go in order ID order; one cancelled first does not go again",
+  "rules": ["E-8.1", "E-12.5", "E-12.1"],
+  "notes": [
+    "A bids 1 at 10c, 1 at 11c and 1 at 12c, each GTD and each set to expire at the same moment, and 1 at 13c expiring later. Reserved is 10 + 11 + 12 + 13 = 46, available 10000 - 46 = 9954.",
+    "Cancelling the 12c bid releases 12 (E-12.1): reserved 34, available 9966. Its expiry is now due at a moment when the order is already gone.",
+    "Amending the 13c bid to 14c changes the price, so it loses priority and rests again (E-12.5); the reservation moves from 13 to 14: reserved 35, available 9965. Its expiry is unchanged.",
+    "The tick at the shared expiry cancels the 10c bid and then the 11c bid, ascending (expiresAt, orderId) (E-8.1). The cancelled 12c bid is not cancelled a second time. Reserved 35 - 10 - 11 = 14, available 9986.",
+    "The last tick is at the 14c bid's expiry: it is cancelled once, however many times it rested. Reserved 0, available 10000."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000},
+    {"op": "fund", "accountId": 1, "cents": 10000}
+  ],
+  "steps": [
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a1", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1, "timeInForce": "GTD", "expiresAfterNs": 10000000}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a2", "instrumentId": 1000, "side": "BUY", "tick": 10, "quantity": 1, "timeInForce": "GTD", "expiresAfterNs": 9000000}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a3", "instrumentId": 1000, "side": "BUY", "tick": 11, "quantity": 1, "timeInForce": "GTD", "expiresAfterNs": 8000000}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a4", "instrumentId": 1000, "side": "BUY", "tick": 12, "quantity": 1, "timeInForce": "GTD", "expiresAfterNs": 30000000}, "expect": null},
+    {"input": {"msg": "CancelOrder", "accountId": 1, "instrumentId": 1000, "orderId": "O3"},
+     "expect": [
+       {"msg": "OrderCancelled", "orderId": "O3", "accountId": 1, "instrumentId": 1000, "cancelledQuantity": 1, "reason": "CLIENT_REQUEST"},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9966, "reservedCents": 34},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 11, "quantity": 0, "orderCount": 0}
+     ]},
+    {"input": {"msg": "AmendOrder", "accountId": 1, "instrumentId": 1000, "orderId": "O4", "newTick": 13},
+     "expect": [
+       {"msg": "OrderAmended", "orderId": "O4", "accountId": 1, "instrumentId": 1000, "tick": 13, "quantity": 1, "atEventStart": "CANCEL", "priorityKept": "FALSE"},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9965, "reservedCents": 35},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 12, "quantity": 0, "orderCount": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 13, "quantity": 1, "orderCount": 1}
+     ]},
+    {"input": {"msg": "TimeTick"}, "advanceNs": 5000000,
+     "expect": [
+       {"msg": "OrderCancelled", "orderId": "O1", "accountId": 1, "instrumentId": 1000, "cancelledQuantity": 1, "reason": "EXPIRED"},
+       {"msg": "OrderCancelled", "orderId": "O2", "accountId": 1, "instrumentId": 1000, "cancelledQuantity": 1, "reason": "EXPIRED"},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9986, "reservedCents": 14},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 0, "orderCount": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 10, "quantity": 0, "orderCount": 0}
+     ]},
+    {"input": {"msg": "TimeTick"}, "advanceNs": 23000000,
+     "expect": [
+       {"msg": "OrderCancelled", "orderId": "O4", "accountId": 1, "instrumentId": 1000, "cancelledQuantity": 1, "reason": "EXPIRED"},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 10000, "reservedCents": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 13, "quantity": 0, "orderCount": 0}
+     ]}
+  ]
+}
