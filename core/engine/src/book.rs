@@ -344,6 +344,9 @@ impl<'a> Engine<'a> {
             self.order_w(old_head)?.account_prev = slot;
         }
         self.index_insert(o.id, slot)?;
+        if let Some(at) = o.expires_at {
+            self.gtd_push((at, o.id))?;
+        }
         self.resting_orders = self.resting_orders.checked_add(1).ok_or(FailStop::Overflow)?;
         Ok(())
     }
@@ -423,6 +426,39 @@ impl<'a> Engine<'a> {
         });
         scratch[..n].sort_unstable();
         n
+    }
+
+    // ------------------------------------------------------------------ orders that expire (E-8.1)
+
+    /// Records that a resting order expires, compacting first if there is no room.
+    pub(crate) fn gtd_push(&mut self, entry: (u64, u64)) -> Result<(), FailStop> {
+        if self.gtd_len == self.gtd.len() {
+            self.gtd_compact();
+        }
+        if heap_push(self.gtd, &mut self.gtd_len, entry) {
+            Ok(())
+        } else {
+            Err(FailStop::Capacity)
+        }
+    }
+
+    /// The earliest record, taken off the heap, if it has expired by `now`.
+    pub(crate) fn gtd_pop_due(&mut self, now: u64) -> Option<(u64, u64)> {
+        heap_pop_due(self.gtd, &mut self.gtd_len, now)
+    }
+
+    /// Drops records whose order has gone, or no longer expires when the record says, and keeps one record per
+    /// order: an amendment that loses priority rests the order again (E-12.5), which records it again. What is left
+    /// is one record per resting order that expires, so it can never outnumber the orders, which is half the heap,
+    /// and so compacting a full heap always makes room.
+    fn gtd_compact(&mut self) {
+        let Self { gtd, gtd_len, order_index, orders, .. } = self;
+        heap_compact(gtd, gtd_len, |(at, id)| {
+            order_index.get(&id).is_some_and(|&slot| {
+                let o = &orders[slot as usize];
+                o.in_use && o.expires_at == Some(at)
+            })
+        });
     }
 
     // ------------------------------------------------------------------ holdings, locks and reservations (§11)
@@ -509,5 +545,165 @@ impl<'a> Engine<'a> {
             self.order_w(slot)?.reserved = 0;
         }
         Ok(())
+    }
+}
+
+// -------------------------------------------------------------------------- the expiry heap (E-8.1)
+//
+// A min-heap of `(expiresAt, orderId)` in `heap[..len]`. Ordering by the pair is what makes the expiries happen in
+// the order the rules require, and the smallest is always at the front, so a tick pays for what expired rather
+// than for every order that rests.
+
+/// Adds `entry`. False if the heap is full, which is the caller's signal to compact.
+fn heap_push(heap: &mut [(u64, u64)], len: &mut usize, entry: (u64, u64)) -> bool {
+    if *len == heap.len() {
+        return false;
+    }
+    heap[*len] = entry;
+    *len += 1;
+    let mut i = *len - 1;
+    while i > 0 {
+        let parent = (i - 1) / 2;
+        if heap[parent] <= heap[i] {
+            break;
+        }
+        heap.swap(parent, i);
+        i = parent;
+    }
+    true
+}
+
+/// The smallest entry, taken off the heap, if it has expired by `now`.
+fn heap_pop_due(heap: &mut [(u64, u64)], len: &mut usize, now: u64) -> Option<(u64, u64)> {
+    if *len == 0 {
+        return None;
+    }
+    let first = heap[0];
+    if first.0 > now {
+        return None;
+    }
+    *len -= 1;
+    heap[0] = heap[*len];
+    heap_sift_down(heap, *len, 0);
+    Some(first)
+}
+
+fn heap_sift_down(heap: &mut [(u64, u64)], len: usize, mut i: usize) {
+    loop {
+        let (left, right) = (2 * i + 1, 2 * i + 2);
+        let mut smallest = i;
+        if left < len && heap[left] < heap[smallest] {
+            smallest = left;
+        }
+        if right < len && heap[right] < heap[smallest] {
+            smallest = right;
+        }
+        if smallest == i {
+            return;
+        }
+        heap.swap(i, smallest);
+        i = smallest;
+    }
+}
+
+/// Keeps the entries `live` accepts, one copy of each.
+fn heap_compact(heap: &mut [(u64, u64)], len: &mut usize, mut live: impl FnMut((u64, u64)) -> bool) {
+    let mut n = 0;
+    for i in 0..*len {
+        let entry = heap[i];
+        if live(entry) {
+            heap[n] = entry;
+            n += 1;
+        }
+    }
+    // An order's expiry never changes, so its entries are all the same pair and sorting puts them side by side.
+    heap[..n].sort_unstable();
+    let mut m = 0;
+    for i in 0..n {
+        if m == 0 || heap[m - 1] != heap[i] {
+            heap[m] = heap[i];
+            m += 1;
+        }
+    }
+    // Sorted is already a heap, so there is nothing to rebuild.
+    *len = m;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{heap_compact, heap_pop_due, heap_push};
+
+    #[test]
+    fn entries_come_back_by_expiry_then_order_id() {
+        let mut heap = [(0u64, 0u64); 8];
+        let mut len = 0;
+        for entry in [(30, 2), (10, 5), (30, 1), (20, 9)] {
+            assert!(heap_push(&mut heap, &mut len, entry));
+        }
+        let mut got = [(0u64, 0u64); 4];
+        for slot in &mut got {
+            *slot = heap_pop_due(&mut heap, &mut len, 100).unwrap();
+        }
+        // The order a tick must expire them in, which is also what the table scan used to produce.
+        assert_eq!(got, [(10, 5), (20, 9), (30, 1), (30, 2)]);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn nothing_comes_back_before_its_time() {
+        let mut heap = [(0u64, 0u64); 4];
+        let mut len = 0;
+        assert!(heap_push(&mut heap, &mut len, (100, 1)));
+        assert!(heap_push(&mut heap, &mut len, (50, 2)));
+        assert_eq!(heap_pop_due(&mut heap, &mut len, 49), None);
+        assert_eq!(heap_pop_due(&mut heap, &mut len, 50), Some((50, 2)));
+        assert_eq!(heap_pop_due(&mut heap, &mut len, 99), None);
+        assert_eq!(heap_pop_due(&mut heap, &mut len, 100), Some((100, 1)));
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn compacting_drops_dead_entries_and_keeps_one_of_each() {
+        // An amendment that loses priority rests the order again (E-12.5), recording it again, so the same pair
+        // can appear several times; order 2 is one that has since been cancelled or filled.
+        let mut heap = [(0u64, 0u64); 8];
+        let mut len = 0;
+        for entry in [(10, 1), (10, 1), (20, 2), (30, 3), (10, 1), (30, 3)] {
+            assert!(heap_push(&mut heap, &mut len, entry));
+        }
+        heap_compact(&mut heap, &mut len, |(_, id)| id != 2);
+        assert_eq!(len, 2);
+        assert_eq!(heap_pop_due(&mut heap, &mut len, 100), Some((10, 1)));
+        assert_eq!(heap_pop_due(&mut heap, &mut len, 100), Some((30, 3)));
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn a_full_heap_refuses_and_compacting_makes_room() {
+        let mut heap = [(0u64, 0u64); 4];
+        let mut len = 0;
+        for id in 0..4u64 {
+            assert!(heap_push(&mut heap, &mut len, (10, id)));
+        }
+        assert!(!heap_push(&mut heap, &mut len, (10, 4)));
+        heap_compact(&mut heap, &mut len, |(_, id)| id == 0);
+        assert_eq!(len, 1);
+        assert!(heap_push(&mut heap, &mut len, (10, 4)));
+        assert_eq!(heap_pop_due(&mut heap, &mut len, 10), Some((10, 0)));
+        assert_eq!(heap_pop_due(&mut heap, &mut len, 10), Some((10, 4)));
+    }
+
+    #[test]
+    fn compacting_all_live_distinct_entries_keeps_them_all() {
+        // The engine sizes the heap at twice the orders, and one resting order leaves one live entry, so a
+        // compaction can never be asked to fit more than half a heap.
+        let mut heap = [(0u64, 0u64); 8];
+        let mut len = 0;
+        for id in 0..4u64 {
+            assert!(heap_push(&mut heap, &mut len, (100 - id, id)));
+        }
+        heap_compact(&mut heap, &mut len, |_| true);
+        assert_eq!(len, 4);
+        assert_eq!(heap_pop_due(&mut heap, &mut len, 100), Some((97, 3)));
     }
 }

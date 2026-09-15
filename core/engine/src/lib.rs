@@ -120,6 +120,10 @@ pub struct Engine<'a> {
     expiry: &'a mut [(u64, (u64, [u8; 32]))],
     expiry_head: usize,
     expiry_len: usize,
+    /// `(expiresAt, orderId)` for the resting orders that expire, as a min-heap, so E-8.1 costs what expires
+    /// rather than what rests.
+    gtd: &'a mut [(u64, u64)],
+    gtd_len: usize,
     commands: FixedMap<'a, [u8; 16], ()>,
     order_groups: FixedMap<'a, (u64, u32), OrderGroup>,
     maker_settings: FixedMap<'a, HoldingKey, MakerSetting>,
@@ -199,6 +203,8 @@ impl<'a> Engine<'a> {
             expiry: memory.expiry,
             expiry_head: 0,
             expiry_len: 0,
+            gtd: memory.gtd,
+            gtd_len: 0,
             commands: cap(FixedMap::new(memory.commands, seed))?,
             order_groups: cap(FixedMap::new(memory.order_groups, seed))?,
             maker_settings: cap(FixedMap::new(memory.maker_settings, seed))?,
@@ -286,13 +292,15 @@ impl<'a> Engine<'a> {
     // ------------------------------------------------------------------ sequencer events (§8)
 
     fn on_time_tick<S: ResultSink>(&mut self, sink: &mut S) -> Result<(), FailStop> {
-        // E-8.1
-        if self.resting_orders > 0 {
-            let now = self.now;
-            let n = self.collect(|o, _| o.expires_at.is_some_and(|at| at <= now), |o| o.expires_at.unwrap_or(0));
-            for i in 0..n {
-                let id = self.scratch[i].1;
-                let slot = *self.order_index.get(&id).ok_or(FailStop::Inconsistent)?;
+        // E-8.1: the heap hands back what expires in `(expiresAt, orderId)` order, which is the order they must go
+        // in, and the work is what actually expired instead of every resting order.
+        let now = self.now;
+        while let Some((at, id)) = self.gtd_pop_due(now) {
+            // A record outlives an order cancelled or filled before its time, so only an order that still rests and
+            // still expires then goes here.
+            let Some(&slot) = self.order_index.get(&id) else { continue };
+            let o = self.orders[slot as usize];
+            if o.in_use && o.expires_at == Some(at) {
                 self.remove(slot, emit::CancelReason::EXPIRED, sink)?;
             }
         }

@@ -276,6 +276,11 @@ pub struct Memory<'a> {
     /// from the front instead of scanning the table. At least `duplicates` slots: a full table and a tick's
     /// recordings must both fit.
     pub expiry: &'a mut [(u64, (u64, ClientOrderId))],
+    /// An `(expiresAt, orderId)` min-heap of the resting orders that expire, so E-8.1 takes them from the front
+    /// instead of walking every order each tick. Twice `orders`: an order cancelled or filled before it expires
+    /// leaves its record behind, and since the live records can never outnumber `orders`, compacting when the heap
+    /// is full always at least halves it.
+    pub gtd: &'a mut [(u64, u64)],
     pub commands: &'a mut [Slot<CommandId, ()>],
     pub order_groups: &'a mut [Slot<(u64, u32), OrderGroup>],
     pub maker_settings: &'a mut [Slot<HoldingKey, MakerSetting>],
