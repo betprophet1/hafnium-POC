@@ -136,10 +136,6 @@
       <validValue name="NEW">0</validValue>
       <validValue name="CANCEL">1</validValue>
     </enum>
-    <enum name="BasketDirection" encodingType="uint8">
-      <validValue name="MINT">0</validValue>
-      <validValue name="REDEEM">1</validValue>
-    </enum>
     <enum name="SeedPurpose" encodingType="uint8">
       <validValue name="CLIENT_ORDER_ID_HASH">0</validValue>
       <validValue name="PRNG">1</validValue>
@@ -232,7 +228,6 @@
       <validValue name="PROTOCOL_VERSION">20</validValue>
       <validValue name="INVALID_COMMAND">21</validValue>
       <validValue name="ORDER_GROUP_TRIGGERED">22</validValue>
-      <validValue name="INSUFFICIENT_POSITION" description="A basket redeem without enough unlocked contracts in every book">23</validValue>
     </enum>
     <enum name="CancelReason" encodingType="uint8">
       <validValue name="CLIENT_REQUEST">0</validValue>
@@ -326,16 +321,6 @@
       <field name="enteredStakeCents" id="25" type="OptionalCents"/>
       <field name="clientOrderGroup" id="26" type="OptionalGroupRef"/>
     </group>
-  </sbe:message>
-
-  <sbe:message name="BasketMintRedeem" id="6" description="Explicit mint or redeem of one contract of every outcome of an event">
-    <field name="record" id="1" type="RecordHeader"/>
-    <field name="sessionId" id="2" type="SessionId"/>
-    <field name="accountId" id="3" type="AccountId"/>
-    <field name="clientOrderId" id="4" type="ClientOrderId"/>
-    <field name="eventId" id="5" type="EventId"/>
-    <field name="quantity" id="6" type="Quantity"/>
-    <field name="direction" id="7" type="BasketDirection"/>
   </sbe:message>
 
   <sbe:message name="SetOrderGroup" id="7" description="Creates or changes a client order group's fill limit; a limit of 0 removes it">
@@ -637,17 +622,6 @@
     <field name="kind" id="4" type="ResolutionKind"/>
     <field name="positionClosed" id="5" type="SignedContracts"/>
     <field name="cents" id="6" type="Cents" description="$1.00 per contract paying in the winning state; on VOID, the event's net cash returned to the account, negative when it took more out than it put in"/>
-  </sbe:message>
-
-  <sbe:message name="BasketApplied" id="113" description="A basket mint or redeem was carried out">
-    <field name="result" id="1" type="ResultHeader"/>
-    <field name="accountId" id="2" type="AccountId"/>
-    <field name="sessionId" id="3" type="SessionId"/>
-    <field name="clientOrderId" id="4" type="ClientOrderId"/>
-    <field name="eventId" id="5" type="EventId"/>
-    <field name="quantity" id="6" type="Quantity"/>
-    <field name="direction" id="7" type="BasketDirection"/>
-    <field name="cashCents" id="8" type="Cents"/>
   </sbe:message>
 
   <sbe:message name="OrderGroupUpdated" id="114" description="A client order group was set, reset or triggered">

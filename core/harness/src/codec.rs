@@ -24,7 +24,6 @@ pub fn encode(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
         Some("AmendOrder") => encode_amend_order(v, buf),
         Some("MassCancel") => encode_mass_cancel(v, buf),
         Some("BatchOrders") => encode_batch_orders(v, buf),
-        Some("BasketMintRedeem") => encode_basket_mint_redeem(v, buf),
         Some("SetOrderGroup") => encode_set_order_group(v, buf),
         Some("ResetOrderGroup") => encode_reset_order_group(v, buf),
         Some("TimeTick") => encode_time_tick(v, buf),
@@ -58,7 +57,6 @@ pub fn encode(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
         Some("BookLevelChanged") => encode_book_level_changed(v, buf),
         Some("MarketStateChanged") => encode_market_state_changed(v, buf),
         Some("SettlementPayout") => encode_settlement_payout(v, buf),
-        Some("BasketApplied") => encode_basket_applied(v, buf),
         Some("OrderGroupUpdated") => encode_order_group_updated(v, buf),
         Some("CommandApplied") => encode_command_applied(v, buf),
         other => Err(format!("unknown message {other:?}")),
@@ -77,7 +75,6 @@ pub fn decode(buf: &[u8]) -> Result<Value, String> {
         amend_order_codec::SBE_TEMPLATE_ID => decode_amend_order(header, buf),
         mass_cancel_codec::SBE_TEMPLATE_ID => decode_mass_cancel(header, buf),
         batch_orders_codec::SBE_TEMPLATE_ID => decode_batch_orders(header, buf),
-        basket_mint_redeem_codec::SBE_TEMPLATE_ID => decode_basket_mint_redeem(header, buf),
         set_order_group_codec::SBE_TEMPLATE_ID => decode_set_order_group(header, buf),
         reset_order_group_codec::SBE_TEMPLATE_ID => decode_reset_order_group(header, buf),
         time_tick_codec::SBE_TEMPLATE_ID => decode_time_tick(header, buf),
@@ -111,7 +108,6 @@ pub fn decode(buf: &[u8]) -> Result<Value, String> {
         book_level_changed_codec::SBE_TEMPLATE_ID => decode_book_level_changed(header, buf),
         market_state_changed_codec::SBE_TEMPLATE_ID => decode_market_state_changed(header, buf),
         settlement_payout_codec::SBE_TEMPLATE_ID => decode_settlement_payout(header, buf),
-        basket_applied_codec::SBE_TEMPLATE_ID => decode_basket_applied(header, buf),
         order_group_updated_codec::SBE_TEMPLATE_ID => decode_order_group_updated(header, buf),
         command_applied_codec::SBE_TEMPLATE_ID => decode_command_applied(header, buf),
         other => Err(format!("unknown template {other}")),
@@ -134,15 +130,6 @@ fn enum_at_event_start(v: &Value, k: &str) -> Result<at_event_start::AtEventStar
         "KEEP" => Ok(at_event_start::AtEventStart::KEEP),
         "UNCHANGED" => Ok(at_event_start::AtEventStart::UNCHANGED),
         other => Err(format!("{k}: {other} is not a AtEventStart")),
-    }
-}
-
-fn enum_basket_direction(v: &Value, k: &str) -> Result<basket_direction::BasketDirection, String> {
-    match js(v, k) {
-        "" => Ok(basket_direction::BasketDirection::MINT),
-        "MINT" => Ok(basket_direction::BasketDirection::MINT),
-        "REDEEM" => Ok(basket_direction::BasketDirection::REDEEM),
-        other => Err(format!("{k}: {other} is not a BasketDirection")),
     }
 }
 
@@ -330,7 +317,6 @@ fn enum_reject_reason(v: &Value, k: &str) -> Result<reject_reason::RejectReason,
         "PROTOCOL_VERSION" => Ok(reject_reason::RejectReason::PROTOCOL_VERSION),
         "INVALID_COMMAND" => Ok(reject_reason::RejectReason::INVALID_COMMAND),
         "ORDER_GROUP_TRIGGERED" => Ok(reject_reason::RejectReason::ORDER_GROUP_TRIGGERED),
-        "INSUFFICIENT_POSITION" => Ok(reject_reason::RejectReason::INSUFFICIENT_POSITION),
         other => Err(format!("{k}: {other} is not a RejectReason")),
     }
 }
@@ -659,45 +645,6 @@ fn decode_batch_orders<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: &'a [
     }
     dec = g.parent().map_err(sbe_err)?;
     m.insert("entries".into(), Value::Array(arr));
-    let _ = &mut dec;
-    Ok(Value::Object(m))
-}
-
-fn encode_basket_mint_redeem(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
-    let mut enc = basket_mint_redeem_codec::BasketMintRedeemEncoder::default().wrap(WriteBuf::new(buf), message_header_codec::ENCODED_LENGTH);
-    enc = enc.header(0).parent().map_err(sbe_err)?;
-    let cv = &v["record"];
-    let mut c = enc.record_encoder();
-    c.sequence(ju(cv, "sequence") as u64);
-    c.sequenced_at(ju(cv, "sequencedAt") as u64);
-    c.sequencer_group(ju(cv, "sequencerGroup") as u16);
-    enc = c.parent().map_err(sbe_err)?;
-    enc.session_id(ju(v, "sessionId") as u64);
-    enc.account_id(ju(v, "accountId") as u64);
-    enc.client_order_id_zero_padded(js(v, "clientOrderId").as_bytes());
-    enc.event_id(ju(v, "eventId") as u64);
-    enc.quantity(ju(v, "quantity") as u32);
-    enc.direction(enum_basket_direction(v, "direction")?);
-    Ok(enc.get_limit())
-}
-
-fn decode_basket_mint_redeem<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: &'a [u8]) -> Result<Value, String> {
-    let mut m = Map::new();
-    m.insert("msg".into(), json!("BasketMintRedeem"));
-    let mut dec = basket_mint_redeem_codec::BasketMintRedeemDecoder::default().header(header, 0);
-    let mut c = dec.record_decoder();
-    let mut cm = Map::new();
-    cm.insert("sequence".into(), json!(c.sequence()));
-    cm.insert("sequencedAt".into(), json!(c.sequenced_at()));
-    cm.insert("sequencerGroup".into(), json!(c.sequencer_group()));
-    dec = c.parent().map_err(sbe_err)?;
-    m.insert("record".into(), Value::Object(cm));
-    m.insert("sessionId".into(), json!(dec.session_id()));
-    m.insert("accountId".into(), json!(dec.account_id()));
-    m.insert("clientOrderId".into(), json!(bytes_str(&dec.client_order_id())));
-    m.insert("eventId".into(), json!(dec.event_id()));
-    m.insert("quantity".into(), json!(dec.quantity()));
-    m.insert("direction".into(), json!(dec.direction().to_string()));
     let _ = &mut dec;
     Ok(Value::Object(m))
 }
@@ -1970,49 +1917,6 @@ fn decode_settlement_payout<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: 
     m.insert("kind".into(), json!(dec.kind().to_string()));
     m.insert("positionClosed".into(), json!(dec.position_closed()));
     m.insert("cents".into(), json!(dec.cents()));
-    let _ = &mut dec;
-    Ok(Value::Object(m))
-}
-
-fn encode_basket_applied(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
-    let mut enc = basket_applied_codec::BasketAppliedEncoder::default().wrap(WriteBuf::new(buf), message_header_codec::ENCODED_LENGTH);
-    enc = enc.header(0).parent().map_err(sbe_err)?;
-    let cv = &v["result"];
-    let mut c = enc.result_encoder();
-    c.input_sequence(ju(cv, "inputSequence") as u64);
-    c.result_index(ju(cv, "resultIndex") as u32);
-    c.sequenced_at(ju(cv, "sequencedAt") as u64);
-    c.sequencer_group(ju(cv, "sequencerGroup") as u16);
-    enc = c.parent().map_err(sbe_err)?;
-    enc.account_id(ju(v, "accountId") as u64);
-    enc.session_id(ju(v, "sessionId") as u64);
-    enc.client_order_id_zero_padded(js(v, "clientOrderId").as_bytes());
-    enc.event_id(ju(v, "eventId") as u64);
-    enc.quantity(ju(v, "quantity") as u32);
-    enc.direction(enum_basket_direction(v, "direction")?);
-    enc.cash_cents(ji(v, "cashCents") as i64);
-    Ok(enc.get_limit())
-}
-
-fn decode_basket_applied<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: &'a [u8]) -> Result<Value, String> {
-    let mut m = Map::new();
-    m.insert("msg".into(), json!("BasketApplied"));
-    let mut dec = basket_applied_codec::BasketAppliedDecoder::default().header(header, 0);
-    let mut c = dec.result_decoder();
-    let mut cm = Map::new();
-    cm.insert("inputSequence".into(), json!(c.input_sequence()));
-    cm.insert("resultIndex".into(), json!(c.result_index()));
-    cm.insert("sequencedAt".into(), json!(c.sequenced_at()));
-    cm.insert("sequencerGroup".into(), json!(c.sequencer_group()));
-    dec = c.parent().map_err(sbe_err)?;
-    m.insert("result".into(), Value::Object(cm));
-    m.insert("accountId".into(), json!(dec.account_id()));
-    m.insert("sessionId".into(), json!(dec.session_id()));
-    m.insert("clientOrderId".into(), json!(bytes_str(&dec.client_order_id())));
-    m.insert("eventId".into(), json!(dec.event_id()));
-    m.insert("quantity".into(), json!(dec.quantity()));
-    m.insert("direction".into(), json!(dec.direction().to_string()));
-    m.insert("cashCents".into(), json!(dec.cash_cents()));
     let _ = &mut dec;
     Ok(Value::Object(m))
 }

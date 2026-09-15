@@ -26,8 +26,6 @@ pub enum RejectReason {
     PROTOCOL_VERSION = 0x14_u8, 
     INVALID_COMMAND = 0x15_u8, 
     ORDER_GROUP_TRIGGERED = 0x16_u8, 
-    /// A basket redeem without enough unlocked contracts in every book
-    INSUFFICIENT_POSITION = 0x17_u8, 
     #[default]
     NullVal = 0xff_u8, 
 }
@@ -58,7 +56,6 @@ impl From<u8> for RejectReason {
             0x14_u8 => Self::PROTOCOL_VERSION, 
             0x15_u8 => Self::INVALID_COMMAND, 
             0x16_u8 => Self::ORDER_GROUP_TRIGGERED, 
-            0x17_u8 => Self::INSUFFICIENT_POSITION, 
             _ => Self::NullVal,
         }
     }
@@ -90,7 +87,6 @@ impl From<RejectReason> for u8 {
             RejectReason::PROTOCOL_VERSION => 0x14_u8, 
             RejectReason::INVALID_COMMAND => 0x15_u8, 
             RejectReason::ORDER_GROUP_TRIGGERED => 0x16_u8, 
-            RejectReason::INSUFFICIENT_POSITION => 0x17_u8, 
             RejectReason::NullVal => 0xff_u8,
         }
     }
@@ -124,7 +120,6 @@ impl core::str::FromStr for RejectReason {
             "PROTOCOL_VERSION" => Ok(Self::PROTOCOL_VERSION), 
             "INVALID_COMMAND" => Ok(Self::INVALID_COMMAND), 
             "ORDER_GROUP_TRIGGERED" => Ok(Self::ORDER_GROUP_TRIGGERED), 
-            "INSUFFICIENT_POSITION" => Ok(Self::INSUFFICIENT_POSITION), 
             _ => Ok(Self::NullVal),
         }
     }
@@ -156,7 +151,6 @@ impl core::fmt::Display for RejectReason {
             Self::PROTOCOL_VERSION => write!(f, "PROTOCOL_VERSION"), 
             Self::INVALID_COMMAND => write!(f, "INVALID_COMMAND"), 
             Self::ORDER_GROUP_TRIGGERED => write!(f, "ORDER_GROUP_TRIGGERED"), 
-            Self::INSUFFICIENT_POSITION => write!(f, "INSUFFICIENT_POSITION"), 
             Self::NullVal => write!(f, "NullVal"),
         }
     }

@@ -75,7 +75,7 @@ guarantees = "Routed by the versioned group map (&sect;5); acknowledged only aft
 format = "SBE: client messages and their results"
 status = "specified"
 spec = "interfaces/sbe/venue-journal.xml"
-messages = ["NewOrder", "CancelOrder", "AmendOrder", "MassCancel", "BatchOrders", "BasketMintRedeem", "SetOrderGroup", "ResetOrderGroup", "OrderAccepted", "OrderRejected", "Fill", "OrderCancelled", "OrderAmended", "BasketApplied", "OrderGroupUpdated"]
+messages = ["NewOrder", "CancelOrder", "AmendOrder", "MassCancel", "BatchOrders", "SetOrderGroup", "ResetOrderGroup", "OrderAccepted", "OrderRejected", "Fill", "OrderCancelled", "OrderAmended", "OrderGroupUpdated"]
 
 [[interface]]
 id = 8
@@ -215,7 +215,7 @@ guarantees = "Each result names its input's sequence; regenerated exactly by rep
 format = "SBE: engine results"
 status = "specified"
 spec = "interfaces/sbe/venue-journal.xml"
-messages = ["OrderAccepted", "OrderRejected", "Fill", "OrderCancelled", "OrderAmended", "OrderReduced", "PositionChanged", "SleeveChanged", "CollateralReleased", "BookLevelChanged", "MarketStateChanged", "SettlementPayout", "BasketApplied", "OrderGroupUpdated", "CommandApplied"]
+messages = ["OrderAccepted", "OrderRejected", "Fill", "OrderCancelled", "OrderAmended", "OrderReduced", "PositionChanged", "SleeveChanged", "CollateralReleased", "BookLevelChanged", "MarketStateChanged", "SettlementPayout", "OrderGroupUpdated", "CommandApplied"]
 
 [[interface]]
 id = 21
