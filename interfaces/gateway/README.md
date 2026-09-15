@@ -27,6 +27,10 @@ lose except flood-limit counters, which by design never reach the journal (bluep
 A 503 means the gateway could not get an answer from the sequencer group; the order may or may not exist. Resend
 with the same `clientOrderId`: a committed original comes back as `status: duplicate` with its order ID.
 
+A `clientOrderId` is remembered for **24 hours** per account, across every market (spec E-9.2, D-12). Within that
+window it cannot be reused, even by an order the engine rejected; an order the gateway refused never reached the
+engine and does not use up its ID.
+
 ## Authentication in test environments
 
 Each account in an environment's catalogue has a fixed dev token. REST sends `Authorization: Bearer <token>`;
