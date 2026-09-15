@@ -10,7 +10,8 @@ transport = "HTTPS and WebSocket via CloudFront and ALB"
 carries = "JSON orders and account calls on <code>/v4</code> paths; conflated market-data topics"
 guarantees = "Idempotent on client order ID (&sect;13); a reconnect resumes by sequence"
 format = "OpenAPI 3.1 and AsyncAPI 3"
-status = "planned"
+status = "specified"
+spec = "interfaces/gateway"
 step = 6
 
 [[interface]]

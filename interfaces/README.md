@@ -27,7 +27,8 @@ A store owned by a single service is not an interface. A table or key that two c
 3. Reader contract: exactly-once application and watermarks, for the ledger, ClickHouse, Valkey and surveillance readers.
 4. Service commands and the outbox relay.
 5. Contracts in the venue's own terms: payment, oracle, dummy oracle control, resolution console, session and auth.
-6. Native REST and WebSocket API, including minimum-sequence reads and the environment manifest.
+6. Native REST and WebSocket API, including minimum-sequence reads and the environment manifest. Draft v0 of the
+   gateway (interface 1) in `gateway/`.
 7. Retention exports, signed manifests and the hold register.
 
 Market-maker wire formats (interfaces 2, 3, 4, 5 and the feed side of 8) are drafted but not frozen until

@@ -1,0 +1,422 @@
+openapi: 3.1.0
+info:
+  title: Venue REST API
+  version: 4.0.0-draft.0
+  summary: Interface 1, the REST half of the REST and WebSocket gateway (blueprint §13).
+  description: |
+    Orders and account calls in the venue's own terms. The gateway authenticates and validates every request
+    completely, converts prices and stakes to the journal's tick ordinals and contract counts (blueprint §6), and
+    submits one canonical message to the sequencer group (interface 7). It answers only once the input is committed
+    and its outcome exists (spec E-17.4).
+
+    Two kinds of refusal, never mixed:
+    - An HTTP 4xx or 503 `Error` is the gateway refusing at the edge. Nothing was journaled.
+    - An HTTP 200 `OrderResult` whose `status` is `rejected` is the engine's sequenced decision, replayable from the
+      journal.
+
+    The WebSocket half is `asyncapi.yaml`. Semantics shared by both are in `README.md` beside this file.
+servers:
+  - url: http://127.0.0.1:8080
+    description: The mini venue on a laptop, after `deploy/laptop.sh web`
+security:
+  - devToken: []
+tags:
+  - name: markets
+    description: Public reference data and books
+  - name: account
+    description: The authenticated account's orders, positions and sleeve
+paths:
+  /v4/markets:
+    get:
+      operationId: listMarkets
+      tags: [markets]
+      summary: Events, their markets and price ladders
+      security: []
+      responses:
+        '200':
+          description: Every event the gateway knows, with its markets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Markets' }
+  /v4/markets/{instrumentId}/book:
+    get:
+      operationId: getBook
+      tags: [markets]
+      summary: A snapshot of one book, in YES terms
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/InstrumentId'
+        - name: depth
+          in: query
+          description: Price levels per side.
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: The book at `sequence`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Book' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v4/account:
+    get:
+      operationId: getAccount
+      tags: [account]
+      summary: The account's sleeve, positions and resting orders
+      responses:
+        '200':
+          description: The account at `sequence`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v4/orders:
+    post:
+      operationId: placeOrder
+      tags: [account]
+      summary: Place an order
+      description: |
+        Idempotent on `clientOrderId` within the published window (spec E-9.2): resending returns `status: duplicate`
+        with the original order ID. After a 503 the outcome is unknown; resend with the same `clientOrderId`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderRequest' }
+      responses:
+        '200':
+          description: The sequenced outcome and every execution the input caused for this account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    delete:
+      operationId: cancelAllOrders
+      tags: [account]
+      summary: Cancel every resting order of the account, or those in one market or event
+      parameters:
+        - name: instrumentId
+          in: query
+          schema: { $ref: '#/components/schemas/Id' }
+        - name: eventId
+          in: query
+          schema: { $ref: '#/components/schemas/Id' }
+      responses:
+        '200':
+          description: The cancellations, in ascending order ID. Empty when nothing was in scope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CancelAllResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v4/orders/{orderId}:
+    patch:
+      operationId: amendOrder
+      tags: [account]
+      summary: Change a resting order's price, quantity or event-start behaviour
+      description: A reduction at the same price keeps priority; anything else loses it and may trade (spec E-12.4, E-12.5).
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AmendRequest' }
+      responses:
+        '200':
+          description: The sequenced outcome.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    delete:
+      operationId: cancelOrder
+      tags: [account]
+      summary: Cancel a resting order
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: The sequenced outcome.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+components:
+  securitySchemes:
+    devToken:
+      type: http
+      scheme: bearer
+      description: |
+        Test environments only: a fixed token per account from the environment's catalogue. Real identity is
+        interface 6 and the issuer named in the environment manifest (interface 22), neither specified yet.
+  parameters:
+    InstrumentId:
+      name: instrumentId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+  responses:
+    BadRequest:
+      description: Refused at the edge; nothing was journaled.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: No valid token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: No such market, or no such resting order of this account.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: The session's flood limit (blueprint §12). Not journaled; retry after the stated delay.
+      headers:
+        Retry-After:
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unavailable:
+      description: The sequencer group did not answer. The outcome is unknown; resend with the same client order ID.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Id:
+      type: string
+      pattern: '^[0-9]{1,20}$'
+      description: A 64-bit identifier or sequence number, as a decimal string so no client loses precision.
+    Rational:
+      type: string
+      pattern: '^[0-9]+/[1-9][0-9]*$'
+      description: An exact probability, numerator over denominator, in lowest terms on output.
+    PriceInput:
+      description: |
+        The price of the outcome the order names, in exactly one form. It must equal a row of the instrument's ladder
+        exactly; the gateway never rounds (blueprint §6). `tick` is that row's ordinal.
+      oneOf:
+        - type: object
+          required: [tick]
+          additionalProperties: false
+          properties:
+            tick: { type: integer, minimum: 0 }
+        - type: object
+          required: [probability]
+          additionalProperties: false
+          properties:
+            probability: { $ref: '#/components/schemas/Rational' }
+        - type: object
+          required: [cents]
+          additionalProperties: false
+          properties:
+            cents: { type: string, pattern: '^[0-9]+(\.[0-9]+)?$', description: 'Price per $1 contract, for example "53" or "0.5".' }
+        - type: object
+          required: [american]
+          additionalProperties: false
+          properties:
+            american: { type: string, pattern: '^[+-][1-9][0-9]*$', description: 'American odds, for example "-110" or "+150".' }
+    PriceQuote:
+      type: object
+      required: [tick, probability, cents]
+      properties:
+        tick: { type: integer, minimum: 0 }
+        probability: { $ref: '#/components/schemas/Rational' }
+        cents: { type: string, description: 'Exact when it terminates within four decimal places, else rounded for display only.' }
+        american: { type: [string, 'null'], description: 'American odds when they are a whole number, else null.' }
+    Side:
+      type: string
+      enum: [buy, sell]
+      description: Canonical YES terms. Buying NO is selling YES at the complementary price.
+    OrderRequest:
+      type: object
+      required: [clientOrderId, instrumentId, action, outcome, price]
+      additionalProperties: false
+      properties:
+        clientOrderId:
+          type: string
+          minLength: 1
+          maxLength: 32
+          pattern: '^[!-~]+$'
+          description: Printable ASCII, unique per account within the published window.
+        instrumentId: { $ref: '#/components/schemas/Id' }
+        action: { type: string, enum: [buy, sell] }
+        outcome: { type: string, enum: ['yes', 'no'] }
+        price: { $ref: '#/components/schemas/PriceInput' }
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+          description: Contracts. Exactly one of `quantity` and `stakeCents`.
+        stakeCents:
+          type: integer
+          minimum: 1
+          description: |
+            Buys only: the money to spend. Converted to contracts at the price exactly; a stake that does not buy a
+            whole number of lots is refused with `STAKE_NOT_ON_STEP`, whose details name the step.
+        timeInForce: { type: string, enum: [GTC, GTD, IOC, FOK], default: GTC }
+        expiresAt: { type: string, format: date-time, description: Required exactly when `timeInForce` is GTD. }
+        postOnly: { type: boolean, default: false }
+        reduceOnly: { type: boolean, default: false }
+        protectionTicks: { type: integer, minimum: 0, maximum: 255, default: 0 }
+        spendCapCents: { type: integer, minimum: 1, description: Buys only (spec E-9.3 check 1). }
+        clientOrderGroup: { type: integer, minimum: 0, maximum: 4294967295 }
+        atEventStart: { type: string, enum: [cancel, keep], default: cancel }
+      oneOf:
+        - required: [quantity]
+        - required: [stakeCents]
+    AmendRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        price: { $ref: '#/components/schemas/PriceInput' }
+        outcome: { type: string, enum: ['yes', 'no'], default: 'yes', description: The outcome `price` is expressed in. }
+        quantity: { type: integer, minimum: 1, maximum: 4294967295 }
+        atEventStart: { type: string, enum: [cancel, keep] }
+    OrderResult:
+      type: object
+      required: [status, sequence, executions]
+      properties:
+        status:
+          type: string
+          enum: [accepted, rejected, duplicate, amended, cancelled]
+        sequence: { $ref: '#/components/schemas/Id' }
+        orderId: { oneOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+        rejectReason:
+          type: [string, 'null']
+          description: The engine's reason in lower snake case, for example `insufficient_sleeve`.
+        executions:
+          type: array
+          items: { $ref: '#/components/schemas/Execution' }
+    CancelAllResult:
+      type: object
+      required: [sequence, executions]
+      properties:
+        sequence: { $ref: '#/components/schemas/Id' }
+        executions:
+          type: array
+          items: { $ref: '#/components/schemas/Execution' }
+    Execution:
+      type: object
+      description: One change to one of the account's orders, in canonical YES terms.
+      required: [type, sequence, orderId, instrumentId]
+      properties:
+        type: { type: string, enum: [accepted, rejected, fill, cancelled, reduced, amended] }
+        sequence: { $ref: '#/components/schemas/Id' }
+        orderId: { oneOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }] }
+        clientOrderId: { type: string }
+        instrumentId: { $ref: '#/components/schemas/Id' }
+        side: { $ref: '#/components/schemas/Side' }
+        price: { $ref: '#/components/schemas/PriceQuote' }
+        quantity: { type: integer, description: 'accepted: the order quantity; fill: contracts filled; cancelled: contracts cancelled.' }
+        remaining: { type: integer }
+        reason: { type: string, description: 'rejected and cancelled: the engine reason in lower snake case.' }
+        tradeId: { $ref: '#/components/schemas/Id' }
+        role: { type: string, enum: [maker, taker] }
+        cashCents: { type: integer, description: 'fill: the change in this account''s cash.' }
+    Position:
+      type: object
+      required: [instrumentId, position]
+      properties:
+        instrumentId: { $ref: '#/components/schemas/Id' }
+        position: { type: integer, description: Signed YES contracts; negative holds NO. }
+    RestingOrder:
+      type: object
+      required: [orderId, instrumentId, side, price, remaining]
+      properties:
+        orderId: { $ref: '#/components/schemas/Id' }
+        instrumentId: { $ref: '#/components/schemas/Id' }
+        side: { $ref: '#/components/schemas/Side' }
+        price: { $ref: '#/components/schemas/PriceQuote' }
+        remaining: { type: integer }
+    Account:
+      type: object
+      required: [accountId, sequence, availableCents, reservedCents, positions, orders]
+      properties:
+        accountId: { $ref: '#/components/schemas/Id' }
+        sequence: { $ref: '#/components/schemas/Id' }
+        availableCents: { type: integer }
+        reservedCents: { type: integer }
+        positions: { type: array, items: { $ref: '#/components/schemas/Position' } }
+        orders: { type: array, items: { $ref: '#/components/schemas/RestingOrder' } }
+    Level:
+      type: object
+      required: [price, quantity, orders]
+      properties:
+        price: { $ref: '#/components/schemas/PriceQuote' }
+        quantity: { type: integer }
+        orders: { type: integer }
+    Book:
+      type: object
+      required: [instrumentId, sequence, state, bids, asks]
+      properties:
+        instrumentId: { $ref: '#/components/schemas/Id' }
+        sequence: { $ref: '#/components/schemas/Id' }
+        state: { $ref: '#/components/schemas/MarketState' }
+        bids: { type: array, items: { $ref: '#/components/schemas/Level' }, description: Best first. }
+        asks: { type: array, items: { $ref: '#/components/schemas/Level' }, description: Best first. }
+        last: { oneOf: [{ $ref: '#/components/schemas/PriceQuote' }, { type: 'null' }] }
+    MarketState:
+      type: string
+      enum: [listed, open, halted, closed, resolving, settled, voided]
+    Market:
+      type: object
+      required: [instrumentId, label, class, state, lotStep, ladder]
+      properties:
+        instrumentId: { $ref: '#/components/schemas/Id' }
+        label: { type: string }
+        class: { type: string, enum: [binary, categorical_outcome, scalar_band, parlay] }
+        state: { $ref: '#/components/schemas/MarketState' }
+        lotStep: { type: integer, minimum: 1 }
+        ladder: { type: array, items: { $ref: '#/components/schemas/PriceQuote' } }
+    Event:
+      type: object
+      required: [eventId, title, outcomes, started, suspended, ended, resolved, markets]
+      properties:
+        eventId: { $ref: '#/components/schemas/Id' }
+        title: { type: string }
+        outcomes: { type: array, items: { type: string } }
+        started: { type: boolean }
+        suspended: { type: boolean }
+        ended: { type: boolean }
+        resolved: { type: boolean }
+        markets: { type: array, items: { $ref: '#/components/schemas/Market' } }
+    Markets:
+      type: object
+      required: [sequence, events]
+      properties:
+        sequence: { $ref: '#/components/schemas/Id' }
+        events: { type: array, items: { $ref: '#/components/schemas/Event' } }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [BAD_REQUEST, UNAUTHORIZED, NOT_FOUND, PRICE_NOT_ON_LADDER, STAKE_NOT_ON_STEP, RATE_LIMITED, UNAVAILABLE]
+            message: { type: string }
+            details: { type: object }

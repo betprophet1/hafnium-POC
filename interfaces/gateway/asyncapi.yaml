@@ -1,0 +1,327 @@
+asyncapi: 3.0.0
+info:
+  title: Venue WebSocket API
+  version: 4.0.0-draft.0
+  description: |
+    Interface 1, the WebSocket half of the REST and WebSocket gateway (blueprint §13). One connection is one client
+    session: it logs in with a token, enters and cancels orders, receives its account's executions, and subscribes
+    to conflated market data. This document describes the gateway: `receive` operations are messages clients send,
+    `send` operations are messages the gateway sends.
+
+    Every message is a JSON text frame. A client may add an `id` to any request; the gateway echoes it on the reply
+    or error. Order bodies, results and executions are the schemas of `openapi.yaml`. Semantics are in `README.md`.
+servers:
+  laptop:
+    host: 127.0.0.1:8080
+    protocol: ws
+    pathname: /v4/ws
+    description: The mini venue on a laptop, after `deploy/laptop.sh web`
+channels:
+  session:
+    address: /v4/ws
+    messages:
+      login: { $ref: '#/components/messages/login' }
+      subscribe: { $ref: '#/components/messages/subscribe' }
+      unsubscribe: { $ref: '#/components/messages/unsubscribe' }
+      order: { $ref: '#/components/messages/order' }
+      amend: { $ref: '#/components/messages/amend' }
+      cancel: { $ref: '#/components/messages/cancel' }
+      cancelAll: { $ref: '#/components/messages/cancelAll' }
+      heartbeat: { $ref: '#/components/messages/heartbeat' }
+      welcome: { $ref: '#/components/messages/welcome' }
+      reply: { $ref: '#/components/messages/reply' }
+      error: { $ref: '#/components/messages/error' }
+      book: { $ref: '#/components/messages/book' }
+      trade: { $ref: '#/components/messages/trade' }
+      market: { $ref: '#/components/messages/market' }
+      execution: { $ref: '#/components/messages/execution' }
+      account: { $ref: '#/components/messages/account' }
+      payout: { $ref: '#/components/messages/payout' }
+      resync: { $ref: '#/components/messages/resync' }
+operations:
+  receiveLogin:
+    action: receive
+    channel: { $ref: '#/channels/session' }
+    summary: Authenticate the session. Required before orders; market data needs no login.
+    messages: [{ $ref: '#/channels/session/messages/login' }]
+    reply:
+      channel: { $ref: '#/channels/session' }
+      messages: [{ $ref: '#/channels/session/messages/welcome' }, { $ref: '#/channels/session/messages/error' }]
+  receiveSubscribe:
+    action: receive
+    channel: { $ref: '#/channels/session' }
+    summary: Subscribe to public topics. Each book topic answers with a snapshot at once.
+    messages: [{ $ref: '#/channels/session/messages/subscribe' }]
+  receiveUnsubscribe:
+    action: receive
+    channel: { $ref: '#/channels/session' }
+    messages: [{ $ref: '#/channels/session/messages/unsubscribe' }]
+  receiveOrder:
+    action: receive
+    channel: { $ref: '#/channels/session' }
+    summary: Place an order; the reply follows once the input is committed.
+    messages: [{ $ref: '#/channels/session/messages/order' }]
+    reply:
+      channel: { $ref: '#/channels/session' }
+      messages: [{ $ref: '#/channels/session/messages/reply' }, { $ref: '#/channels/session/messages/error' }]
+  receiveAmend:
+    action: receive
+    channel: { $ref: '#/channels/session' }
+    messages: [{ $ref: '#/channels/session/messages/amend' }]
+    reply:
+      channel: { $ref: '#/channels/session' }
+      messages: [{ $ref: '#/channels/session/messages/reply' }, { $ref: '#/channels/session/messages/error' }]
+  receiveCancel:
+    action: receive
+    channel: { $ref: '#/channels/session' }
+    messages: [{ $ref: '#/channels/session/messages/cancel' }]
+    reply:
+      channel: { $ref: '#/channels/session' }
+      messages: [{ $ref: '#/channels/session/messages/reply' }, { $ref: '#/channels/session/messages/error' }]
+  receiveCancelAll:
+    action: receive
+    channel: { $ref: '#/channels/session' }
+    messages: [{ $ref: '#/channels/session/messages/cancelAll' }]
+    reply:
+      channel: { $ref: '#/channels/session' }
+      messages: [{ $ref: '#/channels/session/messages/reply' }, { $ref: '#/channels/session/messages/error' }]
+  receiveHeartbeat:
+    action: receive
+    channel: { $ref: '#/channels/session' }
+    summary: Keep a session with `heartbeatSeconds` alive. Any other client message counts too.
+    messages: [{ $ref: '#/channels/session/messages/heartbeat' }]
+  sendBook:
+    action: send
+    channel: { $ref: '#/channels/session' }
+    summary: 'Topic book.{instrumentId}: a full snapshot to the requested depth, at most ten a second per topic.'
+    messages: [{ $ref: '#/channels/session/messages/book' }]
+  sendTrade:
+    action: send
+    channel: { $ref: '#/channels/session' }
+    summary: 'Topic trades.{instrumentId}: every trade, anonymous.'
+    messages: [{ $ref: '#/channels/session/messages/trade' }]
+  sendMarket:
+    action: send
+    channel: { $ref: '#/channels/session' }
+    summary: 'Topic markets: market states and event phases as they change.'
+    messages: [{ $ref: '#/channels/session/messages/market' }]
+  sendExecution:
+    action: send
+    channel: { $ref: '#/channels/session' }
+    summary: After login, every execution on the account's orders, from any session.
+    messages: [{ $ref: '#/channels/session/messages/execution' }]
+  sendAccount:
+    action: send
+    channel: { $ref: '#/channels/session' }
+    summary: After login, the sleeve and changed positions whenever an input changes them.
+    messages: [{ $ref: '#/channels/session/messages/account' }]
+  sendPayout:
+    action: send
+    channel: { $ref: '#/channels/session' }
+    summary: After login, settlement payouts to the account.
+    messages: [{ $ref: '#/channels/session/messages/payout' }]
+  sendResync:
+    action: send
+    channel: { $ref: '#/channels/session' }
+    summary: The gateway cannot resume from the requested sequence; fetch GET /v4/account and continue from `sequence`.
+    messages: [{ $ref: '#/channels/session/messages/resync' }]
+components:
+  schemas:
+    RequestId:
+      type: string
+      maxLength: 64
+      description: Chosen by the client and echoed on the reply or error.
+    Topic:
+      type: string
+      pattern: '^(markets|book\.[0-9]{1,20}|trades\.[0-9]{1,20})$'
+    OrderResult: { $ref: './openapi.yaml#/components/schemas/OrderResult' }
+    CancelAllResult: { $ref: './openapi.yaml#/components/schemas/CancelAllResult' }
+  messages:
+    login:
+      payload:
+        type: object
+        required: [op, token]
+        additionalProperties: false
+        properties:
+          op: { const: login }
+          id: { $ref: '#/components/schemas/RequestId' }
+          token: { type: string, description: The account's dev token in test environments. }
+          cancelOnDisconnect:
+            type: boolean
+            default: false
+            description: When the session ends, its resting orders are cancelled (reason session_disconnect).
+          heartbeatSeconds:
+            type: integer
+            minimum: 0
+            maximum: 300
+            default: 0
+            description: If positive, a session silent this long has its orders cancelled (heartbeat_missed) and is closed.
+          resumeFrom:
+            $ref: './openapi.yaml#/components/schemas/Id'
+            description: Replay the account's executions, account updates and payouts after this sequence.
+    subscribe:
+      payload:
+        type: object
+        required: [op, topics]
+        additionalProperties: false
+        properties:
+          op: { const: subscribe }
+          id: { $ref: '#/components/schemas/RequestId' }
+          topics: { type: array, minItems: 1, maxItems: 100, items: { $ref: '#/components/schemas/Topic' } }
+          depth: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    unsubscribe:
+      payload:
+        type: object
+        required: [op, topics]
+        additionalProperties: false
+        properties:
+          op: { const: unsubscribe }
+          id: { $ref: '#/components/schemas/RequestId' }
+          topics: { type: array, minItems: 1, items: { $ref: '#/components/schemas/Topic' } }
+    order:
+      payload:
+        allOf:
+          - type: object
+            required: [op]
+            properties:
+              op: { const: order }
+              id: { $ref: '#/components/schemas/RequestId' }
+          - $ref: './openapi.yaml#/components/schemas/OrderRequest'
+    amend:
+      payload:
+        allOf:
+          - type: object
+            required: [op, orderId]
+            properties:
+              op: { const: amend }
+              id: { $ref: '#/components/schemas/RequestId' }
+              orderId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          - $ref: './openapi.yaml#/components/schemas/AmendRequest'
+    cancel:
+      payload:
+        type: object
+        required: [op, orderId]
+        additionalProperties: false
+        properties:
+          op: { const: cancel }
+          id: { $ref: '#/components/schemas/RequestId' }
+          orderId: { $ref: './openapi.yaml#/components/schemas/Id' }
+    cancelAll:
+      payload:
+        type: object
+        required: [op]
+        additionalProperties: false
+        properties:
+          op: { const: cancelAll }
+          id: { $ref: '#/components/schemas/RequestId' }
+          instrumentId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          eventId: { $ref: './openapi.yaml#/components/schemas/Id' }
+    heartbeat:
+      payload:
+        type: object
+        required: [op]
+        additionalProperties: false
+        properties:
+          op: { const: heartbeat }
+          id: { $ref: '#/components/schemas/RequestId' }
+    welcome:
+      payload:
+        type: object
+        required: [type, accountId, sessionId, sequence, resumed]
+        properties:
+          type: { const: welcome }
+          id: { $ref: '#/components/schemas/RequestId' }
+          accountId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          sessionId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          sequence: { $ref: './openapi.yaml#/components/schemas/Id' }
+          resumed: { type: boolean, description: True when every message after `resumeFrom` follows. }
+    reply:
+      payload:
+        type: object
+        required: [type, result]
+        properties:
+          type: { const: reply }
+          id: { $ref: '#/components/schemas/RequestId' }
+          result:
+            oneOf:
+              - $ref: '#/components/schemas/OrderResult'
+              - $ref: '#/components/schemas/CancelAllResult'
+    error:
+      payload:
+        type: object
+        required: [type, error]
+        properties:
+          type: { const: error }
+          id: { $ref: '#/components/schemas/RequestId' }
+          error: { $ref: './openapi.yaml#/components/schemas/Error/properties/error' }
+    book:
+      payload:
+        allOf:
+          - type: object
+            required: [type]
+            properties:
+              type: { const: book }
+          - $ref: './openapi.yaml#/components/schemas/Book'
+    trade:
+      payload:
+        type: object
+        required: [type, sequence, instrumentId, price, quantity, takerSide]
+        properties:
+          type: { const: trade }
+          sequence: { $ref: './openapi.yaml#/components/schemas/Id' }
+          instrumentId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          tradeId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          price: { $ref: './openapi.yaml#/components/schemas/PriceQuote' }
+          quantity: { type: integer }
+          takerSide: { $ref: './openapi.yaml#/components/schemas/Side' }
+          at: { type: string, format: date-time, description: The sequencer's time. }
+    market:
+      payload:
+        type: object
+        required: [type, sequence, eventId]
+        properties:
+          type: { const: market }
+          sequence: { $ref: './openapi.yaml#/components/schemas/Id' }
+          eventId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          instrumentId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          state: { $ref: './openapi.yaml#/components/schemas/MarketState' }
+          phase: { type: string, enum: [started, suspended, resumed, ended], description: Set for an event phase change. }
+    execution:
+      payload:
+        allOf:
+          - type: object
+            required: [type, execution]
+            properties:
+              type: { const: execution }
+              execution: { $ref: './openapi.yaml#/components/schemas/Execution' }
+    account:
+      payload:
+        type: object
+        required: [type, sequence, availableCents, reservedCents, positions]
+        properties:
+          type: { const: account }
+          sequence: { $ref: './openapi.yaml#/components/schemas/Id' }
+          availableCents: { type: integer }
+          reservedCents: { type: integer }
+          positions:
+            type: array
+            description: Only positions this input changed, including those now zero.
+            items: { $ref: './openapi.yaml#/components/schemas/Position' }
+    payout:
+      payload:
+        type: object
+        required: [type, sequence, instrumentId, kind, positionClosed, cents]
+        properties:
+          type: { const: payout }
+          sequence: { $ref: './openapi.yaml#/components/schemas/Id' }
+          instrumentId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          kind: { type: string, enum: [resolved, void] }
+          positionClosed: { type: integer }
+          cents: { type: integer }
+    resync:
+      payload:
+        type: object
+        required: [type, sequence]
+        properties:
+          type: { const: resync }
+          sequence: { $ref: './openapi.yaml#/components/schemas/Id' }
