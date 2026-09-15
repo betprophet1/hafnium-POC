@@ -5,7 +5,7 @@ The mini venue's actors (blueprint §16), for laptops and test clusters only.
 | Command | What it does | Talks to |
 |---|---|---|
 | `seed` | Defines the cent tick table, funds the catalogue's accounts and lists round 1 of every market. Every command has a fixed ID, so running it again changes nothing (spec E-7.1). | the core's ingress, as an operator |
-| `maker` | Quotes several levels on both sides of every open market (three by default, each a tick further out and larger) around a seeded random-walk fair value, rescaled to sum to 100¢ across an event's outcomes, with a doubled spread once the event starts. Pulls its quotes when an event ends or is suspended. | the gateway's REST API, with its dev token |
+| `maker` | Quotes several levels on both sides of every open market (three by default, each a tick further out and larger) around a seeded random-walk fair value, rescaled to sum to 100¢ across an event's outcomes, with a doubled spread once the event starts. Pulls its quotes when an event ends or is suspended. It follows book topics and its own executions on one session with cancel-on-disconnect and a 10 s heartbeat, so a maker that dies or hangs has its quotes pulled by the gateway; it logs in again and reads `/v4/account` to start afresh. | the gateway's WebSocket, with its dev token (REST only for the market list and account snapshots) |
 | `taker` | Sends immediate-or-cancel orders at the touch at random: buying YES, buying NO or selling YES, with prices as ticks or cents and buys often as stakes, and an occasional sweep three ticks through. | the gateway's REST API, with its dev token |
 | `web` | The web page: an order book, a market maker tab and a retail customer tab that trade over the gateway's WebSocket, and a settlement tab that drives the dummy oracle. It passes `/v4` through to the gateway, so one address serves the page and the API. | the gateway for trading; the core's ingress and feed for settlement |
 
@@ -39,4 +39,5 @@ Then open http://127.0.0.1:8080.
 - **Dev tokens.** Tokens are fixed per account in the catalogue, and the page is handed them. Test environments only.
 - **No resolution console.** The dummy oracle sequences `SetEventPhase`, `SetMarketState` and `ResolveEvent`
   directly; §16's proposal, sign-off and auto-approver path does not exist yet.
-- **The bots use REST.** They exercise orders, stakes and price forms but not WebSocket sessions; the page's tabs do.
+- **One flow each.** The maker trades over a WebSocket session, as market makers do; the taker over REST, as simple
+  programmatic clients do. Between them and the page's tabs, both of interface 1's order flows carry load.

@@ -2,6 +2,7 @@
 
 mod bots;
 mod client;
+mod session;
 mod web;
 
 use std::collections::BTreeMap;
@@ -119,8 +120,9 @@ fn maker(args: &Args) -> Result<(), Error> {
         interval: Duration::from_millis(args.number("interval-ms", 700)?),
         seed: args.number("seed", 1)?,
     };
-    let api = client::Api::new(&args.get("gateway", None)?, &args.get("token", Some("dev-synthetic-maker"))?);
-    bots::maker(&api, &config, Ids::new('m')?)
+    let (gateway, token) = (args.get("gateway", None)?, args.get("token", Some("dev-synthetic-maker"))?);
+    let api = client::Api::new(&gateway, &token);
+    bots::maker(&api, &gateway, &token, &config, Ids::new('m')?)
 }
 
 fn taker(args: &Args) -> Result<(), Error> {

@@ -1,13 +1,17 @@
-//! Synthetic makers and takers (blueprint §16). Ordinary clients of the gateway with dev tokens: they decide only from
-//! what the gateway publishes and act only through its REST API, so they exercise the same edge customers use,
-//! including its price forms, stakes and NO orders.
+//! Synthetic makers and takers (blueprint §16). Ordinary clients of the gateway with dev tokens, exercising both of
+//! its flows: the maker holds a WebSocket session, as market makers do, and the taker uses the REST API, as
+//! programmatic retail does. Both decide only from what the gateway publishes.
 
 use crate::client::{Api, Response};
+use crate::session::{self, Session};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 use std::time::Duration;
 use venue_link::wire::{Error, Ids};
+
+/// The maker's session heartbeat: silence this long and the gateway pulls its quotes.
+const HEARTBEAT_SECONDS: u64 = 10;
 
 /// A small seeded generator (splitmix64), so a run can be repeated.
 pub struct Rng(u64);
@@ -91,13 +95,14 @@ fn markets(api: &Api) -> Result<Vec<Market>, Error> {
 }
 
 /// A book's levels as `(tick, quantity)`, best first.
+#[derive(Clone)]
 struct Book {
     bids: Vec<(u64, u64)>,
     asks: Vec<(u64, u64)>,
 }
 
-fn book(api: &Api, instrument: u64) -> Result<Book, Error> {
-    let body = ok(api.get(&format!("/v4/markets/{instrument}/book?depth=10"))?)?;
+/// A book from a REST book or a WebSocket `book` message, which share the schema.
+fn book_of(body: &Value) -> Book {
     let levels = |side: &str| -> Vec<(u64, u64)> {
         body[side]
             .as_array()
@@ -106,9 +111,14 @@ fn book(api: &Api, instrument: u64) -> Result<Book, Error> {
             .map(|l| (l["price"]["tick"].as_u64().unwrap_or(0), l["quantity"].as_u64().unwrap_or(0)))
             .collect()
     };
-    Ok(Book { bids: levels("bids"), asks: levels("asks") })
+    Book { bids: levels("bids"), asks: levels("asks") }
 }
 
+fn book(api: &Api, instrument: u64) -> Result<Book, Error> {
+    Ok(book_of(&ok(api.get(&format!("/v4/markets/{instrument}/book?depth=10"))?)?))
+}
+
+#[derive(Clone)]
 struct Resting {
     id: u64,
     instrument: u64,
@@ -148,17 +158,37 @@ enum Action {
 
 /// What became of one action.
 enum Outcome {
-    /// Sequenced, with the input's sequence when the gateway named one.
+    /// Sequenced, with the input's sequence when it changed something this bot will see.
     Sequenced(Option<u64>),
     /// Refused by the flood limit: wait this long before sending more.
     Throttled(Duration),
+    /// The order an amend or cancel named no longer rests: it filled or was cancelled first.
+    Gone(u64),
     /// Refused or failed, and already logged if it was worth logging.
     Failed,
 }
 
-/// Performs one action, logging refusals and rejections worth a human's attention.
+fn retry_after(error: &Value) -> Duration {
+    Duration::from_millis(error["details"]["retryAfterMillis"].as_u64().unwrap_or(1000).max(100))
+}
+
+/// An amend or cancel can lose a race with a fill, at the gateway (not found) or in the engine (unknown order). That is
+/// the market working, not something to log.
+fn lost_race(order_may_be_gone: bool, code: &Value) -> bool {
+    order_may_be_gone && (code == "NOT_FOUND" || code == "unknown_order")
+}
+
+/// The order an amend or cancel names.
+const fn named_order(action: &Action) -> Option<u64> {
+    match action {
+        Action::Amend(order, _) | Action::Cancel(order) => Some(*order),
+        Action::Place(_) | Action::CancelEvent(_) => None,
+    }
+}
+
+/// Performs one action over REST.
 fn perform(api: &Api, who: &str, action: Action) -> Outcome {
-    let order_may_be_gone = matches!(action, Action::Amend(..) | Action::Cancel(_));
+    let order_may_be_gone = named_order(&action).is_some();
     let response = match action {
         Action::Place(body) => api.post("/v4/orders", &body),
         Action::Amend(order, body) => api.patch(&format!("/v4/orders/{order}"), &body),
@@ -167,17 +197,13 @@ fn perform(api: &Api, who: &str, action: Action) -> Outcome {
     };
     match response {
         Ok(r) if r.status == 200 => {
-            if r.body["status"] == "rejected" {
+            if r.body["status"] == "rejected" && !lost_race(order_may_be_gone, &r.body["rejectReason"]) {
                 eprintln!("{who}: rejected: {}", r.body["rejectReason"]);
             }
             Outcome::Sequenced(r.body["sequence"].as_str().and_then(|s| s.parse().ok()))
         }
-        // The order filled or was cancelled between reading the account and acting on it: nothing left to do.
-        Ok(r) if r.status == 404 && order_may_be_gone => Outcome::Failed,
-        Ok(r) if r.status == 429 => {
-            let millis = r.body["error"]["details"]["retryAfterMillis"].as_u64().unwrap_or(1000);
-            Outcome::Throttled(Duration::from_millis(millis.max(100)))
-        }
+        Ok(r) if lost_race(order_may_be_gone, &r.body["error"]["code"]) => Outcome::Failed,
+        Ok(r) if r.status == 429 => Outcome::Throttled(retry_after(&r.body["error"])),
         Ok(r) => {
             eprintln!("{who}: refused: {}", r.refusal());
             Outcome::Failed
@@ -189,10 +215,51 @@ fn perform(api: &Api, who: &str, action: Action) -> Outcome {
     }
 }
 
+/// Performs one action as a WebSocket session op. `Err` means the session is gone.
+fn perform_on(session: &mut Session, who: &str, action: Action) -> Result<Outcome, Error> {
+    let named = named_order(&action);
+    let order_may_be_gone = named.is_some();
+    let with_op = |op: &str, mut body: Value| {
+        body["op"] = json!(op);
+        body
+    };
+    let message = match action {
+        Action::Place(body) => with_op("order", body),
+        Action::Amend(order, body) => {
+            let mut m = with_op("amend", body);
+            m["orderId"] = json!(order.to_string());
+            m
+        }
+        Action::Cancel(order) => json!({"op": "cancel", "orderId": order.to_string()}),
+        Action::CancelEvent(event) => json!({"op": "cancelAll", "eventId": event.to_string()}),
+    };
+    let reply = session.request(message)?;
+    Ok(match reply["type"].as_str() {
+        Some("reply") if lost_race(order_may_be_gone, &reply["result"]["rejectReason"]) => {
+            Outcome::Gone(named.unwrap_or(0))
+        }
+        Some("reply") => {
+            let result = &reply["result"];
+            if result["status"] == "rejected" {
+                eprintln!("{who}: rejected: {}", result["rejectReason"]);
+            }
+            // Only an input that produced executions for this account is sure to reach this session's stream.
+            let seen = result["executions"].as_array().is_some_and(|e| !e.is_empty());
+            Outcome::Sequenced(seen.then(|| result["sequence"].as_str().and_then(|s| s.parse().ok())).flatten())
+        }
+        Some("error") if lost_race(order_may_be_gone, &reply["error"]["code"]) => Outcome::Gone(named.unwrap_or(0)),
+        Some("error") if reply["error"]["code"] == "RATE_LIMITED" => Outcome::Throttled(retry_after(&reply["error"])),
+        _ => {
+            eprintln!("{who}: refused: {}", reply["error"]);
+            Outcome::Failed
+        }
+    })
+}
+
 type Plan<'a> = dyn FnMut(&[Market], &Account, &dyn Fn(u64) -> Option<Book>) -> Vec<Action> + 'a;
 
-/// Every `interval`, reads the markets and the account and performs what `plan` decides. It plans again only once the
-/// account shows the effects of everything it sent, so it never acts on a picture older than its own last action.
+/// The taker's loop over REST. Every `interval` it reads the markets and the account and performs what `plan` decides,
+/// planning again only once the account shows the effects of everything it sent.
 fn run(api: &Api, interval: Duration, who: &str, plan: &mut Plan<'_>) -> ! {
     let (mut sent, mut stale) = (0u64, 0u32);
     loop {
@@ -223,6 +290,157 @@ fn run(api: &Api, interval: Duration, who: &str, plan: &mut Plan<'_>) -> ! {
                     thread::sleep(wait);
                     break;
                 }
+                Outcome::Sequenced(None) | Outcome::Gone(_) | Outcome::Failed => {}
+            }
+        }
+    }
+}
+
+/// What a session has told the maker: its resting orders, the books it follows, and how far its picture reaches.
+#[derive(Default)]
+struct Stream {
+    orders: BTreeMap<u64, Resting>,
+    books: BTreeMap<u64, Book>,
+    /// Every input at or below this sequence is reflected in `orders` and `books`.
+    sequence: u64,
+    /// The sequence of the account snapshot `orders` started from; executions at or below it are already in it.
+    snapshot: u64,
+    markets_changed: bool,
+    resync: bool,
+}
+
+impl Stream {
+    fn restart(&mut self, snapshot: Account) {
+        self.snapshot = snapshot.sequence;
+        self.sequence = self.sequence.max(snapshot.sequence);
+        self.orders = snapshot.orders.into_iter().map(|o| (o.id, o)).collect();
+    }
+
+    fn apply(&mut self, message: &Value) {
+        let execution = &message["execution"];
+        for sequence in [&message["sequence"], &execution["sequence"]] {
+            if let Some(s) = sequence.as_str().and_then(|s| s.parse::<u64>().ok()) {
+                self.sequence = self.sequence.max(s);
+            }
+        }
+        match message["type"].as_str().unwrap_or("") {
+            "execution" if id(&execution["sequence"]) <= self.snapshot => {}
+            "execution" => {
+                let order = id(&execution["orderId"]);
+                let remaining = execution["remaining"].as_u64();
+                match execution["type"].as_str().unwrap_or("") {
+                    "accepted" => {
+                        let resting = Resting {
+                            id: order,
+                            instrument: id(&execution["instrumentId"]),
+                            side: execution["side"].as_str().unwrap_or("").to_string(),
+                            tick: execution["price"]["tick"].as_u64().unwrap_or(0),
+                            remaining: remaining.unwrap_or(0),
+                        };
+                        self.orders.insert(order, resting);
+                    }
+                    "fill" | "reduced" | "amended" => {
+                        if remaining == Some(0) {
+                            self.orders.remove(&order);
+                        } else if let Some(o) = self.orders.get_mut(&order) {
+                            o.remaining = remaining.unwrap_or(o.remaining);
+                            if execution["type"] == "amended" {
+                                o.tick = execution["price"]["tick"].as_u64().unwrap_or(o.tick);
+                            }
+                        }
+                    }
+                    "cancelled" => {
+                        self.orders.remove(&order);
+                    }
+                    _ => {}
+                }
+            }
+            "book" => {
+                self.books.insert(id(&message["instrumentId"]), book_of(message));
+            }
+            "market" => self.markets_changed = true,
+            "resync" => self.resync = true,
+            _ => {}
+        }
+    }
+}
+
+/// The maker's loop over a WebSocket session. Books and its own orders arrive as messages and actions go out as session
+/// ops. When the session ends the gateway cancels its quotes, and the loop logs in again from a fresh snapshot.
+fn run_session(api: &Api, gateway: &str, token: &str, interval: Duration, who: &str, plan: &mut Plan<'_>) -> ! {
+    loop {
+        if let Err(e) = session_pass(api, gateway, token, interval, who, plan) {
+            eprintln!("{who}: session ended: {e}; logging in again");
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn session_pass(
+    api: &Api,
+    gateway: &str,
+    token: &str,
+    interval: Duration,
+    who: &str,
+    plan: &mut Plan<'_>,
+) -> Result<(), Error> {
+    let (mut session, welcome) = Session::open(gateway, token, HEARTBEAT_SECONDS)?;
+    eprintln!("{who}: session {} logged in", welcome["sessionId"].as_str().unwrap_or("?"));
+    let mut stream = Stream { sequence: id(&welcome["sequence"]), ..Stream::default() };
+    stream.restart(account(api)?);
+    let mut markets = markets(api)?;
+    session.send(&json!({"op": "subscribe", "topics": ["markets"]}))?;
+    let mut followed: BTreeSet<u64> = BTreeSet::new();
+    let (mut sent, mut waited) = (0u64, 0u32);
+    let mut next_plan = session::monotonic();
+    loop {
+        let unfollowed: Vec<String> = markets
+            .iter()
+            .filter(|m| m.state == "open" && followed.insert(m.id))
+            .map(|m| format!("book.{}", m.id))
+            .collect();
+        if !unfollowed.is_empty() {
+            session.send(&json!({"op": "subscribe", "topics": unfollowed, "depth": 10}))?;
+        }
+        for message in session.poll(Duration::from_millis(100))? {
+            stream.apply(&message);
+        }
+        if stream.markets_changed {
+            stream.markets_changed = false;
+            markets = crate::bots::markets(api)?;
+        }
+        if stream.resync {
+            stream.resync = false;
+            stream.restart(account(api)?);
+        }
+        if session::monotonic() < next_plan {
+            continue;
+        }
+        next_plan = session::monotonic() + interval;
+        if stream.sequence < sent {
+            // Wait for the session to show the last action, but not for ever.
+            waited += 1;
+            if waited < 20 {
+                continue;
+            }
+        }
+        waited = 0;
+        let account = Account { sequence: stream.sequence, orders: stream.orders.values().cloned().collect() };
+        let actions = {
+            let books = |instrument: u64| stream.books.get(&instrument).cloned();
+            plan(&markets, &account, &books)
+        };
+        for action in actions {
+            match perform_on(&mut session, who, action)? {
+                Outcome::Sequenced(Some(sequence)) => sent = sent.max(sequence),
+                Outcome::Throttled(wait) => {
+                    eprintln!("{who}: flood limit reached; pausing {} ms", wait.as_millis());
+                    thread::sleep(wait);
+                    break;
+                }
+                Outcome::Gone(order) => {
+                    stream.orders.remove(&order);
+                }
                 Outcome::Sequenced(None) | Outcome::Failed => {}
             }
         }
@@ -245,11 +463,12 @@ pub struct Maker {
 }
 
 /// Quotes several levels on both sides of every open market around a seeded random-walk fair value, rescaled to sum
-/// to 100¢ across an event's outcomes. Pulls its quotes when an event ends or is suspended.
-pub fn maker(api: &Api, config: &Maker, mut ids: Ids) -> ! {
+/// to 100¢ across an event's outcomes, over a WebSocket session with cancel-on-disconnect. Pulls its quotes when an
+/// event ends or is suspended.
+pub fn maker(api: &Api, gateway: &str, token: &str, config: &Maker, mut ids: Ids) -> ! {
     let mut rng = Rng::new(config.seed);
     let mut fair: BTreeMap<u64, u64> = BTreeMap::new();
-    run(api, config.interval, "maker", &mut |markets, account, books| {
+    run_session(api, gateway, token, config.interval, "maker", &mut |markets, account, books| {
         let mut out = Vec::new();
         let mut by_event: BTreeMap<u64, Vec<&Market>> = BTreeMap::new();
         for m in markets.iter().filter(|m| m.state == "open") {
@@ -354,8 +573,8 @@ pub struct Taker {
     pub seed: u64,
 }
 
-/// Sends immediate-or-cancel orders at the touch at random, as retail arrives: buying YES, buying NO or selling YES,
-/// with prices as ticks or cents and buys often as stakes, and the occasional sweep.
+/// Sends immediate-or-cancel orders at the touch at random over REST, as retail arrives: buying YES, buying NO or
+/// selling YES, with prices as ticks or cents and buys often as stakes, and the occasional sweep.
 pub fn taker(api: &Api, config: &Taker, mut ids: Ids) -> ! {
     let mut rng = Rng::new(config.seed);
     run(api, config.interval, "taker", &mut |markets, _account, books| {

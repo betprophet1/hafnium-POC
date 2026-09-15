@@ -13,3 +13,4 @@ workspace = true
 [dependencies]
 venue-link = { path = "../link" }
 serde_json = "1"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
