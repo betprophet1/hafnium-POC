@@ -85,8 +85,10 @@ fn nearest_tick(rows: &[u64], target: u64) -> u64 {
 
 pub struct Maker {
     pub account: u64,
-    /// Contracts quoted on each side, in lots.
+    /// Contracts quoted at the touch on each side, in lots; each level further out quotes one more multiple.
     pub size: u64,
+    /// Price levels quoted on each side.
+    pub levels: u64,
     /// Ticks from fair value to each quote; doubled once an event has started.
     pub half_spread: u64,
     pub interval: Duration,
@@ -144,30 +146,50 @@ pub fn maker(ingress: &str, live: &Live, config: &Maker, mut ids: Ids) -> ! {
                     fair.insert(*id, *f);
                 }
             }
-            for (id, inst, _, f) in quotes {
-                let size = config.size * inst.lot.max(1);
-                for (side, desired) in [("BUY", f - spread), ("SELL", f + spread)] {
-                    let crossing = if side == "BUY" {
-                        inst.best_ask().is_some_and(|a| desired >= a)
+            for (id, inst, rows, f) in quotes {
+                let top = rows.len() as u64 - 1;
+                for side in ["BUY", "SELL"] {
+                    // Level k sits k ticks behind the touch and carries k + 1 times the size. A level that would
+                    // cross someone else's order is left out, since post-only would reject it.
+                    let desired: Vec<(u64, u64)> = (0..config.levels.max(1))
+                        .filter_map(|k| {
+                            let tick = if side == "BUY" {
+                                f.checked_sub(spread + k)?
+                            } else {
+                                (f + spread + k <= top).then_some(f + spread + k)?
+                            };
+                            Some((tick, config.size * (k + 1) * inst.lot.max(1)))
+                        })
+                        .filter(|(tick, _)| {
+                            if side == "BUY" {
+                                inst.best_ask().is_none_or(|a| *tick < a)
+                            } else {
+                                inst.best_bid().is_none_or(|b| *tick > b)
+                            }
+                        })
+                        .collect();
+                    // Existing orders nearest the touch first, paired with the desired levels in the same order.
+                    let mut orders = mine(view, account, id, Some(side));
+                    if side == "BUY" {
+                        orders.sort_by_key(|o| std::cmp::Reverse(o.1.tick));
                     } else {
-                        inst.best_bid().is_some_and(|b| desired <= b)
-                    };
-                    let orders = mine(view, account, id, Some(side));
-                    match orders.split_first() {
-                        None if !crossing => out.push(order(
+                        orders.sort_by_key(|o| o.1.tick);
+                    }
+                    for (k, &(oid, o)) in orders.iter().enumerate() {
+                        match desired.get(k) {
+                            Some(&(tick, size)) if o.tick != tick || o.remaining < size => {
+                                out.push(amend(account, id, oid, tick, size));
+                            }
+                            Some(_) => {}
+                            None => out.push(cancel(account, id, oid)),
+                        }
+                    }
+                    for &(tick, size) in desired.iter().skip(orders.len()) {
+                        out.push(order(
                             account,
                             ids.fresh(),
-                            json!({"instrumentId": id, "side": side, "tick": desired, "quantity": size, "flags": ["POST_ONLY"]}),
-                        )),
-                        None => {}
-                        Some((&(first, o), rest)) => {
-                            for &(extra, _) in rest {
-                                out.push(cancel(account, id, extra));
-                            }
-                            if !crossing && (o.tick != desired || o.remaining < size) {
-                                out.push(amend(account, id, first, desired, size));
-                            }
-                        }
+                            json!({"instrumentId": id, "side": side, "tick": tick, "quantity": size, "flags": ["POST_ONLY"]}),
+                        ));
                     }
                 }
             }

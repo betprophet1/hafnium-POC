@@ -17,7 +17,8 @@ use wire::{Error, Ids, Ingress};
 const USAGE: &str = "usage:
   venue-sim seed  --ingress ADDR --catalogue FILE
   venue-sim web   --ingress ADDR --feed ADDR --catalogue FILE [--listen 127.0.0.1:8080]
-  venue-sim maker --ingress ADDR --feed ADDR [--account 10] [--size 10] [--spread 1] [--interval-ms 700] [--seed 1]
+  venue-sim maker --ingress ADDR --feed ADDR [--account 10] [--size 10] [--levels 3] [--spread 1]
+                  [--interval-ms 700] [--seed 1]
   venue-sim taker --ingress ADDR --feed ADDR [--account 20] [--max-quantity 5] [--chance 250] [--sweep-chance 30]
                   [--interval-ms 1000] [--seed 2]
 
@@ -113,6 +114,7 @@ fn maker(args: &Args) -> Result<(), Error> {
     let config = bots::Maker {
         account: args.number("account", 10)?,
         size: args.number("size", 10)?,
+        levels: args.number("levels", 3)?,
         half_spread: args.number("spread", 1)?,
         interval: Duration::from_millis(args.number("interval-ms", 700)?),
         seed: args.number("seed", 1)?,

@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mini venue</title>
+<link rel="icon" href="data:,">
 <style>
 :root {
   --bg: #f6f7f9; --card: #ffffff; --ink: #16181d; --muted: #6b7280; --line: #e3e6eb;
@@ -20,12 +21,13 @@
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
 .num, .px, table, .kv b { font-variant-numeric: tabular-nums; }
-header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--card); }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--card); }
 .brand { font-weight: 650; letter-spacing: .01em; }
 .status { margin-left: auto; color: var(--muted); display: flex; align-items: center; gap: 8px; font-size: 12px; }
 #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
 #dot.on { background: var(--ok); }
 nav.markets { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 20px; }
+nav.markets select { max-width: 100%; }
 select, input { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
 input[type=number] { width: 7em; }
 button { font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--ink); padding: 6px 12px; }

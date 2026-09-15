@@ -6,7 +6,7 @@ the node: inputs go through its ingress, and everything it knows comes from its 
 | Command | What it does |
 |---|---|
 | `seed` | Defines the cent tick table, funds the catalogue's accounts and lists round 1 of every market. Every command has a fixed ID, so running it again changes nothing (spec E-7.1). |
-| `maker` | Quotes both sides of every open market around a seeded random-walk fair value, rescaled to sum to 100¢ across an event's outcomes, with a doubled spread once the event starts. Pulls its quotes when an event ends or is suspended. |
+| `maker` | Quotes several levels on both sides of every open market (three by default, each a tick further out and larger) around a seeded random-walk fair value, rescaled to sum to 100¢ across an event's outcomes, with a doubled spread once the event starts. Pulls its quotes when an event ends or is suspended. |
 | `taker` | Sends immediate-or-cancel orders at the touch at random, retail-sized, with the occasional sweep three ticks through. |
 | `web` | The web page: an order book, a market maker tab, a retail customer tab and a settlement tab driving the dummy oracle. |
 

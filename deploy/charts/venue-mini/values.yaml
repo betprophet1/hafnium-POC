@@ -35,8 +35,10 @@ bots:
   maker:
     enabled: true
     account: 10
-    # Contracts quoted on each side, in lots.
+    # Contracts quoted at the touch on each side, in lots; level k further out quotes (k + 1) times this.
     size: 10
+    # Price levels quoted on each side.
+    levels: 3
     # Ticks from fair value to each quote.
     spread: 1
     intervalMs: 700
