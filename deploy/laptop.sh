@@ -23,7 +23,9 @@ case "${1:-up}" in
     # On a fresh cluster the smoke test can start before cluster DNS answers.
     kubectl -n kube-system rollout status deployment/coredns --timeout 2m
     helm upgrade --install "$RELEASE" "$CHART" --set image.tag="$TAG" --wait --timeout 5m
-    # Deployments pick up a rebuilt image with the same tag only when their pods are replaced.
+    # A rebuilt image with the same tag reaches pods only when they are replaced. The core is OnDelete, so it would
+    # otherwise keep the old build indefinitely; replacing it here is safe on a laptop because it replays its journal.
+    "$0" restart
     kubectl rollout restart deployment -l "app.kubernetes.io/instance=$RELEASE"
     kubectl rollout status deployment -l "app.kubernetes.io/instance=$RELEASE" --timeout 3m
     helm test "$RELEASE" --logs
