@@ -19,6 +19,8 @@ case "${1:-up}" in
     docker build -f "$ROOT/deploy/images/venue-node.Dockerfile" -t "venue-node:$TAG" "$ROOT"
     k3d cluster get "$CLUSTER" >/dev/null 2>&1 || k3d cluster create "$CLUSTER" --wait
     k3d image import "venue-node:$TAG" --cluster "$CLUSTER"
+    # On a fresh cluster the smoke test can start before cluster DNS answers.
+    kubectl -n kube-system rollout status deployment/coredns --timeout 2m
     helm upgrade --install "$RELEASE" "$CHART" --set image.tag="$TAG" --wait --timeout 5m
     helm test "$RELEASE" --logs
     echo
@@ -26,7 +28,9 @@ case "${1:-up}" in
     ;;
   restart)
     kubectl delete pod "$RELEASE-core-0"
-    kubectl rollout status statefulset "$RELEASE-core" --timeout 5m
+    # rollout status does not apply to OnDelete: wait for the controller's new pod, then for its journal replay.
+    until kubectl get pod "$RELEASE-core-0" >/dev/null 2>&1; do sleep 1; done
+    kubectl wait --for=condition=Ready "pod/$RELEASE-core-0" --timeout 5m
     ;;
   down)
     k3d cluster delete "$CLUSTER"
