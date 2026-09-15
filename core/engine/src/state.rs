@@ -172,6 +172,7 @@ pub enum Undo {
     Holding(HoldingKey, Option<Holding>),
     OrderIndex(u64, Option<u32>),
     Collateral(u64, i64),
+    EventCash(EventCashKey, Option<i64>),
     MakerCounter(HoldingKey, Option<WindowCounter>),
     Group((u64, u32), Option<OrderGroup>),
     Scalars { next_trade: u64, free_order: u32, resting_orders: u32 },
@@ -195,6 +196,8 @@ pub const MARK_FILLED: u8 = 2;
 pub type Slot<K, V> = Option<(K, V)>;
 pub type HoldingKey = (u64, u64);
 pub type LevelKey = (u64, u8, u16);
+/// `(accountId, eventId)`.
+pub type EventCashKey = (u64, u64);
 
 /// How many of each record the engine holds. Maps get twice as many slots, rounded up to a power of two.
 #[derive(Clone, Copy, Debug)]
@@ -213,6 +216,8 @@ pub struct Capacities {
     pub order_groups: usize,
     pub maker_settings: usize,
     pub maker_counters: usize,
+    /// Accounts' net cash in each unresolved event they have traded (D-1).
+    pub event_cash: usize,
     /// Positions, sleeves and levels one unit may touch; also the end-of-unit marks.
     pub touches: usize,
     /// Writes one dry run may log.
@@ -241,6 +246,7 @@ impl Capacities {
             order_groups: 4_096,
             maker_settings: 4_096,
             maker_counters: 16_384,
+            event_cash: 16_384,
             touches: 65_536,
             undo: 65_536,
         }
@@ -268,10 +274,12 @@ pub struct Memory<'a> {
     pub order_groups: &'a mut [Slot<(u64, u32), OrderGroup>],
     pub maker_settings: &'a mut [Slot<HoldingKey, MakerSetting>],
     pub maker_counters: &'a mut [Slot<HoldingKey, WindowCounter>],
+    pub event_cash: &'a mut [Slot<EventCashKey, i64>],
     pub position_touches: &'a mut [(HoldingKey, u32, i64)],
     pub sleeve_touches: &'a mut [(u64, u32, (i64, i64))],
     pub level_touches: &'a mut [(LevelKey, u32, (u64, u32))],
-    /// Working space for collecting keys to act on in order; as long as `orders` and half the `holdings` slots.
+    /// Working space for collecting keys to act on in order; as long as `orders`, half the `holdings` slots and
+    /// half the `event_cash` slots.
     pub scratch: &'a mut [(u64, u64)],
     /// `touches` entries.
     pub marks: &'a mut [Mark],

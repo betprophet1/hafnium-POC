@@ -135,6 +135,19 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    /// Adds to an account's balance and to the net cash the event has paid it (E-10.6, E-14.2, E-14.3; D-1).
+    pub(crate) fn add_event_cash(&mut self, account_slot: u32, event_id: u64, cents: i64) -> Result<(), FailStop> {
+        self.add_balance(account_slot, cents)?;
+        let key = (self.accounts[account_slot as usize].id, event_id);
+        let old = self.event_cash.get(&key).copied();
+        let cash = old.unwrap_or(0).checked_add(cents).ok_or(FailStop::Overflow)?;
+        capacity(self.event_cash.insert(key, cash))?;
+        if self.dry {
+            self.push_undo(Undo::EventCash(key, old))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn maker_counter_w(&mut self, key: HoldingKey, value: WindowCounter) -> Result<(), FailStop> {
         let old = capacity(self.maker_counters.insert(key, value))?;
         if self.dry {
@@ -179,6 +192,7 @@ impl<'a> Engine<'a> {
                         e.collateral = cents;
                     }
                 }
+                Undo::EventCash(key, old) => restore(&mut self.event_cash, key, old)?,
                 Undo::MakerCounter(key, old) => restore(&mut self.maker_counters, key, old)?,
                 Undo::Group(key, old) => restore(&mut self.order_groups, key, old)?,
                 Undo::Scalars { next_trade, free_order, resting_orders } => {

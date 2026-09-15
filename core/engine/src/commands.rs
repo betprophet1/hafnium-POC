@@ -337,7 +337,7 @@ impl<'a> Engine<'a> {
                 let slot = self.account_slot(dec.account_id())?;
                 let a = &self.accounts[slot as usize];
                 let available = a.balance.checked_sub(a.reserved).ok_or(FailStop::Overflow)?;
-                Ok(if delta > available { Rejected(RejectReason::INSUFFICIENT_SLEEVE) } else { Applied })
+                Ok(if delta > available.max(0) { Rejected(RejectReason::INSUFFICIENT_SLEEVE) } else { Applied })
             }
         }
     }

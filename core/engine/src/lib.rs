@@ -45,11 +45,11 @@ pub enum FailStop {
     MalformedCommand,
     /// E-2.2: arithmetic on money or quantities overflowed.
     Overflow,
-    /// E-3.3: an account's available cash went negative.
+    /// E-3.3: an account's available cash fell below zero, or further below it, other than by a void.
     NegativeAvailable,
     /// E-10.10: a book was left crossed.
     CrossedBook,
-    /// E-15.2: an event's payouts in some state no longer equal its collateral.
+    /// E-15.2, E-15.6: an event's payouts in some state, or at settlement, do not equal its collateral.
     Conservation,
     /// E-7.7: activation of a protocol version or binary this engine does not implement.
     UnsupportedProtocol,
@@ -121,6 +121,9 @@ pub struct Engine<'a> {
     order_groups: FixedMap<'a, (u64, u32), OrderGroup>,
     maker_settings: FixedMap<'a, HoldingKey, MakerSetting>,
     maker_counters: FixedMap<'a, HoldingKey, WindowCounter>,
+    event_cash: FixedMap<'a, EventCashKey, i64>,
+    /// This input is a void, the one input that may take available cash below zero (E-3.3).
+    voided: bool,
 
     position_touches: Touches<'a, HoldingKey, i64>,
     sleeve_touches: Touches<'a, u64, (i64, i64)>,
@@ -145,7 +148,8 @@ impl<'a> Engine<'a> {
         let seed = config.table_seed;
         let orders = memory.orders;
         let order_count = orders.len();
-        if order_count >= NONE as usize || memory.scratch.len() < order_count.max(memory.holdings.len() / 2) {
+        let scratch_needed = order_count.max(memory.holdings.len() / 2).max(memory.event_cash.len() / 2);
+        if order_count >= NONE as usize || memory.scratch.len() < scratch_needed {
             return Err(FailStop::Capacity);
         }
         for (i, o) in orders.iter_mut().enumerate() {
@@ -194,6 +198,8 @@ impl<'a> Engine<'a> {
             order_groups: cap(FixedMap::new(memory.order_groups, seed))?,
             maker_settings: cap(FixedMap::new(memory.maker_settings, seed))?,
             maker_counters: cap(FixedMap::new(memory.maker_counters, seed))?,
+            event_cash: cap(FixedMap::new(memory.event_cash, seed))?,
+            voided: false,
             position_touches: Touches::new(memory.position_touches),
             sleeve_touches: Touches::new(memory.sleeve_touches),
             level_touches: Touches::new(memory.level_touches),
@@ -243,6 +249,7 @@ impl<'a> Engine<'a> {
         self.now = record.sequenced_at;
         self.emitter.begin(record.sequence, record.sequenced_at);
         self.marks_len = 0;
+        self.voided = false;
         // E-4.3: another group's input
         let foreign = record.sequencer_group != self.config.sequencer_group;
         if foreign && frame.kind != Kind::Client {
@@ -404,20 +411,24 @@ impl<'a> Engine<'a> {
             instrument_index,
             levels,
             emitter,
+            voided,
             ..
         } = self;
         position_touches.finish(
             |k| holdings.get(k).map_or(0, |h| h.position),
-            |k, position| emitter.emit(sink, &Out::PositionChanged { account_id: k.0, instrument_id: k.1, position }),
+            |k, _, position| {
+                emitter.emit(sink, &Out::PositionChanged { account_id: k.0, instrument_id: k.1, position })
+            },
         )?;
         sleeve_touches.finish(
             |id| {
                 account_index.get(id).map_or((0, 0), |&s| (accounts[s as usize].balance, accounts[s as usize].reserved))
             },
-            |id, (balance, reserved)| {
-                // E-3.3
+            |id, (start_balance, start_reserved), (balance, reserved)| {
+                // E-3.3: only a void takes available cash below zero, or further below it.
                 let available = balance.checked_sub(reserved).ok_or(FailStop::Overflow)?;
-                if available < 0 {
+                let before = start_balance.checked_sub(start_reserved).ok_or(FailStop::Overflow)?;
+                if available < before.min(0) && !*voided {
                     return Err(FailStop::NegativeAvailable);
                 }
                 emitter.emit(
@@ -434,7 +445,7 @@ impl<'a> Engine<'a> {
                     (l.quantity, l.count)
                 })
             },
-            |k, (quantity, count)| {
+            |k, _, (quantity, count)| {
                 let quantity = u32::try_from(quantity).map_err(|_| FailStop::Overflow)?;
                 emitter.emit(
                     sink,

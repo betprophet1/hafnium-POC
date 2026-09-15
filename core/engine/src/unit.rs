@@ -43,12 +43,12 @@ impl<'a, K: Ord + Copy, V: Copy + PartialEq> Touches<'a, K, V> {
         Ok(())
     }
 
-    /// Calls `changed(key, final)` for each touched key whose final value differs from its start value, in
+    /// Calls `changed(key, start, final)` for each touched key whose final value differs from its start value, in
     /// ascending key order, then clears the log.
     pub fn finish<E>(
         &mut self,
         mut current: impl FnMut(&K) -> V,
-        mut changed: impl FnMut(&K, V) -> Result<(), E>,
+        mut changed: impl FnMut(&K, V, V) -> Result<(), E>,
     ) -> Result<(), E> {
         let log = &mut self.log[..self.len];
         log.sort_unstable_by_key(|e| (e.0, e.1));
@@ -57,7 +57,7 @@ impl<'a, K: Ord + Copy, V: Copy + PartialEq> Touches<'a, K, V> {
             let (key, _, start) = log[i];
             let now = current(&key);
             if now != start {
-                changed(&key, now)?;
+                changed(&key, start, now)?;
             }
             while i < log.len() && log[i].0 == key {
                 i += 1;
@@ -92,7 +92,7 @@ mod tests {
         let mut n = 0;
         t.finish(
             |k| state[*k as usize],
-            |k, v| -> Result<(), ()> {
+            |k, _, v| -> Result<(), ()> {
                 seen[n] = (*k, v);
                 n += 1;
                 Ok(())

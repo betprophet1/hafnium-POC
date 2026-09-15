@@ -487,7 +487,8 @@ impl<'a> Engine<'a> {
             }
         }
         let account = self.accounts[o.account_slot as usize];
-        if self.reservation_of(&o)? > account.balance - account.reserved {
+        // E-3.3: an account below zero can spend nothing.
+        if self.reservation_of(&o)? > (account.balance - account.reserved).max(0) {
             return Ok(Some(R::INSUFFICIENT_SLEEVE));
         }
         Ok(None)
@@ -743,8 +744,8 @@ impl<'a> Engine<'a> {
         let seller_cash = yes - 100 * (q - s_reduce);
         self.set_position(buyer.account_id, inst.id, pb.checked_add(q).ok_or(FailStop::Overflow)?)?;
         self.set_position(seller.account_id, inst.id, ps.checked_sub(q).ok_or(FailStop::Overflow)?)?;
-        self.add_balance(buyer.account_slot, buyer_cash)?;
-        self.add_balance(seller.account_slot, seller_cash)?;
+        self.add_event_cash(buyer.account_slot, inst.event_id, buyer_cash)?;
+        self.add_event_cash(seller.account_slot, inst.event_id, seller_cash)?;
         self.add_collateral(inst.event_id, 100 * (minted - burned))?;
         // E-11.3
         for x in [taker_slot, maker_slot] {
@@ -1016,7 +1017,7 @@ impl<'a> Engine<'a> {
                 cur = inst.next_in_event;
             }
             let cents = if side == Side::SELL { 100 * k } else { 100 * (n - 1) * k };
-            self.add_balance(account_slot, cents)?;
+            self.add_event_cash(account_slot, event_id, cents)?;
             self.add_collateral(event_id, -cents)?;
             self.out(sink, &Out::CollateralReleased { account_id, event_id, cents, kind })?;
         }
@@ -1199,7 +1200,7 @@ impl<'a> Engine<'a> {
         let cost = self.unit_cost(o.instrument_slot, o.side, tick, u64::from(quantity - new_lock))?;
         let new_reserved = o.spend_cap_remaining.map_or(cost, |cap| cost.min(cap));
         let account = &self.accounts[o.account_slot as usize];
-        if new_reserved - o.reserved > account.balance - account.reserved {
+        if new_reserved - o.reserved > (account.balance - account.reserved).max(0) {
             return Ok(Err(R::INSUFFICIENT_SLEEVE));
         }
         Ok(Ok((slot, tick, quantity, false)))

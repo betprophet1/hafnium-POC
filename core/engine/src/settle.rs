@@ -9,20 +9,6 @@ use venue_journal::instrument_class::InstrumentClass;
 use venue_journal::venue_mode::VenueMode;
 use venue_journal::{basket_mint_redeem_codec, expire_parlay_codec, resolve_event_codec};
 
-/// Settlement weights by state (E-15.4). `total` is never 0.
-pub(crate) struct Weights {
-    of: [u64; 64],
-    total: u64,
-}
-
-impl Weights {
-    fn only(state: u8) -> Self {
-        let mut of = [0; 64];
-        of[usize::from(state)] = 1;
-        Self { of, total: 1 }
-    }
-}
-
 /// E-15.1.
 fn payout(position: i64, mask: u64, state: u8) -> i64 {
     let in_mask = mask >> state & 1 == 1;
@@ -34,10 +20,11 @@ fn payout(position: i64, mask: u64, state: u8) -> i64 {
 }
 
 impl<'a> Engine<'a> {
-    // ------------------------------------------------------------------ E-15.3, E-15.4
+    // ------------------------------------------------------------------ E-15.3
 
-    /// The event, kind and weights of a valid `ResolveEvent`, or `None` if it is rejected.
-    pub(crate) fn resolution(&self, input: &[u8]) -> Result<Option<(u64, ResolutionKind, Weights)>, FailStop> {
+    /// The event, kind and winning state of a valid `ResolveEvent`, or `None` if it is rejected. A void takes no
+    /// weights (D-1); its winning state is unused.
+    pub(crate) fn resolution(&self, input: &[u8]) -> Result<Option<(u64, ResolutionKind, u8)>, FailStop> {
         let dec = resolve_event_codec::ResolveEventDecoder::default().header(header(input), 0);
         let (event_id, kind, winning) = (dec.event_id(), dec.kind(), dec.winning_state());
         if kind == ResolutionKind::NullVal {
@@ -48,34 +35,17 @@ impl<'a> Engine<'a> {
             return Ok(None);
         }
         if kind == ResolutionKind::RESOLVED {
-            return Ok((winning < event.state_count).then(|| (event_id, kind, Weights::only(winning))));
+            return Ok((winning < event.state_count).then_some((event_id, kind, winning)));
         }
-        let mut weights = Weights { of: [0; 64], total: 0 };
-        let (mut seen, mut given) = (0u64, 0usize);
-        let mut entries = dec.void_weights_decoder();
-        while entries.advance().map_err(|_| FailStop::MalformedCommand)?.is_some() {
-            let state = entries.state();
-            if state >= event.state_count || seen >> state & 1 == 1 {
-                return Ok(None);
-            }
-            seen |= 1 << state;
-            weights.of[usize::from(state)] = u64::from(entries.weight());
-            weights.total += u64::from(entries.weight());
-            given += 1;
-        }
-        if given == 0 {
-            for w in &mut weights.of[..usize::from(event.state_count)] {
-                *w = 1;
-            }
-            weights.total = u64::from(event.state_count);
-        } else if weights.total == 0 {
+        let mut weights = dec.void_weights_decoder();
+        if weights.advance().map_err(|_| FailStop::MalformedCommand)?.is_some() {
             return Ok(None);
         }
-        Ok(Some((event_id, kind, weights)))
+        Ok(Some((event_id, kind, 0)))
     }
 
-    /// E-15.7: the event and weights of a valid `ExpireParlay`, or `None` if it is rejected.
-    pub(crate) fn parlay_expiry(&self, input: &[u8]) -> Result<Option<(u64, Weights)>, FailStop> {
+    /// E-15.7: the event and losing state of a valid `ExpireParlay`, or `None` if it is rejected.
+    pub(crate) fn parlay_expiry(&self, input: &[u8]) -> Result<Option<(u64, u8)>, FailStop> {
         let dec = expire_parlay_codec::ExpireParlayDecoder::default().header(header(input), 0);
         let Some(&slot) = self.instrument_index.get(&dec.instrument_id()) else { return Ok(None) };
         let inst = self.instruments[slot as usize];
@@ -85,17 +55,17 @@ impl<'a> Engine<'a> {
         }
         // Listing (E-6.3) guarantees the mask leaves some state out.
         let losing = (0..event.state_count).find(|s| inst.mask >> s & 1 == 0).ok_or(FailStop::Inconsistent)?;
-        Ok(Some((inst.event_id, Weights::only(losing))))
+        Ok(Some((inst.event_id, losing)))
     }
 
     pub(crate) fn apply_resolution<S: ResultSink>(&mut self, input: &[u8], sink: &mut S) -> Result<(), FailStop> {
-        let (event_id, kind, weights) = self.resolution(input)?.ok_or(FailStop::Inconsistent)?;
-        self.settle(event_id, kind, &weights, sink)
+        let (event_id, kind, winning) = self.resolution(input)?.ok_or(FailStop::Inconsistent)?;
+        self.settle(event_id, kind, winning, sink)
     }
 
     pub(crate) fn apply_parlay_expiry<S: ResultSink>(&mut self, input: &[u8], sink: &mut S) -> Result<(), FailStop> {
-        let (event_id, weights) = self.parlay_expiry(input)?.ok_or(FailStop::Inconsistent)?;
-        self.settle(event_id, ResolutionKind::RESOLVED, &weights, sink)
+        let (event_id, losing) = self.parlay_expiry(input)?.ok_or(FailStop::Inconsistent)?;
+        self.settle(event_id, ResolutionKind::RESOLVED, losing, sink)
     }
 
     /// E-15.5, E-15.6.
@@ -103,7 +73,7 @@ impl<'a> Engine<'a> {
         &mut self,
         event_id: u64,
         kind: ResolutionKind,
-        weights: &Weights,
+        winning: u8,
         sink: &mut S,
     ) -> Result<(), FailStop> {
         let event = *self.events.get(&event_id).ok_or(FailStop::Inconsistent)?;
@@ -117,7 +87,24 @@ impl<'a> Engine<'a> {
             self.out(sink, &Out::MarketStateChanged { instrument_id, state })?;
             cur = next;
         }
-        // Open positions in the event, ascending by account then instrument.
+        let paid = if kind == ResolutionKind::RESOLVED {
+            self.pay_winners(event_id, winning, sink)?
+        } else {
+            self.reverse(&event, event_id, sink)?
+        };
+        // The event's cash is settled with it.
+        self.event_cash.retain(|key, _| key.1 != event_id);
+        if paid != event.collateral {
+            return Err(FailStop::Conservation);
+        }
+        let e = self.events.get_mut(&event_id).ok_or(FailStop::Inconsistent)?;
+        e.collateral = 0;
+        e.resolved = true;
+        Ok(())
+    }
+
+    /// E-15.5 for `RESOLVED`: each open position is paid in the winning state, ascending by account then instrument.
+    fn pay_winners<S: ResultSink>(&mut self, event_id: u64, winning: u8, sink: &mut S) -> Result<i64, FailStop> {
         let n = {
             let Self { holdings, instrument_index, instruments, scratch, .. } = self;
             let mut n = 0;
@@ -138,18 +125,12 @@ impl<'a> Engine<'a> {
             let position = self.holding(account_id, instrument_id).position;
             let slot = *self.instrument_index.get(&instrument_id).ok_or(FailStop::Inconsistent)?;
             let mask = self.instruments[slot as usize].mask;
-            let mut weighted = 0i128;
-            for s in 0..event.state_count {
-                let w = weights.of[usize::from(s)];
-                if w != 0 {
-                    weighted += i128::from(w) * i128::from(payout(position, mask, s));
-                }
-            }
-            let cents = i64::try_from(weighted / i128::from(weights.total)).map_err(|_| FailStop::Overflow)?;
+            let cents = payout(position, mask, winning);
             let account_slot = self.account_slot(account_id)?;
             self.add_balance(account_slot, cents)?;
             self.set_position(account_id, instrument_id, 0)?;
             paid = paid.checked_add(cents).ok_or(FailStop::Overflow)?;
+            let kind = ResolutionKind::RESOLVED;
             let payout = Out::SettlementPayout { account_id, instrument_id, kind, position_closed: position, cents };
             self.out(sink, &payout)?;
         }
@@ -158,21 +139,66 @@ impl<'a> Engine<'a> {
             let key = self.scratch[j];
             self.holdings.remove(&key);
         }
-        let remainder = event.collateral.checked_sub(paid).ok_or(FailStop::Overflow)?;
-        if remainder < 0 {
-            return Err(FailStop::Conservation);
+        Ok(paid)
+    }
+
+    /// E-15.5 for `VOID` (D-1): each account with a position or cash in the event, ascending by account, has its
+    /// positions closed and is paid the negation of the cash the event paid it.
+    fn reverse<S: ResultSink>(&mut self, event: &Event, event_id: u64, sink: &mut S) -> Result<i64, FailStop> {
+        self.voided = true;
+        // Every fill, basket and set burn records cash, so every account holding a position has an entry.
+        let n = {
+            let Self { event_cash, scratch, .. } = self;
+            let mut n = 0;
+            event_cash.for_each(|&(account_id, e), _| {
+                if e == event_id {
+                    scratch[n] = (account_id, 0);
+                    n += 1;
+                }
+            });
+            scratch[..n].sort_unstable();
+            n
+        };
+        let mut paid = 0i64;
+        for j in 0..n {
+            let account_id = self.scratch[j].0;
+            let cash = self.event_cash.get(&(account_id, event_id)).copied().unwrap_or(0);
+            let mut open = false;
+            let mut cur = event.first_instrument;
+            while cur != NONE {
+                let inst = self.instruments[cur as usize];
+                if self.holding(account_id, inst.id).position != 0 {
+                    open = true;
+                    self.set_position(account_id, inst.id, 0)?;
+                    // A voided holding holds nothing and no order can lock it again.
+                    self.holdings.remove(&(account_id, inst.id));
+                }
+                cur = inst.next_in_event;
+            }
+            if cash == 0 && !open {
+                continue;
+            }
+            let cents = cash.checked_neg().ok_or(FailStop::Overflow)?;
+            let account_slot = self.account_slot(account_id)?;
+            self.add_balance(account_slot, cents)?;
+            paid = paid.checked_add(cents).ok_or(FailStop::Overflow)?;
+            let kind = ResolutionKind::VOID;
+            self.out(sink, &Out::SettlementPayout { account_id, instrument_id: 0, kind, position_closed: 0, cents })?;
         }
-        if remainder > 0 {
-            let reserve = self.account_slot(0)?;
-            self.add_balance(reserve, remainder)?;
-            let payout =
-                Out::SettlementPayout { account_id: 0, instrument_id: 0, kind, position_closed: 0, cents: remainder };
-            self.out(sink, &payout)?;
+        // A position with no cash entry would have escaped the reversal.
+        let mut left = 0usize;
+        let Self { holdings, instrument_index, instruments, .. } = self;
+        holdings.for_each(|&(_, instrument_id), h| {
+            let in_event =
+                instrument_index.get(&instrument_id).is_some_and(|&s| instruments[s as usize].event_id == event_id);
+            if h.position != 0 && in_event {
+                left += 1;
+            }
+        });
+        if left > 0 {
+            return Err(FailStop::Inconsistent);
         }
-        let e = self.events.get_mut(&event_id).ok_or(FailStop::Inconsistent)?;
-        e.collateral = 0;
-        e.resolved = true;
-        Ok(())
+        Ok(paid)
     }
 
     // ------------------------------------------------------------------ E-14.1, E-14.2
@@ -211,7 +237,7 @@ impl<'a> Engine<'a> {
             cur = inst.next_in_event;
         }
         let cash = if mint { -100 * (q - closed) } else { 100 * q };
-        self.add_balance(account_slot, cash)?;
+        self.add_event_cash(account_slot, event_id, cash)?;
         self.add_collateral(event_id, -cash)?;
         let applied = Out::BasketApplied {
             account_id,
@@ -289,7 +315,7 @@ impl<'a> Engine<'a> {
                 cur = self.instruments[cur as usize].next_in_event;
             }
             let a = &self.accounts[account_slot as usize];
-            if 100 * i64::from(quantity) > a.balance - a.reserved {
+            if 100 * i64::from(quantity) > (a.balance - a.reserved).max(0) {
                 return Ok(Err((R::INSUFFICIENT_SLEEVE, None)));
             }
         } else {
