@@ -14,7 +14,7 @@ Scenario numbers refer to `spec/engine/scenarios/NN-*.json`. "Differential" mean
 | 2 | Fixed-capacity state and reference data | 1 | §3, §6, §7 | 16 |
 | 3 | Resting orders without matching | 2 | §8, E-9.1–E-9.3 (not checks 13, 14, 16, 17), E-9.5–E-9.8, §11, E-12.1–E-12.2, E-12.6, §16 | 08, 09, 10, 21 |
 | 4 | Matching and clearing | 3 | §10, E-9.9, E-12.3–E-12.5, E-12.8, E-13.1 | 01 steps 1–4, 02, 03, 04, 05, 11, 13, 14, 18, 20 |
-| 5 | Protections, limits, baskets, settlement | 4 | E-9.4, E-9.7, E-12.7, E-13.2–E-13.4, §14, §15 | all, and every differential vector |
+| 5 | Protections, limits, set burns, settlement | 4 | E-9.4, E-9.7, E-12.7, E-13.2–E-13.4, §14, §15 | all, and every differential vector |
 | 6 | Invariants inside the engine | 5 | E-3.3, E-10.10, E-15.2, E-18.1 | all, plus fail-stop tests |
 | 7 | Canonical snapshots and event transfer | 6 | spec first, then §19 items | snapshot equivalence |
 | 8 | Simulated sequencer, journal files and replay | 6 | §17 | golden replay of differential vectors |
@@ -98,14 +98,14 @@ changed key in the specified order.
 
 **Done when** scenarios 01 (steps 1–4), 02, 03, 04, 05, 11, 13, 14, 18 and 20 pass.
 
-## WP-5 Protections, limits, baskets and settlement
+## WP-5 Protections, limits, set burns and settlement
 
 **Goal.** The rest of the specification.
 
 - E-9.4 rule limits per second of sequencer time; E-9.7 position limits.
 - E-13.2 maker auto-pull and E-13.3 order groups, acting at the end of the unit (E-13.4); E-12.7.
-- §14 baskets with netting (E-14.2) and set burns with lot-step rounding (E-14.3).
-- §15 resolution, void weights, flooring, the settlement reserve, parlay expiry.
+- §14 set burns with lot-step rounding (E-14.3); basket mint and redeem are withdrawn (D-24).
+- §15 resolution, voids reversing each account's event cash (D-1), parlay expiry.
 
 **Done when** every scenario and every differential vector passes, and `ENGINE_REQUIRED=1` is set in
 `./check`. From here on, run at least 300 differential seeds before proposing a change.

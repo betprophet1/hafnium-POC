@@ -7,7 +7,6 @@ use crate::{FailStop, ResultSink};
 use venue_journal::*;
 
 pub use venue_journal::at_event_start::AtEventStart;
-pub use venue_journal::basket_direction::BasketDirection;
 pub use venue_journal::cancel_reason::CancelReason;
 pub use venue_journal::command_outcome::CommandOutcome;
 pub use venue_journal::market_state::MarketState;
@@ -113,15 +112,6 @@ pub enum Out {
         kind: ResolutionKind,
         position_closed: i64,
         cents: i64,
-    },
-    BasketApplied {
-        account_id: u64,
-        session_id: u64,
-        client_order_id: ClientOrderId,
-        event_id: u64,
-        quantity: u32,
-        direction: BasketDirection,
-        cash_cents: i64,
     },
     OrderGroupUpdated {
         account_id: u64,
@@ -304,21 +294,6 @@ impl Emitter {
                 let mut e = begin!(settlement_payout_codec, SettlementPayoutEncoder);
                 e.account_id(account_id).instrument_id(instrument_id).kind(kind);
                 e.position_closed(position_closed).cents(cents);
-                e.get_limit()
-            }
-            Out::BasketApplied {
-                account_id,
-                session_id,
-                client_order_id,
-                event_id,
-                quantity,
-                direction,
-                cash_cents,
-            } => {
-                let mut e = begin!(basket_applied_codec, BasketAppliedEncoder);
-                e.account_id(account_id).session_id(session_id);
-                e.client_order_id(&client_order_id);
-                e.event_id(event_id).quantity(quantity).direction(direction).cash_cents(cash_cents);
                 e.get_limit()
             }
             Out::OrderGroupUpdated {

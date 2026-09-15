@@ -61,7 +61,6 @@ const LAYOUTS: &[Layout] = &[
     fixed(amend_order_codec::SBE_TEMPLATE_ID, Kind::Client, amend_order_codec::SBE_BLOCK_LENGTH),
     fixed(mass_cancel_codec::SBE_TEMPLATE_ID, Kind::Client, mass_cancel_codec::SBE_BLOCK_LENGTH),
     grouped(batch_orders_codec::SBE_TEMPLATE_ID, Kind::Client, batch_orders_codec::SBE_BLOCK_LENGTH, 89),
-    fixed(basket_mint_redeem_codec::SBE_TEMPLATE_ID, Kind::Client, basket_mint_redeem_codec::SBE_BLOCK_LENGTH),
     fixed(set_order_group_codec::SBE_TEMPLATE_ID, Kind::Client, set_order_group_codec::SBE_BLOCK_LENGTH),
     fixed(reset_order_group_codec::SBE_TEMPLATE_ID, Kind::Client, reset_order_group_codec::SBE_BLOCK_LENGTH),
     fixed(time_tick_codec::SBE_TEMPLATE_ID, Kind::Sequencer, time_tick_codec::SBE_BLOCK_LENGTH),

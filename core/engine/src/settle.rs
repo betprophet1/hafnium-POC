@@ -1,13 +1,11 @@
-//! Baskets (spec E-14.1, E-14.2) and resolution and settlement (§15).
+//! Resolution and settlement (spec §15). There are no baskets (D-24).
 
 use crate::commands::header;
-use crate::emit::{BasketDirection, CancelReason, MarketState, Out, RejectReason, ResolutionKind, Side};
-use crate::orders::NO_CLIENT_ORDER_ID;
+use crate::emit::{CancelReason, MarketState, Out, ResolutionKind};
 use crate::state::*;
 use crate::{Engine, FailStop, ResultSink};
 use venue_journal::instrument_class::InstrumentClass;
-use venue_journal::venue_mode::VenueMode;
-use venue_journal::{basket_mint_redeem_codec, expire_parlay_codec, resolve_event_codec};
+use venue_journal::{expire_parlay_codec, resolve_event_codec};
 
 /// E-15.1.
 fn payout(position: i64, mask: u64, state: u8) -> i64 {
@@ -146,7 +144,7 @@ impl<'a> Engine<'a> {
     /// positions closed and is paid the negation of the cash the event paid it.
     fn reverse<S: ResultSink>(&mut self, event: &Event, event_id: u64, sink: &mut S) -> Result<i64, FailStop> {
         self.voided = true;
-        // Every fill, basket and set burn records cash, so every account holding a position has an entry.
+        // Every fill and set burn records cash, so every account holding a position has an entry.
         let n = {
             let Self { event_cash, scratch, .. } = self;
             let mut n = 0;
@@ -199,135 +197,5 @@ impl<'a> Engine<'a> {
             return Err(FailStop::Inconsistent);
         }
         Ok(paid)
-    }
-
-    // ------------------------------------------------------------------ E-14.1, E-14.2
-
-    pub(crate) fn basket<S: ResultSink>(&mut self, input: &[u8], sink: &mut S) -> Result<(), FailStop> {
-        let d = basket_mint_redeem_codec::BasketMintRedeemDecoder::default().header(header(input), 0);
-        let (session_id, account_id, client_order_id) = (d.session_id(), d.account_id(), d.client_order_id());
-        let (event_id, quantity, direction) = (d.event_id(), d.quantity(), d.direction());
-        let event = match self.basket_checks(account_id, &client_order_id, event_id, quantity, direction)? {
-            Ok(event) => event,
-            Err((reason, original_order_id)) => {
-                let reject = Out::OrderRejected {
-                    account_id,
-                    session_id,
-                    client_order_id,
-                    instrument_id: 0,
-                    reason,
-                    original_order_id,
-                };
-                self.out(sink, &reject)?;
-                return self.end_unit(sink);
-            }
-        };
-        let (q, mint) = (i64::from(quantity), direction == BasketDirection::MINT);
-        let account_slot = self.account_slot(account_id)?;
-        // New YES closes NO the account holds, so only the rest is newly funded.
-        let mut closed = 0i64;
-        let mut cur = event.first_instrument;
-        while cur != NONE {
-            let inst = self.instruments[cur as usize];
-            let position = self.holding(account_id, inst.id).position;
-            if mint {
-                closed += q.min((-position).max(0));
-            }
-            self.set_position(account_id, inst.id, if mint { position + q } else { position - q })?;
-            cur = inst.next_in_event;
-        }
-        let cash = if mint { -100 * (q - closed) } else { 100 * q };
-        self.add_event_cash(account_slot, event_id, cash)?;
-        self.add_collateral(event_id, -cash)?;
-        let applied = Out::BasketApplied {
-            account_id,
-            session_id,
-            client_order_id,
-            event_id,
-            quantity,
-            direction,
-            cash_cents: cash,
-        };
-        self.out(sink, &applied)?;
-        if mint {
-            let mut cur = event.first_instrument;
-            while cur != NONE {
-                self.restore_locks(account_slot, cur, sink)?;
-                cur = self.instruments[cur as usize].next_in_event;
-            }
-        }
-        self.end_unit(sink)
-    }
-
-    fn basket_checks(
-        &mut self,
-        account_id: u64,
-        client_order_id: &[u8; 32],
-        event_id: u64,
-        quantity: u32,
-        direction: BasketDirection,
-    ) -> Result<Result<Event, (RejectReason, Option<u64>)>, FailStop> {
-        use RejectReason as R;
-        if account_id == 0
-            || *client_order_id == NO_CLIENT_ORDER_ID
-            || quantity == 0
-            || direction == BasketDirection::NullVal
-        {
-            return Ok(Err((R::MALFORMED, None)));
-        }
-        let key = (account_id, *client_order_id);
-        if let Some(entry) = self.duplicates.get(&key).copied() {
-            if self.now < entry.expires_at {
-                return Ok(Err((R::DUPLICATE_CLIENT_ORDER_ID, entry.order_id)));
-            }
-        }
-        let expires_at = self.now.checked_add(self.duplicate_window()).ok_or(FailStop::Overflow)?;
-        let entry = Duplicate { expires_at, order_id: None };
-        self.duplicates.insert(key, entry).map_err(|_| FailStop::Capacity)?;
-        let event = match self.events.get(&event_id).copied() {
-            Some(e) if !e.resolved && self.is_partition(&e) => e,
-            _ => return Ok(Err((R::UNKNOWN_INSTRUMENT, None))),
-        };
-        let (mut open, mut on_step) = (!event.suspended, true);
-        let mut cur = event.first_instrument;
-        while cur != NONE {
-            let inst = &self.instruments[cur as usize];
-            open &= inst.market_state == MarketState::OPEN;
-            on_step &= quantity.is_multiple_of(inst.lot_step);
-            cur = inst.next_in_event;
-        }
-        if !open {
-            return Ok(Err((R::MARKET_NOT_OPEN, None)));
-        }
-        if !on_step {
-            return Ok(Err((R::QUANTITY_NOT_ON_LOT_STEP, None)));
-        }
-        let account_slot = self.account_slot(account_id)?;
-        if direction == BasketDirection::MINT {
-            if self.venue_mode != VenueMode::NORMAL {
-                return Ok(Err((R::VENUE_MODE, None)));
-            }
-            let mut cur = event.first_instrument;
-            while cur != NONE {
-                if self.position_limit_breached(account_slot, cur, Side::BUY, quantity, NONE) {
-                    return Ok(Err((R::POSITION_LIMIT, None)));
-                }
-                cur = self.instruments[cur as usize].next_in_event;
-            }
-            let a = &self.accounts[account_slot as usize];
-            if 100 * i64::from(quantity) > (a.balance - a.reserved).max(0) {
-                return Ok(Err((R::INSUFFICIENT_SLEEVE, None)));
-            }
-        } else {
-            let mut cur = event.first_instrument;
-            while cur != NONE {
-                let inst = &self.instruments[cur as usize];
-                if self.unlocked_holding(account_id, inst.id, Side::SELL) < i64::from(quantity) {
-                    return Ok(Err((R::INSUFFICIENT_POSITION, None)));
-                }
-                cur = inst.next_in_event;
-            }
-        }
-        Ok(Ok(event))
     }
 }

@@ -135,7 +135,7 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    /// Adds to an account's balance and to the net cash the event has paid it (E-10.6, E-14.2, E-14.3; D-1).
+    /// Adds to an account's balance and to the net cash the event has paid it (E-10.6, E-14.3; D-1).
     pub(crate) fn add_event_cash(&mut self, account_slot: u32, event_id: u64, cents: i64) -> Result<(), FailStop> {
         self.add_balance(account_slot, cents)?;
         let key = (self.accounts[account_slot as usize].id, event_id);

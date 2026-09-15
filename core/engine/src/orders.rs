@@ -18,8 +18,8 @@ use venue_journal::self_match_prevention::SelfMatchPrevention;
 use venue_journal::time_in_force::TimeInForce;
 use venue_journal::venue_mode::VenueMode;
 use venue_journal::{
-    amend_order_codec, basket_mint_redeem_codec, batch_orders_codec, cancel_order_codec, mass_cancel_codec,
-    new_order_codec, reset_order_group_codec, set_order_group_codec,
+    amend_order_codec, batch_orders_codec, cancel_order_codec, mass_cancel_codec, new_order_codec,
+    reset_order_group_codec, set_order_group_codec,
 };
 
 pub(crate) const NS_PER_SECOND: u64 = 1_000_000_000;
@@ -109,10 +109,6 @@ fn client_identity(template: u16, input: &[u8]) -> (u64, u64, ClientOrderId, u64
             let d = reset_order_group_codec::ResetOrderGroupDecoder::default().header(h, 0);
             (d.account_id(), d.session_id(), NO_CLIENT_ORDER_ID, 0)
         }
-        basket_mint_redeem_codec::SBE_TEMPLATE_ID => {
-            let d = basket_mint_redeem_codec::BasketMintRedeemDecoder::default().header(h, 0);
-            (d.account_id(), d.session_id(), d.client_order_id(), 0)
-        }
         _ => (0, 0, NO_CLIENT_ORDER_ID, 0),
     }
 }
@@ -184,7 +180,6 @@ impl<'a> Engine<'a> {
             set_order_group_codec::SBE_TEMPLATE_ID | reset_order_group_codec::SBE_TEMPLATE_ID => {
                 self.order_group(template, input, sink)
             }
-            basket_mint_redeem_codec::SBE_TEMPLATE_ID => self.basket(input, sink),
             _ => Err(FailStop::MalformedCommand),
         }
     }
