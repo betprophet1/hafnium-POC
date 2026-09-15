@@ -18,8 +18,7 @@ NS_PER_SECOND = 10**9
 NS_PER_MILLI = 10**6
 
 CLIENT_MESSAGES = {
-    "NewOrder", "CancelOrder", "AmendOrder", "MassCancel", "BatchOrders", "BasketMintRedeem",
-    "SetOrderGroup", "ResetOrderGroup",
+    "NewOrder", "CancelOrder", "AmendOrder", "MassCancel", "BatchOrders", "SetOrderGroup", "ResetOrderGroup",
 }
 COMMANDS = {
     "ActivateProtocol", "SleeveAdjust", "DefineTickTable", "DefineEvent", "ListInstrument", "SetEventPhase",
@@ -204,7 +203,7 @@ class Engine:
         self.touch_sleeve(account_id)
         self.account(account_id).balance += cents
 
-    def add_event_cash(self, account_id, event_id, cents):             # E-10.6, E-14.2, E-14.3 (D-1)
+    def add_event_cash(self, account_id, event_id, cents):             # E-10.6, E-14.3 (D-1)
         self.add_balance(account_id, cents)
         cash = self.account(account_id).event_cash
         cash[event_id] = cash.get(event_id, 0) + cents
@@ -1273,57 +1272,7 @@ class Engine:
                           triggered="FALSE")
         self.end_unit()
 
-    # ============================================================ baskets and burns (§14)
-
-    def on_BasketMintRedeem(self, inp):                                  # E-14.1, E-14.2
-        self.begin_unit()
-        a, coid, q = inp["accountId"], inp.get("clientOrderId", ""), inp["quantity"]
-
-        def rejected(reason, original=None):
-            self.reject_unit("OrderRejected", accountId=a, sessionId=inp["sessionId"], clientOrderId=coid,
-                             instrumentId=0, reason=reason, originalOrderId=original)
-            self.end_unit()
-
-        if a == 0 or not coid or q <= 0:
-            return rejected("MALFORMED")
-        dup = self.duplicate_of(a, coid)
-        if dup:
-            return rejected("DUPLICATE_CLIENT_ORDER_ID", dup[1])
-        self.duplicates[(a, coid)] = (self.duplicate_expiry(), None)
-        ev = self.events.get(inp["eventId"])
-        if ev is None or ev.resolved or not self.is_partition(ev):
-            return rejected("UNKNOWN_INSTRUMENT")
-        insts = [self.instruments[i] for i in ev.instruments]
-        if any(i.market_state != "OPEN" for i in insts) or ev.suspended:
-            return rejected("MARKET_NOT_OPEN")
-        if any(q % i.lot_step for i in insts):
-            return rejected("QUANTITY_NOT_ON_LOT_STEP")
-        acc = self.account(a)
-        if inp["direction"] == "MINT":
-            if self.venue_mode != "NORMAL":
-                return rejected("VENUE_MODE")
-            if any(self.position_limit_breached(a, i, "BUY", q) for i in insts):
-                return rejected("POSITION_LIMIT")
-            if 100 * q > max(0, acc.balance - acc.reserved):
-                return rejected("INSUFFICIENT_SLEEVE")
-            sign = 1
-        else:
-            if any(self.unlocked_holding(a, i, "SELL") < q for i in insts):
-                return rejected("INSUFFICIENT_POSITION")
-            sign = -1
-        # E-14.2: new YES closes NO the account holds, so only (q - K) is newly funded.
-        closed = sum(min(q, max(0, -self.position(a, i.instrument_id))) for i in insts) if sign > 0 else 0
-        cash = -100 * (q - closed) if sign > 0 else 100 * q
-        for i in insts:
-            self.set_position(a, i.instrument_id, self.position(a, i.instrument_id) + sign * q)
-        self.add_event_cash(a, ev.event_id, cash)
-        ev.collateral -= cash
-        self.emit_outcome("BasketApplied", accountId=a, sessionId=inp["sessionId"], clientOrderId=coid,
-                          eventId=ev.event_id, quantity=q, direction=inp["direction"], cashCents=cash)
-        if sign > 0:
-            for i in insts:
-                self.restore_locks(a, i)
-        self.end_unit()
+    # ============================================================ set burns (§14; no baskets, D-24)
 
     def set_burns(self):                                                 # E-14.3
         for (event_id, a) in sorted(self.unit.filled):

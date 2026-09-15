@@ -33,12 +33,12 @@ STATES = {100: 2, 101: 2, 200: 3, 300: 2, 400: 4}
 
 ALL_RESULTS = {"OrderAccepted", "OrderRejected", "Fill", "OrderCancelled", "OrderAmended", "OrderReduced",
                "PositionChanged", "SleeveChanged", "CollateralReleased", "BookLevelChanged", "MarketStateChanged",
-               "SettlementPayout", "BasketApplied", "OrderGroupUpdated", "CommandApplied"}
+               "SettlementPayout", "OrderGroupUpdated", "CommandApplied"}
 ALL_REJECTS = {"MALFORMED", "UNKNOWN_INSTRUMENT", "UNKNOWN_ORDER", "MARKET_NOT_OPEN", "VENUE_MODE",
                "TICK_NOT_ON_LADDER", "QUANTITY_NOT_ON_LOT_STEP", "EXPIRY_IN_PAST", "INSUFFICIENT_SLEEVE",
                "POST_ONLY_WOULD_TAKE", "FOK_NOT_FILLABLE", "REDUCE_ONLY_NO_POSITION", "CLOSED_ONLY_MODE",
                "SPEND_CAP_BELOW_ONE_CONTRACT", "DUPLICATE_CLIENT_ORDER_ID", "RULE_LIMIT", "POSITION_LIMIT",
-               "ORDER_CAPACITY", "ORDER_GROUP_TRIGGERED", "INSUFFICIENT_POSITION"}
+               "ORDER_CAPACITY", "ORDER_GROUP_TRIGGERED"}
 ALL_CANCELS = {"CLIENT_REQUEST", "MASS_CANCEL", "SESSION_DISCONNECT", "HEARTBEAT_MISSED", "EVENT_START", "EXPIRED",
                "IOC_REMAINDER", "SELF_MATCH_PREVENTED", "MAKER_AUTO_PULL", "KILL_SWITCH", "MARKET_RESOLVED",
                "POSITION_CLOSED", "MARKET_CLOSED", "ORDER_GROUP_TRIGGERED", "SPEND_CAP_REACHED"}
@@ -140,6 +140,8 @@ class Fuzzer:
             e["tick"] = 120                                          # off the ladder
         if r.random() < 0.03 and LOT[i] > 1:
             e["quantity"] += 1                                       # off the lot step
+        if r.random() < 0.01:
+            e["instrumentId"] = 9999                                 # never listed
         return e
 
     def random_input(self):
@@ -148,9 +150,9 @@ class Fuzzer:
         if self.engine.venue_mode != "NORMAL" and r.random() < 0.3:
             return dict(msg="SetVenueMode", commandId=self.next_cmd(), mode="NORMAL"), None
         kind = r.choices(
-            ["new", "cancel", "amend", "mass", "batch", "sweep", "basket", "tick", "grant", "reclaim", "controls",
+            ["new", "cancel", "amend", "mass", "batch", "sweep", "tick", "grant", "reclaim", "controls",
              "protect", "group", "reset", "market", "phase", "venue", "limits", "params", "seed"],
-            [40, 10, 8, 2, 4, 3, 3, 8, 2, 2, 1, 3, 3, 1, 2, 1, 1, 1, 1, 1])[0]
+            [40, 10, 8, 2, 4, 3, 8, 2, 2, 1, 3, 3, 1, 2, 1, 1, 1, 1, 1])[0]
         if kind == "new":
             e = self.order_fields(a)
             e.pop("entryType")
@@ -205,9 +207,6 @@ class Fuzzer:
                 e.pop("expiresAfterNs", None)
                 entries.append(e)
             return dict(msg="BatchOrders", accountId=a, entries=entries), None
-        if kind == "basket":
-            return dict(msg="BasketMintRedeem", accountId=a, clientOrderId=self.next_coid(a), eventId=200,
-                        quantity=r.randint(1, 5), direction=r.choice(["MINT", "REDEEM"])), None
         if kind == "tick":
             return dict(msg="TimeTick"), r.choice([1, 2, 5, 20, 1500]) * 1_000_000
         if kind == "grant":

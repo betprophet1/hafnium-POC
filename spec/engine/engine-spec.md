@@ -29,7 +29,7 @@ make this document executable.
 11. Holdings locks and reservations
 12. Cancels, amendments, mass cancels and batches
 13. Protections: self-match, auto-pull and order groups
-14. Baskets and set burns
+14. Set burns
 15. Resolution and settlement
 16. Market state, event phases and venue modes
 17. Sequencer obligations
@@ -135,7 +135,7 @@ that input's results, counting from 0 across all units of the input.
 **E-5.2** A unit's results are emitted in five blocks, in this order:
 
 1. **Outcome** — exactly one of `OrderAccepted`, `OrderRejected`, `OrderCancelled` (for `CancelOrder`),
-   `OrderAmended`, `BasketApplied`, `OrderGroupUpdated` (for `SetOrderGroup` and `ResetOrderGroup`) or
+   `OrderAmended`, `OrderGroupUpdated` (for `SetOrderGroup` and `ResetOrderGroup`) or
    `CommandApplied`. `MassCancel`, `TimeTick`, `EngineStarted` and `SeedSet` have no outcome result.
 2. **Events** in the order they occur: `Fill`, `OrderCancelled`, `OrderReduced`, `OrderGroupUpdated`
    (triggers), `CollateralReleased`, `MarketStateChanged`, `SettlementPayout`.
@@ -474,26 +474,10 @@ Then set burns run (E-14.3).
 
 ---
 
-## 14. Baskets and set burns
+## 14. Set burns
 
-**E-14.1 `BasketMintRedeem` checks.** In order: account not 0, `clientOrderId` not zero, `quantity > 0`
-(`MALFORMED`); duplicate (E-9.2); event exists and is a partition event (`UNKNOWN_INSTRUMENT`); every
-instrument of the event is `OPEN` and the event not suspended (`MARKET_NOT_OPEN`); `quantity` is a multiple
-of every instrument's `lotStep` (`QUANTITY_NOT_ON_LOT_STEP`). For `MINT`: `venueMode` is `NORMAL`
-(`VENUE_MODE`); no instrument's position limit would be exceeded by E-9.7 as a `BUY` (`POSITION_LIMIT`);
-`100 · quantity` does not exceed available cash (`INSUFFICIENT_SLEEVE`). For `REDEEM`: every instrument's
-unlocked YES holding is at least `quantity` (`INSUFFICIENT_POSITION`).
-
-**E-14.2 Effect.** `MINT`: with `K` the sum over the event's instruments of `min(quantity, max(0, −position))`
-— the NO contracts the new YES closes — every position rises by `quantity`, `balance` changes by
-`−100 · (quantity − K)`, the event's `collateralCents` by `+100 · (quantity − K)`, and lock restoration (E-11.4)
-then runs for the account on every instrument of the event. `REDEEM`: every position falls by `quantity`,
-`balance += 100 · quantity` and `collateralCents −= 100 · quantity`. Outcome: `BasketApplied` with the balance
-change as `cashCents`, which is also added to the account's `eventCash` for the event. No set burn runs after a
-basket unit. Netting is what keeps E-15.2: in a partition event
-the account's payout changes by exactly `100 · (quantity − K)` in every state, so charging `100 · quantity`
-when the account held NO would take money for a payout it did not receive (scenario 19). The available-cash
-check of E-14.1 stays at `100 · quantity`, which covers any reservation lock restoration adds.
+**E-14.1, E-14.2** Withdrawn. There is no basket mint or redeem: contracts are created and destroyed only by
+fills (E-10.6) and set burns *(D-24)*.
 
 **E-14.3 Set burns.** At the end of a unit containing fills, for each partition event with fills and each
 account that was party to one, ascending by event then account, with `N` the event's instruments:
@@ -523,7 +507,7 @@ violation is a fail-stop.
 `RESOLVED`, if `winningState >= stateCount`; for `VOID`, if `voidWeights` is not empty *(D-1)*.
 
 **E-15.4 Payouts.** `RESOLVED` pays each position its E-15.1 payout in `winningState`. `VOID` reverses the
-event: each account is paid `−eventCash` for the event, undoing every fill, basket and set burn in it whether or
+event: each account is paid `−eventCash` for the event, undoing every fill and set burn in it whether or
 not the account still holds a position. The payment is negative for an account that took more cash out of the
 event than it put in *(D-1)*.
 
@@ -566,9 +550,9 @@ ID. `SUSPENDED` sets `suspended`; `RESUMED` requires `suspended` and clears it; 
 no other effect. `SCHEDULED`, or any phase on a resolved event, is rejected.
 
 **E-16.4 `SetVenueMode`.** Sets `venueMode`. `KILL_SWITCH` first removes every resting order in the group
-with `KILL_SWITCH`, ascending order ID. `NEW_ORDER_REJECT` rejects new orders and basket mints;
+with `KILL_SWITCH`, ascending order ID. `NEW_ORDER_REJECT` rejects new orders;
 `CANCEL_ONLY` and `KILL_SWITCH` additionally reject amendments that reprice or increase (E-12.5). Cancels,
-mass cancels, reductions and basket redeems are allowed in every mode.
+mass cancels and reductions are allowed in every mode.
 
 ---
 

@@ -18,8 +18,8 @@ SCENARIOS = HERE.parent / "scenarios"
 T0 = 1_800_000_000_000_000_000
 STEP_NS = 1_000_000
 ORDER_ID_KEYS = {"orderId", "makerOrderId", "takerOrderId", "originalOrderId"}
-CLIENT_MESSAGES = {"NewOrder", "CancelOrder", "AmendOrder", "MassCancel", "BatchOrders", "BasketMintRedeem",
-                   "SetOrderGroup", "ResetOrderGroup"}
+CLIENT_MESSAGES = {"NewOrder", "CancelOrder", "AmendOrder", "MassCancel", "BatchOrders", "SetOrderGroup",
+                   "ResetOrderGroup"}
 NON_COMMANDS = CLIENT_MESSAGES | {"TimeTick", "EngineStarted", "SeedSet"}
 
 NEW_ORDER_DEFAULTS = dict(enteredContract="YES", timeInForce="GTC", atEventStart="CANCEL", flags=[],
@@ -118,7 +118,7 @@ def with_defaults(inp, now):
 
 def expected_with_defaults(result, group):
     r = dict(RESULT_DEFAULTS.get(result["msg"], {}))
-    if result["msg"] in ("OrderAccepted", "OrderRejected", "BasketApplied"):
+    if result["msg"] in ("OrderAccepted", "OrderRejected"):
         r["sessionId"] = result.get("accountId", 0) * 10
     r.update(result)
     return placeholder_ids(r, group)
