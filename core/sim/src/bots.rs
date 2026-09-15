@@ -1,11 +1,11 @@
 //! Synthetic makers and takers (blueprint §16). Ordinary clients of the ingress that decide only from the feed.
 
-use crate::view::{InstrumentView, Live, OrderView, View};
-use crate::wire::{amend, cancel, order, Ids, Ingress};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::thread;
 use std::time::Duration;
+use venue_link::view::{InstrumentView, Live, OrderView, View};
+use venue_link::wire::{amend, cancel, order, Ids, Ingress};
 
 /// A small seeded generator (splitmix64), so a run can be repeated.
 pub struct Rng(u64);

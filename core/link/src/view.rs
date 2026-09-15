@@ -44,6 +44,14 @@ impl InstrumentView {
     }
 }
 
+/// One row of a tick table, exactly as `DefineTickTable` gave it (spec E-6.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Row {
+    pub numerator: u64,
+    pub denominator: u64,
+    pub complement: u64,
+}
+
 #[derive(Clone)]
 pub struct OrderView {
     pub account: u64,
@@ -58,8 +66,10 @@ pub struct View {
     /// The last input applied; a reader has seen an input's effects once this reaches its sequence.
     pub sequence: u64,
     pub version: u64,
-    /// Each table's ticks as basis points of probability.
+    /// Each table's ticks as basis points of probability, for display.
     pub tables: BTreeMap<u64, Vec<u64>>,
+    /// Each table's rows as exact rationals, for anything that converts prices.
+    pub ladders: BTreeMap<u64, Vec<Row>>,
     pub events: BTreeMap<u64, EventView>,
     pub instruments: BTreeMap<u64, InstrumentView>,
     pub orders: BTreeMap<u64, OrderView>,
@@ -91,9 +101,20 @@ impl View {
         let applied = unit.results.iter().any(|r| r["msg"] == "CommandApplied" && r["outcome"] == "APPLIED");
         match input["msg"].as_str().unwrap_or("") {
             "DefineTickTable" if applied => {
-                let rows = input["ticks"].as_array().into_iter().flatten();
-                let bp = rows.map(|r| 10_000 * u(&r["numerator"]) / u(&r["denominator"]).max(1)).collect();
-                self.tables.insert(u(&input["tickTableId"]), bp);
+                let rows: Vec<Row> = input["ticks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|r| Row {
+                        numerator: u(&r["numerator"]),
+                        denominator: u(&r["denominator"]),
+                        complement: u(&r["complement"]),
+                    })
+                    .collect();
+                let bp = rows.iter().map(|r| 10_000 * r.numerator / r.denominator.max(1)).collect();
+                let table = u(&input["tickTableId"]);
+                self.tables.insert(table, bp);
+                self.ladders.insert(table, rows);
             }
             "DefineEvent" if applied => {
                 let event = EventView { state_count: u(&input["stateCount"]), ..EventView::default() };

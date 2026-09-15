@@ -1,0 +1,16 @@
+[package]
+name = "venue-link"
+version = "0.1.0"
+description = "Talking to a node from outside the engine: ingress, feed, a projection of the feed, and the demo catalogue"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+venue-harness = { path = "../harness" }
+venue-node = { path = "../node" }
+serde_json = "1"

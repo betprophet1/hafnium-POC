@@ -7,7 +7,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CORE="$ROOT/core"
-HANDWRITTEN=(-p venue-engine -p venue-harness -p venue-node -p venue-sim)
+HANDWRITTEN=(-p venue-engine -p venue-harness -p venue-node -p venue-link -p venue-gateway -p venue-sim)
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 

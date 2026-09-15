@@ -4,15 +4,15 @@
 //! The oracle here sequences commands directly. Blueprint §16 routes a dummy resolution through a proposal, the
 //! resolution console and an auto-approver; those do not exist yet.
 
-use crate::catalogue::Catalogue;
-use crate::view::Live;
-use crate::wire::{self, Error, Ids, Ingress};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use venue_link::catalogue::Catalogue;
+use venue_link::view::Live;
+use venue_link::wire::{self, Error, Ids, Ingress};
 
 const INDEX: &str = include_str!("index.html");
 

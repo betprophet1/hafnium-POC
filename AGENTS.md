@@ -17,6 +17,8 @@ agent needs to build its core, and the core itself. Read this before changing an
 | `core/harness/` | Runs scenarios and differential vectors against the engine; the JSON codec in `src/codec.rs` is generated. |
 | `core/journal/` | The Rust codec generated from the schema. Never edited by hand. |
 | `core/node/` | The single-member node for laptops and test environments: simulated sequencer, journal, result log, TCP ingress and feed. Never on the production path. |
+| `core/link/` | Talking to a node from outside the engine: ingress client, feed follower, a projection of the feed, the demo catalogue. |
+| `core/gateway/` | Interface 1, the REST and WebSocket gateway (`interfaces/gateway/`): the only client-facing component that writes to a sequencer group. |
 | `core/sim/` | The mini venue's actors: synthetic makers and takers, the dummy oracle, demo markets and the web page. Test environments only. |
 | `core/prototypes/` | Experiments behind blueprint claims. Learn from them; nothing depends on them. |
 | `core/WORK_PACKAGES.md` | The order in which the core is built, and what "done" means for each piece. |

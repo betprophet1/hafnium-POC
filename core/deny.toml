@@ -5,7 +5,8 @@
 all-features = true
 
 [licenses]
-allow = ["MIT", "Apache-2.0"]
+# Unicode-3.0 is OSI-approved and permissive; it reaches the gateway only through unicode-ident in a proc macro.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
 confidence-threshold = 0.9
 private = { ignore = true }
 

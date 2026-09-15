@@ -1,17 +1,15 @@
 //! `venue-sim`: the mini venue's actors. See `core/sim/README.md`.
 
 mod bots;
-mod catalogue;
-mod view;
 mod web;
-mod wire;
 
-use catalogue::Catalogue;
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use venue_link::catalogue::Catalogue;
+use venue_link::{view, wire};
 use wire::{Error, Ids, Ingress};
 
 const USAGE: &str = "usage:
