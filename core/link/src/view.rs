@@ -78,6 +78,8 @@ pub struct View {
     pub sleeves: BTreeMap<u64, (i64, i64)>,
     pub trades: VecDeque<Value>,
     pub payouts: VecDeque<Value>,
+    /// The event whose markets were last settled or voided: a void pays with instrument 0, so its payouts name it.
+    settled_event: u64,
 }
 
 fn u(v: &Value) -> u64 {
@@ -170,6 +172,7 @@ impl View {
                     i.state = s(&r["state"]);
                     if matches!(i.state.as_str(), "SETTLED" | "VOIDED") {
                         let event = i.event;
+                        self.settled_event = event;
                         if let Some(e) = self.events.get_mut(&event) {
                             e.resolved = true;
                         }
@@ -233,8 +236,13 @@ impl View {
                 self.sleeves.insert(u(&r["accountId"]), sleeve);
             }
             "SettlementPayout" => {
+                let instrument = u(&r["instrumentId"]);
+                let event = match instrument {
+                    0 => self.settled_event,
+                    i => self.instruments.get(&i).map_or(0, |i| i.event),
+                };
                 let payout = json!({
-                    "sequence": self.sequence, "account": r["accountId"], "instrument": r["instrumentId"],
+                    "sequence": self.sequence, "account": r["accountId"], "event": event, "instrument": instrument,
                     "kind": r["kind"], "positionClosed": r["positionClosed"], "cents": r["cents"]
                 });
                 keep(&mut self.payouts, payout);

@@ -308,16 +308,24 @@ components:
             description: Only positions this input changed, including those now zero.
             items: { $ref: './openapi.yaml#/components/schemas/Position' }
     payout:
+      summary: >-
+        A resolved event pays each position its value in the winning state, one message per market. A void reverses
+        every trade in the event (spec E-15.4): one message per account, with instrumentId "0" and positionClosed 0,
+        whose cents return what the account put in and take back what it took out, so they can be negative and can
+        leave available cash below zero.
       payload:
         type: object
-        required: [type, sequence, instrumentId, kind, positionClosed, cents]
+        required: [type, sequence, eventId, instrumentId, kind, positionClosed, cents]
         properties:
           type: { const: payout }
           sequence: { $ref: './openapi.yaml#/components/schemas/Id' }
-          instrumentId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          eventId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          instrumentId:
+            allOf: [{ $ref: './openapi.yaml#/components/schemas/Id' }]
+            description: The market for a resolved payout; "0" for a void, which pays per account across the event.
           kind: { type: string, enum: [resolved, void] }
-          positionClosed: { type: integer }
-          cents: { type: integer }
+          positionClosed: { type: integer, description: 0 for a void; positions close through the account message. }
+          cents: { type: integer, description: Negative when a void takes back more than it returns. }
     resync:
       payload:
         type: object

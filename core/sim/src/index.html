@@ -286,7 +286,12 @@ function onMessage(s, msg) {
       break;
     }
     case 'account': soon(s); break;
-    case 'payout': toast(`${s.label}: paid ${money(msg.cents)} for ${Math.abs(msg.positionClosed)} contracts`, 'ok'); soon(s); break;
+    case 'payout':
+      toast(msg.kind === 'void'
+        ? `${s.label}: void ${msg.cents < 0 ? 'took back' : 'returned'} ${money(Math.abs(msg.cents))}`
+        : `${s.label}: paid ${money(msg.cents)} for ${Math.abs(msg.positionClosed)} contracts`, msg.cents < 0 ? 'bad' : 'ok');
+      soon(s);
+      break;
     case 'book': books[msg.instrumentId] = msg; if (msg.instrumentId === selInst) renderBook(); renderPills(); renderRetail(); break;
     case 'trade': {
       const list = trades[msg.instrumentId] = trades[msg.instrumentId] || [];
@@ -465,8 +470,10 @@ function renderSettle() {
   }).join('') || '<p class="muted">No events yet.</p>');
   const name = id => (S.accounts.find(a => a.id === id) || {name: id === 0 ? 'Settlement reserve' : '#' + id}).name;
   const label = id => { for (const e of S.events) for (const i of e.instruments) if (i.id === id) return e.title + ' · ' + i.label; return '—'; };
+  // A void pays per account across the whole event, with instrument 0; its cents can be negative.
+  const market = p => p.instrument ? label(p.instrument) : ((S.events.find(e => e.id === p.event) || {title: '—'}).title + ' · whole event');
   setHTML($('#payouts'), S.payouts.length ? '<table><thead><tr><th>Account</th><th>Market</th><th>Kind</th><th class="r">Closed</th><th class="r">Paid</th></tr></thead><tbody>'
-    + S.payouts.map(p => `<tr><td>${esc(name(p.account))}</td><td>${esc(label(p.instrument))}</td><td class="muted">${words(p.kind)}</td><td class="r">${p.positionClosed}</td><td class="r">${money(p.cents)}</td></tr>`).join('')
+    + S.payouts.map(p => `<tr><td>${esc(name(p.account))}</td><td>${esc(market(p))}</td><td class="muted">${words(p.kind)}</td><td class="r">${p.kind === 'VOID' ? '—' : p.positionClosed}</td><td class="r">${money(p.cents)}</td></tr>`).join('')
     + '</tbody></table>' : '<p class="muted">None yet.</p>');
 }
 

@@ -205,6 +205,13 @@ impl Hub {
             self.send_to_account(account, sequence, json!({"type": "execution", "execution": execution}).to_string());
         }
         let mut accounts: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
+        let event_of = |view: &View, instrument: u64| view.instruments.get(&instrument).map_or(0, |i| i.event);
+        // A void pays per account with instrument 0; its event is the one whose markets this unit settled.
+        let settled_event = unit
+            .results
+            .iter()
+            .find(|r| r["msg"] == "MarketStateChanged")
+            .map_or(0, |r| event_of(&self.view, u(&r["instrumentId"])));
         for r in &unit.results {
             let instrument = u(&r["instrumentId"]);
             match r["msg"].as_str().unwrap_or("") {
@@ -216,8 +223,9 @@ impl Hub {
                     accounts.entry(u(&r["accountId"])).or_default();
                 }
                 "SettlementPayout" if u(&r["accountId"]) != 0 => {
+                    let event = if instrument == 0 { settled_event } else { event_of(&self.view, instrument) };
                     let payout = json!({
-                        "type": "payout", "sequence": id(sequence), "instrumentId": id(instrument),
+                        "type": "payout", "sequence": id(sequence), "eventId": id(event), "instrumentId": id(instrument),
                         "kind": lower(&r["kind"]), "positionClosed": r["positionClosed"], "cents": r["cents"]
                     });
                     self.send_to_account(u(&r["accountId"]), sequence, payout.to_string());
