@@ -1,9 +1,9 @@
 {
   "accounts": [
-    {"id": 1, "name": "Market maker", "tab": "maker", "cents": 5000000},
-    {"id": 2, "name": "Retail customer", "tab": "retail", "cents": 50000},
-    {"id": 10, "name": "Synthetic maker", "tab": null, "cents": 100000000},
-    {"id": 20, "name": "Synthetic taker", "tab": null, "cents": 20000000}
+    {"id": 1, "name": "Market maker", "tab": "maker", "cents": 5000000, "token": "dev-market-maker"},
+    {"id": 2, "name": "Retail customer", "tab": "retail", "cents": 50000, "token": "dev-retail-customer"},
+    {"id": 10, "name": "Synthetic maker", "tab": null, "cents": 100000000, "token": "dev-synthetic-maker"},
+    {"id": 20, "name": "Synthetic taker", "tab": null, "cents": 20000000, "token": "dev-synthetic-taker"}
   ],
   "markets": [
     {

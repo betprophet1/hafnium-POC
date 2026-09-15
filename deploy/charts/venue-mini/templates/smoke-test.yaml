@@ -16,6 +16,7 @@ metadata:
   name: {{ include "venue-mini.fullname" . }}-smoke
   labels:
     {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: smoke
   annotations:
     helm.sh/hook: test
     helm.sh/hook-delete-policy: before-hook-creation

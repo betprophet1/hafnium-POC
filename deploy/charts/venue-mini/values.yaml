@@ -31,10 +31,18 @@ core:
 web:
   enabled: true
 
+# Interface 1. Flood limits per WebSocket session, and per account for REST: messages a second and burst, logons a
+# minute per account (blueprint §12). Set well above what the page and bots need.
+gateway:
+  perSecond: 50
+  burst: 100
+  logonsPerMinute: 30
+
+# Synthetic traders, clients of the gateway. Each acts as the catalogue account its dev token names.
 bots:
   maker:
     enabled: true
-    account: 10
+    token: dev-synthetic-maker
     # Contracts quoted at the touch on each side, in lots; level k further out quotes (k + 1) times this.
     size: 10
     # Price levels quoted on each side.
@@ -45,7 +53,7 @@ bots:
     seed: 1
   taker:
     enabled: true
-    account: 20
+    token: dev-synthetic-taker
     maxQuantity: 5
     # Chance per market per interval of an order, and of that order being a sweep, in thousandths.
     chance: 250

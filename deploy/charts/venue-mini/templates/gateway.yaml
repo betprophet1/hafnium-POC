@@ -1,0 +1,104 @@
+{{- $name := include "venue-mini.fullname" . }}
+{{- $core := printf "%s-core" $name }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-gateway
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  selector:
+    {{- include "venue-mini.selector" (dict "ctx" . "component" "gateway") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+---
+# Interface 1, the REST and WebSocket gateway (interfaces/gateway): the only client-facing way into the core.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-gateway
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" . | nindent 8 }}
+        app.kubernetes.io/component: gateway
+    spec:
+      securityContext:
+        {{- include "venue-mini.podSecurity" . | nindent 8 }}
+      containers:
+        - name: gateway
+          image: {{ include "venue-mini.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["venue-gateway"]
+          env:
+            - name: VENUE_LISTEN
+              value: "0.0.0.0:8081"
+            - name: VENUE_INGRESS
+              value: "{{ $core }}:7101"
+            - name: VENUE_FEED
+              value: "{{ $core }}:7102"
+            - name: VENUE_CATALOGUE
+              value: /catalogue/markets.json
+            - name: VENUE_PER_SECOND
+              value: {{ .Values.gateway.perSecond | quote }}
+            - name: VENUE_BURST
+              value: {{ .Values.gateway.burst | quote }}
+            - name: VENUE_LOGONS_PER_MINUTE
+              value: {{ .Values.gateway.logonsPerMinute | quote }}
+          ports:
+            - name: http
+              containerPort: 8081
+          # Ready once the gateway has caught up with the core's feed.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+          securityContext:
+            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: catalogue
+              mountPath: /catalogue
+      volumes:
+        - name: catalogue
+          configMap:
+            name: {{ $name }}-catalogue
+---
+# Only the gateway, the operator tools (seed job, the web page's settlement side) and the core's own smoke test may
+# reach the core's ingress and feed. Everything a customer or bot does goes through the gateway (blueprint §16).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $core }}
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "venue-mini.coreSelector" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- range list "gateway" "web" "seed" "smoke" }}
+        - podSelector:
+            matchLabels:
+              {{- include "venue-mini.selector" (dict "ctx" $ "component" .) | nindent 14 }}
+        {{- end }}
+      ports:
+        - port: 7101
+        - port: 7102
