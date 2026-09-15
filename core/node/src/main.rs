@@ -18,6 +18,8 @@ const USAGE: &str = "usage:
   venue-node replay JOURNAL RESULTS        runs a journal through a fresh engine and writes its result log
   venue-node dump FILE                     prints a journal or result log as JSON lines
   venue-node import VECTORS JOURNAL        writes a compiled scenario's inputs, as stamped, as a journal
+  venue-node bench JOURNAL [--runs N]      times every input of a journal through a fresh engine; build it with
+                                           the perf profile (core/Cargo.toml) for numbers worth reading
 
 serve reads VENUE_LISTEN, VENUE_FEED, VENUE_DATA, VENUE_GROUP, VENUE_NODE_ID and VENUE_TICK_MS; flags override them.";
 
@@ -31,6 +33,7 @@ fn main() -> ExitCode {
         }
         (Some("dump"), 2) => dump(&args[1]),
         (Some("import"), 3) => import(&args[1], &args[2]),
+        (Some("bench"), 2 | 4) => bench(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(64);
@@ -135,6 +138,15 @@ fn dump(path: &str) -> Result<(), Error> {
         writeln!(out, "{}", codec::decode(&buf[..n])?)?;
     }
     Ok(())
+}
+
+fn bench(args: &[String]) -> Result<(), Error> {
+    let runs = match args {
+        [_] => 1,
+        [_, flag, n] if flag == "--runs" => n.parse()?,
+        _ => return Err(USAGE.into()),
+    };
+    venue_node::bench::bench(Path::new(&args[0]), runs)
 }
 
 fn import(vectors: &str, journal: &str) -> Result<(), Error> {

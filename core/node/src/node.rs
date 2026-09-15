@@ -53,7 +53,7 @@ pub fn binary_hash() -> Result<[u8; 32], Error> {
     Ok(Sha256::digest(&bytes).into())
 }
 
-fn engine_config(group: u16) -> Result<EngineConfig, Error> {
+pub(crate) fn engine_config(group: u16) -> Result<EngineConfig, Error> {
     Ok(EngineConfig { sequencer_group: group, binary_hash: binary_hash()?, table_seed: TABLE_SEED })
 }
 

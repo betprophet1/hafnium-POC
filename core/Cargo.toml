@@ -25,3 +25,15 @@ overflow-checks = true
 [profile.release]
 overflow-checks = true
 debug = 1
+
+# Latency-oriented build for benchmarks and performance runs: whole-program optimisation, one codegen unit, no
+# unwinding, symbols kept for profilers, overflow checks still on. Always name the target CPU, never `native`
+# (blueprint §4), and keep it in its own target directory so the ordinary build cache survives:
+#   RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --profile perf --target-dir target/perf-v3
+[profile.perf]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+incremental = false
