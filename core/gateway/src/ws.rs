@@ -161,7 +161,8 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
     match op {
         "heartbeat" => {
             only(message, &["op", "id"])?;
-            Ok(Vec::new())
+            // Answered when it carries an id, so a client can tell a gateway that has gone from a quiet market.
+            Ok(if request_id.is_null() { Vec::new() } else { vec![reply(&request_id, json!({}))] })
         }
         "login" => login(gateway, session, message),
         "subscribe" => {

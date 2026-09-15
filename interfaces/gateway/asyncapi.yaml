@@ -89,8 +89,13 @@ operations:
   receiveHeartbeat:
     action: receive
     channel: { $ref: '#/channels/session' }
-    summary: Keep a session with `heartbeatSeconds` alive. Any other client message counts too.
+    summary: >-
+      Keep a session with `heartbeatSeconds` alive; any other client message counts too. A heartbeat carrying an `id`
+      is answered with an empty reply, so a client can tell a gateway that has gone from a quiet market.
     messages: [{ $ref: '#/channels/session/messages/heartbeat' }]
+    reply:
+      channel: { $ref: '#/channels/session' }
+      messages: [{ $ref: '#/channels/session/messages/reply' }]
   sendBook:
     action: send
     channel: { $ref: '#/channels/session' }
@@ -229,7 +234,9 @@ components:
         additionalProperties: false
         properties:
           op: { const: heartbeat }
-          id: { $ref: '#/components/schemas/RequestId' }
+          id:
+            allOf: [{ $ref: '#/components/schemas/RequestId' }]
+            description: If present, the gateway answers with a reply carrying this id and an empty result.
     welcome:
       payload:
         type: object

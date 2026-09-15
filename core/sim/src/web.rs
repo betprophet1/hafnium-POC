@@ -18,6 +18,12 @@ use venue_link::wire::{self, Error, Ids, Ingress};
 
 const INDEX: &str = include_str!("index.html");
 
+/// How long a `/v4` pass-through may stay silent before it is closed, so a gateway that vanished without a reset
+/// cannot leave a request hanging or a WebSocket that looks open. A REST answer comes at once; the page's WebSocket
+/// sessions heartbeat every 15 s and the gateway answers each one, so a healthy session is never silent for 45 s.
+const REST_SILENCE: Duration = Duration::from_secs(30);
+const SESSION_SILENCE: Duration = Duration::from_secs(45);
+
 pub struct Web {
     catalogue: Catalogue,
     live: Arc<Live>,
@@ -186,7 +192,8 @@ fn proxy(
     mut from_client: BufReader<TcpStream>,
     mut to_client: TcpStream,
 ) -> Result<(), Error> {
-    let upstream = match TcpStream::connect(gateway) {
+    // Connecting is bounded, like the bots' connections.
+    let upstream = match crate::session::connect(gateway) {
         Ok(s) => s,
         Err(e) => {
             let body =
@@ -194,7 +201,16 @@ fn proxy(
             return respond(to_client, 502, "application/json", body.to_string().as_bytes());
         }
     };
+    let websocket = head.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("upgrade") && value.trim().eq_ignore_ascii_case("websocket")
+        })
+    });
+    let silence = if websocket { SESSION_SILENCE } else { REST_SILENCE };
     let _ = upstream.set_nodelay(true);
+    upstream.set_read_timeout(Some(silence))?;
+    from_client.get_ref().set_read_timeout(Some(silence))?;
+    to_client.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut from_gateway = upstream.try_clone()?;
     let mut to_gateway = upstream;
     to_gateway.write_all(head.as_bytes())?;

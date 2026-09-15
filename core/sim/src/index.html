@@ -246,9 +246,16 @@ function openSession(name) {
       const login = {op: 'login', id: 'login', token: s.token};
       if (s.last) login.resumeFrom = s.last;
       ws.send(JSON.stringify(login));
+      // The gateway answers a heartbeat with an id, so the page's server can close a session nothing answers.
+      s.beat = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({op: 'heartbeat', id: 'heartbeat'}));
+      }, 15000);
     };
     ws.onmessage = m => onMessage(s, JSON.parse(m.data));
-    ws.onclose = () => { s.open = false; s.topics = new Set(); renderStatus(); setTimeout(connect, 1500); };
+    ws.onclose = () => {
+      clearInterval(s.beat);
+      s.open = false; s.topics = new Set(); renderStatus(); setTimeout(connect, 1500);
+    };
   };
   connect();
 }
@@ -271,7 +278,7 @@ function onMessage(s, msg) {
       if (s.name === 'maker') subscribeMarket();
       break;
     case 'resync': refreshAccount(s); break;
-    case 'reply': report(msg.result); soon(s); break;
+    case 'reply': if (msg.id === 'heartbeat') break; report(msg.result); soon(s); break;
     case 'error': toast(`${words(msg.error.code)}: ${msg.error.message}`, 'bad'); break;
     case 'execution': {
       const e = msg.execution;

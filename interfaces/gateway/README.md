@@ -90,6 +90,10 @@ of the session's resting orders with cause `SESSION_DISCONNECT`. `heartbeatSecon
 gateway's connection to the sequencer group, so a failover does not empty the books (blueprint §5). REST requests
 have no session and never cancel on disconnect.
 
+A `heartbeat` that carries an `id` is answered with an empty `reply`. A client that sends one on a schedule always
+hears back from a gateway that is alive, so it can close and reconnect a session that has gone silent instead of
+mistaking a lost gateway for a quiet market. The mini venue's web page does this every 15 seconds.
+
 ## Flood limits
 
 Per session, in the gateway's memory, as generic cell rate buckets (blueprint §12): messages per second, and logons
