@@ -146,8 +146,19 @@ enum Action {
     CancelEvent(u64),
 }
 
-/// Performs one action and returns the input sequence it produced, logging refusals and rejections.
-fn perform(api: &Api, who: &str, action: Action) -> Option<u64> {
+/// What became of one action.
+enum Outcome {
+    /// Sequenced, with the input's sequence when the gateway named one.
+    Sequenced(Option<u64>),
+    /// Refused by the flood limit: wait this long before sending more.
+    Throttled(Duration),
+    /// Refused or failed, and already logged if it was worth logging.
+    Failed,
+}
+
+/// Performs one action, logging refusals and rejections worth a human's attention.
+fn perform(api: &Api, who: &str, action: Action) -> Outcome {
+    let order_may_be_gone = matches!(action, Action::Amend(..) | Action::Cancel(_));
     let response = match action {
         Action::Place(body) => api.post("/v4/orders", &body),
         Action::Amend(order, body) => api.patch(&format!("/v4/orders/{order}"), &body),
@@ -159,15 +170,21 @@ fn perform(api: &Api, who: &str, action: Action) -> Option<u64> {
             if r.body["status"] == "rejected" {
                 eprintln!("{who}: rejected: {}", r.body["rejectReason"]);
             }
-            r.body["sequence"].as_str().and_then(|s| s.parse().ok())
+            Outcome::Sequenced(r.body["sequence"].as_str().and_then(|s| s.parse().ok()))
+        }
+        // The order filled or was cancelled between reading the account and acting on it: nothing left to do.
+        Ok(r) if r.status == 404 && order_may_be_gone => Outcome::Failed,
+        Ok(r) if r.status == 429 => {
+            let millis = r.body["error"]["details"]["retryAfterMillis"].as_u64().unwrap_or(1000);
+            Outcome::Throttled(Duration::from_millis(millis.max(100)))
         }
         Ok(r) => {
             eprintln!("{who}: refused: {}", r.refusal());
-            None
+            Outcome::Failed
         }
         Err(e) => {
             eprintln!("{who}: {e}");
-            None
+            Outcome::Failed
         }
     }
 }
@@ -198,8 +215,15 @@ fn run(api: &Api, interval: Duration, who: &str, plan: &mut Plan<'_>) -> ! {
         stale = 0;
         let books = |instrument: u64| book(api, instrument).ok();
         for action in plan(&markets, &account, &books) {
-            if let Some(sequence) = perform(api, who, action) {
-                sent = sent.max(sequence);
+            match perform(api, who, action) {
+                Outcome::Sequenced(Some(sequence)) => sent = sent.max(sequence),
+                Outcome::Throttled(wait) => {
+                    // The rest of this pass was planned from a picture that will be stale after the wait.
+                    eprintln!("{who}: flood limit reached; pausing {} ms", wait.as_millis());
+                    thread::sleep(wait);
+                    break;
+                }
+                Outcome::Sequenced(None) | Outcome::Failed => {}
             }
         }
     }

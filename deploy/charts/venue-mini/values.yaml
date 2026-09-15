@@ -32,10 +32,11 @@ web:
   enabled: true
 
 # Interface 1. Flood limits per WebSocket session, and per account for REST: messages a second and burst, logons a
-# minute per account (blueprint §12). Set well above what the page and bots need.
+# minute per account (blueprint §12). Set well above what the page and bots need: a maker requoting every market can
+# send a few dozen requests in one pass.
 gateway:
-  perSecond: 50
-  burst: 100
+  perSecond: 200
+  burst: 400
   logonsPerMinute: 30
 
 # Synthetic traders, clients of the gateway. Each acts as the catalogue account its dev token names.

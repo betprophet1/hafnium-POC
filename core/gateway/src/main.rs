@@ -22,7 +22,7 @@ use venue_link::wire::{self, Error, Ingress};
 
 const USAGE: &str = "usage:
   venue-gateway --ingress ADDR --feed ADDR --catalogue FILE [--listen 127.0.0.1:8081]
-                [--per-second 50] [--burst 100] [--logons-per-minute 30]
+                [--per-second 200] [--burst 400] [--logons-per-minute 30]
 
 REST on /v4/..., WebSocket on /v4/ws. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
@@ -70,8 +70,8 @@ fn main() -> ExitCode {
 fn run(args: &Args) -> Result<(), Error> {
     let catalogue = Catalogue::load(&args.get("catalogue", None)?)?;
     let limits = Limits {
-        per_second: args.number("per-second", 50)?,
-        burst: args.number("burst", 100)?,
+        per_second: args.number("per-second", 200)?,
+        burst: args.number("burst", 400)?,
         logons_per_minute: args.number("logons-per-minute", 30)?,
     };
     let gateway = Arc::new(Gateway::new(Hub::new(catalogue), Ingress::new(&args.get("ingress", None)?), limits));
