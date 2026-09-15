@@ -450,14 +450,14 @@
     <field name="mode" id="3" type="VenueMode"/>
   </sbe:message>
 
-  <sbe:message name="ResolveEvent" id="88" description="Issued only after two-of-three sign-off. RESOLVED names the state that occurred; VOID settles every contract at its value under the given state weights, equal weights when the group is empty">
+  <sbe:message name="ResolveEvent" id="88" description="Issued only after two-of-three sign-off. RESOLVED names the state that occurred; VOID reverses every cash flow the event caused, as if no trade had happened (spec E-15.4)">
     <field name="record" id="1" type="RecordHeader"/>
     <field name="commandId" id="2" type="CommandId"/>
     <field name="eventId" id="3" type="EventId"/>
     <field name="kind" id="4" type="ResolutionKind"/>
     <field name="caseId" id="5" type="CaseId"/>
     <field name="winningState" id="6" type="StateIndex" description="RESOLVED only"/>
-    <group name="voidWeights" id="10" dimensionType="groupSizeEncoding">
+    <group name="voidWeights" id="10" dimensionType="groupSizeEncoding" description="Must be empty: a void takes no weights (spec E-15.3)">
       <field name="state" id="11" type="StateIndex"/>
       <field name="weight" id="12" type="Count"/>
     </group>
@@ -630,13 +630,13 @@
     <field name="state" id="3" type="MarketState"/>
   </sbe:message>
 
-  <sbe:message name="SettlementPayout" id="111" description="One per account with a position in the event when it resolves or voids, plus the settlement reserve (account 0) for rounding remainders">
+  <sbe:message name="SettlementPayout" id="111" description="On RESOLVED, one per account and instrument with a position in the event; on VOID, one per account with a position or cash in the event, with instrumentId 0 and positionClosed 0">
     <field name="result" id="1" type="ResultHeader"/>
     <field name="accountId" id="2" type="AccountId"/>
     <field name="instrumentId" id="3" type="InstrumentId"/>
     <field name="kind" id="4" type="ResolutionKind"/>
     <field name="positionClosed" id="5" type="SignedContracts"/>
-    <field name="cents" id="6" type="Cents" description="$1.00 per contract paying in the winning state; on VOID, the state-weighted value, floored to a cent per account per event"/>
+    <field name="cents" id="6" type="Cents" description="$1.00 per contract paying in the winning state; on VOID, the event's net cash returned to the account, negative when it took more out than it put in"/>
   </sbe:message>
 
   <sbe:message name="BasketApplied" id="113" description="A basket mint or redeem was carried out">

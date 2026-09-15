@@ -1,14 +1,14 @@
 {
-  "name": "Mint, transfer, then void at equal weights",
-  "rules": ["E-5.2", "E-9.8", "E-10.6", "E-11.1", "E-11.2", "E-15.4", "E-15.5"],
+  "name": "Mint, transfer, then void: every account ends as if it had never traded",
+  "rules": ["E-5.2", "E-9.8", "E-10.6", "E-11.1", "E-11.2", "E-15.4", "E-15.5", "E-15.6"],
   "notes": [
     "Tick 39 is 40c, tick 69 is 70c. Every account starts with $100.00 (10000c).",
     "Step 1: A bids 10 at 40c. Reservation = yesCost(39, 10) = 400.",
     "Step 2: B sells 10 at 40c from flat. Reservation = noCost = 1000 - 400 = 600. Both flat: bBurn 0, sReduce 0, minted 10. buyerCash -400, sellerCash 400 - 1000 = -600.",
     "Step 3: A offers 4 at 70c holding 10 YES: lock 4, reservation noCost(69, 0) = 0.",
     "Step 4: C buys A's 4 at 70c. sReduce 4 so minted 0: a transfer. buyerCash -280, sellerCash +280. A now 6 YES, C 4 YES, B 10 NO.",
-    "Step 5: VOID with no weights: both states weight 1, W = 2. A: (0 + 600) / 2 = 300. B: (1000 + 0) / 2 = 500. C: (0 + 400) / 2 = 200. Sum 1000 = collateral, no remainder.",
-    "Refunding cost basis instead would owe C 280 and B 600 from a 1000c pool that also owes A: this is decision D-1."
+    "Step 5: VOID reverses the event's cash (D-1). eventCash: A -400 + 280 = -120, B -600, C -280. Payouts are the negations: A 120, B 600, C 280. Sum 1000 = collateral.",
+    "Each void payout is one line per account with instrumentId 0; positions close through PositionChanged. Every account is back to 10000c."
   ],
   "setup": [
     {"op": "centTable", "tickTableId": 1},
@@ -53,15 +53,15 @@
      "expect": [
        {"msg": "CommandApplied", "commandId": "r1", "outcome": "APPLIED"},
        {"msg": "MarketStateChanged", "instrumentId": 1000, "state": "VOIDED"},
-       {"msg": "SettlementPayout", "accountId": 1, "instrumentId": 1000, "kind": "VOID", "positionClosed": 6, "cents": 300},
-       {"msg": "SettlementPayout", "accountId": 2, "instrumentId": 1000, "kind": "VOID", "positionClosed": -10, "cents": 500},
-       {"msg": "SettlementPayout", "accountId": 3, "instrumentId": 1000, "kind": "VOID", "positionClosed": 4, "cents": 200},
+       {"msg": "SettlementPayout", "accountId": 1, "instrumentId": 0, "kind": "VOID", "positionClosed": 0, "cents": 120},
+       {"msg": "SettlementPayout", "accountId": 2, "instrumentId": 0, "kind": "VOID", "positionClosed": 0, "cents": 600},
+       {"msg": "SettlementPayout", "accountId": 3, "instrumentId": 0, "kind": "VOID", "positionClosed": 0, "cents": 280},
        {"msg": "PositionChanged", "accountId": 1, "instrumentId": 1000, "position": 0},
        {"msg": "PositionChanged", "accountId": 2, "instrumentId": 1000, "position": 0},
        {"msg": "PositionChanged", "accountId": 3, "instrumentId": 1000, "position": 0},
-       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 10180, "reservedCents": 0},
-       {"msg": "SleeveChanged", "accountId": 2, "availableCents": 9900, "reservedCents": 0},
-       {"msg": "SleeveChanged", "accountId": 3, "availableCents": 9920, "reservedCents": 0}
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 10000, "reservedCents": 0},
+       {"msg": "SleeveChanged", "accountId": 2, "availableCents": 10000, "reservedCents": 0},
+       {"msg": "SleeveChanged", "accountId": 3, "availableCents": 10000, "reservedCents": 0}
      ]}
   ]
 }

@@ -118,6 +118,7 @@ class Account:
     positions: dict = field(default_factory=dict)
     yes_locked: dict = field(default_factory=dict)
     no_locked: dict = field(default_factory=dict)
+    event_cash: dict = field(default_factory=dict)          # eventId -> net cash the event paid (D-1)
     closed_only: bool = False
     self_match_prevention: str = "CANCEL_INCOMING"          # D-3
     second: int = -1
@@ -177,6 +178,8 @@ class Engine:
         self.next_trade = 1
         self.results = []
         self.unit = None
+        self.available_before = {}                             # E-3.3, per input
+        self.voided = False
 
     # ---- accessors that record start values for §5
 
@@ -200,6 +203,11 @@ class Engine:
     def add_balance(self, account_id, cents):
         self.touch_sleeve(account_id)
         self.account(account_id).balance += cents
+
+    def add_event_cash(self, account_id, event_id, cents):             # E-10.6, E-14.2, E-14.3 (D-1)
+        self.add_balance(account_id, cents)
+        cash = self.account(account_id).event_cash
+        cash[event_id] = cash.get(event_id, 0) + cents
 
     def level(self, instrument_id, side, tick):
         queue = self.instruments[instrument_id].book[side].get(tick, [])
@@ -304,6 +312,8 @@ class Engine:
         self.last_sequence = record["sequence"]
         self.now = record["sequencedAt"]
         self.results = []
+        self.available_before = {a: acc.balance - acc.reserved for a, acc in self.accounts.items()}
+        self.voided = False
         if record["sequencerGroup"] != self.group:
             if msg in CLIENT_MESSAGES:
                 self.begin_unit()
@@ -347,8 +357,9 @@ class Engine:
             orders = [o for o in self.orders.values() if o.account_id == a]
             if acc.reserved != sum(o.reserved for o in orders):
                 raise FailStop(f"reserved mismatch for {a}")
-            if acc.balance - acc.reserved < 0:
-                raise FailStop(f"negative available cash for {a} (E-3.3)")
+            available = acc.balance - acc.reserved
+            if available < min(0, self.available_before.get(a, 0)) and not self.voided:
+                raise FailStop(f"available cash fell below zero for {a} (E-3.3)")
             for i in set(acc.positions) | set(acc.yes_locked) | set(acc.no_locked):
                 yl = sum(o.lock for o in orders if o.instrument_id == i and o.side == "SELL")
                 nl = sum(o.lock for o in orders if o.instrument_id == i and o.side == "BUY")
@@ -486,7 +497,7 @@ class Engine:
                 raise Reject("INVALID_COMMAND")
             if inp["reason"] == "RECLAIM":
                 acc = self.account(a)
-                if delta > acc.balance - acc.reserved:
+                if delta > max(0, acc.balance - acc.reserved):
                     raise Reject("INSUFFICIENT_SLEEVE")
                 delta = -delta
             self.applied(cid)
@@ -608,14 +619,9 @@ class Engine:
                     raise Reject("INVALID_COMMAND")
                 weights = {inp["winningState"]: 1}
             else:
-                given = inp.get("voidWeights", [])
-                states = [w["state"] for w in given]
-                if any(s >= ev.state_count for s in states) or len(set(states)) != len(states):
+                if inp.get("voidWeights"):                              # D-1: a void reverses, never weighs
                     raise Reject("INVALID_COMMAND")
-                if given and sum(w["weight"] for w in given) == 0:
-                    raise Reject("INVALID_COMMAND")
-                weights = {w["state"]: w["weight"] for w in given} if given else \
-                    {s: 1 for s in range(ev.state_count)}
+                weights = None
             self.applied(cid)
             self.settle(ev, inp["kind"], weights)
         self.command(inp, body)
@@ -638,27 +644,37 @@ class Engine:
         for i in ev.instruments:
             self.instruments[i].market_state = new_state
             self.emit_event("MarketStateChanged", instrumentId=i, state=new_state)
-        total_weight = sum(weights.values())
         paid = 0
-        for a in sorted(self.accounts):
-            for i in ev.instruments:
-                p = self.position(a, i)
-                if p == 0:
+        if kind == "RESOLVED":                                           # E-15.4, E-15.5
+            (winning,) = weights
+            for a in sorted(self.accounts):
+                for i in ev.instruments:
+                    p = self.position(a, i)
+                    if p == 0:
+                        continue
+                    cents = self.payout(p, self.instruments[i].state_mask, winning)
+                    self.add_balance(a, cents)
+                    self.set_position(a, i, 0)
+                    paid += cents
+                    self.emit_event("SettlementPayout", accountId=a, instrumentId=i, kind=kind, positionClosed=p,
+                                    cents=cents)
+        else:                                                            # VOID reverses the event (D-1)
+            self.voided = True
+            for a in sorted(self.accounts):
+                cash = self.accounts[a].event_cash.get(ev.event_id, 0)
+                if cash == 0 and not any(self.position(a, i) for i in ev.instruments):
                     continue
-                mask = self.instruments[i].state_mask
-                cents = sum(w * self.payout(p, mask, s) for s, w in weights.items()) // total_weight
-                self.add_balance(a, cents)
-                self.set_position(a, i, 0)
-                paid += cents
-                self.emit_event("SettlementPayout", accountId=a, instrumentId=i, kind=kind, positionClosed=p,
-                                cents=cents)
-        remainder = ev.collateral - paid
-        if remainder < 0:
-            raise FailStop("payouts exceed collateral")
-        if remainder:
-            self.add_balance(0, remainder)
-            self.emit_event("SettlementPayout", accountId=0, instrumentId=0, kind=kind, positionClosed=0,
-                            cents=remainder)
+                for i in ev.instruments:
+                    if self.position(a, i):
+                        self.set_position(a, i, 0)
+                self.add_balance(a, -cash)
+                paid -= cash
+                self.emit_event("SettlementPayout", accountId=a, instrumentId=0, kind=kind, positionClosed=0,
+                                cents=-cash)
+        for acc in self.accounts.values():
+            acc.event_cash.pop(ev.event_id, None)
+        if paid != ev.collateral:                                        # E-15.6
+            raise FailStop(f"payouts {paid} do not equal collateral {ev.collateral} (E-15.6)")
         ev.collateral = 0
         ev.resolved = True
 
@@ -874,7 +890,7 @@ class Engine:
             if self.active_order_limit and len(self.orders) >= self.active_order_limit:
                 raise Reject("ORDER_CAPACITY")
         # check 18
-        if self.compute_reserved(order) > acc.balance - acc.reserved:
+        if self.compute_reserved(order) > max(0, acc.balance - acc.reserved):
             raise Reject("INSUFFICIENT_SLEEVE")
         return order
 
@@ -1023,8 +1039,8 @@ class Engine:
         self.touch_level(inst.instrument_id, maker.side, maker.tick)
         self.set_position(b, inst.instrument_id, pb + f)
         self.set_position(s, inst.instrument_id, ps - f)
-        self.add_balance(b, buyer_cash)
-        self.add_balance(s, seller_cash)
+        self.add_event_cash(b, ev.event_id, buyer_cash)
+        self.add_event_cash(s, ev.event_id, seller_cash)
         ev.collateral += 100 * (minted - burned)
         for x in (taker, maker):                                         # E-11.3
             used = min(f, x.lock)
@@ -1197,7 +1213,7 @@ class Engine:
         if o.spend_cap_remaining is not None:
             new_reserved = min(new_reserved, o.spend_cap_remaining)
         acc = self.account(a)
-        if new_reserved - o.reserved > acc.balance - acc.reserved:
+        if new_reserved - o.reserved > max(0, acc.balance - acc.reserved):
             return rejected("INSUFFICIENT_SLEEVE")
         self.unlink(o)
         if o.lock > new_lock:
@@ -1288,7 +1304,7 @@ class Engine:
                 return rejected("VENUE_MODE")
             if any(self.position_limit_breached(a, i, "BUY", q) for i in insts):
                 return rejected("POSITION_LIMIT")
-            if 100 * q > acc.balance - acc.reserved:
+            if 100 * q > max(0, acc.balance - acc.reserved):
                 return rejected("INSUFFICIENT_SLEEVE")
             sign = 1
         else:
@@ -1300,7 +1316,7 @@ class Engine:
         cash = -100 * (q - closed) if sign > 0 else 100 * q
         for i in insts:
             self.set_position(a, i.instrument_id, self.position(a, i.instrument_id) + sign * q)
-        self.add_balance(a, cash)
+        self.add_event_cash(a, ev.event_id, cash)
         ev.collateral -= cash
         self.emit_outcome("BasketApplied", accountId=a, sessionId=inp["sessionId"], clientOrderId=coid,
                           eventId=ev.event_id, quantity=q, direction=inp["direction"], cashCents=cash)
@@ -1323,7 +1339,7 @@ class Engine:
             if k > 0:
                 for i in insts:
                     self.set_position(a, i.instrument_id, self.position(a, i.instrument_id) - k)
-                self.add_balance(a, 100 * k)
+                self.add_event_cash(a, event_id, 100 * k)
                 ev.collateral -= 100 * k
                 self.emit_event("CollateralReleased", accountId=a, eventId=event_id, cents=100 * k,
                                 kind="YES_SET_BURN")
@@ -1331,7 +1347,7 @@ class Engine:
             if k > 0:
                 for i in insts:
                     self.set_position(a, i.instrument_id, self.position(a, i.instrument_id) + k)
-                self.add_balance(a, 100 * (n - 1) * k)
+                self.add_event_cash(a, event_id, 100 * (n - 1) * k)
                 ev.collateral -= 100 * (n - 1) * k
                 self.emit_event("CollateralReleased", accountId=a, eventId=event_id, cents=100 * (n - 1) * k,
                                 kind="NO_SET_BURN")

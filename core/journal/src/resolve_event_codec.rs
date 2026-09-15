@@ -202,7 +202,7 @@ pub mod encoder {
             self
         }
 
-        /// GROUP ENCODER (id=10)
+        /// GROUP ENCODER (id=10, description='Must be empty: a void takes no weights (spec E-15.3)')
         #[inline]
         pub fn void_weights_encoder(self, count: u16, void_weights_encoder: VoidWeightsEncoder<Self>) -> VoidWeightsEncoder<Self> {
             void_weights_encoder.wrap(self, count)
@@ -439,7 +439,7 @@ pub mod decoder {
             self.get_buf().get_u8_at(self.offset + 51)
         }
 
-        /// GROUP DECODER (id=10)
+        /// GROUP DECODER (id=10, description='Must be empty: a void takes no weights (spec E-15.3)')
         #[inline]
         pub fn void_weights_decoder(self) -> VoidWeightsDecoder<Self> {
             VoidWeightsDecoder::default().wrap(self)
@@ -499,7 +499,7 @@ pub mod decoder {
             self
         }
 
-        /// group token - Token{signal=BEGIN_GROUP, name='voidWeights', referencedName='null', description='null', packageName='null', id=10, version=0, deprecated=0, encodedLength=5, offset=52, componentTokenCount=12, encoding=Encoding{presence=REQUIRED, primitiveType=null, byteOrder=LITTLE_ENDIAN, minValue=null, maxValue=null, nullValue=null, constValue=null, characterEncoding='null', epoch='null', timeUnit=null, semanticType='null'}}
+        /// group token - Token{signal=BEGIN_GROUP, name='voidWeights', referencedName='null', description='Must be empty: a void takes no weights (spec E-15.3)', packageName='null', id=10, version=0, deprecated=0, encodedLength=5, offset=52, componentTokenCount=12, encoding=Encoding{presence=REQUIRED, primitiveType=null, byteOrder=LITTLE_ENDIAN, minValue=null, maxValue=null, nullValue=null, constValue=null, characterEncoding='null', epoch='null', timeUnit=null, semanticType='null'}}
         #[inline]
         pub fn parent(&mut self) -> SbeResult<P> {
             self.parent.take().ok_or(SbeErr::ParentNotSet)

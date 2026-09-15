@@ -214,8 +214,17 @@ class Fuzzer:
             return dict(msg="SleeveAdjust", commandId=self.next_cmd(), accountId=a,
                         deltaCents=r.randint(0, 3000), reason="GRANT"), None
         if kind == "reclaim":
+            # Withdrawing everything, sale proceeds included, is what lets a later void leave an account below zero
+            # (E-3.3, D-1).
+            gains = [(max(x.event_cash.values(), default=0), k) for k, x in sorted(self.engine.accounts.items()) if k]
+            best, richest = max(gains, default=(0, 0))
+            if best > 0 and r.random() < 0.4:
+                a = richest
+            acc = self.engine.accounts.get(a)
+            available = acc.balance - acc.reserved if acc else 0
+            delta = available if available > 0 and r.random() < 0.6 else r.randint(1, 3000)
             return dict(msg="SleeveAdjust", commandId=self.next_cmd(), accountId=a,
-                        deltaCents=r.randint(1, 3000), reason="RECLAIM"), None
+                        deltaCents=delta, reason="RECLAIM"), None
         if kind == "controls":
             return dict(msg="SetAccountControls", commandId=self.next_cmd(), accountId=a,
                         closedOnly=r.choice(["FALSE", "FALSE", "TRUE"]),
@@ -261,9 +270,15 @@ class Fuzzer:
         if r.random() < 0.5:
             return dict(msg="ResolveEvent", commandId=self.next_cmd(), eventId=ev, kind="RESOLVED",
                         winningState=r.randrange(STATES[ev]), caseId=1, voidWeights=[])
-        weights = [dict(state=s, weight=r.randint(0, 3)) for s in range(STATES[ev]) if r.random() < 0.7]
-        if weights and sum(w["weight"] for w in weights) == 0:
-            weights[0]["weight"] = 1
+        # Prefer voiding an event whose reversal takes back more than some account holds, so accounts below zero
+        # keep trading afterwards (E-3.3, D-1).
+        e = self.engine
+        exposed = [x for x in sorted(STATES) if x in e.events and not e.events[x].resolved and any(
+            acc.event_cash.get(x, 0) > acc.balance - acc.reserved for k, acc in sorted(e.accounts.items()) if k)]
+        if exposed and r.random() < 0.5:
+            ev = r.choice(exposed)
+        # A void reverses the event and refuses weights (E-15.3, D-1); send some anyway.
+        weights = [dict(state=0, weight=1)] if r.random() < 0.1 else []
         return dict(msg="ResolveEvent", commandId=self.next_cmd(), eventId=ev, kind="VOID", caseId=1,
                     voidWeights=weights)
 

@@ -141,7 +141,7 @@ pub mod encoder {
         }
 
         /// primitive field 'cents'
-        /// - description: $1.00 per contract paying in the winning state; on VOID, the state-weighted value, floored to a cent per account per event
+        /// - description: $1.00 per contract paying in the winning state; on VOID, the event's net cash returned to the account, negative when it took more out than it put in
         /// - min value: -9223372036854775807
         /// - max value: 9223372036854775807
         /// - null value: -9223372036854775808_i64
@@ -270,7 +270,7 @@ pub mod decoder {
         }
 
         /// primitive field - 'REQUIRED'
-        /// - description: $1.00 per contract paying in the winning state; on VOID, the state-weighted value, floored to a cent per account per event
+        /// - description: $1.00 per contract paying in the winning state; on VOID, the event's net cash returned to the account, negative when it took more out than it put in
         #[inline]
         pub fn cents(&self) -> i64 {
             self.get_buf().get_i64_at(self.offset + 47)

@@ -91,7 +91,7 @@ orders and for trades within the group *(D-13)*.
 | Instruments | by `instrumentId`: `eventId`, `instrumentClass`, `tickTableId`, `lotStep`, `allocationPolicy`, `stateMask`, `positionLimit`, `legs`, `marketState` [`LISTED`] |
 | Books | per instrument, per side, per tick: a FIFO of order IDs |
 | Orders | by `orderId`: `accountId`, `sessionId`, `clientOrderId`, `instrumentId`, `side`, `enteredContract`, `tick` (effective limit), `remaining`, `timeInForce`, `expiresAt`, `atEventStart`, `postOnly`, `reduceOnly`, `spendCapRemaining` (or none), `clientOrderGroup` (or none), `lock`, `reserved`, `acceptedAt` (input sequence) |
-| Accounts | by `accountId`: `balance` [0], `reserved` [0] (always the sum of its orders' `reserved`); per instrument `position` [0], `yesLocked` [0], `noLocked` [0]; `closedOnly` [false], `selfMatchPrevention` [`CANCEL_INCOMING`] *(D-3)* |
+| Accounts | by `accountId`: `balance` [0], `reserved` [0] (always the sum of its orders' `reserved`); per instrument `position` [0], `yesLocked` [0], `noLocked` [0]; per event `eventCash` [0], the net cash the event has paid the account *(D-1)*; `closedOnly` [false], `selfMatchPrevention` [`CANCEL_INCOMING`] *(D-3)* |
 | Rule limits | by `accountId` (0 is the default for accounts without their own): the four fields of `SetRuleLimits` [all 0 = none]; per account, per second of sequencer time, counts of new orders and of fills |
 | Maker protection | by `(accountId, eventId)` with `eventId` 0 as the account's default: threshold and window; per `(accountId, eventId)` a counter and window start |
 | Order groups | by `(accountId, clientOrderGroup)`: threshold, window, counter, window start, `triggered` |
@@ -100,10 +100,13 @@ orders and for trades within the group *(D-13)*.
 | Counters | next order number and next trade number [1] |
 
 **E-3.2** An account exists from its first mention; until then every field has its initial value. Account 0
-is the settlement reserve (E-15.6) and may not submit orders.
+is the settlement reserve *(D-21)* and may not submit orders.
 
-**E-3.3** **Available cash** is `balance − reserved` and is never negative. An implementation must treat a
-negative value as a fail-stop (§18); the rules below are constructed so it cannot happen.
+**E-3.3** **Available cash** is `balance − reserved`. Only a void (E-15.5) makes it negative, by taking back
+cash an account has already received *(D-1)*. For every other input, each account's available cash afterwards
+is at least the lesser of 0 and its value before, so an account below zero can receive cash but not spend it; an
+implementation must treat anything else as a fail-stop (§18). Wherever a rule compares an amount with available
+cash, it compares with `max(0, available cash)`.
 
 ---
 
@@ -345,7 +348,7 @@ sellerCash =  yes − 100 · (q − sReduce)
 ```
 
 Then `position(B) += q`, `position(S) −= q`, `balance(B) += buyerCash`, `balance(S) += sellerCash`,
-and the event's `collateralCents += 100 · (minted − burned)`, which always equals
+the same amounts are added to each account's `eventCash` for the event, and the event's `collateralCents += 100 · (minted − burned)`, which always equals
 `−(buyerCash + sellerCash)`. A `Fill` is emitted with the trade ID, both orders' remaining quantities after
 the fill, `mintedPairs`, `burnedPairs` and both cash changes.
 
@@ -486,7 +489,8 @@ unlocked YES holding is at least `quantity` (`INSUFFICIENT_POSITION`).
 `−100 · (quantity − K)`, the event's `collateralCents` by `+100 · (quantity − K)`, and lock restoration (E-11.4)
 then runs for the account on every instrument of the event. `REDEEM`: every position falls by `quantity`,
 `balance += 100 · quantity` and `collateralCents −= 100 · quantity`. Outcome: `BasketApplied` with the balance
-change as `cashCents`. No set burn runs after a basket unit. Netting is what keeps E-15.2: in a partition event
+change as `cashCents`, which is also added to the account's `eventCash` for the event. No set burn runs after a
+basket unit. Netting is what keeps E-15.2: in a partition event
 the account's payout changes by exactly `100 · (quantity − K)` in every state, so charging `100 · quantity`
 when the account held NO would take money for a payout it did not receive (scenario 19). The available-cash
 check of E-14.1 stays at `100 · quantity`, which covers any reservation lock restoration adds.
@@ -502,6 +506,8 @@ account that was party to one, ascending by event then account, with `N` the eve
   `k`, `balance += 100 · (N − 1) · k`, `collateralCents −= 100 · (N − 1) · k`, and `CollateralReleased` is
   emitted with `NO_SET_BURN` *(D-8, D-9)*.
 
+Each release is also added to the account's `eventCash` for the event.
+
 ---
 
 ## 15. Resolution and settlement
@@ -514,23 +520,29 @@ instruments of the payout in `s` equals the event's `collateralCents`. Every rul
 violation is a fail-stop.
 
 **E-15.3 `ResolveEvent` checks.** Rejected `INVALID_COMMAND` if the event does not exist or is resolved; for
-`RESOLVED`, if `winningState >= stateCount`; for `VOID`, if any weight names a state at or above
-`stateCount`, names a state twice, or all weights sum to 0 while the group is non-empty.
+`RESOLVED`, if `winningState >= stateCount`; for `VOID`, if `voidWeights` is not empty *(D-1)*.
 
-**E-15.4 Weights.** `RESOLVED` weights `winningState` at 1 and every other state at 0. `VOID` uses the given
-weights, with states not given at 0, or every state at 1 if none is given. `W` is the sum of weights.
+**E-15.4 Payouts.** `RESOLVED` pays each position its E-15.1 payout in `winningState`. `VOID` reverses the
+event: each account is paid `−eventCash` for the event, undoing every fill, basket and set burn in it whether or
+not the account still holds a position. The payment is negative for an account that took more cash out of the
+event than it put in *(D-1)*.
 
 **E-15.5 Effect.** In order: `CommandApplied`; every resting order in the event's instruments is removed
 with `MARKET_RESOLVED`, ascending order ID; each instrument, ascending ID, takes `marketState` `SETTLED`
-(`RESOLVED`) or `VOIDED` (`VOID`) and emits `MarketStateChanged`; then for each account with a non-zero
-position in the event, ascending by account then instrument, the payout is
-`⌊ Σ_s weight(s) · payout(position, mask, s) / W ⌋`, added to `balance`, the position set to 0, and
-`SettlementPayout` emitted with the position closed and the cents.
+(`RESOLVED`) or `VOIDED` (`VOID`) and emits `MarketStateChanged`; then:
 
-**E-15.6 Remainder.** The event's `collateralCents` minus all payouts — never negative, and non-zero only
-for a `VOID` — is, when not zero, added to account 0's `balance` and emitted as a `SettlementPayout` to account 0 with
-`instrumentId` 0 and `positionClosed` 0. The event is marked resolved and its `collateralCents` set to 0
-*(D-1, D-21)*.
+- `RESOLVED`: for each account with a non-zero position in the event, ascending by account then instrument,
+  the payout is added to `balance`, the position set to 0, and `SettlementPayout` emitted with the position
+  closed and the cents.
+- `VOID`: for each account with a non-zero position or non-zero `eventCash` in the event, ascending by
+  account, every position in the event is set to 0, `−eventCash` is added to `balance`, and one
+  `SettlementPayout` is emitted with `instrumentId` 0, `positionClosed` 0 and those cents.
+
+Every account's `eventCash` for the event is then discarded.
+
+**E-15.6 Conservation at settlement.** The payouts sum to the event's `collateralCents` exactly: for `RESOLVED`
+by E-15.2, and for `VOID` because every change to `eventCash` moved `collateralCents` by its negation. Anything
+else is a fail-stop. The event is marked resolved and its `collateralCents` set to 0 *(D-1, D-21)*.
 
 **E-15.7 `ExpireParlay`.** Rejected `INVALID_COMMAND` unless the instrument exists, is a `PARLAY` and its
 event is unresolved. Then processed as `ResolveEvent` `RESOLVED` on the instrument's event with the
@@ -581,8 +593,8 @@ and its outcome result exists.
 ## 18. Fail-stop
 
 **E-18.1** The engine stops, emitting nothing further, on: a sequence or time violation (E-4.1); a malformed
-command or sequencer event (E-4.3); an arithmetic overflow (E-2.2); negative available cash (E-3.3); a
-crossed book (E-10.10); a conservation violation (E-15.2); an unsupported protocol activation (E-7.7).
+command or sequencer event (E-4.3); an arithmetic overflow (E-2.2); available cash falling below zero other
+than by a void (E-3.3); a crossed book (E-10.10); a conservation violation (E-15.2, E-15.6); an unsupported protocol activation (E-7.7).
 
 **E-18.2** Stopping is deterministic: every replica stops at the same input. Recovery is an operator
 decision — a fixed engine replaying the journal, or the quarantine path of blueprint §5.
