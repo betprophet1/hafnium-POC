@@ -18,7 +18,7 @@ pub use venue_journal::side::Side;
 pub type ClientOrderId = [u8; 32];
 pub type CommandId = [u8; 16];
 
-/// One result, with the schema's fields. Fees are not carried: they are zero in v0 (E-5.4).
+/// One result, with the schema's fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Out {
     OrderAccepted {
@@ -56,6 +56,9 @@ pub enum Out {
         burned_pairs: u32,
         buyer_cash_cents: i64,
         seller_cash_cents: i64,
+        /// E-5.4, E-10.11: positive when paid, negative for a rebate.
+        maker_fee_cents: i64,
+        taker_fee_cents: i64,
     },
     OrderCancelled {
         order_id: u64,
@@ -229,6 +232,8 @@ impl Emitter {
                 burned_pairs,
                 buyer_cash_cents,
                 seller_cash_cents,
+                maker_fee_cents,
+                taker_fee_cents,
             } => {
                 let mut e = begin!(fill_codec, FillEncoder);
                 e.trade_id(trade_id).instrument_id(instrument_id).tick(tick).quantity(quantity);
@@ -236,7 +241,7 @@ impl Emitter {
                 e.taker_order_id(taker_order_id).taker_account_id(taker_account_id).taker_remaining(taker_remaining);
                 e.taker_side(taker_side).minted_pairs(minted_pairs).burned_pairs(burned_pairs);
                 e.buyer_cash_cents(buyer_cash_cents).seller_cash_cents(seller_cash_cents);
-                e.maker_fee_cents(0).taker_fee_cents(0);
+                e.maker_fee_cents(maker_fee_cents).taker_fee_cents(taker_fee_cents);
                 e.get_limit()
             }
             Out::OrderCancelled { order_id, account_id, instrument_id, cancelled_quantity, reason } => {
@@ -359,6 +364,8 @@ mod tests {
             burned_pairs: 0,
             buyer_cash_cents: -300,
             seller_cash_cents: -200,
+            maker_fee_cents: -1,
+            taker_fee_cents: 7,
         };
         e.emit(&mut sink, &fill).unwrap();
         e.emit(&mut sink, &fill).unwrap();
@@ -371,6 +378,7 @@ mod tests {
         assert_eq!((h.input_sequence(), h.result_index(), h.sequenced_at(), h.sequencer_group()), (41, 1, 1_800, 3));
         let dec = h.parent().unwrap();
         assert_eq!((dec.buyer_cash_cents(), dec.seller_cash_cents(), dec.minted_pairs()), (-300, -200, 5));
+        assert_eq!((dec.maker_fee_cents(), dec.taker_fee_cents()), (-1, 7));
         e.begin(42, 1_801);
         assert_eq!(e.count(), 0);
     }

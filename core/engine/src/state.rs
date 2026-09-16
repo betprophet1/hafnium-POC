@@ -124,6 +124,10 @@ pub struct Account {
     pub limits: Option<RuleLimits>,
     pub first_order: u32,
     pub resting_orders: u32,
+    /// Fees charged to the account in the unit numbered `fees_unit`, rebates not counted: how far below its bound
+    /// E-3.3 lets that unit take the account's available cash (D-26).
+    pub fees_charged: i64,
+    pub fees_unit: u64,
 }
 
 /// An account's position in one instrument and the holdings its resting orders lock (E-11.1).
@@ -153,6 +157,26 @@ pub struct MakerSetting {
 pub struct WindowCounter {
     pub count: u64,
     pub window_start: Option<u64>,
+}
+
+/// A maker and a taker rate, in millionths (E-10.11).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FeeRates {
+    pub maker_micros: i32,
+    pub taker_micros: i32,
+}
+
+/// An override of the fee schedule (E-7.10). An `account_id`, `instrument_id` or `event_id` of 0 matches any.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FeeOverride {
+    pub account_id: u64,
+    pub priority: u32,
+    pub id: u64,
+    pub instrument_id: u64,
+    pub event_id: u64,
+    pub maker_rate_micros: i32,
+    pub taker_rate_micros: i32,
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -237,6 +261,8 @@ pub struct Capacities {
     pub maker_counters: usize,
     /// Accounts' net cash in each unresolved event they have traded (D-1).
     pub event_cash: usize,
+    /// Fee overrides in force at once, expired ones not counted (D-27).
+    pub fee_overrides: usize,
     /// Positions, sleeves and levels one unit may touch; also the end-of-unit marks.
     pub touches: usize,
     /// Writes one dry run may log.
@@ -269,6 +295,7 @@ impl Capacities {
             maker_settings: 4_096,
             maker_counters: 16_384,
             event_cash: 16_384,
+            fee_overrides: 1_024,
             touches: 65_536,
             undo: 65_536,
         }
@@ -296,6 +323,7 @@ impl Capacities {
             maker_settings: 65_536,
             maker_counters: 262_144,
             event_cash: 1_048_576,
+            fee_overrides: 16_384,
             touches: 1_048_576,
             undo: 65_536,
         }
@@ -318,6 +346,7 @@ impl Capacities {
             maker_settings: 262_144,
             maker_counters: 1_048_576,
             event_cash: 4_194_304,
+            fee_overrides: 65_536,
             touches: 4_194_304,
             undo: 65_536,
         }
@@ -370,6 +399,8 @@ pub struct Memory<'a> {
     pub maker_settings: &'a mut [Slot<HoldingKey, MakerSetting>],
     pub maker_counters: &'a mut [Slot<HoldingKey, WindowCounter>],
     pub event_cash: &'a mut [Slot<EventCashKey, i64>],
+    /// `fee_overrides` entries, kept sorted (`fees.rs`).
+    pub fee_overrides: &'a mut [FeeOverride],
     pub position_touches: &'a mut [(HoldingKey, u32, i64)],
     pub sleeve_touches: &'a mut [(u64, u32, (i64, i64))],
     pub level_touches: &'a mut [(LevelKey, u32, (u64, u32))],

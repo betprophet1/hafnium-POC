@@ -2,7 +2,7 @@
 
 use crate::emit::{CommandId, CommandOutcome, MarketState, Out, RejectReason};
 use crate::state::*;
-use crate::{Engine, FailStop, ResultSink, PROTOCOL_VERSION};
+use crate::{fees, Engine, FailStop, ResultSink, PROTOCOL_VERSION};
 use venue_journal::message_header_codec::MessageHeaderDecoder;
 use venue_journal::*;
 
@@ -90,6 +90,20 @@ impl<'a> Engine<'a> {
             set_rule_limits_codec::SBE_TEMPLATE_ID
             | set_account_controls_codec::SBE_TEMPLATE_ID
             | set_maker_protection_codec::SBE_TEMPLATE_ID => self.check_account_settings(template, input)?,
+            set_fee_schedule_codec::SBE_TEMPLATE_ID => {
+                let dec = set_fee_schedule_codec::SetFeeScheduleDecoder::default().header(header(input), 0);
+                valid(fees::rates_valid(dec.maker_rate_micros(), dec.taker_rate_micros()))
+            }
+            set_fee_override_codec::SBE_TEMPLATE_ID => {
+                // E-7.10: an override that has already expired is refused rather than stored unseen.
+                let dec = set_fee_override_codec::SetFeeOverrideDecoder::default().header(header(input), 0);
+                let unexpired = dec.expires_at().is_none_or(|at| at > self.now);
+                valid(fees::rates_valid(dec.maker_rate_micros(), dec.taker_rate_micros()) && unexpired)
+            }
+            remove_fee_override_codec::SBE_TEMPLATE_ID => {
+                let dec = remove_fee_override_codec::RemoveFeeOverrideDecoder::default().header(header(input), 0);
+                valid(self.fee_override_exists(dec.override_id()))
+            }
             resolve_event_codec::SBE_TEMPLATE_ID => valid(self.resolution(input)?.is_some()),
             expire_parlay_codec::SBE_TEMPLATE_ID => valid(self.parlay_expiry(input)?.is_some()),
             // §19: not in v0.
@@ -147,6 +161,33 @@ impl<'a> Engine<'a> {
             set_venue_mode_codec::SBE_TEMPLATE_ID => self.apply_venue_mode(input, sink),
             resolve_event_codec::SBE_TEMPLATE_ID => self.apply_resolution(input, sink),
             expire_parlay_codec::SBE_TEMPLATE_ID => self.apply_parlay_expiry(input, sink),
+            set_fee_schedule_codec::SBE_TEMPLATE_ID => {
+                // E-7.9
+                let dec = set_fee_schedule_codec::SetFeeScheduleDecoder::default().header(header(input), 0);
+                self.fee_schedule =
+                    FeeRates { maker_micros: dec.maker_rate_micros(), taker_micros: dec.taker_rate_micros() };
+                Ok(())
+            }
+            set_fee_override_codec::SBE_TEMPLATE_ID => {
+                // E-7.10
+                let dec = set_fee_override_codec::SetFeeOverrideDecoder::default().header(header(input), 0);
+                self.set_fee_override(FeeOverride {
+                    account_id: dec.account_id(),
+                    priority: dec.priority(),
+                    id: dec.override_id(),
+                    instrument_id: dec.instrument_id(),
+                    event_id: dec.event_id(),
+                    maker_rate_micros: dec.maker_rate_micros(),
+                    taker_rate_micros: dec.taker_rate_micros(),
+                    expires_at: dec.expires_at(),
+                })
+            }
+            remove_fee_override_codec::SBE_TEMPLATE_ID => {
+                // E-7.11
+                let dec = remove_fee_override_codec::RemoveFeeOverrideDecoder::default().header(header(input), 0);
+                self.remove_fee_override(dec.override_id());
+                Ok(())
+            }
             _ => self.apply_account_settings(template, input),
         }
     }

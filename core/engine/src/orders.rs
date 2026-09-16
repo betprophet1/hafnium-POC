@@ -792,6 +792,14 @@ impl<'a> Engine<'a> {
         self.add_event_cash(buyer.account_slot, inst.event_id, buyer_cash)?;
         self.add_event_cash(seller.account_slot, inst.event_id, seller_cash)?;
         self.add_collateral(inst.event_id, 100 * (minted - burned))?;
+        // E-10.11, E-10.12: each party at its own rate. Fees move cash between the parties and account 0, never
+        // collateral, and are charged whatever the parties' available cash.
+        let maker_rate = self.fee_rates(maker.account_id, inst.id, inst.event_id).maker_micros;
+        let taker_rate = self.fee_rates(taker.account_id, inst.id, inst.event_id).taker_micros;
+        let maker_fee = crate::fees::fee_cents(maker_rate, yes, quantity)?;
+        let taker_fee = crate::fees::fee_cents(taker_rate, yes, quantity)?;
+        self.charge_fee(maker.account_slot, inst.event_id, maker_fee)?;
+        self.charge_fee(taker.account_slot, inst.event_id, taker_fee)?;
         // E-11.3
         for x in [taker_slot, maker_slot] {
             let o = self.orders[x as usize];
@@ -827,6 +835,8 @@ impl<'a> Engine<'a> {
             burned_pairs: burned as u32,
             buyer_cash_cents: buyer_cash,
             seller_cash_cents: seller_cash,
+            maker_fee_cents: maker_fee,
+            taker_fee_cents: taker_fee,
         };
         self.out(sink, &fill)?;
         // E-11.4, for both accounts in ascending order.

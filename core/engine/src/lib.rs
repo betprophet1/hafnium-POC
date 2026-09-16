@@ -21,6 +21,7 @@ mod book;
 mod check;
 mod commands;
 pub mod emit;
+pub mod fees;
 pub mod fixed;
 pub mod frame;
 mod orders;
@@ -46,7 +47,8 @@ pub enum FailStop {
     MalformedCommand,
     /// E-2.2: arithmetic on money or quantities overflowed.
     Overflow,
-    /// E-3.3: an account's available cash fell below zero, or further below it, other than by a void.
+    /// E-3.3: an account's available cash fell below zero, or further below it, other than by a void or the fees
+    /// the unit charged it.
     NegativeAvailable,
     /// E-10.10: a book was left crossed.
     CrossedBook,
@@ -144,6 +146,13 @@ pub struct Engine<'a> {
     maker_settings: FixedMap<'a, HoldingKey, MakerSetting>,
     maker_counters: FixedMap<'a, HoldingKey, WindowCounter>,
     event_cash: FixedMap<'a, EventCashKey, i64>,
+    /// The default rates (E-7.9, D-2).
+    fee_schedule: FeeRates,
+    /// Overrides, sorted by `(accountId, priority, overrideId)` in `fee_overrides[..fee_overrides_len]` (`fees.rs`).
+    fee_overrides: &'a mut [FeeOverride],
+    fee_overrides_len: usize,
+    /// Numbers units, so fees charged in one are not counted against the next (E-3.3).
+    unit_serial: u64,
     /// This input is a void, the one input that may take available cash below zero (E-3.3).
     voided: bool,
 
@@ -244,6 +253,10 @@ impl<'a> Engine<'a> {
             maker_settings: cap(FixedMap::new(memory.maker_settings, seed))?,
             maker_counters: cap(FixedMap::new(memory.maker_counters, seed))?,
             event_cash: cap(FixedMap::new(memory.event_cash, seed))?,
+            fee_schedule: FeeRates::default(),
+            fee_overrides: memory.fee_overrides,
+            fee_overrides_len: 0,
+            unit_serial: 0,
             voided: false,
             position_touches: Touches::new(memory.position_touches),
             sleeve_touches: Touches::new(memory.sleeve_touches),
@@ -539,8 +552,11 @@ impl<'a> Engine<'a> {
             levels,
             emitter,
             voided,
+            unit_serial,
             ..
         } = self;
+        let unit = *unit_serial;
+        *unit_serial = unit.checked_add(1).ok_or(FailStop::Overflow)?;
         position_touches.finish(
             |k| holdings.get(k).map_or(0, |h| h.position),
             |k, _, position| {
@@ -552,10 +568,20 @@ impl<'a> Engine<'a> {
                 account_index.get(id).map_or((0, 0), |&s| (accounts[s as usize].balance, accounts[s as usize].reserved))
             },
             |id, (start_balance, start_reserved), (balance, reserved)| {
-                // E-3.3: only a void takes available cash below zero, or further below it.
+                // E-3.3: only a void, or the fees the unit charged, take available cash below zero or further
+                // below it. Account 0 pays rebates, so it is exempt.
                 let available = balance.checked_sub(reserved).ok_or(FailStop::Overflow)?;
                 let before = start_balance.checked_sub(start_reserved).ok_or(FailStop::Overflow)?;
-                if available < before.min(0) && !*voided {
+                let fees = account_index.get(id).map_or(0, |&s| {
+                    let a = &accounts[s as usize];
+                    if a.fees_unit == unit {
+                        a.fees_charged
+                    } else {
+                        0
+                    }
+                });
+                let floor = before.min(0).checked_sub(fees).ok_or(FailStop::Overflow)?;
+                if available < floor && !*voided && *id != fees::FEE_ACCOUNT {
                     return Err(FailStop::NegativeAvailable);
                 }
                 emitter.emit(
