@@ -75,7 +75,7 @@ paths:
       tags: [account]
       summary: Place an order
       description: |
-        Idempotent on `clientOrderId` for 24 hours (spec E-9.2): resending returns `status: duplicate`
+        Idempotent on `clientOrderId` for two hours (spec E-9.2): resending returns `status: duplicate`
         with the original order ID. After a 503 the outcome is unknown; resend with the same `clientOrderId`.
       requestBody:
         required: true
@@ -257,7 +257,7 @@ components:
           minLength: 1
           maxLength: 32
           pattern: '^[!-~]+$'
-          description: Printable ASCII, unique per account for 24 hours across every market.
+          description: Printable ASCII, unique per account for two hours across every market.
         instrumentId: { $ref: '#/components/schemas/Id' }
         action: { type: string, enum: [buy, sell] }
         outcome: { type: string, enum: ['yes', 'no'] }

@@ -3497,7 +3497,7 @@ accept if required ≤ available_cash</code></pre>
       <tr><td class="lbl">Allocation</td><td>Price-time default, pro-rata configurable</td><td>Per-instrument policy (&sect;6), always applied within a continuous book.</td></tr>
       <tr><td class="lbl">Runtime platform</td><td>No orchestrator for the core or the latency edge; EKS for services</td><td>Three deployment regimes rather than two (&sect;15). Containers are adopted as an artefact format and rejected as a runtime, and a boot-time profile assertion replaces the reconciliation loop.</td></tr>
       <tr><td class="lbl">Margin</td><td>Fully collateralised</td><td>Not a CFTC requirement, but the reason you can self-clear with a small risk team (&sect;8). Exact offsetting day one, portfolio margining phase two, no leverage.</td></tr>
-      <tr><td class="lbl">Engine defaults customers notice</td><td>All confirmed: no self-trading, a repricing amendment loses priority, a 24-hour client order ID window, spare complete sets burned after every fill, and no basket mint or redeem</td><td>Voids reverse every trade (&sect;11), and the capital a basket would have saved market makers comes from portfolio margining (&sect;8). The specification records each as a decision.</td></tr>
+      <tr><td class="lbl">Engine defaults customers notice</td><td>All confirmed: no self-trading, a repricing amendment loses priority, a two-hour client order ID window, spare complete sets burned after every fill, and no basket mint or redeem</td><td>Voids reverse every trade (&sect;11), and the capital a basket would have saved market makers comes from portfolio margining (&sect;8). The specification records each as a decision.</td></tr>
     </tbody>
   </table>
   </div>

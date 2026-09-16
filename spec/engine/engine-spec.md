@@ -85,7 +85,7 @@ orders and for trades within the group *(D-13)*.
 | State | Contents |
 |---|---|
 | Clock | `now` [0], `lastSequence` [0], `protocolVersion` [1] |
-| Venue | `venueMode` [`NORMAL`], `activeOrderLimit` [0 = none], `clientOrderIdWindowSeconds` [86 400] *(D-12)* |
+| Venue | `venueMode` [`NORMAL`], `activeOrderLimit` [0 = none], `clientOrderIdWindowSeconds` [7 200] *(D-12)* |
 | Tick tables | by `tickTableId`: ordered rows of `numerator`, `denominator`, `complement` |
 | Events | by `eventId`: `stateCount`, `scheduledStart`, `started`, `suspended`, `ended` [all false], `resolved` [false], `collateralCents` [0] |
 | Instruments | by `instrumentId`: `eventId`, `instrumentClass`, `tickTableId`, `lotStep`, `allocationPolicy`, `stateMask`, `positionLimit`, `legs`, `marketState` [`LISTED`] |

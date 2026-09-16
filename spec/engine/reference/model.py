@@ -161,7 +161,7 @@ class Engine:
         self.protocol_version = 1
         self.venue_mode = "NORMAL"
         self.active_order_limit = 0
-        self.client_order_id_window_seconds = 86_400          # D-12
+        self.client_order_id_window_seconds = 7_200           # D-12
         self.tick_tables = {}
         self.events = {}
         self.instruments = {}
