@@ -20,3 +20,5 @@ mio = { version = "1", default-features = false, features = ["os-poll", "net"] }
 [dev-dependencies]
 # The request-path tests run order entry against a real node rather than a stub of one.
 venue-node = { path = "../node" }
+# And deposits and withdrawals against a real treasury.
+venue-treasury = { path = "../treasury" }

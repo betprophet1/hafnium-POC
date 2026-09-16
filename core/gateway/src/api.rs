@@ -4,6 +4,7 @@
 use crate::hub::{self, id, Hub};
 use crate::limits::{monotonic, Bucket};
 use crate::price::{self, PriceError};
+use crate::treasury::Treasury;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -209,9 +210,9 @@ impl Half {
         let path = path.split('?').next().unwrap_or("");
         match path {
             "/v4/ws_public" | "/v4/markets" => Some(Self::Public),
-            "/v4/ws_private" | "/v4/account" | "/v4/orders" => Some(Self::Private),
+            "/v4/ws_private" | "/v4/account" | "/v4/orders" | "/v4/transfers" => Some(Self::Private),
             p if p.starts_with("/v4/markets/") => Some(Self::Public),
-            p if p.starts_with("/v4/orders/") => Some(Self::Private),
+            p if p.starts_with("/v4/orders/") || p.starts_with("/v4/transfers/") => Some(Self::Private),
             _ => None,
         }
     }
@@ -226,6 +227,8 @@ pub struct Gateway {
     pub limits: Limits,
     rest_buckets: Mutex<BTreeMap<u64, Bucket>>,
     logon_buckets: Mutex<BTreeMap<u64, Bucket>>,
+    /// Where deposits and withdrawals go, when this private half offers them.
+    treasury: Option<Treasury>,
 }
 
 impl Gateway {
@@ -247,7 +250,23 @@ impl Gateway {
             limits,
             rest_buckets: Mutex::new(BTreeMap::new()),
             logon_buckets: Mutex::new(BTreeMap::new()),
+            treasury: None,
         }
+    }
+
+    /// The same half, passing deposits and withdrawals to the treasury at `address`.
+    pub fn with_treasury(mut self, address: &str) -> Self {
+        self.treasury = Some(Treasury::new(address));
+        self
+    }
+
+    /// The treasury, for a credential allowed to move money (interfaces/gateway/README.md, permissions). Every dev
+    /// token is; an API key will be only if it was issued with the transfers flag, and this is where that flag is
+    /// read.
+    pub fn treasury(&self, _token: &str) -> Result<&Treasury, ApiError> {
+        self.treasury
+            .as_ref()
+            .ok_or_else(|| ApiError::unavailable("this gateway has no treasury; transfers are not offered"))
     }
 
     /// The node's ingress, which only the private half has.

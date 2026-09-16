@@ -36,6 +36,12 @@ pub struct Venue {
     pub ws_private: String,
 }
 
+/// A seeded node, a treasury on it with a fake bank that decides `dummy_bank` transfers within half a second and never
+/// fails one, and a gateway serving both halves that passes transfers to it.
+pub fn venue_with_treasury(name: &str) -> Venue {
+    venue_with(name, true, true, true)
+}
+
 fn free_address() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
     listener.local_addr().expect("its address").to_string()
@@ -97,6 +103,10 @@ pub fn venue(name: &str) -> Venue {
 /// The same, with the gateway process serving only the halves asked for, as `--serve` does. Both halves' gateways
 /// still follow the feed, so a test can look at either.
 pub fn venue_serving(name: &str, public: bool, private: bool) -> Venue {
+    venue_with(name, public, private, false)
+}
+
+fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue {
     let (ingress, feed) = start_node(name);
     // Sends wait for the forwarder's first connection, so seeding can start before the node is listening.
     let seeder = Submit::spawn(&ingress);
@@ -107,7 +117,15 @@ pub fn venue_serving(name: &str, public: bool, private: bool) -> Venue {
     }
     let limits = Limits { per_second: 1_000_000, burst: 1_000_000, logons_per_minute: 1_000_000 };
     let hub = || Hub::new(Catalogue::load(CATALOGUE).expect("the mini venue's catalogue"));
-    let gateway = crate::start_half(Gateway::private(hub(), Submit::spawn(&ingress), limits), &feed);
+    let mut private_half = Gateway::private(hub(), Submit::spawn(&ingress), limits);
+    let treasury = treasury.then(|| start_treasury(name, &ingress, &feed));
+    if let Some(address) = &treasury {
+        private_half = private_half.with_treasury(address);
+    }
+    let gateway = crate::start_half(private_half, &feed);
+    if let Some(address) = treasury {
+        crate::treasury::follow_updates(&gateway, address);
+    }
     let public_half = crate::start_half(Gateway::public(hub(), limits), &feed);
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
     let address = listener.local_addr().expect("its address").to_string();
@@ -127,6 +145,25 @@ pub fn venue_serving(name: &str, public: bool, private: bool) -> Venue {
     }
     let (ws_public, ws_private) = (format!("ws://{address}/v4/ws_public"), format!("ws://{address}/v4/ws_private"));
     Venue { gateway, address, ws_public, ws_private }
+}
+
+/// Starts a treasury of the test's own on the node, with a fresh book, and returns where it listens.
+fn start_treasury(name: &str, ingress: &str, feed: &str) -> String {
+    let ledger = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}.treasury", std::process::id()));
+    let _ = std::fs::remove_file(&ledger);
+    let settings = venue_treasury::Settings {
+        ingress: ingress.to_string(),
+        feed: feed.to_string(),
+        catalogue: CATALOGUE.to_string(),
+        ledger,
+        fsync: false,
+        bank: venue_treasury::bank::FakeBank { seed: 1, min_delay_ms: 200, max_delay_ms: 500, failure_per_mille: 0 },
+        max_cents: 100_000_000,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the treasury");
+    let address = listener.local_addr().expect("its address").to_string();
+    venue_treasury::start(&settings, listener).expect("a treasury");
+    address
 }
 
 /// Waits up to five seconds, in 20 ms steps, for `ready` to hold.

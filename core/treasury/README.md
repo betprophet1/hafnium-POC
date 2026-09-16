@@ -62,6 +62,8 @@ Not interface 1, and never exposed beyond the gateway: it trusts the account in 
 ```sh
 target/release/venue-treasury --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 \
   --catalogue ../deploy/charts/venue-mini/files/markets.json --ledger /tmp/venue/treasury.jsonl
+target/release/venue-gateway --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 \
+  --catalogue ../deploy/charts/venue-mini/files/markets.json --treasury 127.0.0.1:8083
 ```
 
 ## Known shortcuts

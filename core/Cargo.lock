@@ -335,6 +335,7 @@ dependencies = [
  "tungstenite",
  "venue-link",
  "venue-node",
+ "venue-treasury",
 ]
 
 [[package]]

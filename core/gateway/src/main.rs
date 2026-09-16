@@ -10,6 +10,7 @@ mod reactor;
 mod rest;
 #[cfg(test)]
 mod testing;
+mod treasury;
 mod ws;
 
 use api::{Gateway, Limits};
@@ -26,12 +27,14 @@ use venue_link::submit::Submit;
 use venue_link::wire::{self, Error};
 
 const USAGE: &str = "usage:
-  venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--listen 127.0.0.1:8081]
-                [--per-second 200] [--burst 400] [--logons-per-minute 30]
+  venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--treasury ADDR]
+                [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
 
 --serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
 /v4/ws_public and GET /v4/markets; private is orders and accounts on /v4/ws_private, /v4/account and /v4/orders,
-and needs --ingress. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
+and needs --ingress. With --treasury, the private half also passes deposits and withdrawals (/v4/transfers) to the
+treasury there and sends its updates to private sessions; without it, /v4/transfers answers 503. Every flag can also
+be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
 struct Args(BTreeMap<String, String>);
 
@@ -98,7 +101,16 @@ fn run(args: &Args) -> Result<(), Error> {
         },
         private: if private {
             let ingress = Submit::spawn(&args.get("ingress", None)?);
-            Some(start_half(Gateway::private(Hub::new(catalogue), ingress, limits), &feed))
+            let mut gateway = Gateway::private(Hub::new(catalogue), ingress, limits);
+            let treasury = args.get("treasury", Some(""))?;
+            if !treasury.is_empty() {
+                gateway = gateway.with_treasury(&treasury);
+            }
+            let half = start_half(gateway, &feed);
+            if !treasury.is_empty() {
+                treasury::follow_updates(&half, treasury);
+            }
+            Some(half)
         } else {
             None
         },

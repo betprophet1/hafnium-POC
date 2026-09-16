@@ -259,12 +259,15 @@ impl Treasury {
             Self::write(&mut inner, json!({"book": {"nonce": nonce, "created": now}}))?;
             let mut postings = Vec::new();
             for (&account, &cents) in treasury.config.accounts.iter().filter(|(_, c)| **c > 0) {
-                let posting = Posting::moving(cents, ledger::DEMO_OPENING, &ledger::customer(account))?;
-                inner.ledger.post(&posting)?;
-                postings.push(posting_json("opening balance granted by the environment's seed", &posting));
+                postings.push(Posting::moving(cents, ledger::DEMO_OPENING, &ledger::customer(account))?);
             }
             if !postings.is_empty() {
-                Self::write(&mut inner, json!({"postings": postings}))?;
+                let memo = "opening balance granted by the environment's seed";
+                let written: Vec<Value> = postings.iter().map(|p| posting_json(memo, p)).collect();
+                Self::write(&mut inner, json!({"postings": written}))?;
+                for posting in &postings {
+                    inner.ledger.post(posting)?;
+                }
             }
         }
         Ok(treasury)
@@ -525,12 +528,18 @@ impl Treasury {
             _ => false,
         });
         let Some(mut t) = due.cloned() else { return Ok(false) };
+        if t.stage == Stage::ToBank {
+            let decision = self.config.bank.decide(t.id, t.kind, t.method);
+            let due = now.saturating_add(decision.delay_ms);
+            t.stage = Stage::AtBank { due, settles: decision.settles };
+            // A bank that decides at once is decided in the same breath, so nobody waiting sees it at the bank.
+            if due > now {
+                self.commit(inner, t, &[], now)?;
+                return Ok(true);
+            }
+        }
         let mut postings = Vec::new();
         match (t.stage, t.kind) {
-            (Stage::ToBank, _) => {
-                let decision = self.config.bank.decide(t.id, t.kind, t.method);
-                t.stage = Stage::AtBank { due: now.saturating_add(decision.delay_ms), settles: decision.settles };
-            }
             (Stage::AtBank { settles: true, .. }, Kind::Deposit) => {
                 postings.push((
                     "deposit received at the bank",

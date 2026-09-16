@@ -4,6 +4,7 @@
 
 use crate::api::{parse_id, ApiError, Gateway, Half, Pending};
 use crate::http::{self, Request};
+use crate::treasury::Call;
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use venue_link::submit::Notify;
@@ -13,6 +14,8 @@ use venue_link::submit::Notify;
 pub enum Routed {
     Now(Result<Value, ApiError>),
     Later(Pending),
+    /// A request passed to the treasury, whose whole response `Call::take` has once the notify is called.
+    Treasury(Call),
 }
 
 /// The response for an answer.
@@ -46,6 +49,21 @@ fn account(gateway: &Gateway, request: &Request) -> Result<u64, ApiError> {
     let account = gateway.authenticate(token.trim())?;
     gateway.rest_rate(account)?;
     Ok(account)
+}
+
+/// Deposits and withdrawals: the account authenticated and allowed to move money, then the request passed to the
+/// treasury as it came, which validates it and answers in interface 1's terms.
+fn transfer(gateway: &Gateway, request: &Request, notify: &Notify) -> Result<Routed, ApiError> {
+    let account = account(gateway, request)?;
+    let token = request.headers.get("authorization").and_then(|h| h.strip_prefix("Bearer ")).unwrap_or("");
+    let treasury = gateway.treasury(token.trim())?;
+    if let Some(id) = request.path.trim_matches('/').split('/').nth(2) {
+        parse_id(id, "transferId")?;
+    }
+    let query: Vec<String> = request.query.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let call =
+        treasury.call(account, &request.method, &request.path, &query.join("&"), &request.body, Arc::clone(notify))?;
+    Ok(Routed::Treasury(call))
 }
 
 fn body(request: &Request) -> Result<Value, ApiError> {
@@ -107,6 +125,9 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Res
             let account = account(gateway, request)?;
             let order = parse_id(order, "orderId")?;
             Ok(Routed::Later(gateway.cancel_pending(account, rest_session(account), order, later())?))
+        }
+        ("POST" | "GET", ["v4", "transfers"]) | ("GET" | "DELETE", ["v4", "transfers", _]) => {
+            transfer(gateway, request, notify)
         }
         _ => Err(ApiError::not_found("no such route")),
     }
@@ -247,6 +268,7 @@ mod tests {
         assert_eq!(request(a, "GET", "/v4/markets", None, None).0, 200);
         assert_eq!(request(a, "GET", "/v4/account", Some(MAKER_TOKEN), None).0, 404);
         assert_eq!(request(a, "POST", "/v4/orders", Some(MAKER_TOKEN), Some(&order("public-only"))).0, 404);
+        assert_eq!(request(a, "GET", "/v4/transfers", Some(MAKER_TOKEN), None).0, 404);
         assert!(tungstenite::connect(&venue.ws_private).is_err(), "a public-only gateway took a private session");
         assert!(tungstenite::connect(&venue.ws_public).is_ok(), "a public-only gateway refused a public session");
     }

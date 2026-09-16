@@ -20,6 +20,7 @@
 use crate::api::{Gateway, Half, Pending};
 use crate::hub::Outbox;
 use crate::limits::monotonic;
+use crate::treasury::Call;
 use crate::ws::{self, Session};
 use crate::{http, rest};
 use mio::net::TcpStream as Stream;
@@ -135,6 +136,8 @@ struct Http {
     stream: Stream,
     request: Vec<u8>,
     pending: Option<Pending>,
+    /// A request passed to the treasury, until its response is there.
+    call: Option<Call>,
     response: Vec<u8>,
     written: usize,
 }
@@ -329,7 +332,7 @@ fn decide(gateway: &Gateway, conn: &mut Conn, max_behind: usize, registry: &Regi
             Err(HandshakeError::Failure(_)) => return Decided::Gone,
         }
     } else {
-        Socket::Http(Http { stream, request: Vec::new(), pending: None, response: Vec::new(), written: 0 })
+        Socket::Http(Http { stream, request: Vec::new(), pending: None, call: None, response: Vec::new(), written: 0 })
     });
     Decided::Here
 }
@@ -337,7 +340,7 @@ fn decide(gateway: &Gateway, conn: &mut Conn, max_behind: usize, registry: &Regi
 /// A REST connection: read until the request is whole, answer it — now, or when the node has — write the response,
 /// and let the connection go.
 fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify) -> bool {
-    if http.pending.is_none() && http.response.is_empty() {
+    if http.pending.is_none() && http.call.is_none() && http.response.is_empty() {
         let mut chunk = [0u8; READ_BUFFER];
         loop {
             match http.stream.read(&mut chunk) {
@@ -354,6 +357,7 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify) -> bool {
             Ok(Some(request)) => match rest::route(gateway, &request, notify) {
                 rest::Routed::Now(answer) => http.response = rest::response(answer),
                 rest::Routed::Later(pending) => http.pending = Some(pending),
+                rest::Routed::Treasury(call) => http.call = Some(call),
             },
             Err(reason) => http.response = rest::unreadable(&reason),
         }
@@ -362,6 +366,11 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify) -> bool {
         let Some(answer) = gateway.finish(pending) else { return true };
         http.response = rest::response(answer);
         http.pending = None;
+    }
+    if let Some(call) = &http.call {
+        let Some(response) = call.take() else { return true };
+        http.response = response;
+        http.call = None;
     }
     while http.written < http.response.len() {
         match http.stream.write(&http.response[http.written..]) {
@@ -447,7 +456,7 @@ fn sweep(gateway: &Arc<Gateway>, conns: &mut [Option<Conn>], free: &mut Vec<usiz
         let Some(conn) = conns[token].as_mut() else { continue };
         let arriving = match &conn.socket {
             Some(Socket::Undecided(_) | Socket::Handshake(_)) => true,
-            Some(Socket::Http(http)) => http.pending.is_none() && http.response.is_empty(),
+            Some(Socket::Http(http)) => http.pending.is_none() && http.call.is_none() && http.response.is_empty(),
             _ => false,
         };
         if arriving {
