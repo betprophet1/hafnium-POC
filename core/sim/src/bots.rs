@@ -1,6 +1,7 @@
 //! Synthetic makers and takers (blueprint §16). Ordinary clients of the gateway with dev tokens, exercising both of
 //! its flows: the maker holds a WebSocket session, as market makers do, and the taker uses the REST API, as
-//! programmatic retail does. Both decide only from what the gateway publishes.
+//! programmatic retail does. Both decide only from what the gateway publishes. The maker is also a registered
+//! responder: it answers requests for quote on parlays with resting sells (interfaces/gateway/README.md, parlays).
 
 use crate::client::{Api, Response};
 use crate::session::{self, Session};
@@ -50,6 +51,8 @@ fn id(v: &Value) -> u64 {
 struct Market {
     id: u64,
     event: u64,
+    /// `binary`, `categorical_outcome`, `scalar_band` or `parlay`.
+    class: String,
     state: String,
     lot: u64,
     /// Each ladder row's probability in basis points.
@@ -82,6 +85,7 @@ fn markets(api: &Api) -> Result<Vec<Market>, Error> {
             out.push(Market {
                 id: id(&m["instrumentId"]),
                 event: id(&e["eventId"]),
+                class: m["class"].as_str().unwrap_or("").to_string(),
                 state: m["state"].as_str().unwrap_or("").to_string(),
                 lot: m["lotStep"].as_u64().unwrap_or(1).max(1),
                 bp: m["ladder"].as_array().into_iter().flatten().map(basis_points).collect(),
@@ -308,6 +312,8 @@ struct Stream {
     snapshot: u64,
     markets_changed: bool,
     resync: bool,
+    /// Requests for quote received and not answered yet.
+    rfqs: Vec<Value>,
 }
 
 impl Stream {
@@ -361,17 +367,31 @@ impl Stream {
             }
             "market" => self.markets_changed = true,
             "resync" => self.resync = true,
+            "rfq" => self.rfqs.push(message.clone()),
             _ => {}
         }
     }
 }
 
+/// How a responder answers a request for quote: the body of the resting sell it quotes with, or `None` to let the
+/// request pass.
+type Respond<'a> = dyn FnMut(&[Market], &dyn Fn(u64) -> Option<Book>, &Value) -> Option<Value> + 'a;
+
 /// The maker's loop over two WebSocket sessions: its own orders arrive on the private one, where its actions go out as
 /// session ops, and books and market states on the public one. When the session ends the gateway cancels its quotes, and the loop logs in again, cancels whatever an earlier
-/// session left resting, and starts from a fresh snapshot.
-fn run_session(api: &Api, gateway: &str, token: &str, interval: Duration, who: &str, plan: &mut Plan<'_>) -> ! {
+/// session left resting, and starts from a fresh snapshot. Requests for quote arrive on the private session too, and
+/// are answered as they come rather than on the planning interval: a request's window is short.
+fn run_session(
+    api: &Api,
+    gateway: &str,
+    token: &str,
+    interval: Duration,
+    who: &str,
+    plan: &mut Plan<'_>,
+    respond: &mut Respond<'_>,
+) -> ! {
     loop {
-        if let Err(e) = session_pass(api, gateway, token, interval, who, plan) {
+        if let Err(e) = session_pass(api, gateway, token, interval, who, plan, respond) {
             eprintln!("{who}: session ended: {e}; logging in again");
         }
         thread::sleep(Duration::from_secs(1));
@@ -385,6 +405,7 @@ fn session_pass(
     interval: Duration,
     who: &str,
     plan: &mut Plan<'_>,
+    respond: &mut Respond<'_>,
 ) -> Result<(), Error> {
     let (mut session, welcome) = Session::open(gateway, token, HEARTBEAT_SECONDS)?;
     eprintln!("{who}: session {} logged in", welcome["sessionId"].as_str().unwrap_or("?"));
@@ -428,6 +449,18 @@ fn session_pass(
             stream.resync = false;
             stream.restart(account(api)?);
         }
+        for rfq in std::mem::take(&mut stream.rfqs) {
+            // A parlay listed for this very request is not in the market list yet.
+            if !markets.iter().any(|m| m.id == id(&rfq["instrumentId"])) {
+                markets = crate::bots::markets(api)?;
+            }
+            // The legs' whole books, from REST: the public session's book messages carry only what changed.
+            let books = |instrument: u64| book(api, instrument).ok();
+            match respond(&markets, &books, &rfq) {
+                Some(order) => answer_rfq(&mut session, who, &rfq, order)?,
+                None => eprintln!("{who}: no price for request {}: a leg has no two-sided book", rfq["requestId"]),
+            }
+        }
         if session::monotonic() < next_plan {
             continue;
         }
@@ -462,6 +495,34 @@ fn session_pass(
     }
 }
 
+/// Rests the quote's sell and attaches it to the request. `Err` means the session is gone; a refusal is only logged,
+/// since the request will have lapsed by the time anything could be done about it.
+fn answer_rfq(session: &mut Session, who: &str, rfq: &Value, mut order: Value) -> Result<(), Error> {
+    order["op"] = json!("order");
+    let placed = session.request(order)?;
+    let Some(order_id) = placed["result"]["orderId"].as_str().filter(|_| placed["result"]["status"] == "accepted")
+    else {
+        eprintln!(
+            "{who}: quote not rested: {}",
+            if placed["type"] == "error" { &placed["error"] } else { &placed["result"] }
+        );
+        return Ok(());
+    };
+    let attach = json!({"op": "attachQuote", "requestId": rfq["requestId"], "orderId": order_id});
+    let attached = session.request(attach)?;
+    if attached["type"] == "reply" {
+        let price = &attached["result"]["price"]["cents"];
+        eprintln!(
+            "{who}: quoted request {} at {}c",
+            rfq["requestId"].as_str().unwrap_or("?"),
+            price.as_str().unwrap_or("?")
+        );
+    } else {
+        eprintln!("{who}: quote not attached: {}", attached["error"]);
+    }
+    Ok(())
+}
+
 fn nearest_tick(bp: &[u64], target: u64) -> u64 {
     bp.iter().enumerate().min_by_key(|(_, b)| b.abs_diff(target)).map_or(0, |(t, _)| t as u64)
 }
@@ -475,18 +536,50 @@ pub struct Maker {
     pub half_spread: u64,
     pub interval: Duration,
     pub seed: u64,
+    /// What the maker adds to a parlay's price as a responder, in thousandths of it.
+    pub margin_per_mille: u64,
+}
+
+/// A parlay's price as a responder quotes it, as a row of the parlay's ladder, or `None` if a leg has no two-sided
+/// book to take a price from. Each leg's chance is the middle of its book (for a NO leg, one minus it), and the
+/// parlay's is their product: the legs are on different events, which the maker takes as independent. Correlated
+/// legs make that wrong, which is why the exchange leaves the pricing to responders (blueprint §6). The margin is on
+/// top, plus a tenth of a cent, rounded up to the ladder, and never the top row.
+fn parlay_tick(markets: &[Market], books: &dyn Fn(u64) -> Option<Book>, rfq: &Value, margin: u64) -> Option<u64> {
+    let parlay = markets.iter().find(|m| m.id == id(&rfq["instrumentId"]))?;
+    let mut ppm: u128 = 1_000_000;
+    for leg in rfq["legs"].as_array()? {
+        let market = markets.iter().find(|m| m.id == id(&leg["instrumentId"]))?;
+        let book = books(market.id)?;
+        let (bid, ask) = (book.bids.first()?.0, book.asks.first()?.0);
+        let mid = (market.bp.get(bid as usize)? + market.bp.get(ask as usize)?) / 2;
+        let chance = if leg["outcome"] == "yes" { mid } else { 10_000u64.saturating_sub(mid) };
+        ppm = ppm * u128::from(chance) / 10_000;
+    }
+    let target_bp = u64::try_from((ppm * u128::from(1_000 + margin) / 1_000 + 1_000).div_ceil(100)).ok()?;
+    let top = parlay.bp.len().checked_sub(2)?;
+    Some(parlay.bp.iter().position(|&bp| bp >= target_bp).unwrap_or(top).min(top) as u64)
 }
 
 /// Quotes several levels on both sides of every open market around a seeded random-walk fair value, rescaled to sum
 /// to 100¢ across an event's outcomes, over a WebSocket session with cancel-on-disconnect. Pulls its quotes when an
-/// event ends or is suspended.
-pub fn maker(api: &Api, gateway: &str, token: &str, config: &Maker, mut ids: Ids) -> ! {
+/// event ends or is suspended. Answers each request for quote with a sell of the whole size, good until the request's
+/// window closes, priced by `parlay_tick`; parlays are otherwise left to their requesters and anyone who takes a quote.
+pub fn maker(api: &Api, gateway: &str, token: &str, config: &Maker, mut ids: Ids, mut quote_ids: Ids) -> ! {
     let mut rng = Rng::new(config.seed);
     let mut fair: BTreeMap<u64, u64> = BTreeMap::new();
-    run_session(api, gateway, token, config.interval, "maker", &mut |markets, account, books| {
+    let margin = config.margin_per_mille;
+    let mut respond = |markets: &[Market], books: &dyn Fn(u64) -> Option<Book>, rfq: &Value| {
+        let tick = parlay_tick(markets, books, rfq, margin)?;
+        Some(json!({
+            "clientOrderId": quote_ids.fresh(), "instrumentId": rfq["instrumentId"], "action": "sell", "outcome": "yes",
+            "price": {"tick": tick}, "quantity": rfq["quantity"], "timeInForce": "GTD", "expiresAt": rfq["expiresAt"]
+        }))
+    };
+    let mut plan = |markets: &[Market], account: &Account, books: &dyn Fn(u64) -> Option<Book>| {
         let mut out = Vec::new();
         let mut by_event: BTreeMap<u64, Vec<&Market>> = BTreeMap::new();
-        for m in markets.iter().filter(|m| m.state == "open") {
+        for m in markets.iter().filter(|m| m.state == "open" && m.class != "parlay") {
             by_event.entry(m.event).or_default().push(m);
         }
         for (event, open) in by_event {
@@ -579,7 +672,8 @@ pub fn maker(api: &Api, gateway: &str, token: &str, config: &Maker, mut ids: Ids
             }
         }
         out
-    })
+    };
+    run_session(api, gateway, token, config.interval, "maker", &mut plan, &mut respond)
 }
 
 pub struct Taker {
@@ -599,7 +693,8 @@ pub fn taker(api: &Api, config: &Taker, mut ids: Ids) -> ! {
     let mut rng = Rng::new(config.seed);
     run(api, config.interval, "taker", &mut |markets, _account, books| {
         let mut out = Vec::new();
-        for m in markets.iter().filter(|m| m.state == "open" && !m.suspended && !m.resolved) {
+        // Parlays are left alone: their quotes are for their requesters to take first.
+        for m in markets.iter().filter(|m| m.state == "open" && !m.suspended && !m.resolved && m.class != "parlay") {
             if !rng.chance(config.per_mille) {
                 continue;
             }
@@ -646,4 +741,60 @@ pub fn taker(api: &Api, config: &Taker, mut ids: Ids) -> ! {
         }
         out
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn market(id: u64, class: &str, bp: Vec<u64>) -> Market {
+        Market {
+            id,
+            event: id,
+            class: class.into(),
+            state: "open".into(),
+            lot: 1,
+            bp,
+            started: false,
+            suspended: false,
+            ended: false,
+            resolved: false,
+        }
+    }
+
+    /// The cent ladder's basis points, and the parlay ladder's: 0.1¢ to 10¢, whole cents, 90¢ to 99.9¢.
+    fn ladders() -> (Vec<u64>, Vec<u64>) {
+        let cents = (1..=99).map(|c| c * 100).collect();
+        let parlay = (1..=100).chain((110..=890).step_by(10)).chain(900..=999).map(|n| n * 10).collect();
+        (cents, parlay)
+    }
+
+    #[test]
+    fn a_parlay_is_priced_from_the_middle_of_its_legs_books_with_a_margin_on_top() {
+        let (cents, parlay) = ladders();
+        let markets =
+            vec![market(1, "binary", cents.clone()), market(2, "binary", cents), market(9, "parlay", parlay.clone())];
+        // Both legs 49¢ bid, 51¢ offered (ticks 48 and 50): a middle of 50¢.
+        let book = Book { bids: vec![(48, 10)], asks: vec![(50, 10)] };
+        let books = |_: u64| Some(book.clone());
+        let rfq = json!({"instrumentId": "9", "legs": [{"instrumentId": "1", "outcome": "yes"}, {"instrumentId": "2", "outcome": "no"}]});
+        // 25% plus a tenth of it and 0.1¢ is 27.6¢, rounded up to the ladder's 28¢.
+        let tick = parlay_tick(&markets, &books, &rfq, 100).expect("priced");
+        assert_eq!(parlay[tick as usize], 2_800);
+        // Without a book on a leg there is no price to quote.
+        assert_eq!(parlay_tick(&markets, &|_| None, &rfq, 100), None);
+    }
+
+    #[test]
+    fn a_long_shot_is_quoted_on_the_parlays_finest_rows() {
+        let (cents, parlay) = ladders();
+        let markets: Vec<Market> =
+            (1..=4).map(|i| market(i, "binary", cents.clone())).chain([market(9, "parlay", parlay.clone())]).collect();
+        // Four legs at 20¢ each: 0.16%, which a cent ladder could not tell from nothing.
+        let book = Book { bids: vec![(18, 10)], asks: vec![(20, 10)] };
+        let legs: Vec<Value> = (1..=4).map(|i| json!({"instrumentId": i.to_string(), "outcome": "yes"})).collect();
+        let rfq = json!({"instrumentId": "9", "legs": legs});
+        let tick = parlay_tick(&markets, &|_| Some(book.clone()), &rfq, 0).expect("priced");
+        assert_eq!(parlay[tick as usize], 30, "0.16¢ and 0.1¢ is 0.26¢, rounded up to 0.3¢");
+    }
 }

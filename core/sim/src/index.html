@@ -103,6 +103,15 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
 @media (max-width: 520px) { .money { grid-template-columns: 1fr; } }
 .money form { border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin: 0; }
 .money h4 { width: 100%; margin: 0; font-size: 13px; }
+.legpick { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 6px 10px; padding: 6px 0; border-top: 1px solid var(--line); }
+.legpick .title { font-size: 12px; color: var(--muted); }
+.yn { display: flex; gap: 4px; }
+.yn button { padding: 3px 12px; font-size: 12px; }
+.yn button.yes.on { background: var(--bid-soft); border-color: var(--bid); color: var(--bid); }
+.yn button.no.on { background: var(--ask-soft); border-color: var(--ask); color: var(--ask); }
+.picker { max-height: 260px; overflow: auto; }
+.legs { margin: 6px 0; padding-left: 18px; font-size: 13px; }
+.legs li { margin: 2px 0; }
 #toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 5; }
 .toast { background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--muted); border-radius: 6px; padding: 8px 12px; box-shadow: 0 4px 16px rgba(0,0,0,.12); max-width: 360px; }
 .toast.bad { border-left-color: var(--bad); } .toast.ok { border-left-color: var(--ok); }
@@ -136,6 +145,7 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
       <button data-tab="maker" class="on">Market maker</button>
       <button data-tab="retail">Retail customer</button>
       <button data-tab="account">Account</button>
+      <button data-tab="parlays">Parlays</button>
       <button data-tab="settle">Settlement</button>
     </div>
 
@@ -143,12 +153,12 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
       <div id="makerAcct"></div>
       <div class="quote">
         <div class="qside bid">
-          <label>Bid price (¢)<input id="bidPx" type="number" min="1" max="99"></label>
+          <label>Bid price (¢)<input id="bidPx" type="number" min="0.1" max="99.9" step="0.1"></label>
           <label>Size<input id="bidQty" type="number" min="1" value="10"></label>
           <button id="placeBid" class="buy">Place bid</button>
         </div>
         <div class="qside ask">
-          <label>Ask price (¢)<input id="askPx" type="number" min="1" max="99"></label>
+          <label>Ask price (¢)<input id="askPx" type="number" min="0.1" max="99.9" step="0.1"></label>
           <label>Size<input id="askQty" type="number" min="1" value="10"></label>
           <button id="placeAsk" class="sell">Place ask</button>
         </div>
@@ -171,7 +181,7 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
       </div>
       <div class="row">
         <label>Order type<select id="rType"><option value="market">Market</option><option value="limit">Limit</option></select></label>
-        <label id="rPxWrap" hidden>Limit price (¢)<input id="rPx" type="number" min="1" max="99"></label>
+        <label id="rPxWrap" hidden>Limit price (¢)<input id="rPx" type="number" min="0.1" max="99.9" step="0.1"></label>
         <label>Amount<select id="rUnit"><option value="contracts">Contracts</option><option value="stake">Spend ($)</option></select></label>
         <label id="rQtyLabel">Contracts<input id="rQty" type="number" min="1" value="10"></label>
       </div>
@@ -204,8 +214,22 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
       <h3>Positions</h3><div id="acctPositions"></div>
     </div>
 
+    <div id="tab-parlays" hidden>
+      <p class="note">A parlay pays $1 if every leg happens as picked, and nothing otherwise. Pick legs from open markets, one per event, and request quotes as the retail customer: registered responders (the synthetic maker) answer with firm quotes, which are real sell orders resting on the parlay's own book until they lapse. Once a parlay exists it trades on the retail and maker tabs like any market, and it settles by itself as its legs resolve: the first leg lost expires it, a voided leg voids it.</p>
+      <h3>Build a parlay</h3>
+      <div id="pbLegs" class="picker"></div>
+      <p id="pbSummary" class="note"></p>
+      <div class="row">
+        <label>Contracts (lots of 10)<input id="pbQty" type="number" min="10" step="10" value="10"></label>
+        <button id="pbRequest" class="primary">Request quotes</button>
+        <button id="pbClear" class="ghost">Clear legs</button>
+      </div>
+      <h3>Requests and quotes</h3><div id="rfqs"></div>
+      <h3>Parlays</h3><div id="parlays"></div>
+    </div>
+
     <div id="tab-settle" hidden>
-      <p class="note">The dummy oracle lists, runs and settles these markets on a calendar. Two dummy sources, alpha and beta, report each result; when they disagree a referee breaks the tie. The auto-approver signs the proposal, which waits out a dispute window before the resolution is sequenced. The buttons act through the same oracle.</p>
+      <p class="note">The dummy oracle lists, runs and settles these markets on a calendar. Two dummy sources, alpha and beta, report each result; when they disagree a referee breaks the tie. The auto-approver signs the proposal, which waits out a dispute window before the resolution is sequenced. The buttons act through the same oracle. Parlays are not listed here: the parlay service settles them from their legs.</p>
       <div id="calendar"></div>
       <div id="events"></div>
       <h3>Payouts</h3><div id="payouts"></div>
@@ -219,6 +243,8 @@ const $ = s => document.querySelector(s);
 let C = null, M = null, S = null;
 let tab = 'maker', selEvent = null, selInst = null, retailSide = 'yes', acctName = 'retail';
 const books = {}, trades = {}, sessions = {}, winning = {}, announced = new Set();
+// The parlay builder's picks, one leg per event, and this page's requests for quote, newest first.
+const picks = new Map(), rfqs = [];
 
 // A book arrives as levels: every one of them when the message is flagged a snapshot, and only the ones that
 // moved after that. A quantity of zero means the level has gone. The sides are kept as maps and the sorted lists
@@ -376,7 +402,12 @@ function onMessage(s, msg) {
       break;
     case 'resync': refreshAccount(s); break;
     case 'transfer': onTransfer(s, msg.transfer); break;
-    case 'reply': if (msg.id === 'heartbeat') break; report(msg.result); soon(s); break;
+    case 'reply':
+      if (msg.id === 'heartbeat') break;
+      if (String(msg.id).startsWith('rfq-')) { opened(msg.result); break; }
+      if (String(msg.id).startsWith('accept-')) accepted(msg.id.split('-')[1], msg.result);
+      report(msg.result); soon(s); break;
+    case 'quote': quoted(msg); break;
     case 'error': toast(`${words(msg.error.code)}: ${msg.error.message}`, 'bad'); break;
     case 'execution': {
       const e = msg.execution;
@@ -417,10 +448,132 @@ function report(result) {
   if (m == null) return;
 }
 
-function send(name, op, body) {
+function send(name, op, body, id) {
   const s = sessions[name];
   if (!s || !s.open) return toast('Not connected to the gateway yet', 'bad');
-  s.ws.send(JSON.stringify({op, id: `${op}-${++orderCount}`, ...body}));
+  s.ws.send(JSON.stringify({op, id: id || `${op}-${++orderCount}`, ...body}));
+}
+
+// ------------------------------------------------------------------------------------------ parlays
+
+const isParlay = e => e.markets.some(m => m.class === 'parlay');
+// The market list leaves settled events out, and with them every settled parlay and resolved leg. The parlays tab
+// fetches the whole list, only while it is shown.
+let A = null;
+async function loadAllMarkets() {
+  if (tab !== 'parlays') return;
+  try {
+    const r = await fetch('/v4/markets');
+    if (r.ok) { A = await r.json(); renderParlays(); }
+  } catch (e) { /* the next poll retries */ }
+}
+function findAny(instrumentId) {
+  for (const e of (A ? A.events : [])) for (const m of e.markets) if (m.instrumentId === instrumentId) return [e, m];
+  return find(instrumentId);
+}
+const legName = l => `${l.title} · ${l.label} ${l.outcome.toUpperCase()}`;
+const secondsUntil = at => Math.max(0, Math.round((Date.parse(at) - Date.now()) / 1000));
+
+function opened(rfq) {
+  rfqs.unshift({rfq, quotes: new Map(), outcome: null});
+  rfqs.length = Math.min(rfqs.length, 8);
+  toast(`Request sent to responders: ${rfq.legs.length} legs, ${rfq.quantity} contracts${rfq.listed ? ', parlay listed' : ''}`, 'ok');
+  loadMarkets();
+  loadAllMarkets();
+  renderParlays();
+}
+
+// A quote arrives when a responder attaches it, again as fills reduce it, and a last time when it leaves the book.
+function quoted(quote) {
+  const r = rfqs.find(x => x.rfq.requestId === quote.requestId);
+  if (!r) return;
+  if (!r.quotes.has(quote.orderId)) toast(`Quote: ${quote.quantity} contracts at ${quote.price.cents}¢`, 'ok');
+  r.quotes.set(quote.orderId, quote);
+  renderParlays();
+}
+
+function accepted(requestId, result) {
+  const r = rfqs.find(x => x.rfq.requestId === requestId);
+  if (!r) return;
+  const fills = (result.executions || []).filter(e => e.type === 'fill');
+  const filled = fills.reduce((n, e) => n + e.quantity, 0);
+  r.outcome = result.status === 'rejected' ? `Not bought: ${words(result.rejectReason)}.`
+    : filled ? `Bought ${filled} contracts at ${fills[0].price.cents}¢: pays ${money(filled * 100)} if every leg happens.`
+    : 'Nothing bought: the quote had already gone.';
+  renderParlays();
+}
+
+function requestQuotes() {
+  const quantity = +$('#pbQty').value;
+  if (!(quantity >= 10 && quantity % 10 === 0)) return toast('A parlay trades in lots of 10 contracts', 'bad');
+  send('retail', 'requestQuote', {legs: [...picks.values()], quantity}, `rfq-${++orderCount}`);
+}
+
+function acceptQuote(requestId, orderId) {
+  const r = rfqs.find(x => x.rfq.requestId === requestId), q = r && r.quotes.get(orderId);
+  if (!q) return;
+  // An ordinary buy at the quote's price: whoever gets there first takes it, and anything unfilled is cancelled.
+  send('retail', 'order', {clientOrderId: clientOrderId(), instrumentId: q.instrumentId, action: 'buy', outcome: 'yes',
+    price: {tick: q.price.tick}, quantity: q.quantity, timeInForce: 'IOC'}, `accept-${requestId}-${++orderCount}`);
+}
+
+async function openBook(instrumentId) {
+  let [e, m] = find(instrumentId);
+  if (!m) { await loadMarkets(); [e, m] = find(instrumentId); }
+  if (!m) return;
+  selEvent = e.eventId; selInst = m.instrumentId;
+  subscribeMarket();
+  showTab('retail');
+}
+
+function renderParlays() {
+  if (!M) return;
+  const open = M.events.filter(e => !e.resolved && !isParlay(e) && e.markets.some(m => m.state === 'open'));
+  setHTML($('#pbLegs'), open.map(e => e.markets.filter(m => m.state === 'open').map(m => {
+    const p = picks.get(e.eventId), on = o => p && p.instrumentId === m.instrumentId && p.outcome === o ? 'on' : '';
+    const pick = o => `<button class="${o} ${on(o)}" data-leg="${m.instrumentId}" data-legevent="${e.eventId}" data-outcome="${o}">${o === 'yes' ? 'Yes' : 'No'}</button>`;
+    return `<div class="legpick"><div><div class="title">${esc(e.title)}</div>${esc(m.label)}</div><div class="yn">${pick('yes')}${pick('no')}</div></div>`;
+  }).join('')).join('') || '<p class="muted">No open markets.</p>');
+  // A pick whose market has stopped trading since it was picked can no longer be a leg.
+  for (const [event, p] of picks) { const [, m] = find(p.instrumentId); if (!m || m.state !== 'open') picks.delete(event); }
+  const chosen = [...picks.values()];
+  $('#pbSummary').textContent = chosen.length < 2
+    ? `Pick at least two legs, each on a different event (${chosen.length} picked).`
+    : `${chosen.length} legs: ` + chosen.map(p => { const [, m] = find(p.instrumentId); return `${m ? m.label : p.instrumentId} ${p.outcome}`; }).join(' + ') + '.';
+  $('#pbRequest').disabled = chosen.length < 2 || chosen.length > 6;
+
+  setHTML($('#rfqs'), rfqs.map(r => {
+    const left = secondsUntil(r.rfq.expiresAt), quotes = [...r.quotes.values()];
+    const table = quotes.length
+      ? '<table><thead><tr><th class="r">Price</th><th class="r">Contracts</th><th>Valid for</th><th>State</th><th></th></tr></thead><tbody>'
+        + quotes.map(q => {
+          const live = q.state === 'open' && q.quantity > 0;
+          const valid = !live ? '—' : q.expiresAt ? `${secondsUntil(q.expiresAt)} s` : 'until cancelled';
+          const buy = live ? `<button class="primary" data-accept="${r.rfq.requestId}" data-order="${q.orderId}">Buy at ${q.price.cents}¢</button>` : '';
+          return `<tr><td class="r">${q.price.cents}¢</td><td class="r">${q.quantity}</td><td class="muted">${valid}</td><td>${esc(q.state)}</td><td class="r">${buy}</td></tr>`;
+        }).join('') + '</tbody></table>'
+      : `<p class="muted">${left > 0 ? 'Waiting for quotes…' : 'No quotes arrived.'}</p>`;
+    return `<div class="event"><div class="ehead"><strong>${r.rfq.quantity} contracts · request ${esc(r.rfq.requestId)}</strong><span class="badge">${left > 0 ? `open ${left} s` : 'window closed'}</span></div>`
+      + `<ul class="legs">${r.rfq.legs.map(l => `<li>${esc(legName(l))}</li>`).join('')}</ul>${table}`
+      + (r.outcome ? `<p class="note">${esc(r.outcome)}</p>` : '')
+      + `<div class="row"><button data-openbook="${r.rfq.instrumentId}">Open its book</button></div></div>`;
+  }).join('') || '<p class="muted">None from this page yet.</p>');
+
+  setHTML($('#parlays'), (A || M).events.filter(isParlay).reverse().map(e => {
+    const m = e.markets[0], b = books[m.instrumentId];
+    const status = e.resolution ? (e.resolution.kind === 'void' ? 'voided' : e.resolution.outcome === 'Wins' ? 'settled: won' : 'expired: lost') : words(m.state);
+    const legs = (m.legs || []).map(l => {
+      const [le, lm] = findAny(l.instrumentId);
+      const where = le && le.resolution ? (le.resolution.kind === 'void' ? 'voided' : `resolved ${le.resolution.outcome}`) : lm ? words(lm.state) : '';
+      return `<li>${esc(legName(l))} <span class="muted small">· ${esc(where)}</span></li>`;
+    }).join('');
+    const touch = b && m.instrumentId === selInst ? ` · best ${b.bids[0] ? b.bids[0].price.cents + '¢' : '—'} / ${b.asks[0] ? b.asks[0].price.cents + '¢' : '—'}` : '';
+    const held = ['retail', 'maker'].map(n => sessions[n] && sessions[n].account && sessions[n].account.positions.find(p => p.instrumentId === m.instrumentId))
+      .map((p, k) => p ? `${k ? 'maker' : 'retail'} holds ${p.position > 0 ? 'YES' : 'NO'} × ${Math.abs(p.position)}` : null).filter(Boolean).join(' · ');
+    return `<div class="event ${e.resolution ? 'done' : ''}"><div class="ehead"><strong>Parlay ${esc(m.instrumentId.slice(-6))}</strong><span class="badge">${esc(status)}</span></div>`
+      + `<ul class="legs">${legs}</ul><div class="row"><span class="muted small">${held || 'no positions on this page'}${touch}</span>`
+      + `${e.resolution ? '' : `<button data-openbook="${m.instrumentId}">Trade on its book</button>`}</div></div>`;
+  }).join('') || '<p class="muted">No parlays yet: request quotes to create one.</p>');
 }
 const clientOrderId = () => `${tab}-${Date.now().toString(36)}-${++orderCount}`;
 
@@ -444,13 +597,13 @@ function render() {
   renderStatus();
   if (!M) return;
   setHTML($('#event'), M.events.map(e => `<option value="${e.eventId}" ${e.eventId === selEvent ? 'selected' : ''}>${esc(e.title)}${e.resolved ? ' — settled' : ''}</option>`).join(''));
-  renderPills(); renderBook(); renderTrades(); renderMaker(); renderRetail(); renderAccount(); renderSettle();
+  renderPills(); renderBook(); renderTrades(); renderMaker(); renderRetail(); renderAccount(); renderParlays(); renderSettle();
 }
 
 function renderBook() {
   const [e, m] = current();
   if (!m) { $('#bookTitle').textContent = ''; return setHTML($('#ladder'), '<p class="muted">No markets yet. The seed job lists the demo markets.</p>'); }
-  $('#bookTitle').textContent = `${m.label} · ${words(m.state)}${e.started ? ' · in play' : ''}`;
+  $('#bookTitle').textContent = `${m.class === 'parlay' ? e.title : m.label} · ${words(m.state)}${e.started ? ' · in play' : ''}`;
   const b = books[m.instrumentId] || {bids: [], asks: [], last: null};
   const n = m.ladder.length;
   const bids = new Map(b.bids.map(l => [l.price.tick, l.quantity])), asks = new Map(b.asks.map(l => [l.price.tick, l.quantity]));
@@ -718,7 +871,7 @@ function placeMaker(side) {
   const [, m] = current();
   if (!m) return;
   const px = $(side === 'buy' ? '#bidPx' : '#askPx').value, qty = +$(side === 'buy' ? '#bidQty' : '#askQty').value;
-  if (!(+px > 0 && +px < 100 && qty > 0)) return toast('Enter a price between 1¢ and 99¢ and a size', 'bad');
+  if (!(+px > 0 && +px < 100 && qty > 0)) return toast('Enter a price between 0¢ and 100¢ and a size', 'bad');
   send('maker', 'order', {clientOrderId: clientOrderId(), instrumentId: m.instrumentId, action: side, outcome: 'yes', price: {cents: String(+px)}, quantity: qty * m.lotStep, postOnly: $('#postOnly').checked});
 }
 
@@ -734,7 +887,7 @@ function placeRetail() {
     Object.assign(body, {price: {tick: m.ladder.length - 1}, protectionTicks: 5, timeInForce: 'IOC', quantity: amount * m.lotStep});
   } else {
     const px = +$('#rPx').value;
-    if (!(px > 0 && px < 100)) return toast('Enter a limit price between 1¢ and 99¢', 'bad');
+    if (!(px > 0 && px < 100)) return toast('Enter a limit price between 0¢ and 100¢', 'bad');
     Object.assign(body, {price: {cents: String(px)}, timeInForce: 'GTC'}, stake ? {stakeCents: Math.round(amount * 100)} : {quantity: amount * m.lotStep});
   }
   send('retail', 'order', body);
@@ -743,8 +896,9 @@ function placeRetail() {
 function showTab(name) {
   tab = name;
   for (const b of document.querySelectorAll('[data-tab]')) b.classList.toggle('on', b.dataset.tab === name);
-  for (const t of ['maker', 'retail', 'account', 'settle']) $('#tab-' + t).hidden = t !== name;
+  for (const t of ['maker', 'retail', 'account', 'parlays', 'settle']) $('#tab-' + t).hidden = t !== name;
   render();
+  if (name === 'parlays') loadAllMarkets();
 }
 
 document.addEventListener('click', ev => {
@@ -752,6 +906,14 @@ document.addEventListener('click', ev => {
   if (!t || t.disabled) return;
   const [, m] = current();
   if (t.dataset.tab) return showTab(t.dataset.tab);
+  if (t.dataset.leg) {
+    const event = t.dataset.legevent, current = picks.get(event);
+    if (current && current.instrumentId === t.dataset.leg && current.outcome === t.dataset.outcome) picks.delete(event);
+    else picks.set(event, {instrumentId: t.dataset.leg, outcome: t.dataset.outcome});
+    return renderParlays();
+  }
+  if (t.dataset.accept) return acceptQuote(t.dataset.accept, t.dataset.order);
+  if (t.dataset.openbook) return openBook(t.dataset.openbook);
   if (t.dataset.pick) { selInst = t.dataset.pick; subscribeMarket(); return render(); }
   if (t.dataset.cancel) return send(t.dataset.session, 'cancel', {orderId: t.dataset.cancel});
   if (t.dataset.acct) { acctName = t.dataset.acct; return renderAccount(); }
@@ -790,6 +952,8 @@ document.addEventListener('click', ev => {
     case 'pickYes': retailSide = 'yes'; return render();
     case 'pickNo': retailSide = 'no'; return render();
     case 'rPlace': return placeRetail();
+    case 'pbRequest': return requestQuotes();
+    case 'pbClear': picks.clear(); return renderParlays();
   }
 });
 
@@ -817,6 +981,9 @@ document.addEventListener('input', ev => { if (ev.target.id === 'rQty' || ev.tar
   loadSchedule();
   setInterval(loadSchedule, 1000);
   setInterval(tickCountdowns, 1000);
+  // Quotes and request windows count down.
+  setInterval(() => { if (tab === 'parlays') renderParlays(); }, 1000);
+  setInterval(loadAllMarkets, 5000);
   const es = new EventSource('/api/events');
   es.onmessage = m => { S = JSON.parse(m.data); if (tab === 'settle') renderSettle(); };
 })();

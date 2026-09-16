@@ -5,10 +5,13 @@ The mini venue's actors (blueprint §16), for laptops and test clusters only.
 | Command | What it does | Talks to |
 |---|---|---|
 | `seed` | Sets the demo fee schedule (7% taker, 1.75% maker, of contracts × P × (1 − P), with a standing 0.5% maker rebate for the synthetic maker), defines the cent tick table, funds the catalogue's accounts and lists round 1 of every market. Every command has a fixed ID, so running it again changes nothing (spec E-7.1). | the core's ingress, as an operator |
-| `maker` | Quotes several levels on both sides of every open market (three by default, each a tick further out and larger) around a seeded random-walk fair value, rescaled to sum to 100¢ across an event's outcomes, with a doubled spread once the event starts. Pulls its quotes when an event ends or is suspended. It follows its own executions on a private session with cancel-on-disconnect and a 10 s heartbeat, and books on a public one, so a maker that dies or hangs has its quotes pulled by the gateway; it logs in again, cancels anything an earlier session left (orders a dead gateway could not cancel), and reads `/v4/account` to start afresh. | the gateway's two WebSocket endpoints, `/v4/ws_private` with its dev token and `/v4/ws_public` for books (REST only for the market list and account snapshots) |
-| `taker` | Sends immediate-or-cancel orders at the touch at random: buying YES, buying NO or selling YES, with prices as ticks or cents and buys often as stakes, and an occasional sweep three ticks through. | the gateway's REST API, with its dev token |
+| `maker` | Quotes several levels on both sides of every open market (three by default, each a tick further out and larger) around a seeded random-walk fair value, rescaled to sum to 100¢ across an event's outcomes, with a doubled spread once the event starts. Pulls its quotes when an event ends or is suspended. It follows its own executions on a private session with cancel-on-disconnect and a 10 s heartbeat, and books on a public one, so a maker that dies or hangs has its quotes pulled by the gateway; it logs in again, cancels anything an earlier session left (orders a dead gateway could not cancel), and reads `/v4/account` to start afresh. As a registered responder (`"responder": true` in the catalogue), answers each request for quote on a parlay: it prices the parlay as the product of its legs' mid prices, read from their books, adds `--margin` thousandths and 0.1¢, rests a GTD sell of the whole size until the request's window closes, and attaches it with `attachQuote`. It never quotes parlays otherwise. | the gateway's two WebSocket endpoints, `/v4/ws_private` with its dev token and `/v4/ws_public` for books (REST only for the market list, account snapshots and the books of a parlay's legs) |
+| `taker` | Leaves parlays to their requesters. Sends immediate-or-cancel orders at the touch at random: buying YES, buying NO or selling YES, with prices as ticks or cents and buys often as stakes, and an occasional sweep three ticks through. | the gateway's REST API, with its dev token |
 | `oracle` | The dummy oracle: lists a new round of each demo market on a calendar, starts it, sometimes suspends it, ends it, closes its markets and settles it through two dummy sources, a referee, the auto-approver and a dispute window, voiding one now and then. Serves a control API for the page and for people. See [The dummy oracle](#the-dummy-oracle). | the core's ingress and feed, as an operator |
-| `web` | The web page: an order book, a market maker tab and a retail customer tab that trade over the gateway's private WebSocket (the book comes from its public one), an account tab, and a settlement tab that shows the oracle's schedule and cases and drives it. The account tab shows either account's available and reserved cash and positions, deposits and withdraws through `/v4/transfers`, and lists its transfers as their states change. It passes `/v4` through to the gateway and `/oracle` to the dummy oracle, so one address serves the page and both APIs. | the gateway for trading and transfers; the dummy oracle for settlement; the core's feed for the event list |
+| `web` | The web page: an order book, a market maker tab and a retail customer tab that trade over the gateway's private WebSocket (the book comes from its public one), an account tab, a parlays tab, and a settlement tab that shows the oracle's schedule and cases and drives it. The account tab shows either account's available and reserved cash and positions, deposits and withdraws through `/v4/transfers`, and lists its transfers as their states change. The parlays tab builds a parlay from open markets (one leg per event, yes or no, in lots of 10), requests quotes as the retail customer, shows each quote's price and remaining validity as it arrives, buys at a quote with an immediate-or-cancel order, and lists every parlay with its legs' states and its own: open, closed, settled as won, expired as lost, or voided. A parlay's book trades from the other tabs like any market's. It passes `/v4` through to the gateway and `/oracle` to the dummy oracle, so one address serves the page and both APIs. | the gateway for trading, transfers and requests for quote; the dummy oracle for settlement; the core's feed for the event list |
+
+Parlays themselves are the parlay service's (`core/parlays`, `venue-parlays`), not an actor here: it lists them on
+request, routes requests for quote, and settles them from their legs.
 
 The bots and the trading tabs are ordinary clients of interface 1 (`interfaces/gateway/`): the core cannot tell them
 from customers, which is the point of §16's rule that activity arrives through the real edge.
@@ -18,9 +21,10 @@ from customers, which is the point of §16's rule that activity arrives through 
 `deploy/charts/venue-mini/files/markets.json` names the accounts, their dev tokens, which tab shows each, and the
 markets. The engine never sees titles or outcome names, so IDs carry where they came from: event
 `template × 1 000 000 + round`, instrument `event × 100 + index`, so a template has a million rounds and an event a
-hundred markets. Events below a million were listed under the first scheme (`template × 1000 + round`, instrument
-`event × 10 + index`) and are still labelled. "List now" on the settlement tab lists the same market again under the
-next round.
+hundred markets. Parlays are numbered apart, from 2^52 up, by a hash of their legs; an account with `"responder":
+true` receives requests for quote. Events below a million were listed under the first scheme (`template × 1000 + round`,
+instrument `event × 10 + index`) and are still labelled. "List now" on the settlement tab lists the same market again
+under the next round.
 
 ## The dummy oracle
 
@@ -81,12 +85,14 @@ hours; a fresh journal starts again.
 ## Running it without a cluster
 
 ```sh
-cargo build --release -p venue-node -p venue-gateway -p venue-sim -p venue-treasury
+cargo build --release -p venue-node -p venue-gateway -p venue-parlays -p venue-sim -p venue-treasury
 CAT=../deploy/charts/venue-mini/files/markets.json
 target/release/venue-node serve --data /tmp/venue --tick-ms 100 &
 target/release/venue-sim seed --ingress 127.0.0.1:7101 --catalogue $CAT
 target/release/venue-treasury --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT --ledger /tmp/venue/treasury.jsonl &
-target/release/venue-gateway --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT --treasury 127.0.0.1:8083 &
+target/release/venue-parlays --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT &
+target/release/venue-gateway --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT --treasury 127.0.0.1:8083 \
+  --parlays 127.0.0.1:7103 &
 target/release/venue-sim oracle --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT \
   --calendar ../deploy/charts/venue-mini/files/calendar.json &
 target/release/venue-sim maker --gateway 127.0.0.1:8081 &

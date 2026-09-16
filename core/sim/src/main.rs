@@ -26,7 +26,7 @@ const USAGE: &str = "usage:
   venue-sim oracle --ingress ADDR --feed ADDR --catalogue FILE --calendar FILE [--capacity small]
                   [--listen 127.0.0.1:8082]
   venue-sim maker --gateway ADDR [--token dev-synthetic-maker] [--size 10] [--levels 3] [--spread 1]
-                  [--interval-ms 700] [--seed 1]
+                  [--interval-ms 700] [--seed 1] [--margin 100]
   venue-sim taker --gateway ADDR [--token dev-synthetic-taker] [--max-quantity 5] [--chance 250]
                   [--sweep-chance 30] [--interval-ms 1000] [--seed 2]
   venue-sim workload --ingress ADDR [--books 600] [--hot 15] [--warm 100] [--accounts 500]
@@ -35,8 +35,10 @@ const USAGE: &str = "usage:
                   (the last two default from the node's capacity profile: 3/4 of its orders, and its
                   client order ID table's entries / 120 000 seconds)
 
-The bots are clients of the gateway. seed, workload and the dummy oracle are operator tools and use the core's
-ingress and feed; the web page's settlement tab drives the dummy oracle's control API. workload puts a venue-shaped load on a core on its own, with no gateway in the way.
+The bots are clients of the gateway. The maker answers requests for quote when its account is a registered
+responder, adding --margin thousandths to its price for a parlay. seed, workload and the dummy oracle are operator
+tools and use the core's ingress and feed; the web page's settlement tab drives the dummy oracle's control API.
+workload puts a venue-shaped load on a core on its own, with no gateway in the way.
 Every flag can also be given as VENUE_<FLAG> in the environment, for example VENUE_GATEWAY.";
 
 struct Args(BTreeMap<String, String>);
@@ -176,10 +178,11 @@ fn maker(args: &Args) -> Result<(), Error> {
         half_spread: args.number("spread", 1)?,
         interval: Duration::from_millis(args.number("interval-ms", 700)?),
         seed: args.number("seed", 1)?,
+        margin_per_mille: args.number("margin", 100)?,
     };
     let (gateway, token) = (args.get("gateway", None)?, args.get("token", Some("dev-synthetic-maker"))?);
     let api = client::Api::new(&gateway, &token);
-    bots::maker(&api, &gateway, &token, &config, Ids::new('m')?)
+    bots::maker(&api, &gateway, &token, &config, Ids::new('m')?, Ids::new('q')?)
 }
 
 fn taker(args: &Args) -> Result<(), Error> {
