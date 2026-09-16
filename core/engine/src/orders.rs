@@ -462,9 +462,14 @@ impl<'a> Engine<'a> {
         let o = self.orders[slot as usize];
         let tif = o.time_in_force;
         let may_rest = matches!(tif, TimeInForce::GTC | TimeInForce::GTD);
-        // The dry run is evaluated only where its answer can change the outcome.
-        let needs_dry_run =
-            tif == TimeInForce::FOK || (may_rest && (limits.max_resting_orders > 0 || self.active_order_limit > 0));
+        // The dry run is evaluated only where its answer can change the outcome. Checks 16 and 17 compare counts
+        // that are already known here, and the dry run restores both through `Undo::Scalars`, so a venue below
+        // either limit cannot reject however much the order would fill: arming it there is pure cost, which is
+        // what made a non-zero `activeOrderLimit` expensive enough to leave unset.
+        let at_account_limit = limits.max_resting_orders > 0
+            && self.accounts[o.account_slot as usize].resting_orders >= limits.max_resting_orders;
+        let at_group_limit = self.active_order_limit > 0 && self.resting_orders >= self.active_order_limit;
+        let needs_dry_run = tif == TimeInForce::FOK || (may_rest && (at_account_limit || at_group_limit));
         let filled = if needs_dry_run { self.dry_run(slot, sink)? } else { 0 };
         if tif == TimeInForce::FOK && filled < o.remaining {
             return Ok(Some(R::FOK_NOT_FILLABLE));
