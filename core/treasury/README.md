@@ -26,12 +26,13 @@ Integer cents, debits positive, every posting balanced, so all balances sum to z
 | Account | Holds |
 |---|---|
 | `customer:{id}:cash` | what the account has brought in less what it has taken out (a credit balance: negative) |
-| `bank:fbo_omnibus` | the fake bank's FBO omnibus: deposits settled less withdrawals paid out |
+| `bank:fbo_omnibus` | the fake bank's FBO omnibus: the seed's grants and deposits settled, less withdrawals paid out |
 | `transit:deposits` | deposits the bank has settled and the sequencer group has not granted yet |
 | `transit:withdrawals` | withdrawals reclaimed and not yet paid out or granted back |
-| `house:demo_opening_balances` | the seed's grants, posted once when a book is created, which no bank ever held |
 
-Trading moves cash inside the sequencer group, which this ledger does not follow yet: it is the treasury's account of
+The seed's grants are posted once, when a book is created, as money the fake bank holds for each account, so the
+omnibus always equals the customers' cash plus what is in transit (§11's invariant). Trading moves cash inside the
+sequencer group, which this ledger does not follow yet: it is the treasury's account of
 what crossed the venue's edge, not of what each account now holds.
 
 The book is an append-only file of JSON lines. Its first line names the book's nonce; each later line is a transfer

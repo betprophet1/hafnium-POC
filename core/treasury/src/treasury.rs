@@ -218,7 +218,9 @@ fn text<'a>(fields: &'a Map<String, Value>, name: &str) -> Result<&'a str, Refus
 
 impl Treasury {
     /// A treasury whose book is the file at `path`, replayed if it exists. A new book records the seed's grants as
-    /// opening balances, so the ledger starts where the sequencer group does.
+    /// opening balances held at the fake bank, so the ledger starts where the sequencer group does and the omnibus
+    /// covers every customer's cash from the first posting (blueprint §11): a withdrawal of seeded money is paid out
+    /// of money the bank holds, not out of nothing.
     pub fn open(config: Config, path: &Path, fsync: bool, now: u64) -> Result<Self, String> {
         let (book, records) = Book::open(path, fsync)?;
         let mut inner = Inner {
@@ -259,10 +261,10 @@ impl Treasury {
             Self::write(&mut inner, json!({"book": {"nonce": nonce, "created": now}}))?;
             let mut postings = Vec::new();
             for (&account, &cents) in treasury.config.accounts.iter().filter(|(_, c)| **c > 0) {
-                postings.push(Posting::moving(cents, ledger::DEMO_OPENING, &ledger::customer(account))?);
+                postings.push(Posting::moving(cents, ledger::FBO, &ledger::customer(account))?);
             }
             if !postings.is_empty() {
-                let memo = "opening balance granted by the environment's seed";
+                let memo = "opening balance: the environment's seed grant, held at the fake bank";
                 let written: Vec<Value> = postings.iter().map(|p| posting_json(memo, p)).collect();
                 Self::write(&mut inner, json!({"postings": written}))?;
                 for posting in &postings {
@@ -643,7 +645,7 @@ impl Treasury {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::{customer, DEMO_OPENING, DEPOSITS_IN_TRANSIT, FBO, WITHDRAWALS_IN_TRANSIT};
+    use crate::ledger::{customer, DEPOSITS_IN_TRANSIT, FBO, WITHDRAWALS_IN_TRANSIT};
 
     /// A sequencer group that keeps sleeves and remembers command IDs as E-7.1 and E-7.2 say, and can be told to
     /// stop answering.
@@ -717,8 +719,14 @@ mod tests {
         }
     }
 
+    /// The ledger sums to zero, and the omnibus holds exactly the customers' cash plus what is in transit
+    /// (blueprint §11: the sum of customer cash equals the FBO balance minus in-flight transfers).
     fn balanced(treasury: &Treasury) {
-        assert_eq!(treasury.trial_balance()["total"], "0", "{}", treasury.trial_balance());
+        let trial = treasury.trial_balance();
+        assert_eq!(trial["total"], "0", "{trial}");
+        let customers: i64 = [1, ACCOUNT].iter().map(|a| treasury.balance(&customer(*a))).sum();
+        let transit = treasury.balance(DEPOSITS_IN_TRANSIT) + treasury.balance(WITHDRAWALS_IN_TRANSIT);
+        assert_eq!(treasury.balance(FBO), -customers - transit, "{trial}");
     }
 
     #[test]
@@ -727,7 +735,7 @@ mod tests {
         let treasury = open(&p);
         let mut group = Group::default();
         assert_eq!(treasury.balance(&customer(ACCOUNT)), -50_000, "the seed's opening balance");
-        assert_eq!(treasury.balance(DEMO_OPENING), 50_000);
+        assert_eq!(treasury.balance(FBO), 50_000);
         let id = treasury.request(ACCOUNT, &body("d1", "deposit", 10_000, "dummy_bank"), 1_000).expect("requested");
         treasury.step(&mut group, 1_000);
         assert_eq!(state(&treasury, id).0, "pending");
@@ -735,7 +743,7 @@ mod tests {
         run(&treasury, &mut group, 1_500);
         assert_eq!(state(&treasury, id), ("settled".into(), Value::Null));
         assert_eq!(group.sleeves[&ACCOUNT], 10_000);
-        assert_eq!((treasury.balance(FBO), treasury.balance(&customer(ACCOUNT))), (10_000, -60_000));
+        assert_eq!((treasury.balance(FBO), treasury.balance(&customer(ACCOUNT))), (60_000, -60_000));
         assert_eq!(treasury.balance(DEPOSITS_IN_TRANSIT), 0);
         assert!(treasury.get(ACCOUNT, id).expect("the transfer")["sequence"].is_string());
         balanced(&treasury);
@@ -752,7 +760,7 @@ mod tests {
         run(&treasury, &mut group, 1_500);
         assert_eq!(state(&treasury, id), ("failed".into(), json!("insufficient_available_cash")));
         assert_eq!(group.sleeves[&ACCOUNT], 300);
-        assert_eq!(treasury.balance(FBO), 0);
+        assert_eq!(treasury.balance(FBO), 50_000);
         assert_eq!(treasury.balance(WITHDRAWALS_IN_TRANSIT), 0);
         assert!(treasury.get(ACCOUNT, id).expect("the transfer")["sequence"].is_null());
         balanced(&treasury);
@@ -772,7 +780,7 @@ mod tests {
         run(&treasury, &mut group, 1_500);
         assert_eq!(state(&treasury, id), ("settled".into(), Value::Null));
         assert_eq!(group.sleeves[&ACCOUNT], 600);
-        assert_eq!((treasury.balance(FBO), treasury.balance(WITHDRAWALS_IN_TRANSIT)), (-400, 0));
+        assert_eq!((treasury.balance(FBO), treasury.balance(WITHDRAWALS_IN_TRANSIT)), (49_600, 0));
         balanced(&treasury);
         let _ = std::fs::remove_file(&p);
     }
@@ -791,7 +799,7 @@ mod tests {
         assert_eq!(state(&treasury, withdrawal), ("failed".into(), json!("returned_by_bank")));
         assert_eq!(group.sleeves[&ACCOUNT], 1_000, "the withdrawal was granted back, the deposit never granted");
         assert_eq!(treasury.balance(&customer(ACCOUNT)), -50_000);
-        assert_eq!((treasury.balance(FBO), treasury.balance(WITHDRAWALS_IN_TRANSIT)), (0, 0));
+        assert_eq!((treasury.balance(FBO), treasury.balance(WITHDRAWALS_IN_TRANSIT)), (50_000, 0));
         balanced(&treasury);
         let _ = std::fs::remove_file(&p);
     }

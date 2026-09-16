@@ -11,9 +11,6 @@ pub const FBO: &str = "bank:fbo_omnibus";
 pub const DEPOSITS_IN_TRANSIT: &str = "transit:deposits";
 /// Withdrawals taken from customers and not yet paid out by the bank, or not yet granted back.
 pub const WITHDRAWALS_IN_TRANSIT: &str = "transit:withdrawals";
-/// The money a test environment's seed grants its accounts, which no bank ever held. Kept apart so it is never
-/// mistaken for customer money that came through a rail.
-pub const DEMO_OPENING: &str = "house:demo_opening_balances";
 
 /// An account's cash as the treasury has moved it: what came in through deposits and the seed, less what went out
 /// through withdrawals. Trading moves cash inside the sequencer group, which this ledger does not see yet.
