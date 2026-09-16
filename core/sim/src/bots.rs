@@ -74,7 +74,8 @@ fn ok(response: Response) -> Result<Value, Error> {
 }
 
 fn markets(api: &Api) -> Result<Vec<Market>, Error> {
-    let body = ok(api.get("/v4/markets")?)?;
+    // Settled events have no open markets, and a venue on a calendar accumulates them all day.
+    let body = ok(api.get("/v4/markets?resolved=false")?)?;
     let mut out = Vec::new();
     for e in body["events"].as_array().into_iter().flatten() {
         for m in e["markets"].as_array().into_iter().flatten() {

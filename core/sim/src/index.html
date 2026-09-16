@@ -106,6 +106,12 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
 #toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 5; }
 .toast { background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--muted); border-radius: 6px; padding: 8px 12px; box-shadow: 0 4px 16px rgba(0,0,0,.12); max-width: 360px; }
 .toast.bad { border-left-color: var(--bad); } .toast.ok { border-left-color: var(--ok); }
+.badge.live { color: var(--ok); border-color: var(--ok); } .badge.warn { color: var(--warn); border-color: var(--warn); } .badge.bad { color: var(--bad); border-color: var(--bad); }
+.times { display: flex; flex-wrap: wrap; gap: 2px 14px; margin: 6px 0; font-size: 12px; color: var(--muted); }
+.times b { color: var(--ink); font-weight: 500; }
+.case { border-left: 3px solid var(--line); padding: 4px 0 4px 10px; margin: 8px 0; font-size: 12px; }
+.case.proposed { border-left-color: var(--accent); } .case.escalated, .case.tiebreak { border-left-color: var(--warn); } .case.settled { border-left-color: var(--ok); }
+.case ul { margin: 4px 0; padding-left: 18px; } .case details { margin-top: 4px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -199,7 +205,8 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
     </div>
 
     <div id="tab-settle" hidden>
-      <p class="note">The dummy oracle sequences these commands straight to the core as an operator. The proposal, sign-off and dispute path of the real resolution console is not built yet.</p>
+      <p class="note">The dummy oracle lists, runs and settles these markets on a calendar. Two dummy sources, alpha and beta, report each result; when they disagree a referee breaks the tie. The auto-approver signs the proposal, which waits out a dispute window before the resolution is sequenced. The buttons act through the same oracle.</p>
+      <div id="calendar"></div>
       <div id="events"></div>
       <h3>Payouts</h3><div id="payouts"></div>
     </div>
@@ -254,7 +261,8 @@ const noCents = (m, t) => m && m.ladder[m.ladder.length - 1 - t] ? m.ladder[m.la
 
 async function loadMarkets() {
   try {
-    const r = await fetch('/v4/markets');
+    // Settled rounds pile up on a calendar; the market picker needs only the live ones.
+    const r = await fetch('/v4/markets?resolved=false');
     if (!r.ok) return;
     M = await r.json();
     if (!M.events.some(e => e.eventId === selEvent)) selEvent = (M.events.find(e => !e.resolved && e.markets.some(m => m.state === 'open')) || M.events[0] || {}).eventId ?? null;
@@ -605,21 +613,85 @@ function renderAccount() {
     + '</tbody></table>' : '<p class="muted">None yet.</p>');
 }
 
+// The dummy oracle's schedule (venue-sim oracle, passed through under /oracle). Times are the sequencer's, in ms; the
+// page keeps its offset from this browser's clock so countdowns tick between polls.
+let O = null, oError = null, oOffset = 0;
+async function loadSchedule() {
+  try {
+    const r = await fetch('/oracle/schedule');
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error && (j.error.message || j.error) || r.statusText);
+    O = j; oOffset = O.now - Date.now(); oError = null;
+  } catch (e) { oError = String(e.message || e); }
+  if (tab === 'settle') renderSettle();
+}
+const seqNow = () => Date.now() + oOffset;
+function countdown(ms) {
+  const s = Math.round((ms - seqNow()) / 1000), a = Math.abs(s);
+  const t = a >= 60 ? `${Math.floor(a / 60)}m ${String(a % 60).padStart(2, '0')}s` : `${a}s`;
+  return s > 0 ? `in ${t}` : s === 0 ? 'now' : `${t} ago`;
+}
+// Countdowns are spans the ticker rewrites, so the tab's HTML changes only when the schedule does.
+const at = ms => ms == null ? '—' : `<b>${new Date(ms).toLocaleTimeString()}</b> <span data-at="${ms}">${countdown(ms)}</span>`;
+function tickCountdowns() { for (const el of document.querySelectorAll('[data-at]')) el.textContent = countdown(+el.dataset.at); }
+
+const STATUS = {upcoming: '', 'in play': 'live', suspended: 'warn', ended: '', closed: '', resolving: 'warn', settled: 'live', voided: 'bad'};
+const outcomeName = (o, e) => o.kind === 'void' ? 'void' : (o.name || e.outcomes[o.winningState] || `state ${o.winningState}`);
+
+function caseHtml(e) {
+  const c = e.case;
+  if (!c) return '';
+  const p = c.detail.proposal;
+  let head = '';
+  switch (c.stage) {
+    case 'collecting': head = 'Waiting for alpha and beta to report.'; break;
+    case 'tiebreak': head = `Alpha and beta disagree: the referee reports ${countdown(c.detail.since + O.tiebreakSeconds * 1000)}.`; break;
+    case 'escalated': head = `Escalated: ${esc(c.detail.reason)}. Propose an outcome, or the auto-approver proposes a void ${at(c.detail.since + O.escalationSeconds * 1000)}.`; break;
+    case 'proposed': head = `Proposal ${p.revision}: <b>${esc(outcomeName(p.outcome, e))}</b>, backed by ${p.sources.join(' and ')}, signed by ${p.signatures.join(' and ')}. Dispute window closes ${at(p.windowEndsAt)}.`; break;
+    case 'sequencing': head = `Dispute window closed: resolving as <b>${esc(outcomeName(p.outcome, e))}</b>.`; break;
+    case 'settled': head = p.revision ? `Proposal ${p.revision} settled: <b>${esc(outcomeName(p.outcome, e))}</b>, backed by ${p.sources.join(' and ')}.` : 'Resolved outside the oracle.'; break;
+  }
+  const reports = c.reports.map(r => `<li><b>${r.source}</b>: ${esc(outcomeName(r.outcome, e))} <span class="muted">— ${esc(r.evidence)}</span></li>`).join('');
+  const history = c.history.map(h => `<div>${new Date(h.at).toLocaleTimeString()} ${esc(h.what)}</div>`).join('');
+  return `<div class="case ${c.stage}">${head}${reports ? `<ul>${reports}</ul>` : ''}<details><summary>Case history</summary>${history}</details></div>`;
+}
+
 function renderSettle() {
-  if (!S) return setHTML($('#events'), '<p class="muted">Connecting…</p>');
-  setHTML($('#events'), S.events.map(e => {
-    const flags = [e.resolved ? 'settled' : e.ended ? 'ended' : e.started ? 'in play' : 'not started', e.suspended && !e.resolved ? 'suspended' : null].filter(Boolean);
-    const open = e.instruments.some(i => i.state === 'OPEN' || i.state === 'HALTED');
-    const b = (action, label, cls = '') => `<button class="${cls}" data-oracle="${action}" data-event="${e.id}">${label}</button>`;
-    const k = winning[e.id] ?? 0;
-    return `<div class="event ${e.resolved ? 'done' : ''}"><div class="ehead"><strong>${esc(e.title)}</strong><span>${flags.map(f => `<span class="badge">${f}</span>`).join(' ')}</span></div>`
-      + `<div class="muted small">${e.instruments.map(i => `${esc(i.label)}: ${words(i.state)}`).join(' · ')}</div>`
-      + (e.resolved
-        ? `<div class="row">${e.template ? b('relist', 'List a new round') : ''}</div>`
-        : `<div class="row">${e.started ? '' : b('start', 'Start')}${e.suspended ? b('resume', 'Resume') : b('suspend', 'Suspend')}${e.ended ? '' : b('end', 'End')}${open ? b('close', 'Close markets') : ''}</div>`
-          + `<div class="row"><label>Outcome<select data-win="${e.id}">${e.states.map((s, n) => `<option value="${n}" ${n === k ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select></label>${b('resolve', 'Resolve', 'primary')}${b('void', 'Void', 'ghost')}</div>`)
-      + '</div>';
-  }).join('') || '<p class="muted">No events yet.</p>');
+  if (!O) {
+    setHTML($('#calendar'), '');
+    setHTML($('#events'), oError ? `<p class="note">The dummy oracle is not reachable: ${esc(oError)}. It runs as <code>venue-sim oracle</code>.</p>` : '<p class="muted">Connecting…</p>');
+  } else {
+    setHTML($('#calendar'), (oError ? `<p class="note">Lost the dummy oracle: ${esc(oError)}</p>` : '')
+      + (O.listing ? `<p class="note">${esc(O.listing)}</p>` : '')
+      + '<table><thead><tr><th>Market</th><th class="r">Every</th><th class="r">Latest</th><th>Next round</th><th></th></tr></thead><tbody>'
+      + O.templates.map(t => `<tr><td>${esc(t.title)}</td><td class="r">${Math.round(t.everySeconds / 60 * 10) / 10} min</td><td class="r">${t.latestRound ?? '—'}</td><td>${at(t.nextRoundAt)}</td><td class="r"><button class="link" data-list="${t.template}">List now</button></td></tr>`).join('')
+      + '</tbody></table>');
+    setHTML($('#events'), O.events.map(e => {
+      const done = !!e.resolution;
+      const tradable = e.markets.some(m => m.state === 'open' || m.state === 'halted');
+      const b = (action, label, cls = '') => `<button class="${cls}" data-oracle="${action}" data-event="${e.eventId}">${label}</button>`;
+      const k = winning[e.eventId] ?? 0;
+      const started = e.startedAt != null, ended = e.endedAt != null;
+      const times = [
+        `listed ${at(e.listedAt)}`,
+        e.postponedUntil ? `postponed until ${at(e.postponedUntil)}` : null,
+        started ? `started ${at(e.startedAt)}` : `starts ${at(e.startsAt)}`,
+        ended ? `ended ${at(e.endedAt)}` : e.endsAt ? `ends ${at(e.endsAt)}` : null,
+        !done && e.closesAt ? `closes ${at(e.closesAt)}` : null,
+        !done && !e.case && e.reportsAt ? `results ${at(e.reportsAt)}` : null,
+        done ? `${e.resolution.kind === 'void' ? 'voided' : 'settled as <b>' + esc(e.resolution.outcome) + '</b>'} ${at(e.resolution.at)}` : null,
+      ].filter(Boolean);
+      const proposing = e.case && ['collecting', 'tiebreak', 'escalated', 'proposed'].includes(e.case.stage) || !e.case;
+      return `<div class="event ${done ? 'done' : ''}"><div class="ehead"><strong>${esc(e.title)}</strong><span><span class="badge ${STATUS[e.status] || ''}">${e.status}</span>${e.suspendedByHand ? ' <span class="badge warn">held by hand</span>' : ''}</span></div>`
+        + `<div class="times">${times.map(t => `<span>${t}</span>`).join('')}</div>`
+        + `<div class="muted small">${e.markets.map(m => `${esc(m.label)}: ${words(m.state)}`).join(' · ')}</div>`
+        + caseHtml(e)
+        + (done ? '' : ((buttons => buttons ? `<div class="row">${buttons}</div>` : '')(`${started ? '' : b('start', 'Start now') + b('postpone', 'Postpone 2 min', 'ghost')}${started && !ended ? (e.suspended ? b('resume', 'Resume') : b('suspend', 'Suspend')) : ''}${started && !ended ? b('end', 'End') : ''}${tradable ? b('close', 'Close markets') : ''}`))
+          + (proposing ? `<div class="row"><label>Outcome<select data-win="${e.eventId}">${e.outcomes.map((s, n) => `<option value="${n}" ${n === k ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select></label>${b('propose', 'Propose', 'primary')}${b('void', 'Propose void', 'ghost')}${e.case && e.case.stage === 'proposed' ? b('dispute', 'Dispute', 'ghost') : ''}</div>` : ''))
+        + '</div>';
+    }).join('') || '<p class="muted">No events yet.</p>');
+  }
+  if (!S) return setHTML($('#payouts'), '<p class="muted">Connecting…</p>');
   const name = id => (S.accounts.find(a => a.id === id) || {name: id === 0 ? 'Settlement reserve' : '#' + id}).name;
   const label = id => { for (const e of S.events) for (const i of e.instruments) if (i.id === id) return e.title + ' · ' + i.label; return '—'; };
   // A void pays per account across the whole event, with instrument 0; its cents can be negative.
@@ -629,17 +701,18 @@ function renderSettle() {
     + '</tbody></table>' : '<p class="muted">None yet.</p>');
 }
 
-// ------------------------------------------------------------------------------------------ actions
-
-async function operator(name, body) {
+async function oracle(path, body) {
   try {
-    const r = await fetch('/api/' + name, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    const r = await fetch('/oracle/' + path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body || {})});
     const j = await r.json();
-    if (!r.ok) return toast(j.error || r.statusText, 'bad');
-    for (const x of j.results || []) if (x.msg === 'CommandApplied' && x.outcome !== 'APPLIED') toast(`${words(x.outcome)}: ${words(x.rejectReason)}`, 'bad');
-    loadMarkets();
+    if (!r.ok) return toast(j.error && (j.error.message || j.error) || r.statusText, 'bad');
+    if (j.listed) toast(`Listed ${j.listed}`, 'ok');
   } catch (e) { toast(String(e), 'bad'); }
+  loadSchedule();
+  loadMarkets();
 }
+
+// ------------------------------------------------------------------------------------------ actions
 
 function placeMaker(side) {
   const [, m] = current();
@@ -683,14 +756,24 @@ document.addEventListener('click', ev => {
   if (t.dataset.cancel) return send(t.dataset.session, 'cancel', {orderId: t.dataset.cancel});
   if (t.dataset.acct) { acctName = t.dataset.acct; return renderAccount(); }
   if (t.dataset.cancelTransfer) return transferCall(sessions[acctName], 'DELETE', '/v4/transfers/' + t.dataset.cancelTransfer);
+  if (t.dataset.list) return oracle(`templates/${t.dataset.list}/list`);
   if (t.dataset.oracle) {
-    const action = t.dataset.oracle, event = +t.dataset.event, e = S.events.find(x => x.id === event), body = {action, event};
-    if (action === 'resolve') {
-      body.state = winning[event] ?? 0;
-      if (!confirm(`Resolve “${e.title}” as ${e.states[body.state]}? Resting orders are cancelled and every position pays out.`)) return;
+    const action = t.dataset.oracle, event = t.dataset.event, e = O && O.events.find(x => String(x.eventId) === event);
+    if (!e) return;
+    const body = {};
+    const held = `It is signed by the auto-approver and sequenced after the ${O.disputeSeconds} s dispute window unless someone disputes it.`;
+    if (action === 'propose') {
+      body.winningState = winning[event] ?? 0;
+      if (!confirm(`Propose “${e.title}” resolved as ${e.outcomes[body.winningState]}? ${held}`)) return;
     }
-    if (action === 'void' && !confirm(`Void “${e.title}”? Every contract settles at its equal-weight value.`)) return;
-    return operator('oracle', body);
+    if (action === 'void' && !confirm(`Propose voiding “${e.title}”? Every trade in it would be reversed. ${held}`)) return;
+    if (action === 'dispute') {
+      const reason = prompt('Why is the proposal wrong?');
+      if (!reason) return;
+      body.reason = reason;
+    }
+    if (action === 'postpone') body.seconds = 120;
+    return oracle(`events/${event}/${action}`, body);
   }
   if (t.classList.contains('q') && m) {
     const lvl = t.closest('.lvl'); if (!lvl || lvl.dataset.tick == null) return;
@@ -731,6 +814,9 @@ document.addEventListener('input', ev => { if (ev.target.id === 'rQty' || ev.tar
   openSession('retail');
   await loadMarkets();
   setInterval(loadMarkets, 5000);
+  loadSchedule();
+  setInterval(loadSchedule, 1000);
+  setInterval(tickCountdowns, 1000);
   const es = new EventSource('/api/events');
   es.onmessage = m => { S = JSON.parse(m.data); if (tab === 'settle') renderSettle(); };
 })();

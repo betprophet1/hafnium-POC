@@ -1,7 +1,10 @@
 //! `venue-sim`: the mini venue's actors. See `core/sim/README.md`.
 
 mod bots;
+mod calendar;
 mod client;
+mod oracle;
+mod resolution;
 mod session;
 mod web;
 mod workload;
@@ -19,6 +22,9 @@ use venue_link::wire::{Error, Ids, Ingress};
 const USAGE: &str = "usage:
   venue-sim seed  --ingress ADDR --catalogue FILE [--capacity small]
   venue-sim web   --ingress ADDR --feed ADDR --gateway ADDR --catalogue FILE [--listen 127.0.0.1:8080]
+                  [--oracle 127.0.0.1:8082]
+  venue-sim oracle --ingress ADDR --feed ADDR --catalogue FILE --calendar FILE [--capacity small]
+                  [--listen 127.0.0.1:8082]
   venue-sim maker --gateway ADDR [--token dev-synthetic-maker] [--size 10] [--levels 3] [--spread 1]
                   [--interval-ms 700] [--seed 1]
   venue-sim taker --gateway ADDR [--token dev-synthetic-taker] [--max-quantity 5] [--chance 250]
@@ -29,8 +35,8 @@ const USAGE: &str = "usage:
                   (the last two default from the node's capacity profile: 3/4 of its orders, and its
                   client order ID table's entries / 120 000 seconds)
 
-The bots are clients of the gateway. seed, workload and the web page's settlement tab are operator tools and use
-the core's ingress and feed. workload puts a venue-shaped load on a core on its own, with no gateway in the way.
+The bots are clients of the gateway. seed, workload and the dummy oracle are operator tools and use the core's
+ingress and feed; the web page's settlement tab drives the dummy oracle's control API. workload puts a venue-shaped load on a core on its own, with no gateway in the way.
 Every flag can also be given as VENUE_<FLAG> in the environment, for example VENUE_GATEWAY.";
 
 struct Args(BTreeMap<String, String>);
@@ -73,6 +79,7 @@ fn main() -> ExitCode {
     let outcome = Args::parse(&args[1..]).and_then(|a| match command.as_str() {
         "seed" => seed(&a),
         "web" => web(&a),
+        "oracle" => oracle(&a),
         "maker" => maker(&a),
         "taker" => taker(&a),
         "workload" => workload(&a),
@@ -143,9 +150,23 @@ fn seed(args: &Args) -> Result<(), Error> {
 fn web(args: &Args) -> Result<(), Error> {
     let catalogue = Catalogue::load(&args.get("catalogue", None)?)?;
     let live = view::Live::follow(&args.get("feed", None)?);
-    let ingress = Ingress::new(&args.get("ingress", None)?);
-    let app = web::Web::new(catalogue, live, ingress, Ids::new('w')?, args.get("gateway", Some("127.0.0.1:8081"))?);
+    let (gateway, oracle) = (args.get("gateway", Some("127.0.0.1:8081"))?, args.get("oracle", Some("127.0.0.1:8082"))?);
+    let app = web::Web::new(catalogue, live, gateway, oracle);
     web::serve(&args.get("listen", Some("127.0.0.1:8080"))?, Arc::new(app))
+}
+
+/// The dummy oracle: lists, runs and settles rounds on the calendar, and serves its control API.
+fn oracle(args: &Args) -> Result<(), Error> {
+    let calendar = calendar::Calendar::load(&args.get("calendar", None)?)?;
+    let catalogue = Catalogue::load(&args.get("catalogue", None)?)?;
+    // Listing stops short of the node's capacities, so this must name the profile the node runs with.
+    let profile = venue_link::catalogue::capacity_profile(&args.get("capacity", Some("small"))?)?;
+    let capacity =
+        oracle::Capacity { events: profile.events, instruments: profile.instruments, levels: profile.levels };
+    let live = view::Live::follow(&args.get("feed", None)?);
+    let ingress = Ingress::new(&args.get("ingress", None)?);
+    let oracle = oracle::Oracle::new(calendar, catalogue, capacity, live, ingress)?;
+    oracle::serve(&args.get("listen", Some("127.0.0.1:8082"))?, Arc::new(oracle))
 }
 
 fn maker(args: &Args) -> Result<(), Error> {

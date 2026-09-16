@@ -1,0 +1,26 @@
+{
+  "seed": 11,
+  "resolution": {
+    "reportAfterSeconds": 5,
+    "tiebreakSeconds": 15,
+    "disputeSeconds": 30,
+    "escalationSeconds": 90
+  },
+  "templates": [
+    {
+      "template": 1,
+      "everySeconds": 240, "leadSeconds": 45, "runSeconds": 120, "closeAfterSeconds": 10,
+      "suspendChance": 150, "suspendSeconds": 20, "voidChance": 80, "errorChance": 150
+    },
+    {
+      "template": 2,
+      "everySeconds": 300, "leadSeconds": 60, "runSeconds": 150, "closeAfterSeconds": 10,
+      "suspendChance": 400, "suspendSeconds": 25, "voidChance": 60, "errorChance": 250
+    },
+    {
+      "template": 3,
+      "everySeconds": 360, "leadSeconds": 30, "runSeconds": 180, "closeAfterSeconds": 10,
+      "suspendChance": 100, "suspendSeconds": 15, "voidChance": 50, "errorChance": 150
+    }
+  ]
+}

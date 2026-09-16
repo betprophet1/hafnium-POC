@@ -3,18 +3,21 @@
 //!
 //! Trading goes through the gateway: this server passes `/v4` through to it untouched, WebSocket upgrades included,
 //! and hands the page the dev tokens of the accounts it shows, so deposits and withdrawals go through the gateway to
-//! the treasury too. Settlement is an operator action, sequenced as commands through the core's ingress. The dummy oracle here sequences directly; blueprint §16 routes a dummy
-//! resolution through a proposal, the resolution console and an auto-approver, which do not exist yet.
+//! the treasury too. Settlement goes through the dummy oracle (`venue-sim oracle`), whose control API is passed
+//! through under `/oracle` the same way, so a resolution from the page takes the oracle's proposal, sign-off and
+//! dispute window like any other. Nothing here reaches the core's ingress: accounts are funded by deposits (blueprint
+//! §16: demo balances come from a fake provider, never a ledger shortcut).
 
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use venue_link::catalogue::{split_event, Catalogue};
+use venue_link::catalogue::Catalogue;
 use venue_link::view::Live;
-use venue_link::wire::{self, Error, Ids, Ingress};
+use venue_link::wire::Error;
 
 const INDEX: &str = include_str!("index.html");
 
@@ -27,21 +30,25 @@ const SESSION_SILENCE: Duration = Duration::from_secs(45);
 pub struct Web {
     catalogue: Catalogue,
     live: Arc<Live>,
-    ingress: Mutex<(Ingress, Ids)>,
     gateway: String,
+    oracle: String,
 }
+
+/// Settled rounds of each market the page's event stream still carries, latest first: enough to label recent payouts,
+/// while a venue that settles rounds all day does not send every one it ever listed five times a second.
+const RECENT_SETTLED: usize = 3;
 
 fn poisoned<T>(_: T) -> Error {
     "a lock is poisoned".into()
 }
 
 impl Web {
-    pub fn new(catalogue: Catalogue, live: Arc<Live>, ingress: Ingress, ids: Ids, gateway: String) -> Self {
-        Self { catalogue, live, ingress: Mutex::new((ingress, ids)), gateway }
+    pub fn new(catalogue: Catalogue, live: Arc<Live>, gateway: String, oracle: String) -> Self {
+        Self { catalogue, live, gateway, oracle }
     }
 
     fn snapshot(&self) -> Result<Value, Error> {
-        Ok(self.live.view.lock().map_err(poisoned)?.snapshot(&self.catalogue))
+        Ok(trimmed(self.live.view.lock().map_err(poisoned)?.snapshot(&self.catalogue)))
     }
 
     /// The accounts the page's trading tabs act as, with their dev tokens.
@@ -55,66 +62,31 @@ impl Web {
             .collect();
         json!({"accounts": accounts})
     }
+}
 
-    /// Operator actions: the dummy oracle. Accounts are funded by deposits through the gateway and the treasury, never
-    /// by a grant from here (blueprint §16: demo balances come from a fake provider, never a ledger shortcut).
-    fn action(&self, name: &str, r: &Value) -> Result<Value, Error> {
-        let mut guard = self.ingress.lock().map_err(poisoned)?;
-        let (ingress, ids) = &mut *guard;
-        let inputs = match name {
-            "oracle" => self.oracle(r, ids)?,
-            _ => return Err(format!("no action {name}").into()),
-        };
-        let mut results = Vec::new();
-        for input in inputs {
-            results.extend(ingress.send(input)?);
+/// A snapshot with only the unresolved events and each market's latest few settled rounds.
+fn trimmed(mut snapshot: Value) -> Value {
+    if let Some(events) = snapshot["events"].as_array_mut() {
+        let settled = |e: &Value| (e["resolved"] == true).then(|| (e["template"].as_u64(), e["round"].as_u64()));
+        // Each template's oldest settled round still kept.
+        let mut rounds: BTreeMap<Option<u64>, Vec<Option<u64>>> = BTreeMap::new();
+        for (template, round) in events.iter().filter_map(settled) {
+            rounds.entry(template).or_default().push(round);
         }
-        Ok(json!({"results": results}))
+        let oldest: BTreeMap<Option<u64>, Option<u64>> = rounds
+            .into_iter()
+            .map(|(template, mut r)| {
+                r.sort_unstable_by(|a, b| b.cmp(a));
+                (template, r.get(RECENT_SETTLED - 1).copied().flatten())
+            })
+            .collect();
+        events.retain(|e| {
+            settled(e).is_none_or(|(template, round)| {
+                oldest.get(&template).copied().flatten().is_none_or(|o| round >= Some(o))
+            })
+        });
     }
-
-    /// The dummy oracle's per-event commands (blueprint §16): start, suspend, resume, end, close, resolve, void,
-    /// and a new round of the same market.
-    fn oracle(&self, r: &Value, ids: &mut Ids) -> Result<Vec<Value>, Error> {
-        let event = r["event"].as_u64().ok_or("an event is required")?;
-        let (tradable, next_round) = {
-            let view = self.live.view.lock().map_err(poisoned)?;
-            let e = view.events.get(&event).ok_or("no such event")?;
-            let tradable: Vec<u64> = e
-                .instruments
-                .iter()
-                .copied()
-                .filter(|i| view.instruments.get(i).is_some_and(|i| matches!(i.state.as_str(), "OPEN" | "HALTED")))
-                .collect();
-            let template = split_event(event).0;
-            let round =
-                view.events.keys().map(|id| split_event(*id)).filter(|(t, _)| *t == template).map(|(_, r)| r).max();
-            (tradable, round.unwrap_or(0) + 1)
-        };
-        let phase = |phase: &str, ids: &mut Ids| {
-            wire::command("SetEventPhase", ids.fresh(), json!({"eventId": event, "phase": phase, "source": "OPERATOR"}))
-        };
-        let resolve = |kind: &str, state: u64, ids: &mut Ids| {
-            wire::command(
-                "ResolveEvent",
-                ids.fresh(),
-                json!({"eventId": event, "kind": kind, "caseId": 0, "winningState": state, "voidWeights": []}),
-            )
-        };
-        Ok(match r["action"].as_str().unwrap_or("") {
-            "start" => vec![phase("STARTED", ids)],
-            "suspend" => vec![phase("SUSPENDED", ids)],
-            "resume" => vec![phase("RESUMED", ids)],
-            "end" => vec![phase("ENDED", ids)],
-            "close" => tradable
-                .iter()
-                .map(|i| wire::command("SetMarketState", ids.fresh(), json!({"instrumentId": i, "state": "CLOSED"})))
-                .collect(),
-            "resolve" => vec![resolve("RESOLVED", r["state"].as_u64().ok_or("a winning state is required")?, ids)],
-            "void" => vec![resolve("VOID", 0, ids)],
-            "relist" => self.catalogue.listing(split_event(event).0, next_round, 0)?,
-            other => return Err(format!("no oracle action {other}").into()),
-        })
-    }
+    snapshot
 }
 
 pub fn serve(listen: &str, web: Arc<Web>) -> Result<(), Error> {
@@ -157,7 +129,10 @@ fn handle(web: &Web, stream: TcpStream) -> Result<(), Error> {
         }
     }
     if path.starts_with("/v4") {
-        return proxy(&web.gateway, &head, reader, stream);
+        return proxy(&web.gateway, "gateway", &head, reader, stream);
+    }
+    if path == "/oracle" || path.starts_with("/oracle/") {
+        return proxy(&web.oracle, "dummy oracle", &head, reader, stream);
     }
     if length > 1 << 20 {
         return respond(stream, 413, "text/plain", b"too large");
@@ -169,22 +144,15 @@ fn handle(web: &Web, stream: TcpStream) -> Result<(), Error> {
         ("GET", "/api/config") => respond(stream, 200, "application/json", web.config().to_string().as_bytes()),
         ("GET", "/api/state") => respond(stream, 200, "application/json", web.snapshot()?.to_string().as_bytes()),
         ("GET", "/api/events") => events(web, stream),
-        ("POST", p) if p.starts_with("/api/") => {
-            let request: Value = if body.is_empty() { json!({}) } else { serde_json::from_slice(&body)? };
-            match web.action(&p[5..], &request) {
-                Ok(v) => respond(stream, 200, "application/json", v.to_string().as_bytes()),
-                Err(e) => {
-                    respond(stream, 400, "application/json", json!({"error": e.to_string()}).to_string().as_bytes())
-                }
-            }
-        }
         _ => respond(stream, 404, "text/plain", b"not found"),
     }
 }
 
-/// Passes a request and everything after it through to the gateway, in both directions, until either side closes.
+/// Passes a request and everything after it through to `upstream` (the gateway or the dummy oracle), in both
+/// directions, until either side closes.
 fn proxy(
     gateway: &str,
+    name: &str,
     head: &str,
     mut from_client: BufReader<TcpStream>,
     mut to_client: TcpStream,
@@ -194,7 +162,7 @@ fn proxy(
         Ok(s) => s,
         Err(e) => {
             let body =
-                json!({"error": {"code": "UNAVAILABLE", "message": format!("the gateway is not reachable: {e}")}});
+                json!({"error": {"code": "UNAVAILABLE", "message": format!("the {name} is not reachable: {e}")}});
             return respond(to_client, 502, "application/json", body.to_string().as_bytes());
         }
     };
@@ -221,7 +189,7 @@ fn proxy(
     Ok(())
 }
 
-fn respond(mut stream: TcpStream, status: u16, content_type: &str, body: &[u8]) -> Result<(), Error> {
+pub(crate) fn respond(mut stream: TcpStream, status: u16, content_type: &str, body: &[u8]) -> Result<(), Error> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -263,5 +231,27 @@ fn events(web: &Web, mut stream: TcpStream) -> Result<(), Error> {
         }
         stream.flush()?;
         thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_event_stream_keeps_open_events_and_each_markets_latest_settled_rounds() {
+        let event = |template: u64, round: u64, resolved: bool| json!({"template": template, "round": round, "resolved": resolved});
+        let mut events: Vec<Value> = (1..=6).map(|r| event(1, r, true)).collect();
+        events.extend((1..=2).map(|r| event(2, r, true)));
+        events.push(event(1, 7, false));
+        events.push(event(2, 3, false));
+        let kept = trimmed(json!({"events": events}));
+        let rounds: Vec<(u64, u64)> = kept["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .map(|e| (e["template"].as_u64().unwrap_or(0), e["round"].as_u64().unwrap_or(0)))
+            .collect();
+        assert_eq!(rounds, vec![(1, 4), (1, 5), (1, 6), (2, 1), (2, 2), (1, 7), (2, 3)]);
     }
 }
