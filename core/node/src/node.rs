@@ -45,6 +45,30 @@ pub struct Config {
     pub tick: Duration,
     /// `fsync` the journal after every input, not only flush it to the operating system.
     pub fsync: bool,
+    /// The capacity profile to size the engine's tables by: `small`, `launch` or `scale`.
+    pub capacity: String,
+}
+
+/// The file beside a journal naming the capacity profile it was recorded under.
+pub const CAPACITY: &str = "capacity";
+
+/// The capacity profile a journal was recorded under: the one the file beside it names, or `small` for a journal
+/// with no such file, since every journal from before profiles had names was recorded under `small`.
+///
+/// Replaying a journal under a different profile can fail-stop where the original did not, or not where it did,
+/// so replay, benchmarks and a restarted node all take the profile from here. This works while a node's journal
+/// lives in its own data directory; once replicas receive journals rather than directories, the profile has to
+/// travel in the journal itself.
+pub fn journal_profile(journal: &Path) -> Result<(String, Capacities), Error> {
+    let path = journal.with_file_name(CAPACITY);
+    let name = match fs::read_to_string(&path) {
+        Ok(text) => text.trim().to_string(),
+        Err(e) if e.kind() == ErrorKind::NotFound => "small".to_string(),
+        Err(e) => return Err(e.into()),
+    };
+    let capacities = Capacities::named(&name)
+        .ok_or_else(|| format!("{} names an unknown capacity profile {name:?}", path.display()))?;
+    Ok((name, capacities))
 }
 
 /// SHA-256 of the running binary, for `EngineStarted` and `ActivateProtocol` (E-7.7).
@@ -151,7 +175,8 @@ pub fn replay(journal: &Path, results: &Path) -> Result<u64, Error> {
             None => 1,
         }
     };
-    let mut owned = OwnedMemory::new(&Capacities::small());
+    let (_, capacities) = journal_profile(journal)?;
+    let mut owned = OwnedMemory::new(&capacities);
     let mut engine =
         Engine::new(engine_config(group)?, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
     let mut log = BufWriter::new(File::create(results)?);
@@ -312,7 +337,24 @@ pub fn serve(config: &Config) -> Result<(), Error> {
     let journal_path = config.data_dir.join(JOURNAL);
     let results_path = config.data_dir.join(RESULTS);
     let hash = binary_hash()?;
-    let mut owned = OwnedMemory::new(&Capacities::small());
+    let capacities = Capacities::named(&config.capacity)
+        .ok_or_else(|| format!("unknown capacity profile {:?}: small, launch or scale", config.capacity))?;
+    let recorded = config.data_dir.join(CAPACITY);
+    let journal_started = fs::metadata(&journal_path).is_ok_and(|m| m.len() > 0);
+    if recorded.exists() || journal_started {
+        let (name, _) = journal_profile(&journal_path)?;
+        if name != config.capacity {
+            return Err(format!(
+                "the journal in {} was recorded under the {name} capacity profile, not {}: replaying it under another \
+                 could fail-stop where the original did not",
+                config.data_dir.display(),
+                config.capacity
+            )
+            .into());
+        }
+    }
+    fs::write(&recorded, format!("{}\n", config.capacity))?;
+    let mut owned = OwnedMemory::new(&capacities);
     let mut engine =
         Engine::new(engine_config(config.group)?, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
     let mut results = BufWriter::new(File::create(&results_path)?);

@@ -1,21 +1,32 @@
 //! The demo markets: titles and outcome names the engine never sees, the accounts, and the inputs that create them.
 //!
 //! IDs encode where they came from, so any reader can label them after a restart: event `template × 1000 + round`,
-//! instrument `event × 10 + index`. Every seeding command has a fixed ID, so seeding twice changes nothing (E-7.1).
+//! instrument `event × 10 + index`. Every seeding command has a fixed ID, so seeding twice within seven days changes
+//! nothing (E-7.1). After that the IDs have expired (D-25), and seeding again would grant the accounts' money again.
 
 use crate::wire::{command, Error};
 use serde_json::{json, Value};
 use std::fs;
+use venue_engine::state::Capacities;
 
 pub const TICK_TABLE: u64 = 1;
 
-/// Resting orders the venue allows at once, which E-9.3 check 17 refuses past with `ORDER_CAPACITY`. Zero means
-/// none, and none is what a venue gets unless someone sets this: with no limit nothing checks the group's resting
-/// orders, so a venue that fills its books reaches `alloc_order`, finds the slab's free list empty and fail-stops
-/// instead of rejecting the order. A seeded venue therefore sets one, beneath the slab the node runs with —
-/// `Capacities::small()`, the only profile it has, holds 16 384 — with room to spare for the slot an order takes
-/// before check 17 runs and gives back when it rejects.
-pub const ACTIVE_ORDER_LIMIT: u64 = 12_000;
+/// Resting orders a venue allows at once, which E-9.3 check 17 refuses past with `ORDER_CAPACITY`, for a node whose
+/// capacity profile holds `order_ceiling` orders. Zero means none, and none is what a venue gets unless someone sets
+/// this: with no limit nothing checks the group's resting orders, so a venue that fills its books reaches
+/// `alloc_order`, finds the slab's free list empty and fail-stops instead of rejecting the order. A seeded venue
+/// therefore sets one at three quarters of the ceiling, with room to spare for the slot an order takes before check
+/// 17 runs and gives back when it rejects.
+pub const fn active_order_limit(order_ceiling: usize) -> u64 {
+    order_ceiling as u64 / 4 * 3
+}
+
+/// The order ceiling of a capacity profile by name, which must be the profile the node was started with.
+pub fn order_ceiling(profile: &str) -> Result<usize, Error> {
+    Capacities::named(profile)
+        .map(|c| c.orders)
+        .ok_or_else(|| format!("unknown capacity profile {profile:?}: small, launch or scale").into())
+}
 
 /// D-12's window, restated here because E-7.4 replaces both group parameters together: see `group_parameters`.
 pub const CLIENT_ORDER_ID_WINDOW_SECONDS: u64 = 7_200;
@@ -103,12 +114,12 @@ impl Catalogue {
     /// The venue-wide settings. E-7.4 replaces both of them together, so setting the order limit here also sets
     /// the client order ID window, and the window D-12 publishes has to be restated rather than left out — leaving
     /// it out would reset it to whatever this command carried.
-    fn group_parameters() -> Value {
+    fn group_parameters(order_ceiling: usize) -> Value {
         command(
             "SetGroupParameters",
             "seed-limits".into(),
             json!({
-                "activeOrderLimit": ACTIVE_ORDER_LIMIT,
+                "activeOrderLimit": active_order_limit(order_ceiling),
                 "clientOrderIdWindowSeconds": CLIENT_ORDER_ID_WINDOW_SECONDS
             }),
         )
@@ -116,8 +127,8 @@ impl Catalogue {
 
     /// Everything a fresh venue needs: the group settings, the tick table, funded accounts and round 1 of every
     /// market. The settings come first, so no order can exist before the limit that bounds them.
-    pub fn seed(&self) -> Result<Vec<Value>, Error> {
-        let mut inputs = vec![Self::group_parameters(), Self::cent_table()];
+    pub fn seed(&self, order_ceiling: usize) -> Result<Vec<Value>, Error> {
+        let mut inputs = vec![Self::group_parameters(order_ceiling), Self::cent_table()];
         for a in &self.accounts {
             let id = a["id"].as_u64().ok_or("an account needs an id")?;
             inputs.push(command(

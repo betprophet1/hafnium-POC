@@ -14,6 +14,10 @@ core:
   nodeId: 1
   # TimeTick cadence (spec E-17.3). Production uses 1 ms; an idle laptop does not need a thousand records a second.
   tickMs: 100
+  # Engine capacity profile: small (16k resting orders, ~90 MiB), launch (262k, ~1.5 GiB) or scale (1M, ~6 GiB).
+  # The node refuses a journal recorded under another profile, and the seed sets the order limit beneath this one's
+  # order ceiling, so both read it from here.
+  capacity: small
   # fsync the journal after every input. Off on laptops; the journal is still flushed before each input applies.
   fsync: false
   storage:

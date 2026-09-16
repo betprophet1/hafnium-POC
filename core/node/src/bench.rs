@@ -14,7 +14,6 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 use venue_engine::frame;
-use venue_engine::state::Capacities;
 use venue_engine::{Engine, ResultSink};
 use venue_harness::codec;
 use venue_harness::memory::OwnedMemory;
@@ -113,8 +112,9 @@ pub fn bench(journal: &Path, runs: usize) -> Result<(), Error> {
         journal.display(),
         micros(timer_floor())
     );
+    let (_, capacities) = crate::node::journal_profile(journal)?;
     for run in 1..=runs {
-        let mut owned = OwnedMemory::new(&Capacities::small());
+        let mut owned = OwnedMemory::new(&capacities);
         let mut engine =
             Engine::new(engine_config(group)?, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
         let mut sink = Count::default();

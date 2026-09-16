@@ -60,6 +60,8 @@ spec:
               value: {{ .Values.core.nodeId | quote }}
             - name: VENUE_TICK_MS
               value: {{ .Values.core.tickMs | quote }}
+            - name: VENUE_CAPACITY
+              value: {{ .Values.core.capacity | quote }}
           ports:
             - name: ingress
               containerPort: 7101

@@ -11,6 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+venue-engine = { path = "../engine" }
 venue-harness = { path = "../harness" }
 venue-node = { path = "../node" }
 serde_json = "1"

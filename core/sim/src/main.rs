@@ -17,7 +17,7 @@ use venue_link::view;
 use venue_link::wire::{Error, Ids, Ingress};
 
 const USAGE: &str = "usage:
-  venue-sim seed  --ingress ADDR --catalogue FILE
+  venue-sim seed  --ingress ADDR --catalogue FILE [--capacity small]
   venue-sim web   --ingress ADDR --feed ADDR --gateway ADDR --catalogue FILE [--listen 127.0.0.1:8080]
   venue-sim maker --gateway ADDR [--token dev-synthetic-maker] [--size 10] [--levels 3] [--spread 1]
                   [--interval-ms 700] [--seed 1]
@@ -109,7 +109,9 @@ fn workload(args: &Args) -> Result<(), Error> {
 fn seed(args: &Args) -> Result<(), Error> {
     let catalogue = Catalogue::load(&args.get("catalogue", None)?)?;
     let mut ingress = Ingress::new(&args.get("ingress", None)?);
-    let mut inputs = catalogue.seed()?.into_iter().peekable();
+    // The order limit is set beneath the node's order ceiling, so this must name the profile the node runs with.
+    let ceiling = venue_link::catalogue::order_ceiling(&args.get("capacity", Some("small"))?)?;
+    let mut inputs = catalogue.seed(ceiling)?.into_iter().peekable();
     let mut attempts = 0;
     while let Some(input) = inputs.peek() {
         match ingress.send(input.clone()) {

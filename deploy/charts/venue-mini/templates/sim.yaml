@@ -42,6 +42,8 @@ spec:
           env:
             - name: VENUE_INGRESS
               value: "{{ $core }}:7101"
+            - name: VENUE_CAPACITY
+              value: {{ .Values.core.capacity | quote }}
             - name: VENUE_CATALOGUE
               value: /catalogue/markets.json
           securityContext:

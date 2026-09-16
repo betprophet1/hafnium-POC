@@ -13,6 +13,7 @@ use venue_node::node::{self, Config, Error};
 
 const USAGE: &str = "usage:
   venue-node serve [--listen ADDR] [--feed ADDR] [--data DIR] [--group N] [--node-id N] [--tick-ms N] [--fsync]
+                   [--capacity small|launch|scale]
   venue-node send ADDR [INPUTS]            JSON inputs (an array, or one per line; stdin without a file);
                                            prints each result as a JSON line
   venue-node replay JOURNAL RESULTS        runs a journal through a fresh engine and writes its result log
@@ -24,7 +25,9 @@ const USAGE: &str = "usage:
                                            amends resting orders through a seeded node's ingress, one request at a
                                            time per connection, and reports messages/s and round-trip percentiles
 
-serve reads VENUE_LISTEN, VENUE_FEED, VENUE_DATA, VENUE_GROUP, VENUE_NODE_ID and VENUE_TICK_MS; flags override them.";
+serve reads VENUE_LISTEN, VENUE_FEED, VENUE_DATA, VENUE_GROUP, VENUE_NODE_ID, VENUE_TICK_MS and VENUE_CAPACITY; flags
+override them. The capacity profile (default small) is recorded beside the journal; serve refuses a journal recorded
+under another, and replay and bench use the one recorded.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -60,6 +63,7 @@ fn serve(args: &[String]) -> Result<(), Error> {
     let mut group = env("VENUE_GROUP", "1");
     let mut node_id = env("VENUE_NODE_ID", "1");
     let mut tick_ms = env("VENUE_TICK_MS", "100");
+    let mut capacity = env("VENUE_CAPACITY", "small");
     let mut fsync = false;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -72,6 +76,7 @@ fn serve(args: &[String]) -> Result<(), Error> {
             "--node-id" => node_id = value()?,
             "--tick-ms" => tick_ms = value()?,
             "--fsync" => fsync = true,
+            "--capacity" => capacity = value()?,
             other => return Err(format!("unknown flag {other}\n{USAGE}").into()),
         }
     }
@@ -83,6 +88,7 @@ fn serve(args: &[String]) -> Result<(), Error> {
         node_id: node_id.parse()?,
         tick: Duration::from_millis(tick_ms.parse()?),
         fsync,
+        capacity,
     };
     if config.tick.is_zero() {
         return Err("the tick must be at least 1 ms".into());
