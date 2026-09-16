@@ -1,6 +1,6 @@
 # Interface 1: the REST and WebSocket gateway
 
-Draft v0. `openapi.yaml` is the REST half and `asyncapi.yaml` the WebSocket half; this file holds the semantics
+Draft v1. `openapi.yaml` is the REST half and `asyncapi.yaml` the WebSocket half; this file holds the semantics
 both share. The gateway is the edge of blueprint §5 and §13: every app, bot and tool reaches a sequencer group
 through it, and it is the only client-facing component that writes to one (interface 7).
 
@@ -14,6 +14,27 @@ executions and conflated public market data.
 It never decides anything the engine decides. Client order ID duplicates, lot steps, market state, rule limits and
 collateral are sequenced checks (spec §9), so their rejections replay. The gateway holds no state a failover could
 lose except flood-limit counters, which by design never reach the journal (blueprint §12).
+
+## Public and private
+
+The gateway has two halves, told apart by path alone:
+
+| | Public | Private |
+|---|---|---|
+| WebSocket | `/v4/ws_public` | `/v4/ws_private` |
+| REST | `GET /v4/markets`, `GET /v4/markets/{instrumentId}/book` | `GET /v4/account`, `/v4/orders` and everything under it |
+| Login | never | required: a token on every REST call, `login` first on a session |
+| Carries | markets, books and trades, the same for everyone | one account's orders, executions, account updates, payouts and releases |
+| Reaches the sequencer group | never | every order, amendment and cancel |
+
+A private session carries nothing public, and a public session nothing private. A client that trades and watches the
+market holds one of each and follows the market on the public one. An op sent to the wrong endpoint is refused with
+an `error` (`BAD_REQUEST`) naming the endpoint it belongs on, and a REST path the half does not serve is 404.
+
+The halves are separate so that watching never costs trading anything. Market data is fanned out to every viewer
+(blueprint §9), which at tens of thousands of viewers is most of a gateway's work; orders and their answers are few
+and latency-sensitive. Behind the paths they may be one gateway or two fleets scaled apart: that is a deployment
+choice (blueprint §13), and a client addresses them only by path. `GET /healthz` is answered by both.
 
 ## Refused at the edge, or rejected by the engine
 
@@ -84,9 +105,9 @@ Amending needs no instrument: the gateway knows each resting order's instrument.
 
 ## Sessions: cancel-on-disconnect and heartbeats
 
-`cancelOnDisconnect` in `login` makes the end of the session, a clean close or a dropped connection, a `MassCancel`
-of the session's resting orders with cause `SESSION_DISCONNECT`. `heartbeatSeconds` makes silence that long a
-`MassCancel` with cause `HEARTBEAT_MISSED`, then a close. Both are keyed to the client session, never to the
+These are private sessions, on `/v4/ws_private`. `cancelOnDisconnect` in `login` makes the end of the session, a
+clean close or a dropped connection, a `MassCancel` of the session's resting orders with cause `SESSION_DISCONNECT`.
+`heartbeatSeconds` makes silence that long a `MassCancel` with cause `HEARTBEAT_MISSED`, then a close. Both are keyed to the client session, never to the
 gateway's connection to the sequencer group, so a failover does not empty the books (blueprint §5). REST requests
 have no session and never cancel on disconnect.
 
@@ -96,20 +117,10 @@ mistaking a lost gateway for a quiet market. The mini venue's web page does this
 
 ## Sessions: being streamed to, or not
 
-`stream` in `login` says whether a session is streamed to as things happen. It is true unless a client says
-otherwise, and a session that leaves it alone behaves exactly as it always has.
-
-A session that sets it false is woken rarely rather than promptly: messages for it collect and arrive together, up
-to a second later. That is the right trade for a screen, where nobody can tell, and the wrong one for trading,
-where a fill should arrive at once. Two things are unaffected either way. A reply to the session's own request is
-written as the request is handled, so round trips never wait on this. And anything the client sends makes the
-gateway attentive again immediately, so a session becomes prompt the moment its user does something.
-
-The point of it is what a connection costs when nothing is happening. A gateway holds a thread per connection and
-wakes each one on a timer, so a thousand connections waiting 50 ms at a time cost a quarter of a core between them
-while entirely idle, and five thousand cost more than the machine can schedule. Letting the sessions that do not
-need promptness wait a second instead is what keeps that affordable. A session's wait never grows past half its
-own `heartbeatSeconds`, so setting `stream` false never delays noticing that the session has gone silent.
+`stream` in `login` is accepted and has no effect: every session is streamed to as things happen. It existed so that
+screens could ask to be woken rarely, when a gateway held a thread per connection and woke each one on a timer. A
+gateway now waits on all its connections at once and wakes only for a connection with something to send, so an
+idle session costs nothing to be prompt for, and screens watch the market on the public endpoint anyway.
 
 ## Flood limits
 
@@ -126,7 +137,8 @@ actually meet is a rule limit, which is sequenced and explainable (spec E-9.4).
 | `book.{instrumentId}` | a full snapshot to the requested depth, both sides | a snapshot on subscribe, then at most ten a second, only when the book changed |
 | `trades.{instrumentId}` | each trade: price, quantity, taker side | every trade |
 
-Market data needs no login. A retail client watching a market never causes work in a sequencer group (blueprint §9).
+Topics are subscribed to on `/v4/ws_public`, which needs no login. A retail client watching a market never causes
+work in a sequencer group (blueprint §9).
 
 ## Sequence numbers and resuming
 

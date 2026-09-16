@@ -1,12 +1,19 @@
 asyncapi: 3.0.0
 info:
   title: Venue WebSocket API
-  version: 4.0.0-draft.0
+  version: 4.0.0-draft.1
   description: |
-    Interface 1, the WebSocket half of the REST and WebSocket gateway (blueprint §13). One connection is one client
-    session: it logs in with a token, enters and cancels orders, receives its account's executions, and subscribes
-    to conflated market data. This document describes the gateway: `receive` operations are messages clients send,
-    `send` operations are messages the gateway sends.
+    Interface 1, the WebSocket half of the REST and WebSocket gateway (blueprint §13). There are two endpoints, and
+    one connection is one session on one of them:
+
+    - `/v4/ws_public` carries public market data. It needs no login: a session subscribes to topics and receives
+      conflated books, trades and market states.
+    - `/v4/ws_private` carries one account. A session logs in with a token, enters and cancels orders, and receives
+      that account's executions, account updates, payouts and releases. It carries no public topics.
+
+    A client that trades and watches the market opens one of each. The two may be served by one gateway or by
+    separate ones (README, public and private); a client addresses them only by path. This document describes the
+    gateway: `receive` operations are messages clients send, `send` operations are messages the gateway sends.
 
     Every message is a JSON text frame. A client may add an `id` to any request; the gateway echoes it on the reply
     or error. Order bodies, results and executions are the schemas of `openapi.yaml`. Semantics are in `README.md`.
@@ -14,15 +21,25 @@ servers:
   laptop:
     host: 127.0.0.1:8080
     protocol: ws
-    pathname: /v4/ws
     description: The mini venue on a laptop, after `deploy/laptop.sh web`
 channels:
-  session:
-    address: /v4/ws
+  public:
+    address: /v4/ws_public
+    description: Public market data. No login.
     messages:
-      login: { $ref: '#/components/messages/login' }
       subscribe: { $ref: '#/components/messages/subscribe' }
       unsubscribe: { $ref: '#/components/messages/unsubscribe' }
+      heartbeat: { $ref: '#/components/messages/heartbeat' }
+      reply: { $ref: '#/components/messages/reply' }
+      error: { $ref: '#/components/messages/error' }
+      book: { $ref: '#/components/messages/book' }
+      trade: { $ref: '#/components/messages/trade' }
+      market: { $ref: '#/components/messages/market' }
+  private:
+    address: /v4/ws_private
+    description: One account's orders and everything that happens to them. Log in first.
+    messages:
+      login: { $ref: '#/components/messages/login' }
       order: { $ref: '#/components/messages/order' }
       amend: { $ref: '#/components/messages/amend' }
       cancel: { $ref: '#/components/messages/cancel' }
@@ -31,9 +48,6 @@ channels:
       welcome: { $ref: '#/components/messages/welcome' }
       reply: { $ref: '#/components/messages/reply' }
       error: { $ref: '#/components/messages/error' }
-      book: { $ref: '#/components/messages/book' }
-      trade: { $ref: '#/components/messages/trade' }
-      market: { $ref: '#/components/messages/market' }
       execution: { $ref: '#/components/messages/execution' }
       account: { $ref: '#/components/messages/account' }
       payout: { $ref: '#/components/messages/payout' }
@@ -42,102 +56,112 @@ channels:
 operations:
   receiveLogin:
     action: receive
-    channel: { $ref: '#/channels/session' }
-    summary: Authenticate the session. Required before orders; market data needs no login.
-    messages: [{ $ref: '#/channels/session/messages/login' }]
+    channel: { $ref: '#/channels/private' }
+    summary: Authenticate the session. Required before anything else on this endpoint.
+    messages: [{ $ref: '#/channels/private/messages/login' }]
     reply:
-      channel: { $ref: '#/channels/session' }
-      messages: [{ $ref: '#/channels/session/messages/welcome' }, { $ref: '#/channels/session/messages/error' }]
+      channel: { $ref: '#/channels/private' }
+      messages: [{ $ref: '#/channels/private/messages/welcome' }, { $ref: '#/channels/private/messages/error' }]
   receiveSubscribe:
     action: receive
-    channel: { $ref: '#/channels/session' }
+    channel: { $ref: '#/channels/public' }
     summary: >
       Subscribe to public topics. Each book topic answers at once with every level, flagged snapshot, and sends
       only what changes after that.
-    messages: [{ $ref: '#/channels/session/messages/subscribe' }]
+    messages: [{ $ref: '#/channels/public/messages/subscribe' }]
   receiveUnsubscribe:
     action: receive
-    channel: { $ref: '#/channels/session' }
-    messages: [{ $ref: '#/channels/session/messages/unsubscribe' }]
+    channel: { $ref: '#/channels/public' }
+    messages: [{ $ref: '#/channels/public/messages/unsubscribe' }]
   receiveOrder:
     action: receive
-    channel: { $ref: '#/channels/session' }
+    channel: { $ref: '#/channels/private' }
     summary: Place an order; the reply follows once the input is committed.
-    messages: [{ $ref: '#/channels/session/messages/order' }]
+    messages: [{ $ref: '#/channels/private/messages/order' }]
     reply:
-      channel: { $ref: '#/channels/session' }
-      messages: [{ $ref: '#/channels/session/messages/reply' }, { $ref: '#/channels/session/messages/error' }]
+      channel: { $ref: '#/channels/private' }
+      messages: [{ $ref: '#/channels/private/messages/reply' }, { $ref: '#/channels/private/messages/error' }]
   receiveAmend:
     action: receive
-    channel: { $ref: '#/channels/session' }
-    messages: [{ $ref: '#/channels/session/messages/amend' }]
+    channel: { $ref: '#/channels/private' }
+    messages: [{ $ref: '#/channels/private/messages/amend' }]
     reply:
-      channel: { $ref: '#/channels/session' }
-      messages: [{ $ref: '#/channels/session/messages/reply' }, { $ref: '#/channels/session/messages/error' }]
+      channel: { $ref: '#/channels/private' }
+      messages: [{ $ref: '#/channels/private/messages/reply' }, { $ref: '#/channels/private/messages/error' }]
   receiveCancel:
     action: receive
-    channel: { $ref: '#/channels/session' }
-    messages: [{ $ref: '#/channels/session/messages/cancel' }]
+    channel: { $ref: '#/channels/private' }
+    messages: [{ $ref: '#/channels/private/messages/cancel' }]
     reply:
-      channel: { $ref: '#/channels/session' }
-      messages: [{ $ref: '#/channels/session/messages/reply' }, { $ref: '#/channels/session/messages/error' }]
+      channel: { $ref: '#/channels/private' }
+      messages: [{ $ref: '#/channels/private/messages/reply' }, { $ref: '#/channels/private/messages/error' }]
   receiveCancelAll:
     action: receive
-    channel: { $ref: '#/channels/session' }
-    messages: [{ $ref: '#/channels/session/messages/cancelAll' }]
+    channel: { $ref: '#/channels/private' }
+    messages: [{ $ref: '#/channels/private/messages/cancelAll' }]
     reply:
-      channel: { $ref: '#/channels/session' }
-      messages: [{ $ref: '#/channels/session/messages/reply' }, { $ref: '#/channels/session/messages/error' }]
-  receiveHeartbeat:
+      channel: { $ref: '#/channels/private' }
+      messages: [{ $ref: '#/channels/private/messages/reply' }, { $ref: '#/channels/private/messages/error' }]
+  receivePublicHeartbeat:
     action: receive
-    channel: { $ref: '#/channels/session' }
+    channel: { $ref: '#/channels/public' }
+    summary: >-
+      A heartbeat carrying an `id` is answered with an empty reply, so a client can tell a gateway that has
+      gone from a quiet market.
+    messages: [{ $ref: '#/channels/public/messages/heartbeat' }]
+    reply:
+      channel: { $ref: '#/channels/public' }
+      messages: [{ $ref: '#/channels/public/messages/reply' }]
+  receivePrivateHeartbeat:
+    action: receive
+    channel: { $ref: '#/channels/private' }
     summary: >-
       Keep a session with `heartbeatSeconds` alive; any other client message counts too. A heartbeat carrying an `id`
       is answered with an empty reply, so a client can tell a gateway that has gone from a quiet market.
-    messages: [{ $ref: '#/channels/session/messages/heartbeat' }]
+    messages: [{ $ref: '#/channels/private/messages/heartbeat' }]
     reply:
-      channel: { $ref: '#/channels/session' }
-      messages: [{ $ref: '#/channels/session/messages/reply' }]
+      channel: { $ref: '#/channels/private' }
+      messages: [{ $ref: '#/channels/private/messages/reply' }]
   sendBook:
     action: send
-    channel: { $ref: '#/channels/session' }
+    channel: { $ref: '#/channels/public' }
     summary: 'Topic book.{instrumentId}: a full snapshot to the requested depth, at most ten a second per topic.'
-    messages: [{ $ref: '#/channels/session/messages/book' }]
+    messages: [{ $ref: '#/channels/public/messages/book' }]
   sendTrade:
     action: send
-    channel: { $ref: '#/channels/session' }
+    channel: { $ref: '#/channels/public' }
     summary: 'Topic trades.{instrumentId}: every trade, anonymous.'
-    messages: [{ $ref: '#/channels/session/messages/trade' }]
+    messages: [{ $ref: '#/channels/public/messages/trade' }]
   sendMarket:
     action: send
-    channel: { $ref: '#/channels/session' }
+    channel: { $ref: '#/channels/public' }
     summary: 'Topic markets: market states and event phases as they change.'
-    messages: [{ $ref: '#/channels/session/messages/market' }]
+    messages: [{ $ref: '#/channels/public/messages/market' }]
   sendExecution:
     action: send
-    channel: { $ref: '#/channels/session' }
+    channel: { $ref: '#/channels/private' }
     summary: After login, every execution on the account's orders, from any session.
-    messages: [{ $ref: '#/channels/session/messages/execution' }]
+    messages: [{ $ref: '#/channels/private/messages/execution' }]
   sendAccount:
     action: send
-    channel: { $ref: '#/channels/session' }
+    channel: { $ref: '#/channels/private' }
     summary: After login, the sleeve and changed positions whenever an input changes them.
-    messages: [{ $ref: '#/channels/session/messages/account' }]
+    messages: [{ $ref: '#/channels/private/messages/account' }]
   sendPayout:
     action: send
-    channel: { $ref: '#/channels/session' }
+    channel: { $ref: '#/channels/private' }
     summary: After login, settlement payouts to the account.
-    messages: [{ $ref: '#/channels/session/messages/payout' }]
+    messages: [{ $ref: '#/channels/private/messages/payout' }]
   sendRelease:
     action: send
-    channel: { $ref: '#/channels/session' }
+    channel: { $ref: '#/channels/private' }
     summary: After login, complete sets of the account's contracts returned as cash after a fill.
-    messages: [{ $ref: '#/channels/session/messages/release' }]
+    messages: [{ $ref: '#/channels/private/messages/release' }]
   sendResync:
     action: send
-    channel: { $ref: '#/channels/session' }
+    channel: { $ref: '#/channels/private' }
     summary: The gateway cannot resume from the requested sequence; fetch GET /v4/account and continue from `sequence`.
-    messages: [{ $ref: '#/channels/session/messages/resync' }]
+    messages: [{ $ref: '#/channels/private/messages/resync' }]
 components:
   schemas:
     RequestId:
@@ -175,12 +199,8 @@ components:
           stream:
             type: boolean
             default: true
-            description: >
-              Whether this session is streamed to as things happen. A session that sets this false is woken rarely
-              rather than promptly: messages for it collect and arrive together, up to a second later. Meant for
-              screens, where nobody minds, and not for trading, where a fill should arrive at once. Replies to the
-              session's own requests are unaffected either way, and anything the client sends makes the gateway
-              attentive again at once.
+            deprecated: true
+            description: Accepted and has no effect; every session is streamed to as things happen (README).
     subscribe:
       payload:
         type: object

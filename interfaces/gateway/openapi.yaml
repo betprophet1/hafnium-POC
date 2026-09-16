@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Venue REST API
-  version: 4.0.0-draft.0
+  version: 4.0.0-draft.1
   summary: Interface 1, the REST half of the REST and WebSocket gateway (blueprint §13).
   description: |
     Orders and account calls in the venue's own terms. The gateway authenticates and validates every request
@@ -15,6 +15,9 @@ info:
       journal.
 
     The WebSocket half is `asyncapi.yaml`. Semantics shared by both are in `README.md` beside this file.
+
+    The `markets` paths are the public half and the `account` paths the private half (README, public and private):
+    they may be served by one gateway or by separate ones behind the same host.
 servers:
   - url: http://127.0.0.1:8080
     description: The mini venue on a laptop, after `deploy/laptop.sh web`
@@ -22,9 +25,9 @@ security:
   - devToken: []
 tags:
   - name: markets
-    description: Public reference data and books
+    description: Public reference data and books. The public half; no login.
   - name: account
-    description: The authenticated account's orders, positions and sleeve
+    description: The authenticated account's orders, positions and sleeve. The private half.
 paths:
   /v4/markets:
     get:
