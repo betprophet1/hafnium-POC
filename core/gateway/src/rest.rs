@@ -2,7 +2,7 @@
 //! request and writes the response; nothing here waits, and a request that goes to the node is answered when the
 //! node answers it.
 
-use crate::api::{parse_id, ApiError, Gateway, Pending};
+use crate::api::{parse_id, ApiError, Gateway, Half, Pending};
 use crate::http::{self, Request};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
@@ -58,6 +58,10 @@ pub fn route(gateway: &Gateway, request: &Request, notify: &Notify) -> Routed {
 }
 
 fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Result<Routed, ApiError> {
+    // A path of the other half is not served here, as if it did not exist (README, public and private).
+    if Half::of(&request.path).is_some_and(|half| half != gateway.half) {
+        return Err(ApiError::not_found("no such route"));
+    }
     let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
     let later = || Some(Arc::clone(notify));
     match (request.method.as_str(), segments.as_slice()) {
@@ -233,6 +237,30 @@ mod tests {
             let (status, placed) = answer.join().expect("a request thread");
             assert_eq!((status, placed["status"].as_str()), (200, Some("accepted")), "{placed}");
         }
+    }
+
+    #[test]
+    fn a_gateway_serving_only_the_public_half_refuses_the_private_one() {
+        let venue = testing::venue_serving("rest-public-only", true, false);
+        let a = &venue.address;
+        assert_eq!(request(a, "GET", "/healthz", None, None).0, 200);
+        assert_eq!(request(a, "GET", "/v4/markets", None, None).0, 200);
+        assert_eq!(request(a, "GET", "/v4/account", Some(MAKER_TOKEN), None).0, 404);
+        assert_eq!(request(a, "POST", "/v4/orders", Some(MAKER_TOKEN), Some(&order("public-only"))).0, 404);
+        assert!(tungstenite::connect(&venue.ws_private).is_err(), "a public-only gateway took a private session");
+        assert!(tungstenite::connect(&venue.ws_public).is_ok(), "a public-only gateway refused a public session");
+    }
+
+    #[test]
+    fn a_gateway_serving_only_the_private_half_refuses_the_public_one() {
+        let venue = testing::venue_serving("rest-private-only", false, true);
+        let a = &venue.address;
+        assert_eq!(request(a, "GET", "/healthz", None, None).0, 200);
+        assert_eq!(request(a, "GET", "/v4/markets", None, None).0, 404);
+        assert_eq!(request(a, "GET", &format!("/v4/markets/{MARKET}/book"), None, None).0, 404);
+        assert_eq!(request(a, "GET", "/v4/account", Some(MAKER_TOKEN), None).0, 200);
+        assert!(tungstenite::connect(&venue.ws_public).is_err(), "a private-only gateway took a public session");
+        assert!(tungstenite::connect(&venue.ws_private).is_ok(), "a private-only gateway refused a private session");
     }
 
     #[test]

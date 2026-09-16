@@ -27,11 +27,13 @@ pub const RETAIL_TOKEN: &str = "dev-retail-customer";
 pub const MAX_BEHIND: usize = 256 * 1024;
 
 pub struct Venue {
+    /// The private half: orders and accounts.
     pub gateway: Arc<Gateway>,
     /// Where the gateway listens, as `host:port`, for REST.
     pub address: String,
-    /// Where the gateway's WebSocket is served, as a client would dial it.
-    pub ws_url: String,
+    /// Where each half's WebSocket is served, as a client would dial it.
+    pub ws_public: String,
+    pub ws_private: String,
 }
 
 fn free_address() -> String {
@@ -86,8 +88,15 @@ fn start_node(name: &str) -> (String, String) {
     panic!("no test node for {name} could start in five attempts");
 }
 
-/// A seeded node and a serving gateway, both private to the test that asked. `name` keeps data directories apart.
+/// A seeded node and a gateway serving both halves, both private to the test that asked. `name` keeps data
+/// directories apart.
 pub fn venue(name: &str) -> Venue {
+    venue_serving(name, true, true)
+}
+
+/// The same, with the gateway process serving only the halves asked for, as `--serve` does. Both halves' gateways
+/// still follow the feed, so a test can look at either.
+pub fn venue_serving(name: &str, public: bool, private: bool) -> Venue {
     let (ingress, feed) = start_node(name);
     // Sends wait for the forwarder's first connection, so seeding can start before the node is listening.
     let seeder = Submit::spawn(&ingress);
@@ -97,26 +106,27 @@ pub fn venue(name: &str) -> Venue {
         seeder.send(input).expect("seeded");
     }
     let limits = Limits { per_second: 1_000_000, burst: 1_000_000, logons_per_minute: 1_000_000 };
-    let hub = Hub::new(Catalogue::load(CATALOGUE).expect("the mini venue's catalogue"));
-    let gateway = Arc::new(Gateway::new(hub, Submit::spawn(&ingress), limits));
-    crate::follow_feed(&gateway, feed);
-    crate::conflate(&gateway);
+    let hub = || Hub::new(Catalogue::load(CATALOGUE).expect("the mini venue's catalogue"));
+    let gateway = crate::start_half(Gateway::private(hub(), Submit::spawn(&ingress), limits), &feed);
+    let public_half = crate::start_half(Gateway::public(hub(), limits), &feed);
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
     let address = listener.local_addr().expect("its address").to_string();
-    let ws_url = format!("ws://{address}/v4/ws");
-    {
-        let gateway = Arc::clone(&gateway);
-        thread::spawn(move || crate::serve_with(&gateway, &listener, MAX_BEHIND));
-    }
-    // Up to ten seconds for the feed to deliver the listing, counted in waits rather than read off a clock.
+    let halves = crate::Halves {
+        public: public.then(|| Arc::clone(&public_half)),
+        private: private.then(|| Arc::clone(&gateway)),
+    };
+    thread::spawn(move || crate::serve_with(&halves, &listener, MAX_BEHIND));
+    // Up to ten seconds for the feed to deliver the listing to both halves, counted in waits rather than read off a
+    // clock.
     for wait in 0.. {
-        if gateway.hub().market(MARKET).is_some() {
+        if gateway.hub().market(MARKET).is_some() && public_half.hub().market(MARKET).is_some() {
             break;
         }
         assert!(wait < 500, "the feed never listed market {MARKET}");
         thread::sleep(Duration::from_millis(20));
     }
-    Venue { gateway, address, ws_url }
+    let (ws_public, ws_private) = (format!("ws://{address}/v4/ws_public"), format!("ws://{address}/v4/ws_private"));
+    Venue { gateway, address, ws_public, ws_private }
 }
 
 /// Waits up to five seconds, in 20 ms steps, for `ready` to hold.

@@ -44,6 +44,7 @@ pub struct Pending {
     inner: submit::Pending,
 }
 
+#[derive(Clone, Copy)]
 pub struct Limits {
     pub per_second: u32,
     pub burst: u32,
@@ -185,24 +186,73 @@ const ORDER_FIELDS: [&str; 15] = [
 
 const MAX_CENTS: u64 = i64::MAX as u64;
 
+/// The two halves of interface 1 (interfaces/gateway/README.md, public and private), told apart by path alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Half {
+    /// Market data for everyone: no login, and never a request to the node.
+    Public,
+    /// One account's orders and everything that happens to them.
+    Private,
+}
+
+impl Half {
+    /// Where this half's WebSocket is served.
+    pub const fn websocket(self) -> &'static str {
+        match self {
+            Self::Public => "/v4/ws_public",
+            Self::Private => "/v4/ws_private",
+        }
+    }
+
+    /// The half a request path belongs to, or `None` for one both halves answer (`/healthz`) or neither does.
+    pub fn of(path: &str) -> Option<Self> {
+        let path = path.split('?').next().unwrap_or("");
+        match path {
+            "/v4/ws_public" | "/v4/markets" => Some(Self::Public),
+            "/v4/ws_private" | "/v4/account" | "/v4/orders" => Some(Self::Private),
+            p if p.starts_with("/v4/markets/") => Some(Self::Public),
+            p if p.starts_with("/v4/orders/") => Some(Self::Private),
+            _ => None,
+        }
+    }
+}
+
 pub struct Gateway {
+    pub half: Half,
     hub: Mutex<Hub>,
-    /// Pipelined, so no client waits on another's round trip to the node.
-    ingress: Submit,
+    /// Pipelined, so no client waits on another's round trip to the node. The public half has none: nothing it
+    /// serves ever reaches the node (blueprint §9).
+    ingress: Option<Submit>,
     pub limits: Limits,
     rest_buckets: Mutex<BTreeMap<u64, Bucket>>,
     logon_buckets: Mutex<BTreeMap<u64, Bucket>>,
 }
 
 impl Gateway {
-    pub fn new(hub: Hub, ingress: Submit, limits: Limits) -> Self {
+    /// The public half: market data from `hub`, which follows the node's feed.
+    pub fn public(hub: Hub, limits: Limits) -> Self {
+        Self::new(Half::Public, hub, None, limits)
+    }
+
+    /// The private half: orders to the node through `ingress`, and each account's messages from `hub`.
+    pub fn private(hub: Hub, ingress: Submit, limits: Limits) -> Self {
+        Self::new(Half::Private, hub, Some(ingress), limits)
+    }
+
+    fn new(half: Half, hub: Hub, ingress: Option<Submit>, limits: Limits) -> Self {
         Self {
+            half,
             hub: Mutex::new(hub),
             ingress,
             limits,
             rest_buckets: Mutex::new(BTreeMap::new()),
             logon_buckets: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// The node's ingress, which only the private half has.
+    fn ingress(&self) -> Result<&Submit, ApiError> {
+        self.ingress.as_ref().ok_or_else(|| ApiError::not_found("orders are served on the private half"))
     }
 
     pub fn hub(&self) -> MutexGuard<'_, Hub> {
@@ -232,7 +282,7 @@ impl Gateway {
     /// time. The account travels with it because the results are only an answer once they have been made into one.
     /// `notify` is called once they can be taken, for a caller that waits on many requests at once.
     fn submit(&self, account: u64, input: Value, answer: Answer, notify: Option<Notify>) -> Result<Pending, ApiError> {
-        let inner = self.ingress.submit_notifying(input, notify).map_err(|e| {
+        let inner = self.ingress()?.submit_notifying(input, notify).map_err(|e| {
             eprintln!("gateway: ingress: {e}");
             unavailable()
         })?;
@@ -248,7 +298,7 @@ impl Gateway {
     }
 
     fn send(&self, input: Value) -> Result<Vec<Value>, ApiError> {
-        self.ingress.send(input).map_err(|e| {
+        self.ingress()?.send(input).map_err(|e| {
             eprintln!("gateway: ingress: {e}");
             unavailable()
         })

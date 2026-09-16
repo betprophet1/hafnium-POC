@@ -365,8 +365,8 @@ impl Stream {
     }
 }
 
-/// The maker's loop over a WebSocket session. Books and its own orders arrive as messages and actions go out as session
-/// ops. When the session ends the gateway cancels its quotes, and the loop logs in again, cancels whatever an earlier
+/// The maker's loop over two WebSocket sessions: its own orders arrive on the private one, where its actions go out as
+/// session ops, and books and market states on the public one. When the session ends the gateway cancels its quotes, and the loop logs in again, cancels whatever an earlier
 /// session left resting, and starts from a fresh snapshot.
 fn run_session(api: &Api, gateway: &str, token: &str, interval: Duration, who: &str, plan: &mut Plan<'_>) -> ! {
     loop {
@@ -387,6 +387,8 @@ fn session_pass(
 ) -> Result<(), Error> {
     let (mut session, welcome) = Session::open(gateway, token, HEARTBEAT_SECONDS)?;
     eprintln!("{who}: session {} logged in", welcome["sessionId"].as_str().unwrap_or("?"));
+    // Books and market states come on a public session of their own: the private one carries only this account.
+    let mut market = Session::watch(gateway)?;
     let mut markets = markets(api)?;
     // Cancel-on-disconnect covers one session's orders, and only while its gateway lives to send the MassCancel: a
     // gateway that died took an earlier session's orders' cover with it (interface 1 README, sessions). Cancelling
@@ -399,7 +401,7 @@ fn session_pass(
     }
     let mut stream = Stream { sequence: id(&welcome["sequence"]), ..Stream::default() };
     stream.restart(account(api)?);
-    session.send(&json!({"op": "subscribe", "topics": ["markets"]}))?;
+    market.send(&json!({"op": "subscribe", "topics": ["markets"]}))?;
     let mut followed: BTreeSet<u64> = BTreeSet::new();
     let (mut sent, mut waited) = (0u64, 0u32);
     let mut next_plan = session::monotonic();
@@ -410,9 +412,11 @@ fn session_pass(
             .map(|m| format!("book.{}", m.id))
             .collect();
         if !unfollowed.is_empty() {
-            session.send(&json!({"op": "subscribe", "topics": unfollowed, "depth": 10}))?;
+            market.send(&json!({"op": "subscribe", "topics": unfollowed, "depth": 10}))?;
         }
-        for message in session.poll(Duration::from_millis(100))? {
+        for message in
+            session.poll(Duration::from_millis(50))?.into_iter().chain(market.poll(Duration::from_millis(50))?)
+        {
             stream.apply(&message);
         }
         if stream.markets_changed {

@@ -14,6 +14,7 @@ mod ws;
 
 use api::{Gateway, Limits};
 use hub::Hub;
+use reactor::Reactors;
 use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::process::ExitCode;
@@ -25,10 +26,12 @@ use venue_link::submit::Submit;
 use venue_link::wire::{self, Error};
 
 const USAGE: &str = "usage:
-  venue-gateway --ingress ADDR --feed ADDR --catalogue FILE [--listen 127.0.0.1:8081]
+  venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--listen 127.0.0.1:8081]
                 [--per-second 200] [--burst 400] [--logons-per-minute 30]
 
-REST on /v4/..., WebSocket on /v4/ws. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
+--serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
+/v4/ws_public and GET /v4/markets; private is orders and accounts on /v4/ws_private, /v4/account and /v4/orders,
+and needs --ingress. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
 struct Args(BTreeMap<String, String>);
 
@@ -78,13 +81,50 @@ fn run(args: &Args) -> Result<(), Error> {
         burst: args.number("burst", 400)?,
         logons_per_minute: args.number("logons-per-minute", 30)?,
     };
-    let gateway = Arc::new(Gateway::new(Hub::new(catalogue), Submit::spawn(&args.get("ingress", None)?), limits));
-    follow_feed(&gateway, args.get("feed", None)?);
-    conflate(&gateway);
+    let serving = args.get("serve", Some("both"))?;
+    let (public, private) = match serving.as_str() {
+        "both" => (true, true),
+        "public" => (true, false),
+        "private" => (false, true),
+        other => return Err(format!("--serve must be public, private or both, not {other}").into()),
+    };
+    let feed = args.get("feed", None)?;
+    let catalogue_file = args.get("catalogue", None)?;
+    let halves = Halves {
+        public: if public {
+            Some(start_half(Gateway::public(Hub::new(Catalogue::load(&catalogue_file)?), limits), &feed))
+        } else {
+            None
+        },
+        private: if private {
+            let ingress = Submit::spawn(&args.get("ingress", None)?);
+            Some(start_half(Gateway::private(Hub::new(catalogue), ingress, limits), &feed))
+        } else {
+            None
+        },
+    };
     let listener = TcpListener::bind(args.get("listen", Some("127.0.0.1:8081"))?)?;
-    eprintln!("gateway on {}: REST /v4, WebSocket /v4/ws", listener.local_addr()?);
-    serve(&gateway, &listener);
+    eprintln!(
+        "gateway on {}: serving {serving} (public /v4/ws_public, private /v4/ws_private)",
+        listener.local_addr()?
+    );
+    serve(&halves, &listener);
     Ok(())
+}
+
+/// The halves of interface 1 one process serves (interfaces/gateway/README.md, public and private). Each is a gateway
+/// of its own: its own view of the venue from the feed, its own lock, and its own loops.
+struct Halves {
+    public: Option<Arc<Gateway>>,
+    private: Option<Arc<Gateway>>,
+}
+
+/// A half that follows the node's feed and sends its book subscribers what changed.
+fn start_half(gateway: Gateway, feed: &str) -> Arc<Gateway> {
+    let gateway = Arc::new(gateway);
+    follow_feed(&gateway, feed.to_string());
+    conflate(&gateway);
+    gateway
 }
 
 /// Keeps the hub's view of the venue current from the node's feed, reconnecting for ever.
@@ -109,24 +149,32 @@ fn conflate(gateway: &Arc<Gateway>) {
 /// busy market data, far more than a client that is reading ever holds.
 const MAX_BEHIND: usize = 4 * 1024 * 1024;
 
-/// Accepts connections for ever and hands each one to an event loop, which serves it whether it is a WebSocket
-/// session or a REST request.
-fn serve(gateway: &Arc<Gateway>, listener: &TcpListener) {
-    serve_with(gateway, listener, MAX_BEHIND);
+/// Accepts connections for ever and hands each one to an event loop of the half it is for, which serves it whether it
+/// is a WebSocket session or a REST request.
+fn serve(halves: &Halves, listener: &TcpListener) {
+    serve_with(halves, listener, MAX_BEHIND);
 }
 
 /// `serve`, with a WebSocket client allowed to fall `max_behind` bytes behind.
-fn serve_with(gateway: &Arc<Gateway>, listener: &TcpListener, max_behind: usize) {
+fn serve_with(halves: &Halves, listener: &TcpListener, max_behind: usize) {
     let threads = thread::available_parallelism().map_or(2, |n| n.get().min(4));
-    let reactors = match reactor::Reactors::start(gateway, threads, max_behind) {
-        Ok(reactors) => reactors,
-        Err(e) => {
-            eprintln!("venue-gateway: event loops: {e}");
-            return;
-        }
-    };
+    let start = |gateway: &Arc<Gateway>| Reactors::start(gateway, threads, max_behind);
+    let (public, private) =
+        match (halves.public.as_ref().map(start).transpose(), halves.private.as_ref().map(start).transpose()) {
+            (Ok(public), Ok(private)) => (public, private),
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("venue-gateway: event loops: {e}");
+                return;
+            }
+        };
+    if let (Some(public), Some(private)) = (&public, &private) {
+        Reactors::join(public, private);
+    }
+    // With both halves, a connection lands on the private half's loops first: a trader's connection is never taken
+    // on by loops busy fanning out market data, and a viewer's moves on after one look at its request line.
+    let Some(first) = private.or(public) else { return };
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        reactors.adopt(stream);
+        first.adopt(stream);
     }
 }

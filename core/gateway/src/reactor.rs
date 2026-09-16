@@ -11,22 +11,24 @@
 //! puts the connection's token on that loop's ready list and wakes it, unless a wake is already on its way. A book
 //! reaching five thousand subscribers costs each loop one wakeup, not five thousand.
 //!
-//! A connection arrives undecided. Its first bytes say what it is: a WebSocket upgrade becomes a session (`ws.rs`),
-//! anything else one REST request (`rest.rs`), answered — at once, or when the node answers — and closed. This file
-//! only reads, writes and waits.
+//! Each half of interface 1, public and private, has loops of its own, so that fanning market data out to every viewer
+//! never holds up an order's answer. A connection arrives undecided, and its request line says what it is: a path of
+//! the other half goes to that half's loops, a WebSocket upgrade becomes a session (`ws.rs`), and anything else one
+//! REST request (`rest.rs`), answered — at once, or when the node answers — and closed. This file only reads, writes
+//! and waits.
 
-use crate::api::{Gateway, Pending};
+use crate::api::{Gateway, Half, Pending};
 use crate::hub::Outbox;
 use crate::limits::monotonic;
 use crate::ws::{self, Session};
 use crate::{http, rest};
 use mio::net::TcpStream as Stream;
-use mio::{Events, Interest, Poll, Token, Waker};
+use mio::{Events, Interest, Poll, Registry, Token, Waker};
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 use tungstenite::handshake::server::{NoCallback, ServerHandshake};
@@ -52,9 +54,6 @@ const READ_BUFFER: usize = 4 * 1024;
 /// How long a connection has to say what it is, complete a WebSocket handshake, or send a whole REST request. A
 /// client that trickles its bytes holds only its buffers while it does, but it does not hold them for ever.
 const ARRIVAL: Duration = Duration::from_secs(10);
-
-/// What every WebSocket upgrade request starts with, and nothing else the gateway serves does.
-const WS: &[u8] = b"GET /v4/ws";
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -84,31 +83,42 @@ impl Shared {
     }
 }
 
-/// The loops, and a way to give one of them a connection.
+/// One half's loops, and a way to give one of them a connection.
 pub struct Reactors {
     loops: Vec<Arc<Shared>>,
     next: AtomicUsize,
+    /// The other half's loops, when this process serves both halves: a connection for that half is handed to them.
+    other: OnceLock<Arc<Reactors>>,
 }
 
 impl Reactors {
-    /// Starts `threads` loops serving connections for `gateway`. A WebSocket client more than `max_behind` bytes
-    /// behind on what it has been sent is disconnected.
-    pub fn start(gateway: &Arc<Gateway>, threads: usize, max_behind: usize) -> std::io::Result<Self> {
-        let mut loops = Vec::new();
+    /// Starts `threads` loops serving connections for `gateway`'s half. A WebSocket client more than `max_behind`
+    /// bytes behind on what it has been sent is disconnected.
+    pub fn start(gateway: &Arc<Gateway>, threads: usize, max_behind: usize) -> std::io::Result<Arc<Self>> {
+        let (mut polls, mut loops) = (Vec::new(), Vec::new());
         for _ in 0..threads.max(1) {
             let poll = Poll::new()?;
             let waker = Waker::new(poll.registry(), WAKER)?;
-            let shared = Arc::new(Shared {
+            loops.push(Arc::new(Shared {
                 waker,
                 ready: Mutex::new(Vec::new()),
                 incoming: Mutex::new(Vec::new()),
                 woken: AtomicBool::new(false),
-            });
-            let (gateway, own) = (Arc::clone(gateway), Arc::clone(&shared));
-            thread::spawn(move || run(poll, &own, &gateway, max_behind));
-            loops.push(shared);
+            }));
+            polls.push(poll);
         }
-        Ok(Self { loops, next: AtomicUsize::new(0) })
+        let reactors = Arc::new(Self { loops, next: AtomicUsize::new(0), other: OnceLock::new() });
+        for (poll, shared) in polls.into_iter().zip(&reactors.loops) {
+            let (gateway, own, reactors) = (Arc::clone(gateway), Arc::clone(shared), Arc::clone(&reactors));
+            thread::spawn(move || run(poll, &own, &reactors, &gateway, max_behind));
+        }
+        Ok(reactors)
+    }
+
+    /// Joins the loops of the two halves, so each hands the other the connections that belong to it.
+    pub fn join(public: &Arc<Self>, private: &Arc<Self>) {
+        let _ = public.other.set(Arc::clone(private));
+        let _ = private.other.set(Arc::clone(public));
     }
 
     /// Hands a newly accepted connection to one of the loops.
@@ -152,7 +162,7 @@ struct Conn {
 }
 
 /// One loop, for ever.
-fn run(mut poll: Poll, shared: &Arc<Shared>, gateway: &Arc<Gateway>, max_behind: usize) {
+fn run(mut poll: Poll, shared: &Arc<Shared>, reactors: &Reactors, gateway: &Arc<Gateway>, max_behind: usize) {
     let mut events = Events::with_capacity(1024);
     let mut conns: Vec<Option<Conn>> = Vec::new();
     let mut free: Vec<usize> = Vec::new();
@@ -188,7 +198,7 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, gateway: &Arc<Gateway>, max_behind:
         due.dedup();
         for token in due {
             let alive = match conns.get_mut(token).and_then(Option::as_mut) {
-                Some(conn) => serve(gateway, conn, max_behind),
+                Some(conn) => serve(gateway, conn, max_behind, poll.registry(), reactors),
                 None => continue,
             };
             if !alive {
@@ -253,42 +263,75 @@ fn take_on(
 }
 
 /// Does everything a connection has waiting, and says whether it is still worth keeping.
-fn serve(gateway: &Arc<Gateway>, conn: &mut Conn, max_behind: usize) -> bool {
+fn serve(gateway: &Arc<Gateway>, conn: &mut Conn, max_behind: usize, registry: &Registry, reactors: &Reactors) -> bool {
     if matches!(conn.socket, Some(Socket::Undecided(_))) {
-        let Some(Socket::Undecided(stream)) = conn.socket.take() else { return false };
-        let mut head = [0u8; WS.len()];
-        conn.socket = match stream.peek(&mut head) {
-            Ok(0) => return false,
-            // A prefix of an upgrade so far: the next bytes decide.
-            Ok(n) if n < WS.len() && head[..n] == WS[..n] => {
-                conn.socket = Some(Socket::Undecided(stream));
-                return true;
-            }
-            Ok(n) if n == WS.len() && head == *WS => {
-                match tungstenite::accept_with_config(stream, Some(socket_config(max_behind))) {
-                    Ok(ws) => Some(Socket::Open(ws)),
-                    Err(HandshakeError::Interrupted(mid)) => Some(Socket::Handshake(mid)),
-                    Err(HandshakeError::Failure(_)) => return false,
-                }
-            }
-            Ok(_) => Some(Socket::Http(Http {
-                stream,
-                request: Vec::new(),
-                pending: None,
-                response: Vec::new(),
-                written: 0,
-            })),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                conn.socket = Some(Socket::Undecided(stream));
-                return true;
-            }
-            Err(_) => return false,
-        };
+        match decide(gateway, conn, max_behind, registry, reactors) {
+            Decided::Waiting => return true,
+            Decided::Gone => return false,
+            Decided::Here => {}
+        }
     }
     if let Some(Socket::Http(request)) = conn.socket.as_mut() {
         return serve_http(gateway, request, &conn.notify);
     }
     serve_ws(gateway, conn)
+}
+
+enum Decided {
+    /// Not all of its request line has arrived.
+    Waiting,
+    /// Closed, refused, or handed to the other half's loops.
+    Gone,
+    /// Served by this loop from now on.
+    Here,
+}
+
+/// Settles what a new connection is from its request line, read without taking it from the socket so that whatever
+/// serves the connection reads the request whole. This half's WebSocket upgrade becomes a session. A path of the other
+/// half goes to that half's loops if this process serves it; if not, it is a REST request here, which is refused as a
+/// route this half does not have. Anything else is one REST request.
+fn decide(gateway: &Gateway, conn: &mut Conn, max_behind: usize, registry: &Registry, reactors: &Reactors) -> Decided {
+    let Some(Socket::Undecided(mut stream)) = conn.socket.take() else { return Decided::Gone };
+    let mut head = [0u8; http::MAX_LINE];
+    let n = match stream.peek(&mut head) {
+        Ok(0) => return Decided::Gone,
+        Ok(n) => n,
+        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+            conn.socket = Some(Socket::Undecided(stream));
+            return Decided::Waiting;
+        }
+        Err(_) => return Decided::Gone,
+    };
+    let line = match head[..n].iter().position(|&b| b == b'\n') {
+        Some(end) => &head[..end],
+        None if n < head.len() => {
+            conn.socket = Some(Socket::Undecided(stream));
+            return Decided::Waiting;
+        }
+        // Longer than a request line may be: a REST request, which is refused as one.
+        None => &head[..0],
+    };
+    let line = String::from_utf8_lossy(line);
+    let mut words = line.split_whitespace();
+    let method = words.next().unwrap_or("");
+    let path = words.next().unwrap_or("").split('?').next().unwrap_or("");
+    if let (Some(half), Some(other)) = (Half::of(path), reactors.other.get()) {
+        if half != gateway.half {
+            let _ = registry.deregister(&mut stream);
+            other.adopt(TcpStream::from(stream));
+            return Decided::Gone;
+        }
+    }
+    conn.socket = Some(if method == "GET" && path == gateway.half.websocket() {
+        match tungstenite::accept_with_config(stream, Some(socket_config(max_behind))) {
+            Ok(ws) => Socket::Open(ws),
+            Err(HandshakeError::Interrupted(mid)) => Socket::Handshake(mid),
+            Err(HandshakeError::Failure(_)) => return Decided::Gone,
+        }
+    } else {
+        Socket::Http(Http { stream, request: Vec::new(), pending: None, response: Vec::new(), written: 0 })
+    });
+    Decided::Here
 }
 
 /// A REST connection: read until the request is whole, answer it — now, or when the node has — write the response,

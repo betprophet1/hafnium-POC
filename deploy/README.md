@@ -19,8 +19,9 @@ deploy/laptop.sh up     # build, install, seed, smoke test
 deploy/laptop.sh web    # then open http://127.0.0.1:8080
 ```
 
-The page has an order book and three tabs. The market maker and retail customer tabs are WebSocket sessions on the
-gateway, each logged in with its account's dev token; settlement drives the dummy oracle (start, suspend, end, close,
+The page has an order book and three tabs. The market maker and retail customer tabs are private WebSocket sessions on
+the gateway (`/v4/ws_private`), each logged in with its account's dev token, and the book comes from a public one
+(`/v4/ws_public`); settlement drives the dummy oracle (start, suspend, end, close,
 resolve, void, and list a new round). The synthetic maker quotes over a WebSocket session with cancel-on-disconnect
 (delete its pod and its quotes leave the book until the new pod logs in), and the synthetic taker trades over REST.
 The same port also serves the gateway itself under `/v4`:

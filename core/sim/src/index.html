@@ -241,10 +241,12 @@ function wantedTopics() {
   return topics;
 }
 
-/// Market data rides on the market maker's session: the book and trades of the selected market, and market states.
+/// Market data has a session of its own on the public endpoint, with no login: the books of the selected event, the
+/// trades of the selected market, and market states. The trading sessions carry only their own accounts.
+const feed = {ws: null, open: false, topics: new Set()};
 function subscribeMarket() {
-  const s = sessions.maker;
-  if (!s || !s.open) return;
+  const s = feed;
+  if (!s.open) return;
   const want = wantedTopics();
   const drop = [...s.topics].filter(t => !want.has(t)), add = [...want].filter(t => !s.topics.has(t));
   if (drop.length) s.ws.send(JSON.stringify({op: 'unsubscribe', topics: drop}));
@@ -254,12 +256,48 @@ function subscribeMarket() {
 
 // ------------------------------------------------------------------------------------------ sessions
 
+function openFeed() {
+  const connect = () => {
+    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/v4/ws_public');
+    feed.ws = ws;
+    ws.onopen = () => {
+      feed.open = true;
+      subscribeMarket();
+      // Answered by the gateway, so the page's server never takes a quiet market for a gateway that has gone.
+      feed.beat = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({op: 'heartbeat', id: 'heartbeat'}));
+      }, 15000);
+    };
+    ws.onmessage = m => onFeed(JSON.parse(m.data));
+    ws.onclose = () => {
+      clearInterval(feed.beat);
+      feed.open = false; feed.topics = new Set(); setTimeout(connect, 1500);
+    };
+  };
+  connect();
+}
+
+function onFeed(msg) {
+  switch (msg.type) {
+    case 'error': toast(`${words(msg.error.code)}: ${msg.error.message}`, 'bad'); break;
+    case 'book': applyBook(msg); if (msg.instrumentId === selInst) renderBook(); renderPills(); renderRetail(); break;
+    case 'trade': {
+      const list = trades[msg.instrumentId] = trades[msg.instrumentId] || [];
+      list.unshift(msg);
+      list.length = Math.min(list.length, 40);
+      if (msg.instrumentId === selInst) renderTrades();
+      break;
+    }
+    case 'market': loadMarkets(); break;
+  }
+}
+
 function openSession(name) {
   const account = C.accounts.find(a => a.tab === name);
   if (!account) return;
-  const s = sessions[name] = {name, token: account.token, label: account.name, id: String(account.id), ws: null, open: false, account: null, topics: new Set(), last: null, refresh: 0};
+  const s = sessions[name] = {name, token: account.token, label: account.name, id: String(account.id), ws: null, open: false, account: null, last: null, refresh: 0};
   const connect = () => {
-    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/v4/ws');
+    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/v4/ws_private');
     s.ws = ws;
     ws.onopen = () => {
       const login = {op: 'login', id: 'login', token: s.token};
@@ -273,7 +311,7 @@ function openSession(name) {
     ws.onmessage = m => onMessage(s, JSON.parse(m.data));
     ws.onclose = () => {
       clearInterval(s.beat);
-      s.open = false; s.topics = new Set(); renderStatus(); setTimeout(connect, 1500);
+      s.open = false; renderStatus(); setTimeout(connect, 1500);
     };
   };
   connect();
@@ -288,13 +326,12 @@ async function refreshAccount(s) {
 function soon(s) { clearTimeout(s.refresh); s.refresh = setTimeout(() => refreshAccount(s), 150); }
 
 function onMessage(s, msg) {
-  if (msg.sequence && msg.type !== 'book') s.last = later(s.last, msg.sequence);
+  if (msg.sequence) s.last = later(s.last, msg.sequence);
   switch (msg.type) {
     case 'welcome':
       s.open = true;
       renderStatus();
       refreshAccount(s);
-      if (s.name === 'maker') subscribeMarket();
       break;
     case 'resync': refreshAccount(s); break;
     case 'reply': if (msg.id === 'heartbeat') break; report(msg.result); soon(s); break;
@@ -319,15 +356,6 @@ function onMessage(s, msg) {
       soon(s);
       break;
     case 'release': toast(`${s.label}: complete sets returned ${money(msg.cents)}`, 'ok'); soon(s); break;
-    case 'book': applyBook(msg); if (msg.instrumentId === selInst) renderBook(); renderPills(); renderRetail(); break;
-    case 'trade': {
-      const list = trades[msg.instrumentId] = trades[msg.instrumentId] || [];
-      list.unshift(msg);
-      list.length = Math.min(list.length, 40);
-      if (msg.instrumentId === selInst) renderTrades();
-      break;
-    }
-    case 'market': loadMarkets(); break;
   }
 }
 
@@ -594,6 +622,7 @@ document.addEventListener('input', ev => { if (ev.target.id === 'rQty' || ev.tar
 
 (async function start() {
   C = await (await fetch('/api/config')).json();
+  openFeed();
   openSession('maker');
   openSession('retail');
   await loadMarkets();

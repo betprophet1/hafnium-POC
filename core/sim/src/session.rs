@@ -1,5 +1,6 @@
-//! A client session on the gateway's WebSocket (interfaces/gateway/asyncapi.yaml), as the synthetic maker uses it: one
-//! login with cancel-on-disconnect and a heartbeat, requests matched to replies by `id`, everything else kept in order.
+//! A client session on the gateway's WebSocket (interfaces/gateway/asyncapi.yaml), as the synthetic maker uses it: on
+//! the private endpoint, one login with cancel-on-disconnect and a heartbeat; on the public endpoint, market data with
+//! no login. Requests are matched to replies by `id`, and everything else is kept in order.
 
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -37,21 +38,26 @@ pub struct Session {
 }
 
 impl Session {
-    /// Connects and logs in. The gateway cancels this session's resting orders when it ends, and when it has been
-    /// silent for `heartbeat_seconds` (interfaces/gateway/README.md, sessions).
-    pub fn open(gateway: &str, token: &str, heartbeat_seconds: u64) -> Result<(Self, Value), Error> {
+    /// Connects to one of the gateway's two WebSocket endpoints (interfaces/gateway/README.md, public and private).
+    fn connect(gateway: &str, path: &str, heartbeat: Duration) -> Result<Self, Error> {
         let stream = connect(gateway)?;
         stream.set_nodelay(true)?;
-        let (socket, _) = tungstenite::client(format!("ws://{gateway}/v4/ws"), stream)
+        let (socket, _) = tungstenite::client(format!("ws://{gateway}{path}"), stream)
             .map_err(|e| format!("websocket handshake: {e}"))?;
         socket.get_ref().set_read_timeout(Some(Duration::from_millis(50)))?;
-        let mut session = Self {
-            socket,
-            inbox: VecDeque::new(),
-            next_id: 0,
-            last_sent: monotonic(),
-            heartbeat: Duration::from_secs(heartbeat_seconds.max(1)),
-        };
+        Ok(Self { socket, inbox: VecDeque::new(), next_id: 0, last_sent: monotonic(), heartbeat })
+    }
+
+    /// A session on the public endpoint, for market data: no login. It heartbeats anyway, so a gateway that has gone
+    /// is noticed as a failed send rather than taken for a quiet market.
+    pub fn watch(gateway: &str) -> Result<Self, Error> {
+        Self::connect(gateway, "/v4/ws_public", Duration::from_secs(30))
+    }
+
+    /// Connects to the private endpoint and logs in. The gateway cancels this session's resting orders when it ends,
+    /// and when it has been silent for `heartbeat_seconds` (interfaces/gateway/README.md, sessions).
+    pub fn open(gateway: &str, token: &str, heartbeat_seconds: u64) -> Result<(Self, Value), Error> {
+        let mut session = Self::connect(gateway, "/v4/ws_private", Duration::from_secs(heartbeat_seconds.max(1)))?;
         let login =
             json!({"op": "login", "token": token, "cancelOnDisconnect": true, "heartbeatSeconds": heartbeat_seconds});
         let welcome = session.request(login)?;

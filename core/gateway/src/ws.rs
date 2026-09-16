@@ -4,7 +4,7 @@
 //! and never waits: `reactor.rs` serves the connections, reads what arrives, writes what this returns, and comes
 //! back when a session's `notify` says a reply or a message is waiting.
 
-use crate::api::{only, parse_id, ApiError, Gateway, Pending};
+use crate::api::{only, parse_id, ApiError, Gateway, Half, Pending};
 use crate::hub::{id, Outbox};
 use crate::limits::{monotonic, Bucket};
 use serde_json::{json, Map, Value};
@@ -196,6 +196,15 @@ fn topics(message: &Map<String, Value>) -> Result<Vec<String>, ApiError> {
 fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<Vec<String>, ApiError> {
     let request_id = message.get("id").cloned().unwrap_or(Value::Null);
     let op = message.get("op").and_then(Value::as_str).ok_or_else(|| ApiError::bad("every message needs an op"))?;
+    // Market data and order entry are separate endpoints, possibly separate gateways (README, public and private).
+    let belongs = match op {
+        "subscribe" | "unsubscribe" => Some(Half::Public),
+        "login" | "order" | "amend" | "cancel" | "cancelAll" => Some(Half::Private),
+        _ => None,
+    };
+    if let Some(half) = belongs.filter(|half| *half != gateway.half) {
+        return Err(ApiError::bad(format!("{op} is served on {}", half.websocket())));
+    }
     match op {
         "heartbeat" => {
             only(message, &["op", "id"])?;
@@ -426,12 +435,13 @@ mod tests {
     #[test]
     fn login_welcomes_the_account_and_a_bad_token_is_refused() {
         let venue = testing::venue("ws-login");
-        let mut client = Client::connect(&venue.ws_url);
+        let mut client = Client::connect(&venue.ws_private);
         client.send(json!({"op": "login", "id": "bad", "token": "no-such-token"}));
         let refused = client.next_answer();
         assert_eq!(refused["type"], "error", "{refused}");
         assert_eq!(refused["id"], "bad");
-        let welcome = client.login(json!({}));
+        // `stream` is deprecated and still accepted.
+        let welcome = client.login(json!({"stream": false}));
         assert_eq!(welcome["id"], "login");
         assert_eq!(welcome["accountId"], "1");
         assert!(welcome["sessionId"].as_str().is_some_and(|s| !s.is_empty()), "{welcome}");
@@ -440,7 +450,7 @@ mod tests {
     #[test]
     fn orders_amendments_and_cancels_are_answered_under_their_ids() {
         let venue = testing::venue("ws-order");
-        let mut client = Client::connect(&venue.ws_url);
+        let mut client = Client::connect(&venue.ws_private);
         client.login(json!({}));
         client.send(order("o1", 4));
         let placed = client.next_answer();
@@ -461,7 +471,7 @@ mod tests {
     #[test]
     fn a_burst_sent_without_waiting_is_answered_in_the_order_it_was_sent() {
         let venue = testing::venue("ws-burst");
-        let mut client = Client::connect(&venue.ws_url);
+        let mut client = Client::connect(&venue.ws_private);
         client.login(json!({}));
         // More than a session may have outstanding at once, so the gateway has to hold some back and still keep order.
         let ids: Vec<String> = (0..100).map(|i| format!("b{i}")).collect();
@@ -478,7 +488,7 @@ mod tests {
     #[test]
     fn cancel_all_is_answered_after_the_orders_sent_before_it() {
         let venue = testing::venue("ws-cancel-all");
-        let mut client = Client::connect(&venue.ws_url);
+        let mut client = Client::connect(&venue.ws_private);
         client.login(json!({}));
         for i in 0..10 {
             client.send(order(&format!("m{i}"), 4));
@@ -496,11 +506,11 @@ mod tests {
     #[test]
     fn a_book_subscription_starts_with_a_snapshot_and_then_carries_changes() {
         let venue = testing::venue("ws-book");
-        let mut watcher = Client::connect(&venue.ws_url);
+        let mut watcher = Client::connect(&venue.ws_public);
         watcher.send(json!({"op": "subscribe", "id": "s", "topics": [format!("book.{MARKET}")]}));
         let image = watcher.next_book(|_| true);
         assert_eq!(image["snapshot"], true, "{image}");
-        let mut trader = Client::connect(&venue.ws_url);
+        let mut trader = Client::connect(&venue.ws_private);
         trader.login(json!({}));
         trader.send(order("t1", 7));
         assert_eq!(trader.next_answer()["result"]["status"], "accepted");
@@ -511,26 +521,45 @@ mod tests {
                     .is_some_and(|c| c.iter().any(|l| l["side"] == "buy" && l["price"]["tick"] == 7))
         });
         assert_eq!(change["instrumentId"], MARKET.to_string(), "{change}");
+        // The trader's own session carries its execution, and nothing public, however long it has been open.
+        trader.send(json!({"op": "heartbeat", "id": "h"}));
+        assert_eq!(trader.next_answer()["id"], "h");
+        trader.execution("t1", "accepted");
+        let public: Vec<&Value> = trader
+            .streamed
+            .iter()
+            .filter(|m| matches!(m["type"].as_str(), Some("book" | "trade" | "market")))
+            .collect();
+        assert!(public.is_empty(), "a private session was sent market data: {public:?}");
     }
 
     #[test]
-    fn a_session_that_is_not_streamed_to_still_gets_its_changes() {
-        let venue = testing::venue("ws-unstreamed");
-        let mut watcher = Client::connect(&venue.ws_url);
-        watcher.login(json!({"stream": false}));
-        watcher.send(json!({"op": "subscribe", "id": "s", "topics": [format!("book.{MARKET}")]}));
-        watcher.next_book(|m| m["snapshot"] == true);
-        let mut trader = Client::connect(&venue.ws_url);
-        trader.login(json!({}));
-        trader.send(order("u1", 8));
-        assert_eq!(trader.next_answer()["result"]["status"], "accepted");
-        watcher.next_book(|m| m["changes"].as_array().is_some_and(|c| c.iter().any(|l| l["price"]["tick"] == 8)));
+    fn each_endpoint_refuses_the_other_ones_ops_and_says_where_they_go() {
+        let venue = testing::venue("ws-halves");
+        let mut public = Client::connect(&venue.ws_public);
+        for op in [json!({"op": "login", "id": "l", "token": MAKER_TOKEN}), order("p1", 4)] {
+            public.send(op);
+            let refused = public.next_answer();
+            assert_eq!(refused["type"], "error", "{refused}");
+            assert!(refused["error"]["message"].as_str().is_some_and(|m| m.contains("/v4/ws_private")), "{refused}");
+        }
+        public.send(json!({"op": "heartbeat", "id": "hp"}));
+        assert_eq!(public.next_answer()["id"], "hp");
+        let mut private = Client::connect(&venue.ws_private);
+        private.login(json!({}));
+        private.send(json!({"op": "subscribe", "id": "s", "topics": [format!("book.{MARKET}")]}));
+        let refused = private.next_answer();
+        assert_eq!((refused["type"].as_str(), refused["id"].as_str()), (Some("error"), Some("s")), "{refused}");
+        assert!(refused["error"]["message"].as_str().is_some_and(|m| m.contains("/v4/ws_public")), "{refused}");
+        // The session carries on after being refused.
+        private.send(order("p2", 4));
+        assert_eq!(private.next_answer()["result"]["status"], "accepted");
     }
 
     #[test]
     fn a_heartbeat_is_answered_and_a_missed_one_cancels_and_closes() {
         let venue = testing::venue("ws-heartbeat");
-        let mut client = Client::connect(&venue.ws_url);
+        let mut client = Client::connect(&venue.ws_private);
         client.login(json!({"heartbeatSeconds": 1}));
         client.send(json!({"op": "heartbeat", "id": "h"}));
         let beat = client.next_answer();
@@ -545,11 +574,11 @@ mod tests {
     #[test]
     fn disconnecting_pulls_orders_only_when_the_session_asked() {
         let venue = testing::venue("ws-disconnect");
-        let mut pulled = Client::connect(&venue.ws_url);
+        let mut pulled = Client::connect(&venue.ws_private);
         pulled.login(json!({"cancelOnDisconnect": true}));
         pulled.send(order("d1", 4));
         let pulled_id: u64 = order_id(&pulled.next_answer()).parse().expect("a numeric order ID");
-        let mut kept = Client::connect(&venue.ws_url);
+        let mut kept = Client::connect(&venue.ws_private);
         kept.send(json!({"op": "login", "id": "login", "token": RETAIL_TOKEN}));
         assert_eq!(kept.next_answer()["type"], "welcome");
         kept.send(order("d2", 4));
@@ -565,7 +594,7 @@ mod tests {
     #[test]
     fn a_client_that_stops_reading_is_disconnected_rather_than_buffered_for() {
         let venue = testing::venue("ws-slow");
-        let mut client = Client::connect(&venue.ws_url);
+        let mut client = Client::connect(&venue.ws_private);
         client.login(json!({}));
         // Replies and executions for these come to megabytes, far past what the gateway lets a client fall behind
         // by (`testing::MAX_BEHIND`) and past the kernel's socket buffers too. The client sends and never reads.
@@ -605,7 +634,7 @@ mod tests {
     #[test]
     fn malformed_messages_get_errors_and_the_session_carries_on() {
         let venue = testing::venue("ws-malformed");
-        let mut client = Client::connect(&venue.ws_url);
+        let mut client = Client::connect(&venue.ws_private);
         client.socket.send(Message::text("not json")).expect("sent");
         assert_eq!(client.next_answer()["type"], "error");
         client.socket.send(Message::binary(vec![1, 2, 3])).expect("sent");

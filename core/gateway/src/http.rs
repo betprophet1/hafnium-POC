@@ -6,7 +6,8 @@
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-const MAX_LINE: usize = 8192;
+/// The longest request line; `reactor.rs` reads no further than this to tell what a connection is.
+pub const MAX_LINE: usize = 8192;
 const MAX_HEADERS: usize = 100;
 /// The most the request line and its headers may take together.
 const MAX_HEAD: usize = MAX_LINE * (MAX_HEADERS + 1);
