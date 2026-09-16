@@ -41,6 +41,36 @@ pub const fn is_parlay_id(id: u64) -> bool {
     id >= ID_BASE && id < 2 * ID_BASE
 }
 
+/// Share of each engine capacity, in percent, past which no parlay is listed. It is the dummy oracle's limit for new
+/// rounds too: each lister checks what the venue already holds, the other's listings included, so between them they
+/// stop short of the ceiling rather than one of them taking the node over it.
+pub const CAPACITY_PERCENT: usize = 95;
+
+/// The engine capacities a listing uses up, from the node's capacity profile.
+#[derive(Clone, Copy, Debug)]
+pub struct Capacity {
+    pub events: usize,
+    pub instruments: usize,
+    pub levels: usize,
+}
+
+/// Why listing one more parlay could take the node past its capacity, if it could. The engine never frees an event,
+/// a market or a book's levels, and listing past its capacity profile is a fail-stop, not a rejection (E-6.3), so
+/// on a venue whose calendar keeps listing rounds a fixed most-parlays is not enough on its own.
+pub fn no_room(view: &View, capacity: &Capacity) -> Option<String> {
+    let levels_used: usize = view.instruments.values().map(|i| 2 * view.tables.get(&i.table).map_or(0, Vec::len)).sum();
+    let checks = [
+        ("events", view.events.len(), 1, capacity.events),
+        ("markets", view.instruments.len(), 1, capacity.instruments),
+        ("price levels", levels_used, 2 * ladder().len(), capacity.levels),
+    ];
+    checks.iter().find(|(_, used, adding, limit)| (used + adding) * 100 > limit * CAPACITY_PERCENT).map(
+        |(what, used, _, limit)| {
+            format!("no room for another parlay: the venue holds {used} of its {limit} {what}, and never frees them")
+        },
+    )
+}
+
 /// The numerators of the parlay ladder, over 1000: 0.1¢ steps up to 10¢ and from 90¢, whole cents between. Parlays
 /// live deep out of the money, where a cent is too coarse (a five-leg parlay may be worth 0.8¢), and a whole 0.1¢
 /// ladder would cost 999 rows a side; each book reserves two levels per row whether it uses them or not (E-6.3), and
@@ -385,6 +415,20 @@ mod tests {
         let legs = canonical(&view, &[wanted(100, true), wanted(300, true)]).expect("valid");
         let parlay = list(&mut view, &legs, 200);
         assert!(matches!(refused(&view, &[wanted(parlay, true), wanted(400, true)]), Refusal::Bad(_)), "parlay leg");
+    }
+
+    #[test]
+    fn no_parlay_is_listed_that_would_take_the_venue_past_its_capacity() {
+        let view = venue();
+        let roomy = Capacity { events: 1_000, instruments: 1_000, levels: 1_000_000 };
+        assert_eq!(no_room(&view, &roomy), None);
+        let few_events = Capacity { events: 5, ..roomy };
+        assert!(
+            no_room(&view, &few_events).is_some_and(|r| r.contains("events")),
+            "4 events and 1 more is past 95% of 5"
+        );
+        let few_levels = Capacity { levels: 2 * ladder().len(), ..roomy };
+        assert!(no_room(&view, &few_levels).is_some_and(|r| r.contains("price levels")));
     }
 
     #[test]

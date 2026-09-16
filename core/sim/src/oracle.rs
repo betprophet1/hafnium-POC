@@ -200,10 +200,18 @@ impl Oracle {
         })
     }
 
+    /// Whether `event` is a parlay's. The parlay service lists parlays on request and settles them from their legs
+    /// (`core/parlays`): they are no template's rounds, and the oracle neither schedules, shows nor resolves them.
+    fn is_parlay(view: &View, event: u64) -> bool {
+        view.events
+            .get(&event)
+            .is_some_and(|e| e.instruments.iter().any(|i| view.instruments.get(i).is_some_and(|i| i.class == "PARLAY")))
+    }
+
     /// The latest round of each template and when it was listed.
     fn latest_rounds(view: &View) -> BTreeMap<u64, (u64, u64)> {
         let mut latest = BTreeMap::new();
-        for (&id, e) in &view.events {
+        for (&id, e) in view.events.iter().filter(|(&id, _)| !Self::is_parlay(view, id)) {
             let (template, round) = split_event(id);
             let entry = latest.entry(template).or_insert((round, e.defined_at));
             if round >= entry.0 {
@@ -267,7 +275,7 @@ impl Oracle {
             }
         }
         for (&event, e) in &view.events {
-            if e.resolved {
+            if e.resolved || Self::is_parlay(&view, event) {
                 continue;
             }
             let Some(facts) = Self::facts(&view, &desk, event) else { continue };
@@ -421,13 +429,17 @@ impl Oracle {
                 })
             })
             .collect();
-        let mut recent: Vec<(u64, u64)> =
-            view.events.iter().filter_map(|(&id, e)| e.resolution.as_ref().map(|r| (r.at, id))).collect();
+        let mut recent: Vec<(u64, u64)> = view
+            .events
+            .iter()
+            .filter(|(&id, _)| !Self::is_parlay(&view, id))
+            .filter_map(|(&id, e)| e.resolution.as_ref().map(|r| (r.at, id)))
+            .collect();
         recent.sort_unstable_by(|a, b| b.cmp(a));
         let mut open: Vec<(u64, u64)> = view
             .events
             .iter()
-            .filter(|(_, e)| !e.resolved)
+            .filter(|(&id, e)| !e.resolved && !Self::is_parlay(&view, id))
             .map(|(&id, e)| {
                 let start = self.timing(id).map_or(e.scheduled_start, |t| {
                     Calendar::start_at(
@@ -521,6 +533,12 @@ impl Oracle {
             let view = locked(&self.live.view);
             let mut desk = locked(&self.desk);
             let Some(e) = view.events.get(&event) else { return refuse(404, format!("no event {event}")) };
+            if Self::is_parlay(&view, event) {
+                return refuse(
+                    400,
+                    format!("event {event} is a parlay's: the parlay service settles it from its legs"),
+                );
+            }
             if e.resolved {
                 return refuse(400, "the event is already resolved");
             }
@@ -673,4 +691,37 @@ fn handle(oracle: &Oracle, stream: TcpStream) -> Result<(), Error> {
         }
     };
     crate::web::respond(stream, status, "application/json", answer.to_string().as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use venue_link::wire::Unit;
+
+    fn apply(view: &mut View, msg: Value, at: u64) {
+        let mut input = msg;
+        input["record"] = json!({"sequence": at, "sequencedAt": at, "sequencerGroup": 1});
+        view.apply(&Unit { input, results: vec![json!({"msg": "CommandApplied", "outcome": "APPLIED"})] });
+    }
+
+    #[test]
+    fn a_parlays_event_is_no_templates_round() {
+        let mut view = View::default();
+        let round = catalogue::event_id(1, 3);
+        apply(&mut view, json!({"msg": "DefineEvent", "eventId": round, "stateCount": 2, "scheduledStart": 0}), 1);
+        let market = json!({"msg": "ListInstrument", "instrumentId": catalogue::instrument_id(round, 0), "eventId": round,
+                            "instrumentClass": "BINARY", "stateMask": 2, "tickTableId": 1, "lotStep": 1, "legs": []});
+        apply(&mut view, market, 2);
+        // A parlay's event and instrument share one ID, hashed into the range from 2^52.
+        let parlay = (1u64 << 52) + 12_345_678_901;
+        apply(&mut view, json!({"msg": "DefineEvent", "eventId": parlay, "stateCount": 2, "scheduledStart": 0}), 3);
+        let listing = json!({"msg": "ListInstrument", "instrumentId": parlay, "eventId": parlay,
+                             "instrumentClass": "PARLAY", "stateMask": 2, "tickTableId": 2, "lotStep": 10, "legs": []});
+        apply(&mut view, listing, 4);
+        assert!(!Oracle::is_parlay(&view, round));
+        assert!(Oracle::is_parlay(&view, parlay));
+        let latest = Oracle::latest_rounds(&view);
+        assert_eq!(latest.keys().copied().collect::<Vec<_>>(), vec![1], "only the template's round counts");
+        assert_eq!(latest[&1].0, 3);
+    }
 }

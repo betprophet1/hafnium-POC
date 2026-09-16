@@ -72,7 +72,8 @@ gateway:
 # The parlay service: parlays listed on request, requests for quote routed to the catalogue's responders, and
 # settlement from the legs. A request accepts quotes for windowSeconds of sequencer time. Every book reserves its
 # levels for as long as the core runs, and running out is a fail-stop, so the service lists at most maxParlays: a
-# parlay's ladder has 279 rows, 558 levels, of the small profile's 131 072.
+# parlay's ladder has 279 rows, 558 levels, of the small profile's 131 072. It also stops, like the oracle, while one
+# more parlay would take the core past 95% of core.capacity, which the oracle's rounds use up over the hours.
 parlays:
   enabled: true
   windowSeconds: 30

@@ -80,7 +80,9 @@ state changes. A trading client asks `GET /v4/markets?resolved=false` to leave t
 **Capacity.** The engine never frees a listed event or market, and listing past its capacity profile fail-stops the
 core. The oracle takes the node's `--capacity` and stops listing while another round would pass 95% of the profile's
 events, markets or price levels, and the schedule says so. With `small` and the chart's calendar that is about ten
-hours; a fresh journal starts again.
+hours; a fresh journal starts again. The parlay service (`venue-parlays --capacity`) applies the same limit to
+parlays, counting the oracle's rounds, so neither takes the core over its ceiling. The oracle leaves parlays' events
+alone: they are not on its schedule, and its control API refuses to act on them.
 
 ## Running it without a cluster
 

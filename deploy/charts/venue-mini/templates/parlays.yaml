@@ -58,6 +58,9 @@ spec:
               value: {{ .Values.parlays.windowSeconds | quote }}
             - name: VENUE_MAX_PARLAYS
               value: {{ .Values.parlays.maxParlays | quote }}
+            # No parlay is listed that would take the core past 95% of its profile, which the oracle's rounds share.
+            - name: VENUE_CAPACITY
+              value: {{ .Values.core.capacity | quote }}
           ports:
             - name: gateways
               containerPort: 7103

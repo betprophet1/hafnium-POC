@@ -143,6 +143,14 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
         listen: parlays.clone(),
         window_seconds: 30,
         max_parlays: 20,
+        capacity: {
+            let profile = catalogue::capacity_profile("small").expect("a known profile");
+            venue_parlays::rules::Capacity {
+                events: profile.events,
+                instruments: profile.instruments,
+                levels: profile.levels,
+            }
+        },
     };
     venue_parlays::service::start(Catalogue::load(CATALOGUE).expect("the catalogue"), &config).expect("parlay service");
     Gateway::connect_parlays(&gateway, &parlays);

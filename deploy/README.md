@@ -66,6 +66,7 @@ it is ready. `down` deletes the cluster and the journal with it.
   the oracle stops listing short of the ceiling; `down` and `up` start a fresh journal.
 - **Requests for quote are not journaled.** Open requests live in the parlay service's memory; replacing its pod
   forgets them, while parlays and quotes (listings and orders) stay in the journal. It lists at most
-  `parlays.maxParlays` parlays, because every book reserves its levels for as long as the core runs.
+  `parlays.maxParlays` parlays, because every book reserves its levels for as long as the core runs, and none
+  that would take the core past 95% of its capacity profile, which the oracle's rounds share.
 - **Not yet in the chart:** the resolution console behind the dummy oracle (its cases live in the oracle process), the
   scenario player and the environment manifest of §16.

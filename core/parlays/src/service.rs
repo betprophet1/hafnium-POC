@@ -47,6 +47,8 @@ pub struct Config {
     /// The most parlays the service lists. Every book reserves its levels at listing for as long as the node runs
     /// (E-6.3), and running out of them is a fail-stop, so the service refuses a request past this instead.
     pub max_parlays: usize,
+    /// The node's capacity profile: no parlay is listed that would take the venue past 95% of it (`rules::no_room`).
+    pub capacity: rules::Capacity,
 }
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -187,6 +189,7 @@ pub struct Service {
     responders: BTreeSet<u64>,
     window: u64,
     max_parlays: usize,
+    capacity: rules::Capacity,
     nonce: String,
     state: Mutex<State>,
     changed: Condvar,
@@ -211,6 +214,7 @@ pub fn start(catalogue: Catalogue, config: &Config) -> Result<Arc<Service>, Erro
         responders,
         window: config.window_seconds.max(1) * 1_000_000_000,
         max_parlays: config.max_parlays,
+        capacity: config.capacity,
         nonce: nonce()?,
         state: Mutex::new(State::default()),
         changed: Condvar::new(),
@@ -432,6 +436,9 @@ impl Service {
                     let parlays = state.view.instruments.values().filter(|i| i.class == "PARLAY").count();
                     if parlays >= self.max_parlays {
                         return Err(unavailable(format!("this venue lists at most {} parlays", self.max_parlays)));
+                    }
+                    if let Some(reason) = rules::no_room(&state.view, &self.capacity) {
+                        return Err(unavailable(reason));
                     }
                     let table = (!state.view.ladders.contains_key(&rules::TICK_TABLE)).then(rules::tick_table);
                     table.into_iter().chain(rules::listing(&legs)).collect()

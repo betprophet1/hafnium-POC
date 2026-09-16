@@ -5,15 +5,17 @@ use std::process::ExitCode;
 use std::thread;
 use venue_link::catalogue::Catalogue;
 use venue_link::wire::Error;
+use venue_parlays::rules;
 use venue_parlays::service::{self, Config};
 
 const USAGE: &str = "usage:
   venue-parlays --ingress ADDR --feed ADDR --catalogue FILE [--listen 127.0.0.1:7103] [--window-seconds 30]
-                [--max-parlays 100]
+                [--max-parlays 100] [--capacity small]
 
 Lists parlays when they are first requested, relays requests for quote to the catalogue's responders and their
 quotes to the requester through the gateways that connect to --listen, and settles every parlay from its legs. It
-uses the core's ingress as an operator. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
+uses the core's ingress as an operator. --capacity must name the node's capacity profile: no parlay is listed that
+would take the venue past 95% of its events, markets or price levels. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
 struct Args(BTreeMap<String, String>);
 
@@ -65,6 +67,10 @@ fn run(args: &Args) -> Result<(), Error> {
         listen: args.get("listen", Some("127.0.0.1:7103"))?,
         window_seconds: args.number("window-seconds", 30)?,
         max_parlays: usize::try_from(args.number("max-parlays", 100)?)?,
+        capacity: {
+            let profile = venue_link::catalogue::capacity_profile(&args.get("capacity", Some("small"))?)?;
+            rules::Capacity { events: profile.events, instruments: profile.instruments, levels: profile.levels }
+        },
     };
     let _service = service::start(catalogue, &config)?;
     loop {
