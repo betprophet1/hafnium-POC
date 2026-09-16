@@ -4,6 +4,7 @@ mod bots;
 mod client;
 mod session;
 mod web;
+mod workload;
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -21,9 +22,13 @@ const USAGE: &str = "usage:
                   [--interval-ms 700] [--seed 1]
   venue-sim taker --gateway ADDR [--token dev-synthetic-taker] [--max-quantity 5] [--chance 250]
                   [--sweep-chance 30] [--interval-ms 1000] [--seed 2]
+  venue-sim workload --ingress ADDR [--books 600] [--hot 15] [--warm 100] [--accounts 500]
+                  [--makers 5] [--seconds 60] [--seed 7] [--order-limit 12000]
+                  [--id-window-seconds 15]
 
-The bots are clients of the gateway. seed and the web page's settlement tab are operator tools and use the core's
-ingress and feed. Every flag can also be given as VENUE_<FLAG> in the environment, for example VENUE_GATEWAY.";
+The bots are clients of the gateway. seed, workload and the web page's settlement tab are operator tools and use
+the core's ingress and feed. workload puts a venue-shaped load on a core on its own, with no gateway in the way.
+Every flag can also be given as VENUE_<FLAG> in the environment, for example VENUE_GATEWAY.";
 
 struct Args(BTreeMap<String, String>);
 
@@ -67,6 +72,7 @@ fn main() -> ExitCode {
         "web" => web(&a),
         "maker" => maker(&a),
         "taker" => taker(&a),
+        "workload" => workload(&a),
         _ => Err(USAGE.into()),
     });
     match outcome {
@@ -76,6 +82,24 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// A venue-shaped load straight onto a core: many books, most of them quiet, a few busy, and orders that trade.
+fn workload(args: &Args) -> Result<(), Error> {
+    let config = workload::Config {
+        books: args.number("books", 600)?,
+        hot: args.number("hot", 15)?,
+        warm: args.number("warm", 100)?,
+        accounts: args.number("accounts", 500)?,
+        makers: args.number("makers", 5)?,
+        // Beneath the engine's order slab, and a window the order rate can live inside: see Config.
+        order_limit: args.number("order-limit", 12_000)?,
+        id_window_seconds: args.number("id-window-seconds", 10)?,
+        seconds: args.number("seconds", 60)?,
+        seed: args.number("seed", 7)?,
+    };
+    let mut ingress = Ingress::new(&args.get("ingress", None)?);
+    workload::run(&mut ingress, &config)
 }
 
 /// Lists the demo markets and funds the accounts, waiting up to two minutes for the core to accept connections.
