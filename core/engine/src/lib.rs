@@ -176,7 +176,7 @@ impl<'a> Engine<'a> {
             protocol_version: 1,
             venue_mode: VenueMode::NORMAL,
             active_order_limit: 0,
-            client_order_id_window_seconds: 86_400,
+            client_order_id_window_seconds: 7_200,
             default_limits: None,
             next_order: 1,
             next_trade: 1,

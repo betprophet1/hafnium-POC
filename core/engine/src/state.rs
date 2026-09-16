@@ -241,8 +241,9 @@ impl Capacities {
             accounts: 4_096,
             holdings: 16_384,
             orders: 16_384,
-            // A day of client order IDs (E-9.2, 24-hour window) at about three new orders a second, which a mini
-            // venue's synthetic taker alone approaches; 65 536 filled in under twelve hours and fail-stopped.
+            // Two hours of client order IDs (E-9.2, D-12) at about thirty-six new orders a second, where a
+            // 24-hour window afforded three and a mini venue's synthetic taker alone approached it. The table
+            // never evicts, so a full one fail-stops: size it as the window times new orders a second.
             duplicates: 262_144,
             commands: 65_536,
             order_groups: 4_096,
