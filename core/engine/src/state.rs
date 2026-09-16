@@ -301,7 +301,11 @@ pub struct Memory<'a> {
     /// leaves its record behind, and since the live records can never outnumber `orders`, compacting when the heap
     /// is full always at least halves it.
     pub gtd: &'a mut [(u64, u64)],
-    pub commands: &'a mut [Slot<CommandId, ()>],
+    /// `commandId` to the expiry it was recorded with (E-7.1, D-25).
+    pub commands: &'a mut [Slot<CommandId, u64>],
+    /// One `(expiresAt, commandId)` record per recorded command ID, oldest first, as `expiry` is for client order
+    /// IDs. At least `commands` slots. The window is fixed, so recording order is expiry order.
+    pub command_expiry: &'a mut [(u64, CommandId)],
     pub order_groups: &'a mut [Slot<(u64, u32), OrderGroup>],
     pub maker_settings: &'a mut [Slot<HoldingKey, MakerSetting>],
     pub maker_counters: &'a mut [Slot<HoldingKey, WindowCounter>],

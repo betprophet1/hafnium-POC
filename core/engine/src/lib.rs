@@ -125,7 +125,12 @@ pub struct Engine<'a> {
     /// rather than what rests.
     gtd: &'a mut [(u64, u64)],
     gtd_len: usize,
-    commands: FixedMap<'a, [u8; 16], ()>,
+    /// `commandId` to its expiry (E-7.1, D-25).
+    commands: FixedMap<'a, [u8; 16], u64>,
+    /// `(expiresAt, commandId)` for every recorded command ID, oldest first (E-8.2).
+    command_expiry: &'a mut [(u64, [u8; 16])],
+    command_expiry_head: usize,
+    command_expiry_len: usize,
     order_groups: FixedMap<'a, (u64, u32), OrderGroup>,
     maker_settings: FixedMap<'a, HoldingKey, MakerSetting>,
     maker_counters: FixedMap<'a, HoldingKey, WindowCounter>,
@@ -216,6 +221,9 @@ impl<'a> Engine<'a> {
             gtd: memory.gtd,
             gtd_len: 0,
             commands: cap(FixedMap::new(memory.commands, seed))?,
+            command_expiry: memory.command_expiry,
+            command_expiry_head: 0,
+            command_expiry_len: 0,
             order_groups: cap(FixedMap::new(memory.order_groups, seed))?,
             maker_settings: cap(FixedMap::new(memory.maker_settings, seed))?,
             maker_counters: cap(FixedMap::new(memory.maker_counters, seed))?,
@@ -333,6 +341,18 @@ impl<'a> Engine<'a> {
             self.expiry_head = (self.expiry_head + 1) % self.expiry.len();
             self.expiry_len -= 1;
         }
+        // E-8.2 for command IDs, the same way.
+        while self.command_expiry_len > 0 {
+            let (expires_at, id) = self.command_expiry[self.command_expiry_head];
+            if now < expires_at {
+                break;
+            }
+            if self.commands.get(&id).is_some_and(|&e| e <= now) {
+                self.commands.remove(&id);
+            }
+            self.command_expiry_head = (self.command_expiry_head + 1) % self.command_expiry.len();
+            self.command_expiry_len -= 1;
+        }
         self.end_unit(sink)
     }
 
@@ -387,6 +407,18 @@ impl<'a> Engine<'a> {
         cap(self.account_index.insert(id, slot as u32))?;
         self.accounts_used += 1;
         Ok(slot as u32)
+    }
+
+    /// Records a command ID (E-7.1) and queues its expiry for E-8.2.
+    pub(crate) fn record_command(&mut self, id: [u8; 16], expires_at: u64) -> Result<(), FailStop> {
+        if self.command_expiry_len >= self.command_expiry.len() {
+            return Err(FailStop::Capacity);
+        }
+        cap(self.commands.insert(id, expires_at))?;
+        let at = (self.command_expiry_head + self.command_expiry_len) % self.command_expiry.len();
+        self.command_expiry[at] = (expires_at, id);
+        self.command_expiry_len += 1;
+        Ok(())
     }
 
     /// Records a client order ID (E-9.2) and queues its expiry for E-8.2.

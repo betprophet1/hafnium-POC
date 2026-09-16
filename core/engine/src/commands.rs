@@ -35,6 +35,9 @@ fn malformed<T>(_: T) -> FailStop {
 }
 
 /// Every command's `commandId` follows its record header (18 bytes) at the start of the block.
+/// How long a command ID is remembered: seven days, fixed (E-7.1, D-25).
+const COMMAND_ID_WINDOW_NS: u64 = 604_800 * 1_000_000_000;
+
 fn command_id(input: &[u8]) -> CommandId {
     let at = message_header_codec::ENCODED_LENGTH + 18;
     let mut id = [0u8; 16];
@@ -61,7 +64,7 @@ impl<'a> Engine<'a> {
         sink: &mut S,
     ) -> Result<(), FailStop> {
         let id = command_id(input);
-        if self.commands.contains(&id) {
+        if self.commands.get(&id).is_some_and(|&expires_at| self.now < expires_at) {
             self.emitter.emit(
                 sink,
                 &Out::CommandApplied {
@@ -72,7 +75,8 @@ impl<'a> Engine<'a> {
             )?;
             return self.end_unit(sink);
         }
-        self.commands.insert(id, ()).map_err(|_| FailStop::Capacity)?;
+        let expires_at = self.now.checked_add(COMMAND_ID_WINDOW_NS).ok_or(FailStop::Overflow)?;
+        self.record_command(id, expires_at)?;
         let verdict = match template {
             define_tick_table_codec::SBE_TEMPLATE_ID => self.check_tick_table(input)?,
             define_event_codec::SBE_TEMPLATE_ID => self.check_event(input)?,
