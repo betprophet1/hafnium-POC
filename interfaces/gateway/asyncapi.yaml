@@ -51,7 +51,9 @@ operations:
   receiveSubscribe:
     action: receive
     channel: { $ref: '#/channels/session' }
-    summary: Subscribe to public topics. Each book topic answers with a snapshot at once.
+    summary: >
+      Subscribe to public topics. Each book topic answers at once with every level, flagged snapshot, and sends
+      only what changes after that.
     messages: [{ $ref: '#/channels/session/messages/subscribe' }]
   receiveUnsubscribe:
     action: receive
@@ -277,13 +279,35 @@ components:
           id: { $ref: '#/components/schemas/RequestId' }
           error: { $ref: './openapi.yaml#/components/schemas/Error/properties/error' }
     book:
+      description: >
+        Levels of one book. The first message after subscribing carries every level, with snapshot true, so a
+        client starts from it; every message after it carries only the levels that have moved since. A quantity of
+        zero means that level has gone. A client that would rather resynchronise another way can take a whole book
+        from GET /v4/markets/{instrumentId}/book, which still answers with one.
       payload:
-        allOf:
-          - type: object
-            required: [type]
-            properties:
-              type: { const: book }
-          - $ref: './openapi.yaml#/components/schemas/Book'
+        type: object
+        required: [type, instrumentId, sequence, changes]
+        properties:
+          type: { const: book }
+          instrumentId: { $ref: './openapi.yaml#/components/schemas/Id' }
+          sequence: { $ref: './openapi.yaml#/components/schemas/Id' }
+          state: { type: string, description: The market's state, as in REST. }
+          snapshot:
+            type: boolean
+            description: Every level of the book, to be started from, rather than only what has changed.
+          last:
+            $ref: './openapi.yaml#/components/schemas/PriceQuote'
+            description: Where it last traded, if it has.
+          changes:
+            type: array
+            items:
+              type: object
+              required: [side, price, quantity, orders]
+              properties:
+                side: { $ref: './openapi.yaml#/components/schemas/Side' }
+                price: { $ref: './openapi.yaml#/components/schemas/PriceQuote' }
+                quantity: { type: integer, description: Zero means this level has gone. }
+                orders: { type: integer }
     trade:
       payload:
         type: object

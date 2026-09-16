@@ -182,6 +182,25 @@ const $ = s => document.querySelector(s);
 let C = null, M = null, S = null;
 let tab = 'maker', selEvent = null, selInst = null, retailSide = 'yes';
 const books = {}, trades = {}, sessions = {}, winning = {}, announced = new Set();
+
+// A book arrives as levels: every one of them when the message is flagged a snapshot, and only the ones that
+// moved after that. A quantity of zero means the level has gone. The sides are kept as maps and the sorted lists
+// the renderers read are rebuilt each time rather than patched: a book is at most a couple of hundred levels, so
+// it costs nothing and the two can never drift apart.
+function applyBook(msg) {
+  const b = books[msg.instrumentId]
+    || (books[msg.instrumentId] = { buy: new Map(), sell: new Map(), bids: [], asks: [], last: null });
+  if (msg.snapshot) { b.buy.clear(); b.sell.clear(); }
+  for (const change of msg.changes || []) {
+    const side = change.side === 'buy' ? b.buy : b.sell;
+    if (change.quantity > 0) side.set(change.price.tick, change); else side.delete(change.price.tick);
+  }
+  b.sequence = msg.sequence;
+  b.state = msg.state;
+  b.last = msg.last || null;
+  b.bids = [...b.buy.values()].sort((x, y) => y.price.tick - x.price.tick);
+  b.asks = [...b.sell.values()].sort((x, y) => x.price.tick - y.price.tick);
+}
 let orderCount = 0;
 
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
@@ -300,7 +319,7 @@ function onMessage(s, msg) {
       soon(s);
       break;
     case 'release': toast(`${s.label}: complete sets returned ${money(msg.cents)}`, 'ok'); soon(s); break;
-    case 'book': books[msg.instrumentId] = msg; if (msg.instrumentId === selInst) renderBook(); renderPills(); renderRetail(); break;
+    case 'book': applyBook(msg); if (msg.instrumentId === selInst) renderBook(); renderPills(); renderRetail(); break;
     case 'trade': {
       const list = trades[msg.instrumentId] = trades[msg.instrumentId] || [];
       list.unshift(msg);

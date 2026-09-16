@@ -132,13 +132,20 @@ struct History {
     dropped_through: u64,
 }
 
+/// Book levels by `(buy, tick)`, each with its quantity and order count. A quantity of zero means the level has
+/// gone, which is how the engine reports it and how a client applies it.
+type Levels = BTreeMap<(bool, u64), (u64, u64)>;
+
 pub struct Hub {
     pub view: View,
     catalogue: Catalogue,
     tokens: BTreeMap<String, u64>,
     sessions: BTreeMap<u64, Session>,
     next_key: u64,
-    dirty: BTreeSet<u64>,
+    /// Book levels that have moved since the last flush: instrument, then `(buy, tick)` to that level's latest
+    /// quantity and order count. Writing the same key again is what conflates — a level that moves several times
+    /// inside one flush is sent once, at its final value — and the whole thing is bounded by the ladder.
+    dirty: BTreeMap<u64, Levels>,
     history: BTreeMap<u64, History>,
     connected: bool,
     last_unit: Option<(Instant, u64)>,
@@ -163,7 +170,7 @@ impl Hub {
             tokens,
             sessions: BTreeMap::new(),
             next_key: 0,
-            dirty: BTreeSet::new(),
+            dirty: BTreeMap::new(),
             history: BTreeMap::new(),
             connected: false,
             last_unit: None,
@@ -304,8 +311,11 @@ impl Hub {
                     });
                     self.send_to_topic("markets", &market.to_string());
                 }
+                // The engine already said exactly what moved, so keep it rather than re-reading the book later.
                 "BookLevelChanged" => {
-                    self.dirty.insert(instrument);
+                    let level = (r["side"] == "BUY", u(&r["tick"]));
+                    let moved = (u(&r["quantity"]), u(&r["orderCount"]));
+                    self.dirty.entry(instrument).or_default().insert(level, moved);
                 }
                 _ => {}
             }
@@ -370,17 +380,15 @@ impl Hub {
     }
 
     pub fn subscribe(&mut self, key: u64, topics: &[String], depth: usize) {
-        let snapshots: Vec<String> = topics
-            .iter()
-            .filter_map(|t| t.strip_prefix("book.")?.parse().ok())
-            .filter_map(|instrument| self.book(instrument, depth))
-            .map(|book| typed("book", book))
-            .collect();
+        // The images are taken before the topics are registered, and both happen while this lock is held, so no
+        // unit can land between a book's image and the first change sent after it.
+        let images: Vec<String> =
+            topics.iter().filter_map(|t| t.strip_prefix("book.")?.parse().ok()).map(|i| self.image(i)).collect();
         if let Some(s) = self.sessions.get_mut(&key) {
             s.topics.extend(topics.iter().cloned());
             s.depth = depth;
-            for snapshot in snapshots {
-                let _ = s.tx.send(snapshot);
+            for image in images {
+                let _ = s.tx.send(image);
             }
         }
     }
@@ -393,22 +401,58 @@ impl Hub {
         }
     }
 
-    /// Sends a snapshot of every book that changed since the last call to its subscribers. Calling this at a fixed
-    /// rate is the conflation.
+    /// Sends the levels that moved since the last call to each book's subscribers. Calling this at a fixed rate is
+    /// the conflation: one message per book per tick, carrying only what changed, whatever the churn.
     pub fn flush_books(&mut self) {
-        for instrument in std::mem::take(&mut self.dirty) {
+        for (instrument, levels) in std::mem::take(&mut self.dirty) {
             let topic = format!("book.{instrument}");
-            let wanted: Vec<(usize, Sender<String>)> =
-                self.sessions.values().filter(|s| s.topics.contains(&topic)).map(|s| (s.depth, s.tx.clone())).collect();
-            let mut by_depth: BTreeMap<usize, Option<String>> = BTreeMap::new();
-            for (depth, tx) in wanted {
-                let snapshot =
-                    by_depth.entry(depth).or_insert_with(|| self.book(instrument, depth).map(|b| typed("book", b)));
-                if let Some(snapshot) = snapshot {
-                    let _ = tx.send(snapshot.clone());
-                }
+            if !self.sessions.values().any(|s| s.topics.contains(&topic)) {
+                continue;
+            }
+            let message = self.levels_message(instrument, &levels, false);
+            self.send_to_topic(&topic, &message);
+        }
+    }
+
+    /// Levels as a client applies them: a quantity of zero means the level has gone. `snapshot` says this is the
+    /// whole book rather than what changed, so a client knows to start again from it.
+    fn levels_message(&self, instrument: u64, levels: &Levels, snapshot: bool) -> String {
+        let ladder = ladder(&self.view, instrument);
+        let changes: Vec<Value> = levels
+            .iter()
+            .map(|(&(buy, tick), &(quantity, orders))| {
+                json!({
+                    "side": if buy { "buy" } else { "sell" },
+                    "price": price::quote(ladder, tick), "quantity": quantity, "orders": orders
+                })
+            })
+            .collect();
+        let market = self.view.instruments.get(&instrument);
+        // `last` is one price rather than a list, so sending where it stands costs nothing and saves a client
+        // having to follow the trades topic to know it.
+        typed(
+            "book",
+            json!({
+                "instrumentId": id(instrument), "sequence": id(self.view.sequence),
+                "state": market.map(|i| i.state.to_lowercase()),
+                "last": market.and_then(|i| i.last).map(|t| price::quote(ladder, t)),
+                "snapshot": snapshot, "changes": changes
+            }),
+        )
+    }
+
+    /// Every level of a book, flagged, for a client that has just asked for it.
+    fn image(&self, instrument: u64) -> String {
+        let mut levels = Levels::new();
+        if let Some(i) = self.view.instruments.get(&instrument) {
+            for (&tick, &level) in &i.bids {
+                levels.insert((true, tick), level);
+            }
+            for (&tick, &level) in &i.asks {
+                levels.insert((false, tick), level);
             }
         }
+        self.levels_message(instrument, &levels, true)
     }
 
     pub fn book(&self, instrument: u64, depth: usize) -> Option<Value> {
