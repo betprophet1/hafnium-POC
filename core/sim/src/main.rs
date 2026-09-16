@@ -24,8 +24,10 @@ const USAGE: &str = "usage:
   venue-sim taker --gateway ADDR [--token dev-synthetic-taker] [--max-quantity 5] [--chance 250]
                   [--sweep-chance 30] [--interval-ms 1000] [--seed 2]
   venue-sim workload --ingress ADDR [--books 600] [--hot 15] [--warm 100] [--accounts 500]
-                  [--makers 5] [--seconds 60] [--seed 7] [--order-limit 12000]
-                  [--id-window-seconds 10] [--depth 16]
+                  [--makers 5] [--seconds 60] [--seed 7] [--depth 16] [--capacity small]
+                  [--order-limit N] [--id-window-seconds N]
+                  (the last two default from the node's capacity profile: 3/4 of its orders, and its
+                  client order ID table's entries / 120 000 seconds)
 
 The bots are clients of the gateway. seed, workload and the web page's settlement tab are operator tools and use
 the core's ingress and feed. workload puts a venue-shaped load on a core on its own, with no gateway in the way.
@@ -87,15 +89,20 @@ fn main() -> ExitCode {
 
 /// A venue-shaped load straight onto a core: many books, most of them quiet, a few busy, and orders that trade.
 fn workload(args: &Args) -> Result<(), Error> {
+    // Both limits follow the node's capacity profile, so this must name the profile the node runs with. The order
+    // limit is where the seed puts it; the client order ID window keeps the duplicate table half full at the ~60 000
+    // new orders a second a pipelined run reaches (the table's entries over 120 000 seconds). A fixed ten seconds
+    // filled `small`'s 262 144 entries and fail-stopped the core about seven seconds into a run.
+    let profile = venue_link::catalogue::capacity_profile(&args.get("capacity", Some("small"))?)?;
+    let window = (profile.duplicates as u64 / 120_000).max(1);
     let config = workload::Config {
         books: args.number("books", 600)?,
         hot: args.number("hot", 15)?,
         warm: args.number("warm", 100)?,
         accounts: args.number("accounts", 500)?,
         makers: args.number("makers", 5)?,
-        // Beneath the engine's order slab, and a window the order rate can live inside: see Config.
-        order_limit: args.number("order-limit", 12_000)?,
-        id_window_seconds: args.number("id-window-seconds", 10)?,
+        order_limit: args.number("order-limit", venue_link::catalogue::active_order_limit(profile.orders))?,
+        id_window_seconds: args.number("id-window-seconds", window)?,
         depth: usize::try_from(args.number("depth", 16)?)?,
         seconds: args.number("seconds", 60)?,
         seed: args.number("seed", 7)?,
@@ -110,8 +117,8 @@ fn seed(args: &Args) -> Result<(), Error> {
     let catalogue = Catalogue::load(&args.get("catalogue", None)?)?;
     let mut ingress = Ingress::new(&args.get("ingress", None)?);
     // The order limit is set beneath the node's order ceiling, so this must name the profile the node runs with.
-    let ceiling = venue_link::catalogue::order_ceiling(&args.get("capacity", Some("small"))?)?;
-    let mut inputs = catalogue.seed(ceiling)?.into_iter().peekable();
+    let profile = venue_link::catalogue::capacity_profile(&args.get("capacity", Some("small"))?)?;
+    let mut inputs = catalogue.seed(profile.orders)?.into_iter().peekable();
     let mut attempts = 0;
     while let Some(input) = inputs.peek() {
         match ingress.send(input.clone()) {

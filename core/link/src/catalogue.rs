@@ -21,10 +21,10 @@ pub const fn active_order_limit(order_ceiling: usize) -> u64 {
     order_ceiling as u64 / 4 * 3
 }
 
-/// The order ceiling of a capacity profile by name, which must be the profile the node was started with.
-pub fn order_ceiling(profile: &str) -> Result<usize, Error> {
+/// A capacity profile by name, which must be the profile the node was started with: operator tools size what they
+/// set from it.
+pub fn capacity_profile(profile: &str) -> Result<Capacities, Error> {
     Capacities::named(profile)
-        .map(|c| c.orders)
         .ok_or_else(|| format!("unknown capacity profile {profile:?}: small, launch or scale").into())
 }
 
