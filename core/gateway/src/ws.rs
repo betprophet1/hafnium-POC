@@ -1,9 +1,10 @@
 //! The WebSocket half of interface 1 (interfaces/gateway/asyncapi.yaml). One connection is one client session.
 
-use crate::api::{only, parse_id, ApiError, Gateway};
+use crate::api::{only, parse_id, ApiError, Gateway, Pending};
 use crate::hub::id;
 use crate::limits::{monotonic, Bucket};
 use serde_json::{json, Map, Value};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::net::TcpStream;
@@ -20,6 +21,18 @@ const POLL_MIN: Duration = Duration::from_millis(50);
 /// is much its largest cost: a thousand of them waiting 50ms at a time cost 25% of a core doing nothing else.
 const POLL_IDLE_MAX: Duration = Duration::from_secs(1);
 
+/// How long a session with work outstanding waits on its oldest reply before looking at its socket again.
+///
+/// This wait is on the reply's channel, never on the socket, and the difference is the whole reason a request no
+/// longer costs milliseconds. A socket read timeout is rounded up to a whole kernel tick — a jiffy, 1ms on this
+/// kernel — so asking a socket to wait 200us gets you 1 to 2ms, and a reply that arrived in 40us waits out the
+/// rest of the tick. A channel wait is a futex with a timespec and honours microseconds.
+const AWAIT_REPLY: Duration = Duration::from_millis(2);
+
+/// Requests one session may have outstanding at once. Beyond this it waits for its oldest before reading more,
+/// which is where one client is stopped from queueing work at every other client's expense.
+const MAX_IN_FLIGHT: usize = 64;
+
 struct Session {
     key: u64,
     engine_session: u64,
@@ -31,6 +44,10 @@ struct Session {
     /// How long this session's next quiet read waits, and the most it may ever grow to (`stream` at logon).
     poll: Duration,
     poll_ceiling: Duration,
+    /// Requests given to the node and not yet answered, oldest first, each with the id to answer it under. A node
+    /// answers a connection in commit order, so the oldest is always the first to be ready and replies leave in
+    /// the order they were asked for.
+    in_flight: VecDeque<(Value, Pending)>,
 }
 
 impl Session {
@@ -71,6 +88,7 @@ pub fn serve(gateway: &Gateway, stream: TcpStream) {
         // Until a client says otherwise it is streamed to, and its wait never grows past where it starts.
         poll: POLL_MIN,
         poll_ceiling: POLL_MIN,
+        in_flight: VecDeque::new(),
     };
     run(gateway, &mut socket, &mut session, &rx);
     gateway.hub().remove_session(key);
@@ -82,43 +100,70 @@ pub fn serve(gateway: &Gateway, stream: TcpStream) {
 }
 
 fn run(gateway: &Gateway, socket: &mut WebSocket<TcpStream>, session: &mut Session, rx: &Receiver<String>) {
+    // What the socket is actually set to, so it is only set again when it really changes.
+    let mut applied = POLL_MIN;
+    let mut nonblocking = false;
     loop {
-        // Only what the client sends shortens the wait again. What the gateway sends does not: a session that
-        // asked not to be streamed to would rather collect its messages and take them in one go, and a session
-        // that is streamed to has a ceiling of POLL_MIN, so its wait cannot grow whatever happens here.
-        let mut heard = false;
-        match socket.read() {
-            Ok(Message::Text(text)) => {
-                heard = true;
-                session.last_heard = monotonic();
-                for reply in handle(gateway, session, text.as_str()) {
-                    if socket.send(Message::text(reply)).is_err() {
-                        return;
-                    }
-                }
-            }
-            Ok(Message::Binary(_)) => {
-                heard = true;
-                let refusal = error(&Value::Null, &ApiError::bad("send JSON as text frames"));
-                if socket.send(Message::text(refusal)).is_err() {
-                    return;
-                }
-            }
-            Ok(Message::Close(_)) => return,
-            Ok(_) => {
-                heard = true;
-                session.last_heard = monotonic();
-            }
-            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(_) => return,
-        }
-        while let Ok(message) = rx.try_recv() {
-            if socket.write(Message::text(message)).is_err() {
+        // A session at its limit answers its oldest before taking anything more: one client queueing work is not
+        // allowed to become every other client's problem.
+        while session.in_flight.len() >= MAX_IN_FLIGHT {
+            let Some(message) = wait_for_oldest(gateway, session) else { break };
+            if !queue(socket, message) {
                 return;
             }
         }
-        if socket.flush().is_err() {
-            return;
+        // Everything the client has already sent is taken before anything at all is waited for. While work is
+        // outstanding the socket does not block, so a read that finds nothing returns at once and a burst is
+        // drained in a single pass rather than one request per pass. With nothing outstanding the first read
+        // blocks on this session's own interval, which is what makes an idle connection cost nothing.
+        //
+        // The waiting happens after this, on the reply's channel, which honours microseconds where a socket
+        // timeout rounds up to a whole kernel tick.
+        let mut heard = false;
+        loop {
+            let outstanding = !session.in_flight.is_empty();
+            if outstanding != nonblocking {
+                if socket.get_ref().set_nonblocking(outstanding).is_err() {
+                    return;
+                }
+                nonblocking = outstanding;
+            }
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    heard = true;
+                    session.last_heard = monotonic();
+                    for reply in handle(gateway, session, text.as_str()) {
+                        if !queue(socket, reply) {
+                            return;
+                        }
+                    }
+                }
+                Ok(Message::Binary(_)) => {
+                    heard = true;
+                    if !queue(socket, error(&Value::Null, &ApiError::bad("send JSON as text frames"))) {
+                        return;
+                    }
+                }
+                Ok(Message::Close(_)) => return,
+                Ok(_) => {
+                    heard = true;
+                    session.last_heard = monotonic();
+                }
+                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    break
+                }
+                Err(_) => return,
+            }
+            // Not past the point where this session holds more than its share, however much it sent at once.
+            if session.in_flight.len() >= MAX_IN_FLIGHT {
+                break;
+            }
+        }
+        let busy = !session.in_flight.is_empty();
+        while let Ok(message) = rx.try_recv() {
+            if !queue(socket, message) {
+                return;
+            }
         }
         if let (Some(limit), Some(account)) = (session.heartbeat, session.account) {
             if monotonic().duration_since(session.last_heard) > limit {
@@ -131,12 +176,97 @@ fn run(gateway: &Gateway, socket: &mut WebSocket<TcpStream>, session: &mut Sessi
                 return;
             }
         }
-        let next = if heard { POLL_MIN } else { (session.poll * 2).min(session.ceiling()) };
-        if next != session.poll {
-            session.poll = next;
-            // Only when it actually changes: this is a syscall, and it would otherwise run on every quiet read.
-            let _ = socket.get_ref().set_read_timeout(Some(next));
+        // Replies to what the client asked for, in the order it asked. With nothing ready yet and work still
+        // outstanding, the wait belongs here, on the reply, rather than back on the socket.
+        let mut replies = ready_replies(gateway, session);
+        if replies.is_empty() && !session.in_flight.is_empty() {
+            if let Some(message) = await_oldest(gateway, session) {
+                replies.push(message);
+                replies.extend(ready_replies(gateway, session));
+            }
         }
+        for message in replies {
+            if !queue(socket, message) {
+                return;
+            }
+        }
+        if !flushed(socket) {
+            return;
+        }
+        // Anything the client sends makes the session attentive again; quiet lets its wait grow to its ceiling.
+        session.poll = if heard { POLL_MIN } else { (session.poll * 2).min(session.ceiling()) };
+        // Only meaningful while the socket blocks, and only set when it changes: this is a syscall.
+        if !busy && session.poll != applied {
+            applied = session.poll;
+            let _ = socket.get_ref().set_read_timeout(Some(session.poll));
+        }
+    }
+}
+
+/// Queues a message for the client, and says whether the connection is still worth keeping. A would-block is not
+/// a failure: the message stays in the socket's own buffer and goes out on a later flush. That distinction only
+/// arises because this socket is non-blocking whenever the session has work outstanding, and treating it as a
+/// failure would drop sessions whose client had briefly stopped reading.
+fn queue(socket: &mut WebSocket<TcpStream>, message: String) -> bool {
+    match socket.write(Message::text(message)) {
+        Ok(()) => true,
+        Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    }
+}
+
+/// Pushes what is queued towards the client, tolerating a would-block for the same reason.
+fn flushed(socket: &mut WebSocket<TcpStream>) -> bool {
+    match socket.flush() {
+        Ok(()) => true,
+        Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    }
+}
+
+/// The replies whose results have arrived, oldest first, stopping at the first that has not.
+fn ready_replies(gateway: &Gateway, session: &mut Session) -> Vec<String> {
+    let mut out = Vec::new();
+    // The result is taken before the request leaves the queue, so nothing is dropped between the two.
+    while let Some(result) = session.in_flight.front().and_then(|(_, pending)| gateway.finish(pending)) {
+        if let Some((id, _)) = session.in_flight.pop_front() {
+            out.push(answer(&id, result));
+        }
+    }
+    out
+}
+
+/// Every outstanding reply, waiting for each in turn. For when something has to be answered in one go and must
+/// not overtake what the client asked for before it.
+fn drain_in_flight(gateway: &Gateway, session: &mut Session) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some((id, pending)) = session.in_flight.pop_front() {
+        out.push(answer(&id, gateway.wait_for(pending)));
+    }
+    out
+}
+
+/// The oldest reply, waited for briefly. This is where a session with work outstanding spends its time, so that a
+/// reply goes out when the node answers rather than when the socket next times out.
+fn await_oldest(gateway: &Gateway, session: &mut Session) -> Option<String> {
+    let result = {
+        let (_, pending) = session.in_flight.front()?;
+        gateway.finish_within(pending, AWAIT_REPLY)?
+    };
+    let (id, _) = session.in_flight.pop_front()?;
+    Some(answer(&id, result))
+}
+
+/// The oldest reply, waited for. How a session at its limit makes room before reading anything more.
+fn wait_for_oldest(gateway: &Gateway, session: &mut Session) -> Option<String> {
+    let (id, pending) = session.in_flight.pop_front()?;
+    Some(answer(&id, gateway.wait_for(pending)))
+}
+
+fn answer(id: &Value, result: Result<Value, ApiError>) -> String {
+    match result {
+        Ok(value) => reply(id, value),
+        Err(e) => error(id, &e),
     }
 }
 
@@ -228,9 +358,16 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
             let account = session.account.ok_or_else(ApiError::unauthorized)?;
             let s = session.engine_session;
             let mut body = body_of(message);
-            let result = match op {
-                "order" => gateway.place(account, s, &body)?,
-                "cancelAll" => gateway.cancel_all(account, s, &body)?,
+            // A mass cancel answers with what it cancelled rather than with an order's outcome, and it is rare, so
+            // it is still done in one go. Everything before it is answered first: it must not overtake orders the
+            // client sent earlier.
+            if op == "cancelAll" {
+                let mut out = drain_in_flight(gateway, session);
+                out.push(reply(&request_id, gateway.cancel_all(account, s, &body)?));
+                return Ok(out);
+            }
+            let pending = match op {
+                "order" => gateway.place_pending(account, s, &body)?,
                 _ => {
                     let order = parse_id(body.get("orderId").and_then(Value::as_str).unwrap_or(""), "orderId")?;
                     if let Some(fields) = body.as_object_mut() {
@@ -238,13 +375,16 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
                     }
                     if op == "cancel" {
                         only(&body, &[])?;
-                        gateway.cancel(account, s, order)?
+                        gateway.cancel_pending(account, s, order)?
                     } else {
-                        gateway.amend(account, s, order, &body)?
+                        gateway.amend_pending(account, s, order, &body)?
                     }
                 }
             };
-            Ok(vec![reply(&request_id, result)])
+            // Answered when the node answers, not before: a client with several to send is not held to one at a
+            // time waiting for each round trip.
+            session.in_flight.push_back((request_id, pending));
+            Ok(Vec::new())
         }
         _ => Err(ApiError::bad(format!("unknown op {op}"))),
     }

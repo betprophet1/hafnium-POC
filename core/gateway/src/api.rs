@@ -8,8 +8,22 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use venue_link::submit::Submit;
+use venue_link::submit::{self, Submit};
 use venue_link::wire;
+
+/// What a caller is told when the node did not answer: the outcome is genuinely unknown, so the only safe advice
+/// is to send it again under the same client order ID, which the engine deduplicates (E-9.2, E-17.4).
+fn unavailable() -> ApiError {
+    ApiError::unavailable(
+        "the sequencer group did not answer; the outcome is unknown, so resend with the same client order ID",
+    )
+}
+
+/// A request the node has been given and has not answered yet, with the account whose result it will be.
+pub struct Pending {
+    account: u64,
+    inner: submit::Pending,
+}
 
 pub struct Limits {
     pub per_second: u32,
@@ -195,17 +209,60 @@ impl Gateway {
         bucket.take(monotonic()).map_err(ApiError::rate_limited)
     }
 
+    /// Hands an input to the node without waiting for it, so a client with several to send is not held to one at a
+    /// time. The account travels with it because the results are only an `OrderResult` once `result` has seen them.
+    fn submit(&self, account: u64, input: Value) -> Result<Pending, ApiError> {
+        let inner = self.ingress.submit(input).map_err(|e| {
+            eprintln!("gateway: ingress: {e}");
+            unavailable()
+        })?;
+        Ok(Pending { account, inner })
+    }
+
     fn send(&self, input: Value) -> Result<Vec<Value>, ApiError> {
         self.ingress.send(input).map_err(|e| {
             eprintln!("gateway: ingress: {e}");
-            ApiError::unavailable(
-                "the sequencer group did not answer; the outcome is unknown, so resend with the same client order ID",
-            )
+            unavailable()
         })
     }
 
-    /// POST /v4/orders and the WebSocket `order` op.
-    pub fn place(&self, account: u64, session: u64, body: &Value) -> Result<Value, ApiError> {
+    /// The `OrderResult` for a pending request, waiting however long the node takes. For when something must be
+    /// answered in one go and cannot be left outstanding.
+    pub fn wait_for(&self, pending: Pending) -> Result<Value, ApiError> {
+        match pending.inner.wait() {
+            Ok(results) => Ok(self.result(pending.account, &results)),
+            Err(e) => {
+                eprintln!("gateway: ingress: {e}");
+                Err(unavailable())
+            }
+        }
+    }
+
+    /// The `OrderResult` for a pending request, waiting up to `limit` for the node to answer it. A session with
+    /// nothing else to do waits here, so a reply leaves as soon as it exists rather than at the next poll.
+    pub fn finish_within(&self, pending: &Pending, limit: Duration) -> Option<Result<Value, ApiError>> {
+        Some(match pending.inner.wait_for(limit)? {
+            Ok(results) => Ok(self.result(pending.account, &results)),
+            Err(e) => {
+                eprintln!("gateway: ingress: {e}");
+                Err(unavailable())
+            }
+        })
+    }
+
+    /// The `OrderResult` for a request the node has answered, or `None` while it has not.
+    pub fn finish(&self, pending: &Pending) -> Option<Result<Value, ApiError>> {
+        Some(match pending.inner.take()? {
+            Ok(results) => Ok(self.result(pending.account, &results)),
+            Err(e) => {
+                eprintln!("gateway: ingress: {e}");
+                Err(unavailable())
+            }
+        })
+    }
+
+    /// The input for a new order, once it has passed every check the gateway makes.
+    fn place_input(&self, account: u64, session: u64, body: &Value) -> Result<Value, ApiError> {
         let fields = only(body, &ORDER_FIELDS)?;
         let client_order_id = fields
             .get("clientOrderId")
@@ -288,12 +345,25 @@ impl Gateway {
                 "spendCapCents": spend_cap, "enteredStakeCents": stake, "clientOrderGroup": group
             }),
         );
+        Ok(input)
+    }
+
+    /// POST /v4/orders and the WebSocket `order` op.
+    pub fn place(&self, account: u64, session: u64, body: &Value) -> Result<Value, ApiError> {
+        let input = self.place_input(account, session, body)?;
         let results = self.send(input)?;
         Ok(self.result(account, &results))
     }
 
-    /// PATCH /v4/orders/{orderId} and the WebSocket `amend` op.
-    pub fn amend(&self, account: u64, session: u64, order: u64, body: &Value) -> Result<Value, ApiError> {
+    /// The same, given to the node without waiting for it: `finish` collects the result later.
+    pub fn place_pending(&self, account: u64, session: u64, body: &Value) -> Result<Pending, ApiError> {
+        let input = self.place_input(account, session, body)?;
+        self.submit(account, input)
+    }
+
+    /// The input for an amendment, once it has passed every check. The order is resolved here, before anything is
+    /// sent, so that an amendment still lands on an order this account really has (see `Hub::accept`).
+    fn amend_input(&self, account: u64, session: u64, order: u64, body: &Value) -> Result<Value, ApiError> {
         let fields = only(body, &["price", "outcome", "quantity", "atEventStart"])?;
         let (instrument, ladder) = {
             let hub = self.hub();
@@ -322,16 +392,27 @@ impl Gateway {
         if tick.is_none() && quantity.is_none() && at_event_start == "UNCHANGED" {
             return Err(ApiError::bad("give at least one of price, quantity and atEventStart"));
         }
-        let input = json!({
+        Ok(json!({
             "msg": "AmendOrder", "sessionId": session, "accountId": account, "instrumentId": instrument,
             "orderId": order, "newTick": tick, "newQuantity": quantity, "atEventStart": at_event_start
-        });
+        }))
+    }
+
+    /// PATCH /v4/orders/{orderId} and the WebSocket `amend` op.
+    pub fn amend(&self, account: u64, session: u64, order: u64, body: &Value) -> Result<Value, ApiError> {
+        let input = self.amend_input(account, session, order, body)?;
         let results = self.send(input)?;
         Ok(self.result(account, &results))
     }
 
-    /// DELETE /v4/orders/{orderId} and the WebSocket `cancel` op.
-    pub fn cancel(&self, account: u64, session: u64, order: u64) -> Result<Value, ApiError> {
+    /// The same, given to the node without waiting for it: `finish` collects the result later.
+    pub fn amend_pending(&self, account: u64, session: u64, order: u64, body: &Value) -> Result<Pending, ApiError> {
+        let input = self.amend_input(account, session, order, body)?;
+        self.submit(account, input)
+    }
+
+    /// The input for a cancellation, once the order has been resolved to this account's.
+    fn cancel_input(&self, account: u64, session: u64, order: u64) -> Result<Value, ApiError> {
         let (_, instrument) = self
             .hub()
             .order(order)
@@ -339,8 +420,20 @@ impl Gateway {
             .ok_or_else(|| ApiError::not_found("no such resting order"))?;
         let mut input = wire::cancel(account, instrument, order);
         input["sessionId"] = json!(session);
+        Ok(input)
+    }
+
+    /// DELETE /v4/orders/{orderId} and the WebSocket `cancel` op.
+    pub fn cancel(&self, account: u64, session: u64, order: u64) -> Result<Value, ApiError> {
+        let input = self.cancel_input(account, session, order)?;
         let results = self.send(input)?;
         Ok(self.result(account, &results))
+    }
+
+    /// The same, given to the node without waiting for it.
+    pub fn cancel_pending(&self, account: u64, session: u64, order: u64) -> Result<Pending, ApiError> {
+        let input = self.cancel_input(account, session, order)?;
+        self.submit(account, input)
     }
 
     /// DELETE /v4/orders and the WebSocket `cancelAll` op.
