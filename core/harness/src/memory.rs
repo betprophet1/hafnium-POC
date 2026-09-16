@@ -106,3 +106,47 @@ impl OwnedMemory {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use venue_engine::{Engine, EngineConfig, FailStop};
+
+    /// A table's name and a way to leave it shorter than its rule allows.
+    type Shorten = (&'static str, fn(&mut OwnedMemory));
+
+    fn build(owned: &mut OwnedMemory) -> Result<(), FailStop> {
+        let config = EngineConfig { sequencer_group: 1, binary_hash: [0; 32], table_seed: 7 };
+        Engine::new(config, owned.memory()).map(|_| ())
+    }
+
+    #[test]
+    fn tables_sized_by_their_rules_build() {
+        // The larger profiles take seconds to allocate in a debug build; the launch stress runs build them.
+        assert_eq!(build(&mut OwnedMemory::new(&Capacities::small())), Ok(()));
+    }
+
+    #[test]
+    fn a_table_shorter_than_its_rule_is_refused_before_the_first_input() {
+        let cases: [Shorten; 5] = [
+            ("gtd", |o| {
+                o.gtd.pop();
+            }),
+            ("expiry", |o| {
+                o.expiry.pop();
+            }),
+            ("command_expiry", |o| {
+                o.command_expiry.pop();
+            }),
+            ("check_orders", |o| {
+                o.check_orders.pop();
+            }),
+            ("scratch", |o| o.scratch.truncate(0)),
+        ];
+        for (table, shorten) in cases {
+            let mut owned = OwnedMemory::new(&Capacities::small());
+            shorten(&mut owned);
+            assert_eq!(build(&mut owned), Err(FailStop::Capacity), "{table}");
+        }
+    }
+}

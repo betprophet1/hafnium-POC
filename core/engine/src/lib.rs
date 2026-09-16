@@ -168,7 +168,12 @@ impl<'a> Engine<'a> {
         let scratch_needed = order_count.max(memory.holdings.len() / 2).max(memory.event_cash.len() / 2);
         let check_short =
             memory.check_orders.len() < order_count || memory.check_holdings.len() < memory.accounts.len();
-        if order_count >= NONE as usize || memory.scratch.len() < scratch_needed || check_short {
+        // Tables whose size follows another's, as `Memory` documents them. Short ones used to surface only as a
+        // fail-stop mid-session; a host that sized them wrong now finds out before the first input.
+        let derived_short = memory.gtd.len() < order_count.saturating_mul(2)
+            || memory.expiry.len() < memory.duplicates.len()
+            || memory.command_expiry.len() < memory.commands.len();
+        if order_count >= NONE as usize || memory.scratch.len() < scratch_needed || check_short || derived_short {
             return Err(FailStop::Capacity);
         }
         let (check_orders, check_holdings) = (memory.check_orders, memory.check_holdings);
