@@ -8,8 +8,10 @@ info:
 
     - `/v4/ws_public` carries public market data. It needs no login: a session subscribes to topics and receives
       conflated books, trades and market states.
-    - `/v4/ws_private` carries one account. A session logs in with a token, enters and cancels orders, and receives
-      that account's executions, account updates, payouts, releases and transfer updates. It carries no public topics.
+    - `/v4/ws_private` carries one account. A session logs in with a token, enters and cancels orders, requests
+      quotes for parlays, and receives that account's executions, account updates, payouts, releases and transfer
+      updates, the quotes on its requests and, for a registered responder, other accounts' requests. It carries no
+      public topics.
 
     A client that trades and watches the market opens one of each. The two may be served by one gateway or by
     separate ones (README, public and private); a client addresses them only by path. This document describes the
@@ -44,6 +46,8 @@ channels:
       amend: { $ref: '#/components/messages/amend' }
       cancel: { $ref: '#/components/messages/cancel' }
       cancelAll: { $ref: '#/components/messages/cancelAll' }
+      requestQuote: { $ref: '#/components/messages/requestQuote' }
+      attachQuote: { $ref: '#/components/messages/attachQuote' }
       heartbeat: { $ref: '#/components/messages/heartbeat' }
       welcome: { $ref: '#/components/messages/welcome' }
       reply: { $ref: '#/components/messages/reply' }
@@ -54,6 +58,8 @@ channels:
       release: { $ref: '#/components/messages/release' }
       transfer: { $ref: '#/components/messages/transfer' }
       resync: { $ref: '#/components/messages/resync' }
+      rfq: { $ref: '#/components/messages/rfq' }
+      quote: { $ref: '#/components/messages/quote' }
 operations:
   receiveLogin:
     action: receive
@@ -100,6 +106,25 @@ operations:
     action: receive
     channel: { $ref: '#/channels/private' }
     messages: [{ $ref: '#/channels/private/messages/cancelAll' }]
+    reply:
+      channel: { $ref: '#/channels/private' }
+      messages: [{ $ref: '#/channels/private/messages/reply' }, { $ref: '#/channels/private/messages/error' }]
+  receiveRequestQuote:
+    action: receive
+    channel: { $ref: '#/channels/private' }
+    summary: >-
+      Request quotes for a parlay (README, parlays). The reply names the request and the parlay, listed first if it
+      did not exist; quotes follow as `quote` messages.
+    messages: [{ $ref: '#/channels/private/messages/requestQuote' }]
+    reply:
+      channel: { $ref: '#/channels/private' }
+      messages: [{ $ref: '#/channels/private/messages/reply' }, { $ref: '#/channels/private/messages/error' }]
+  receiveAttachQuote:
+    action: receive
+    channel: { $ref: '#/channels/private' }
+    summary: >-
+      A registered responder attaches one of its resting sells on the request's parlay to the request, as a quote.
+    messages: [{ $ref: '#/channels/private/messages/attachQuote' }]
     reply:
       channel: { $ref: '#/channels/private' }
       messages: [{ $ref: '#/channels/private/messages/reply' }, { $ref: '#/channels/private/messages/error' }]
@@ -165,6 +190,20 @@ operations:
       After login, each change of state of the account's deposits and withdrawals, from any session or REST call.
       Only to sessions whose credential holds the transfers permission.
     messages: [{ $ref: '#/channels/private/messages/transfer' }]
+  sendRfq:
+    action: send
+    channel: { $ref: '#/channels/private' }
+    summary: >-
+      To registered responders logged in, each request for quote from another account as it opens. The requester is
+      not named.
+    messages: [{ $ref: '#/channels/private/messages/rfq' }]
+  sendQuote:
+    action: send
+    channel: { $ref: '#/channels/private' }
+    summary: >-
+      To the requester, each quote on its requests: when it is attached, when a fill reduces it, and when it leaves
+      the book. The responder is not named.
+    messages: [{ $ref: '#/channels/private/messages/quote' }]
   sendResync:
     action: send
     channel: { $ref: '#/channels/private' }
@@ -182,6 +221,8 @@ components:
     OrderResult: { $ref: './openapi.yaml#/components/schemas/OrderResult' }
     CancelAllResult: { $ref: './openapi.yaml#/components/schemas/CancelAllResult' }
     Transfer: { $ref: './openapi.yaml#/components/schemas/Transfer' }
+    Rfq: { $ref: './openapi.yaml#/components/schemas/Rfq' }
+    Quote: { $ref: './openapi.yaml#/components/schemas/Quote' }
   messages:
     login:
       payload:
@@ -267,6 +308,25 @@ components:
           id: { $ref: '#/components/schemas/RequestId' }
           instrumentId: { $ref: './openapi.yaml#/components/schemas/Id' }
           eventId: { $ref: './openapi.yaml#/components/schemas/Id' }
+    requestQuote:
+      payload:
+        allOf:
+          - type: object
+            required: [op]
+            properties:
+              op: { const: requestQuote }
+              id: { $ref: '#/components/schemas/RequestId' }
+          - $ref: './openapi.yaml#/components/schemas/RfqRequest'
+    attachQuote:
+      payload:
+        allOf:
+          - type: object
+            required: [op, requestId]
+            properties:
+              op: { const: attachQuote }
+              id: { $ref: '#/components/schemas/RequestId' }
+              requestId: { $ref: './openapi.yaml#/components/schemas/RfqId' }
+          - $ref: './openapi.yaml#/components/schemas/QuoteAttach'
     heartbeat:
       payload:
         type: object
@@ -299,6 +359,8 @@ components:
             oneOf:
               - $ref: '#/components/schemas/OrderResult'
               - $ref: '#/components/schemas/CancelAllResult'
+              - $ref: '#/components/schemas/Rfq'
+              - $ref: '#/components/schemas/Quote'
     error:
       payload:
         type: object
@@ -432,6 +494,24 @@ components:
         properties:
           type: { const: transfer }
           transfer: { $ref: '#/components/schemas/Transfer' }
+    rfq:
+      summary: A request for quote, as a responder sees it. Quote by resting a sell of YES and attaching it.
+      payload:
+        allOf:
+          - type: object
+            required: [type]
+            properties:
+              type: { const: rfq }
+          - $ref: '#/components/schemas/Rfq'
+    quote:
+      summary: A quote on one of this account's requests, as it is attached, reduced and leaves the book.
+      payload:
+        allOf:
+          - type: object
+            required: [type]
+            properties:
+              type: { const: quote }
+          - $ref: '#/components/schemas/Quote'
     resync:
       payload:
         type: object

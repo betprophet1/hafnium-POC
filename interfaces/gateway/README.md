@@ -19,17 +19,17 @@ except flood-limit counters, which by design never reach the journal (blueprint 
 
 ## Public and private
 
-The gateway has two halves, told apart by path alone: `/v4/ws_private`, `/v4/account`, and `/v4/orders` and
-`/v4/transfers` with everything under them are private; `/v4/ws_public` and `/v4/markets` with everything under it are
-public; `/healthz` belongs to both.
+The gateway has two halves, told apart by path alone: `/v4/ws_private`, `/v4/account`, and `/v4/orders`,
+`/v4/transfers` and `/v4/rfqs` with everything under them are private; `/v4/ws_public` and `/v4/markets` with
+everything under it are public; `/healthz` belongs to both.
 
 | | Public | Private |
 |---|---|---|
 | WebSocket | `/v4/ws_public` | `/v4/ws_private` |
-| REST | `GET /v4/markets`, `GET /v4/markets/{instrumentId}/book` | `GET /v4/account`; `/v4/orders`, `/v4/transfers` and everything under them |
+| REST | `GET /v4/markets`, `GET /v4/markets/{instrumentId}/book` | `GET /v4/account`; `/v4/orders`, `/v4/transfers`, `/v4/rfqs` and everything under them |
 | Login | never | required: a token on every REST call, `login` first on a session |
-| Carries | markets, books and trades, the same for everyone | one account's orders, executions, account updates, payouts, releases and transfers |
-| Reaches the sequencer group | never | every order, amendment and cancel; transfers through the treasury |
+| Carries | markets (parlays included), books and trades, the same for everyone | one account's orders, executions, account updates, payouts, releases and transfers; its requests for quote and their quotes |
+| Reaches the sequencer group | never | every order, amendment and cancel; transfers through the treasury; a request for a parlay not yet listed, through the parlay service |
 
 A private session carries nothing public, and a public session nothing private. A client that trades and watches the
 market holds one of each and follows the market on the public one. An op sent to the wrong endpoint is refused with
@@ -190,8 +190,57 @@ or below the last sequence it applied. `login` with `resumeFrom` replays the acc
 and payouts after that sequence if the gateway still holds them, and answers `resumed: true`; otherwise it sends
 `resync`, and the client fetches `GET /v4/account` before continuing.
 
+## Parlays and requests for quote
+
+A parlay pays $1 if every one of its legs resolves as specified, and nothing otherwise (blueprint §6): economically a
+binary, so it clears like any other contract. Parlays are created on demand by a request for quote (RFQ), and once
+one exists it is an ordinary market with a public book that anyone can trade.
+
+**The instrument.** A request names two to six legs, each a market and an outcome (`yes` or `no`). The legs are put in
+canonical order, ascending by event, and must be on different events, on markets that are `open`, and not on
+parlays. The parlay's ID is a hash of that canonical leg set, so the same parlay requested twice, in any order, is
+the same instrument and accumulates one book. The first request lists it under an event of its own with two outcomes,
+`Loses` and `Wins` (spec D-22), and opens it. `GET /v4/markets` shows a parlay as an event whose one market has
+`class: parlay` and `legs`. Its ladder is finer than a listed market's, 0.1¢ from 0.1¢ to 10¢ and from 90¢ to 99.9¢
+and 1¢ between, because parlays live deep out of the money; its lot step is 10 contracts, which that ladder needs to
+keep every trade's cash in whole cents, and which is also the least a request may ask for.
+
+**Requesting.** `requestQuote` on `/v4/ws_private`, or `POST /v4/rfqs`, with `legs` and `quantity` (a multiple of the
+lot step). The answer names the request (`requestId`), the parlay's `instrumentId` and `eventId`, the canonical legs,
+and `expiresAt`: the end of the request's window, during which responders may quote. Anything wrong with the legs is
+refused at the edge with `BAD_REQUEST` and a reason, and nothing is listed.
+
+**Responding.** Accounts registered as responders in the environment's catalogue receive each request as an `rfq`
+message on their private sessions while they are logged in. The requester is never named. A quote is a real resting
+order: the responder places a sell of YES on the parlay's book, usually GTD so that it lapses (its collateral is
+reserved like any order's), and then attaches it to the request with `attachQuote` or
+`POST /v4/rfqs/{requestId}/quotes`, naming the order. Only a responder's own resting sell on the request's parlay,
+within the request's window, can be attached. The order is on the public book from the moment it rests, so anyone
+may take it, not only the requester.
+
+**Receiving and accepting quotes.** The requester's private sessions receive a `quote` message when a quote is
+attached (`state: open`), again whenever a fill reduces it, and a last time when it leaves the book (`filled`,
+`expired` or `cancelled`). A REST client reads the same with `GET /v4/rfqs/{requestId}`. The responder is not named.
+To accept, the requester places an ordinary order: buy YES on the parlay at the quote's price, usually `IOC` or
+`FOK`. Nothing about acceptance is special; the fill is an execution like any other.
+
+**Settlement.** The parlay service follows every leg. The first leg to resolve against the parlay expires it at once
+(`ExpireParlay`, spec E-15.7: the parlay resolves `Loses`, and sellers' collateral comes back without waiting for
+the other legs). A voided leg voids the whole parlay (`resolution.kind: void`, every trade in it reversed). When
+every leg has won, the parlay resolves `Wins`. Whichever of a loss and a void happened first decides. A parlay trades
+only while all its legs do: it halts while a leg is halted or its event suspended, and closes for good, cancelling its
+resting orders, once any leg stops trading, whether or not it ever traded.
+
+**What holds what.** Parlays, their legs, quotes as orders, fills and settlements are all in the journal. Requests,
+and which order answers which request, are held by the parlay service, not by the gateway and not in the journal: a
+gateway that fails over loses nothing, and every gateway connected to the service delivers the same requests and
+quotes, so a requester and a responder need not share one. A restarted parlay service forgets open requests; the
+quotes stay on the book as orders.
+
 ## Not in this draft
 
 The binary market-maker gateway (interface 2) and the FIX adapter; API keys and their permissions; real payment rails
 and their holds, limits and clawbacks; minimum-sequence reads from the stores (interface 28); the environment manifest
-(interface 22); real identity (interface 6); RFQ; order history beyond what a session resumes.
+(interface 22); real identity (interface 6); a sequenced RFQ state machine (blueprint §6: requests, windows and
+acceptances in the journal) and responder caps and minimum sizes per class; order history beyond what a session
+resumes.

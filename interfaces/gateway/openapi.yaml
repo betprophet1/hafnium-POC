@@ -16,8 +16,8 @@ info:
 
     The WebSocket half is `asyncapi.yaml`. Semantics shared by both are in `README.md` beside this file.
 
-    The `markets` paths are the public half and the `account` and `transfers` paths the private half (README, public
-    and private): they may be served by one gateway or by separate ones behind the same host.
+    The `markets` paths are the public half and the `account`, `transfers` and `rfq` paths the private half (README,
+    public and private): they may be served by one gateway or by separate ones behind the same host.
 
     Transfers move money in and out of the account through the treasury, never through the sequencer group directly
     (README, deposits and withdrawals). They are a permission of their own, named `transfers` in their security
@@ -34,6 +34,8 @@ tags:
     description: The authenticated account's orders, positions and sleeve. The private half.
   - name: transfers
     description: Deposits and withdrawals through the treasury. The private half, and a permission of its own.
+  - name: rfq
+    description: Requests for quote on parlays, and quotes attached to them (README, parlays). The private half.
 paths:
   /v4/markets:
     get:
@@ -269,6 +271,74 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/TreasuryUnavailable' }
+  /v4/rfqs:
+    post:
+      operationId: requestQuote
+      tags: [rfq]
+      summary: Request quotes for a parlay, listing it if it does not exist yet
+      description: |
+        The legs are put in canonical order and must be on different events and on open markets. The parlay's ID is
+        a hash of them, so the same legs always name the same instrument. Registered responders receive the request
+        without the requester's identity, and quote by attaching resting sells of the parlay.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RfqRequest' }
+      responses:
+        '200':
+          description: The open request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Rfq' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v4/rfqs/{requestId}:
+    get:
+      operationId: getRfq
+      tags: [rfq]
+      summary: One of the account's own requests, with its quotes
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: The request and every quote attached to it, open or not.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RfqStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /v4/rfqs/{requestId}/quotes:
+    post:
+      operationId: attachQuote
+      tags: [rfq]
+      summary: Attach a resting order to a request as a quote (responders only)
+      description: |
+        The order must be this account's resting sell of YES on the request's parlay, and the request's window must
+        still be open. The quote is the order: it lapses, fills or is cancelled as the order does.
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/QuoteAttach' }
+      responses:
+        '200':
+          description: The attached quote, as the requester is sent it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Quote' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
 components:
   securitySchemes:
     devToken:
@@ -296,6 +366,11 @@ components:
       in: path
       required: true
       schema: { $ref: '#/components/schemas/Id' }
+    RequestId:
+      name: requestId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/RfqId' }
   responses:
     BadRequest:
       description: Refused at the edge; nothing was journaled.
@@ -318,7 +393,8 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     NotFound:
-      description: No such market, no such resting order of this account, or no such transfer of this account.
+      description: >-
+        No such market, no such resting order of this account, no such transfer of this account, or no such request.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -331,7 +407,9 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     Unavailable:
-      description: The sequencer group did not answer. The outcome is unknown; resend with the same client order ID.
+      description: |
+        The sequencer group did not answer: the outcome is unknown, so resend with the same client order ID. For a
+        request for quote, the parlay service did not answer; nothing was requested, and the request can be sent again.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -593,6 +671,89 @@ components:
         state: { $ref: '#/components/schemas/MarketState' }
         lotStep: { type: integer, minimum: 1 }
         ladder: { type: array, items: { $ref: '#/components/schemas/PriceQuote' } }
+        legs:
+          type: array
+          description: Parlays only, in canonical order. The parlay pays $1 if every leg resolves as given.
+          items: { $ref: '#/components/schemas/ParlayLeg' }
+    ParlayLegInput:
+      type: object
+      required: [instrumentId, outcome]
+      additionalProperties: false
+      properties:
+        instrumentId: { $ref: '#/components/schemas/Id' }
+        outcome: { type: string, enum: ['yes', 'no'], description: The leg holds when this outcome of the market happens. }
+    ParlayLeg:
+      type: object
+      required: [eventId, instrumentId, outcome, title, label]
+      properties:
+        eventId: { $ref: '#/components/schemas/Id' }
+        instrumentId: { $ref: '#/components/schemas/Id' }
+        outcome: { type: string, enum: ['yes', 'no'] }
+        title: { type: string, description: The leg's event. }
+        label: { type: string, description: The leg's market. }
+    RfqId:
+      type: string
+      pattern: '^[0-9a-z]{1,32}$'
+      description: Names a request for quote. Chosen by the parlay service.
+    RfqRequest:
+      type: object
+      required: [legs, quantity]
+      additionalProperties: false
+      properties:
+        legs: { type: array, minItems: 2, maxItems: 6, items: { $ref: '#/components/schemas/ParlayLegInput' } }
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 4294967295
+          description: Contracts wanted, a multiple of the parlay's lot step (10), which is also the minimum.
+    Rfq:
+      type: object
+      required: [requestId, instrumentId, eventId, legs, quantity, lotStep, openedAt, expiresAt]
+      properties:
+        requestId: { $ref: '#/components/schemas/RfqId' }
+        instrumentId: { $ref: '#/components/schemas/Id' }
+        eventId: { $ref: '#/components/schemas/Id' }
+        legs: { type: array, items: { $ref: '#/components/schemas/ParlayLeg' } }
+        quantity: { type: integer, minimum: 1 }
+        lotStep: { type: integer, minimum: 1 }
+        listed: { type: boolean, description: 'True when this request listed the parlay; false when it already existed.' }
+        openedAt: { type: string, format: date-time, description: The sequencer's time when the request opened. }
+        expiresAt:
+          type: string
+          format: date-time
+          description: The end of the window in which quotes can be attached, in the sequencer's time.
+    RfqStatus:
+      allOf:
+        - $ref: '#/components/schemas/Rfq'
+        - type: object
+          required: [open, quotes]
+          properties:
+            open: { type: boolean, description: Whether quotes can still be attached. }
+            quotes: { type: array, items: { $ref: '#/components/schemas/Quote' } }
+    QuoteAttach:
+      type: object
+      required: [orderId]
+      additionalProperties: false
+      properties:
+        orderId: { $ref: '#/components/schemas/Id' }
+    Quote:
+      type: object
+      description: A resting sell of YES on a parlay's book, attached to a request. The responder is not named.
+      required: [requestId, orderId, instrumentId, price, quantity, state]
+      properties:
+        requestId: { $ref: '#/components/schemas/RfqId' }
+        orderId: { $ref: '#/components/schemas/Id' }
+        instrumentId: { $ref: '#/components/schemas/Id' }
+        price: { $ref: '#/components/schemas/PriceQuote' }
+        quantity: { type: integer, minimum: 0, description: Contracts still offered. }
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+          description: When the order lapses, for a GTD order; null for one that rests until cancelled.
+        state:
+          type: string
+          enum: [open, filled, expired, cancelled]
+          description: '`cancelled` covers every other way an order leaves the book, a market closing included.'
     Event:
       type: object
       required: [eventId, title, outcomes, started, suspended, ended, resolved, markets]
