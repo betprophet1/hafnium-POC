@@ -9,23 +9,27 @@ through it, and it is the only client-facing component that writes to one (inter
 It authenticates the session, validates every message completely, converts prices and stakes into the journal's
 tick ordinals and contract counts, enforces flood limits, turns a disconnect or missed heartbeat into a sequenced
 mass cancel, routes to the sequencer group, and answers once the input is committed. It fans out each account's
-executions and conflated public market data.
+executions and conflated public market data. Deposits and withdrawals it passes to the treasury once it has
+authenticated the account, and it fans out the treasury's updates to the account's private sessions.
 
 It never decides anything the engine decides. Client order ID duplicates, lot steps, market state, rule limits and
-collateral are sequenced checks (spec §9), so their rejections replay. The gateway holds no state a failover could
-lose except flood-limit counters, which by design never reach the journal (blueprint §12).
+collateral are sequenced checks (spec §9), so their rejections replay. It never decides anything about money either:
+the treasury owns every transfer and its ledger (blueprint §11). The gateway holds no state a failover could lose
+except flood-limit counters, which by design never reach the journal (blueprint §12).
 
 ## Public and private
 
-The gateway has two halves, told apart by path alone:
+The gateway has two halves, told apart by path alone: `/v4/ws_private`, `/v4/account`, and `/v4/orders` and
+`/v4/transfers` with everything under them are private; `/v4/ws_public` and `/v4/markets` with everything under it are
+public; `/healthz` belongs to both.
 
 | | Public | Private |
 |---|---|---|
 | WebSocket | `/v4/ws_public` | `/v4/ws_private` |
-| REST | `GET /v4/markets`, `GET /v4/markets/{instrumentId}/book` | `GET /v4/account`, `/v4/orders` and everything under it |
+| REST | `GET /v4/markets`, `GET /v4/markets/{instrumentId}/book` | `GET /v4/account`; `/v4/orders`, `/v4/transfers` and everything under them |
 | Login | never | required: a token on every REST call, `login` first on a session |
-| Carries | markets, books and trades, the same for everyone | one account's orders, executions, account updates, payouts and releases |
-| Reaches the sequencer group | never | every order, amendment and cancel |
+| Carries | markets, books and trades, the same for everyone | one account's orders, executions, account updates, payouts, releases and transfers |
+| Reaches the sequencer group | never | every order, amendment and cancel; transfers through the treasury |
 
 A private session carries nothing public, and a public session nothing private. A client that trades and watches the
 market holds one of each and follows the market on the public one. An op sent to the wrong endpoint is refused with
@@ -45,12 +49,51 @@ choice (blueprint §13), and a client addresses them only by path. `GET /healthz
 | Journaled | Never | Always, with its reason |
 | Examples | malformed body, bad token, price not on the ladder, stake off its step, flood limit | insufficient sleeve, market not open, duplicate client order ID |
 
+A transfer the treasury refuses at its edge (a malformed request, a reused client transfer ID, a cancel too late) is an
+HTTP 400 or 409 `Error` and creates nothing. A withdrawal the sequencer group refuses is HTTP 200 with the transfer
+`failed`, because that refusal is journaled.
+
 A 503 means the gateway could not get an answer from the sequencer group; the order may or may not exist. Resend
 with the same `clientOrderId`: a committed original comes back as `status: duplicate` with its order ID.
 
 A `clientOrderId` is remembered for **two hours** per account, across every market (spec E-9.2, D-12). Within that
 window it cannot be reused, even by an order the engine rejected; an order the gateway refused never reached the
 engine and does not use up its ID.
+
+## Deposits and withdrawals
+
+`POST /v4/transfers` moves money into the account or out of it, `GET /v4/transfers` lists the account's transfers
+and `DELETE /v4/transfers/{transferId}` cancels one the bank has not decided yet. The gateway authenticates the
+account and passes the request to the treasury, which validates it, decides it and answers in the same `Error` form;
+the gateway never holds a transfer. A treasury that does not answer is a 503 whose outcome is unknown, as for an
+order.
+
+The treasury owns the authoritative balance (blueprint §5, §11). Money reaches the sequencer group only as sequenced
+sleeve changes the treasury sends (`SleeveAdjust`, spec E-7.2), never as a write by the gateway or a client:
+
+| | Deposit | Withdrawal |
+|---|---|---|
+| On request | sent to the bank: `pending` | reclaimed from available cash, then sent to the bank: `pending`; a refused reclaim is `failed`, `insufficient_available_cash` |
+| The bank settles | granted to available cash: `settled` | paid out: `settled` |
+| The bank fails | `failed`, `declined_by_bank`; nothing was granted | granted back: `failed`, `returned_by_bank` |
+| Cancelled while at the bank | `cancelled`; nothing was granted | granted back: `cancelled` |
+
+A state other than `pending` is final. `clientTransferId` makes a request idempotent: resending returns the transfer
+it created, and an ID is never reusable, even by a transfer that failed. Each change reaches every private session of
+the account as a `transfer` message. These come from the treasury, not the journal: they carry no sequence and are
+not replayed by `resumeFrom`, so a client that reconnects reads `GET /v4/transfers`. A transfer's own `sequence`
+names the input whose `account` message carries the cash it moved.
+
+Test environments have only the fake provider's methods (blueprint §16): `dummy_bank` is decided after a delay and
+occasionally fails, `dummy_instant` settles at once, and `dummy_failing` always fails.
+
+## Permissions
+
+Moving money is a permission of its own, apart from trading, so that a credential for a trading program can be
+issued without it. The contract names it `transfers` in the security requirement of every `/v4/transfers` operation.
+A dev token holds every permission. When API keys arrive, each carries a flag for it: a key without the flag is
+refused with 403 `FORBIDDEN` on `/v4/transfers`, and its sessions are not sent `transfer` messages. Order entry and
+market data never need it.
 
 ## Authentication in test environments
 
@@ -149,6 +192,6 @@ and payouts after that sequence if the gateway still holds them, and answers `re
 
 ## Not in this draft
 
-The binary market-maker gateway (interface 2) and the FIX adapter; minimum-sequence reads from the stores
-(interface 28); the environment manifest (interface 22); real identity (interface 6); RFQ; order history beyond what
-a session resumes.
+The binary market-maker gateway (interface 2) and the FIX adapter; API keys and their permissions; real payment rails
+and their holds, limits and clawbacks; minimum-sequence reads from the stores (interface 28); the environment manifest
+(interface 22); real identity (interface 6); RFQ; order history beyond what a session resumes.

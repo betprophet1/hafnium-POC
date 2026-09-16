@@ -16,8 +16,12 @@ info:
 
     The WebSocket half is `asyncapi.yaml`. Semantics shared by both are in `README.md` beside this file.
 
-    The `markets` paths are the public half and the `account` paths the private half (README, public and private):
-    they may be served by one gateway or by separate ones behind the same host.
+    The `markets` paths are the public half and the `account` and `transfers` paths the private half (README, public
+    and private): they may be served by one gateway or by separate ones behind the same host.
+
+    Transfers move money in and out of the account through the treasury, never through the sequencer group directly
+    (README, deposits and withdrawals). They are a permission of their own, named `transfers` in their security
+    requirement: a dev token holds it, and an API key will hold it only when issued with it.
 servers:
   - url: http://127.0.0.1:8080
     description: The mini venue on a laptop, after `deploy/laptop.sh web`
@@ -28,6 +32,8 @@ tags:
     description: Public reference data and books. The public half; no login.
   - name: account
     description: The authenticated account's orders, positions and sleeve. The private half.
+  - name: transfers
+    description: Deposits and withdrawals through the treasury. The private half, and a permission of its own.
 paths:
   /v4/markets:
     get:
@@ -156,6 +162,106 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/Unavailable' }
+  /v4/transfers:
+    post:
+      operationId: requestTransfer
+      tags: [transfers]
+      summary: Deposit money into the account, or withdraw it
+      description: |
+        Idempotent on `clientTransferId`, for as long as the treasury keeps the account's transfers: resending the same
+        request returns the transfer it created, in whatever state it has reached. The same ID with a different kind,
+        amount or method is refused with `CLIENT_TRANSFER_ID_REUSED`. After a 503 the outcome is unknown; resend with
+        the same `clientTransferId`.
+
+        A deposit adds to available cash only once the bank has settled it, which on most rails is after this answers
+        `pending`. A withdrawal is taken out of available cash first, normally before this answers: if the sequencer
+        group refuses because the amount is more than the account's available cash, the transfer is `failed` with
+        reason `insufficient_available_cash` and nothing moved. That refusal is the engine's sequenced decision, so it
+        is answered with HTTP 200 and the transfer, as a rejected order is.
+      security:
+        - devToken: [transfers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferRequest' }
+      responses:
+        '200':
+          description: The transfer, new or the one this `clientTransferId` already created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transfer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/TreasuryUnavailable' }
+    get:
+      operationId: listTransfers
+      tags: [transfers]
+      summary: The account's transfers, newest first
+      security:
+        - devToken: [transfers]
+      parameters:
+        - name: limit
+          in: query
+          description: At most this many transfers.
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        '200':
+          description: The newest transfers.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transfers' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/TreasuryUnavailable' }
+  /v4/transfers/{transferId}:
+    get:
+      operationId: getTransfer
+      tags: [transfers]
+      summary: One of the account's transfers
+      security:
+        - devToken: [transfers]
+      parameters:
+        - $ref: '#/components/parameters/TransferId'
+      responses:
+        '200':
+          description: The transfer as it stands.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transfer' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/TreasuryUnavailable' }
+    delete:
+      operationId: cancelTransfer
+      tags: [transfers]
+      summary: Cancel a transfer the bank has not yet decided
+      description: |
+        Only a `pending` transfer that is still waiting on the bank can be cancelled; anything else is refused with
+        `TRANSFER_NOT_CANCELLABLE`. A cancelled withdrawal returns its amount to available cash before it answers.
+      security:
+        - devToken: [transfers]
+      parameters:
+        - $ref: '#/components/parameters/TransferId'
+      responses:
+        '200':
+          description: The transfer, cancelled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transfer' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/TreasuryUnavailable' }
 components:
   securitySchemes:
     devToken:
@@ -164,6 +270,9 @@ components:
       description: |
         Test environments only: a fixed token per account from the environment's catalogue. Real identity is
         interface 6 and the issuer named in the environment manifest (interface 22), neither specified yet.
+
+        A requirement may name permissions. `transfers` is the permission to move money: a dev token holds it, and an
+        API key will hold it only if issued with it. A credential without it is refused with 403 `FORBIDDEN`.
   parameters:
     InstrumentId:
       name: instrumentId
@@ -172,6 +281,11 @@ components:
       schema: { $ref: '#/components/schemas/Id' }
     OrderId:
       name: orderId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    TransferId:
+      name: transferId
       in: path
       required: true
       schema: { $ref: '#/components/schemas/Id' }
@@ -186,8 +300,18 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: The credential is valid but lacks the permission this call needs. A dev token never gets this.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: The request contradicts what already exists, such as a client transfer ID used for another transfer.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
     NotFound:
-      description: No such market, or no such resting order of this account.
+      description: No such market, no such resting order of this account, or no such transfer of this account.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -201,6 +325,11 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     Unavailable:
       description: The sequencer group did not answer. The outcome is unknown; resend with the same client order ID.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TreasuryUnavailable:
+      description: The treasury did not answer. The outcome is unknown; resend with the same client transfer ID.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -363,6 +492,70 @@ components:
         reservedCents: { type: integer }
         positions: { type: array, items: { $ref: '#/components/schemas/Position' } }
         orders: { type: array, items: { $ref: '#/components/schemas/RestingOrder' } }
+    TransferRequest:
+      type: object
+      required: [clientTransferId, kind, amountCents, method]
+      additionalProperties: false
+      properties:
+        clientTransferId:
+          type: string
+          minLength: 1
+          maxLength: 32
+          pattern: '^[!-~]+$'
+          description: Printable ASCII, unique per account. Never reusable, even by a transfer that failed.
+        kind: { type: string, enum: [deposit, withdrawal] }
+        amountCents:
+          type: integer
+          minimum: 1
+          description: An environment may refuse an amount above its per-transfer limit with `BAD_REQUEST`.
+        method: { $ref: '#/components/schemas/TransferMethod' }
+    TransferMethod:
+      type: string
+      enum: [dummy_bank, dummy_instant, dummy_failing]
+      description: |
+        The rail the money moves on. Test environments offer only the fake provider's (blueprint §16): `dummy_bank`
+        is decided by the bank after a delay and occasionally fails, `dummy_instant` settles at once, and
+        `dummy_failing` always fails at the bank. Real rails join this list as they are integrated.
+    TransferState:
+      type: string
+      enum: [pending, settled, failed, cancelled]
+      description: |
+        `pending` until the transfer is final, then exactly one of the others, never to change again. A settled
+        deposit has been added to available cash; a settled withdrawal has left the venue. A failed or cancelled
+        deposit never added anything, and a failed or cancelled withdrawal has returned its amount to available cash.
+    TransferReason:
+      type: string
+      enum: [declined_by_bank, returned_by_bank, insufficient_available_cash, cancelled_by_client]
+      description: |
+        Why a transfer failed or was cancelled. `declined_by_bank`: the bank refused a deposit. `returned_by_bank`:
+        the bank could not pay a withdrawal out. `insufficient_available_cash`: the sequencer group refused to take a
+        withdrawal from available cash. `cancelled_by_client`: a cancel request.
+    Transfer:
+      type: object
+      required: [transferId, clientTransferId, kind, amountCents, method, state, reason, sequence, createdAt, updatedAt]
+      properties:
+        transferId: { $ref: '#/components/schemas/Id' }
+        clientTransferId: { type: string }
+        kind: { type: string, enum: [deposit, withdrawal] }
+        amountCents: { type: integer, minimum: 1 }
+        method: { $ref: '#/components/schemas/TransferMethod' }
+        state: { $ref: '#/components/schemas/TransferState' }
+        reason:
+          oneOf: [{ $ref: '#/components/schemas/TransferReason' }, { type: 'null' }]
+          description: Set exactly when the state is failed or cancelled.
+        sequence:
+          oneOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }]
+          description: |
+            The input that last changed available cash for this transfer, whose `account` message carries the new
+            balance: the grant of a settled deposit, the reclaim of a pending or settled withdrawal, or the grant that
+            returned a failed or cancelled one. Null while nothing has moved.
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time, description: When the state, reason or sequence last changed. }
+    Transfers:
+      type: object
+      required: [transfers]
+      properties:
+        transfers: { type: array, items: { $ref: '#/components/schemas/Transfer' }, description: Newest first. }
     Level:
       type: object
       required: [price, quantity, orders]
@@ -421,6 +614,16 @@ components:
           properties:
             code:
               type: string
-              enum: [BAD_REQUEST, UNAUTHORIZED, NOT_FOUND, PRICE_NOT_ON_LADDER, STAKE_NOT_ON_STEP, RATE_LIMITED, UNAVAILABLE]
+              enum:
+                - BAD_REQUEST
+                - UNAUTHORIZED
+                - FORBIDDEN
+                - NOT_FOUND
+                - PRICE_NOT_ON_LADDER
+                - STAKE_NOT_ON_STEP
+                - CLIENT_TRANSFER_ID_REUSED
+                - TRANSFER_NOT_CANCELLABLE
+                - RATE_LIMITED
+                - UNAVAILABLE
             message: { type: string }
             details: { type: object }

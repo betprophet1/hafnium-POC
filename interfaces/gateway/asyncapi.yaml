@@ -9,7 +9,7 @@ info:
     - `/v4/ws_public` carries public market data. It needs no login: a session subscribes to topics and receives
       conflated books, trades and market states.
     - `/v4/ws_private` carries one account. A session logs in with a token, enters and cancels orders, and receives
-      that account's executions, account updates, payouts and releases. It carries no public topics.
+      that account's executions, account updates, payouts, releases and transfer updates. It carries no public topics.
 
     A client that trades and watches the market opens one of each. The two may be served by one gateway or by
     separate ones (README, public and private); a client addresses them only by path. This document describes the
@@ -52,6 +52,7 @@ channels:
       account: { $ref: '#/components/messages/account' }
       payout: { $ref: '#/components/messages/payout' }
       release: { $ref: '#/components/messages/release' }
+      transfer: { $ref: '#/components/messages/transfer' }
       resync: { $ref: '#/components/messages/resync' }
 operations:
   receiveLogin:
@@ -157,6 +158,13 @@ operations:
     channel: { $ref: '#/channels/private' }
     summary: After login, complete sets of the account's contracts returned as cash after a fill.
     messages: [{ $ref: '#/channels/private/messages/release' }]
+  sendTransfer:
+    action: send
+    channel: { $ref: '#/channels/private' }
+    summary: >-
+      After login, each change of state of the account's deposits and withdrawals, from any session or REST call.
+      Only to sessions whose credential holds the transfers permission.
+    messages: [{ $ref: '#/channels/private/messages/transfer' }]
   sendResync:
     action: send
     channel: { $ref: '#/channels/private' }
@@ -173,6 +181,7 @@ components:
       pattern: '^(markets|book\.[0-9]{1,20}|trades\.[0-9]{1,20})$'
     OrderResult: { $ref: './openapi.yaml#/components/schemas/OrderResult' }
     CancelAllResult: { $ref: './openapi.yaml#/components/schemas/CancelAllResult' }
+    Transfer: { $ref: './openapi.yaml#/components/schemas/Transfer' }
   messages:
     login:
       payload:
@@ -406,6 +415,18 @@ components:
           eventId: { $ref: './openapi.yaml#/components/schemas/Id' }
           kind: { type: string, enum: [yes_set_burn, no_set_burn] }
           cents: { type: integer, minimum: 1 }
+    transfer:
+      summary: >-
+        A deposit or withdrawal of the account was created or changed state, reason or sequence. It comes from the
+        treasury rather than the journal, so it carries no sequence of its own and is not replayed by `resumeFrom`: a
+        client that reconnects fetches GET /v4/transfers. A transfer's `sequence` names the input whose `account`
+        message carries the balance it moved.
+      payload:
+        type: object
+        required: [type, transfer]
+        properties:
+          type: { const: transfer }
+          transfer: { $ref: '#/components/schemas/Transfer' }
     resync:
       payload:
         type: object
