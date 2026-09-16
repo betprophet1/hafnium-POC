@@ -68,6 +68,9 @@ fill between the two sessions reported to both, with maker and taker, partial an
 report twice; cancel-on-disconnect after Logout; and an adapter restart after which the market maker logs on
 without resetting sequence numbers and has its first session's messages resent from the archive.
 
+`./check` runs `test.sh` as its last step when the toolchain has been bootstrapped (`bootstrap.sh --check`), and
+skips it with a note otherwise, so a machine without Java still passes every other gate.
+
 ## How it works
 
 ```

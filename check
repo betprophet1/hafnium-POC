@@ -3,6 +3,7 @@
 #   1. blueprint: structure, consistency, figure geometry, Chromium widths (when installed)
 #   2. separation: no change touches core/engine/ together with the specification or schema (AGENTS.md)
 #   3. core/ci.sh: interfaces, reference model, test vectors, engine guardrails, Rust, engine results
+#   4. the FIX adapter's integration test (when its Java toolchain has been bootstrapped)
 #
 # Environment: JAVA and SBE_JAR revalidate the schema and regenerate core/journal; ENGINE_REQUIRED=1 makes engine
 # results fatal; CHECK_RANGE=base..head checks those commits for separation (default: main..HEAD off main);
@@ -54,3 +55,10 @@ else
 fi
 
 "$ROOT/core/ci.sh"
+
+step "FIX adapter: integration test against a local venue"
+if "$ROOT/adapters/fix/bootstrap.sh" --check; then
+  "$ROOT/adapters/fix/test.sh"
+else
+  echo "skipping the FIX adapter: no Java toolchain (run adapters/fix/bootstrap.sh)"
+fi
