@@ -443,3 +443,279 @@ fn login(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<Ve
     }
     Ok(out)
 }
+
+/// What a WebSocket client can rely on, against a gateway on a real node (`testing`). These describe the behaviour,
+/// not how connections are served, so they hold whichever way the gateway waits on its sockets.
+#[cfg(test)]
+mod tests {
+    use crate::testing::{self, eventually, MAKER_TOKEN, MARKET, RETAIL_TOKEN};
+    use serde_json::{json, Value};
+    use std::net::TcpStream;
+    use std::time::Duration;
+    use tungstenite::stream::MaybeTlsStream;
+    use tungstenite::{Message, WebSocket};
+
+    struct Client {
+        socket: WebSocket<MaybeTlsStream<TcpStream>>,
+        /// Streamed messages (market data, private executions and account updates) seen while waiting for an
+        /// answer, in arrival order.
+        streamed: Vec<Value>,
+    }
+
+    impl Client {
+        fn connect(url: &str) -> Self {
+            let (socket, _) = tungstenite::connect(url).expect("the gateway accepts a WebSocket");
+            if let MaybeTlsStream::Plain(stream) = socket.get_ref() {
+                stream.set_read_timeout(Some(Duration::from_secs(5))).expect("a read timeout");
+            }
+            Self { socket, streamed: Vec::new() }
+        }
+
+        fn send(&mut self, message: Value) {
+            self.socket.send(Message::text(message.to_string())).expect("sent");
+        }
+
+        /// The next text message, failing the test if none arrives within the read timeout.
+        fn next(&mut self) -> Value {
+            loop {
+                match self.socket.read().expect("a message before the timeout") {
+                    Message::Text(text) => return serde_json::from_str(text.as_str()).expect("JSON"),
+                    Message::Close(_) => panic!("the gateway closed the connection"),
+                    _ => {}
+                }
+            }
+        }
+
+        /// The next message that answers something the client sent. Everything else a session is sent (market
+        /// data, and for a logged-in session its own executions and account updates) arrives interleaved with the
+        /// answers, and is kept for the test to look at.
+        fn next_answer(&mut self) -> Value {
+            loop {
+                let m = self.next();
+                if matches!(m["type"].as_str(), Some("reply" | "error" | "welcome" | "resync")) {
+                    return m;
+                }
+                self.streamed.push(m);
+            }
+        }
+
+        /// Waits for a private execution of `kind` for the order with `client_order_id`.
+        fn execution(&mut self, client_order_id: &str, kind: &str) -> Value {
+            let matches = |m: &Value| {
+                m["type"] == "execution"
+                    && m["execution"]["clientOrderId"] == client_order_id
+                    && m["execution"]["type"] == kind
+            };
+            loop {
+                if let Some(found) = self.streamed.iter().find(|m| matches(m)) {
+                    return found.clone();
+                }
+                let m = self.next();
+                self.streamed.push(m);
+            }
+        }
+
+        /// The next book message that `wanted` accepts, skipping others.
+        fn next_book(&mut self, wanted: impl Fn(&Value) -> bool) -> Value {
+            loop {
+                let m = self.next();
+                if m["type"] == "book" && wanted(&m) {
+                    return m;
+                }
+            }
+        }
+
+        fn login(&mut self, extra: Value) -> Value {
+            let mut login = json!({"op": "login", "id": "login", "token": MAKER_TOKEN});
+            if let (Some(login), Some(extra)) = (login.as_object_mut(), extra.as_object()) {
+                login.extend(extra.clone());
+            }
+            self.send(login);
+            let welcome = self.next_answer();
+            assert_eq!(welcome["type"], "welcome", "{welcome}");
+            welcome
+        }
+
+        /// Whether the gateway closes the connection within `seconds`.
+        fn closed_within(&mut self, seconds: u64) -> bool {
+            for _ in 0..seconds * 10 {
+                if let MaybeTlsStream::Plain(stream) = self.socket.get_ref() {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                }
+                match self.socket.read() {
+                    Ok(Message::Close(_)) => return true,
+                    Ok(_) => {}
+                    Err(tungstenite::Error::Io(e))
+                        if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                    Err(_) => return true,
+                }
+            }
+            false
+        }
+    }
+
+    fn order(id: &str, tick: u64) -> Value {
+        json!({"op": "order", "id": id, "clientOrderId": id, "instrumentId": MARKET.to_string(), "action": "buy",
+               "outcome": "yes", "price": {"tick": tick}, "quantity": 1})
+    }
+
+    fn order_id(reply: &Value) -> String {
+        reply["result"]["orderId"].as_str().unwrap_or_else(|| panic!("no order ID in {reply}")).to_string()
+    }
+
+    #[test]
+    fn login_welcomes_the_account_and_a_bad_token_is_refused() {
+        let venue = testing::venue("ws-login");
+        let mut client = Client::connect(&venue.ws_url);
+        client.send(json!({"op": "login", "id": "bad", "token": "no-such-token"}));
+        let refused = client.next_answer();
+        assert_eq!(refused["type"], "error", "{refused}");
+        assert_eq!(refused["id"], "bad");
+        let welcome = client.login(json!({}));
+        assert_eq!(welcome["id"], "login");
+        assert_eq!(welcome["accountId"], "1");
+        assert!(welcome["sessionId"].as_str().is_some_and(|s| !s.is_empty()), "{welcome}");
+    }
+
+    #[test]
+    fn orders_amendments_and_cancels_are_answered_under_their_ids() {
+        let venue = testing::venue("ws-order");
+        let mut client = Client::connect(&venue.ws_url);
+        client.login(json!({}));
+        client.send(order("o1", 4));
+        let placed = client.next_answer();
+        assert_eq!((placed["type"].as_str(), placed["id"].as_str()), (Some("reply"), Some("o1")), "{placed}");
+        assert_eq!(placed["result"]["status"], "accepted");
+        let id = order_id(&placed);
+        // The session is also told privately, as an execution, whichever of the two it happens to see first.
+        let accepted = client.execution("o1", "accepted");
+        assert_eq!(accepted["execution"]["orderId"], id.as_str(), "{accepted}");
+        client.send(json!({"op": "amend", "id": "a1", "orderId": id, "quantity": 3}));
+        let amended = client.next_answer();
+        assert_eq!((amended["id"].as_str(), amended["result"]["status"].as_str()), (Some("a1"), Some("amended")));
+        client.send(json!({"op": "cancel", "id": "c1", "orderId": id}));
+        let cancelled = client.next_answer();
+        assert_eq!((cancelled["id"].as_str(), cancelled["result"]["status"].as_str()), (Some("c1"), Some("cancelled")));
+    }
+
+    #[test]
+    fn a_burst_sent_without_waiting_is_answered_in_the_order_it_was_sent() {
+        let venue = testing::venue("ws-burst");
+        let mut client = Client::connect(&venue.ws_url);
+        client.login(json!({}));
+        // More than a session may have outstanding at once, so the gateway has to hold some back and still keep order.
+        let ids: Vec<String> = (0..100).map(|i| format!("b{i}")).collect();
+        for id in &ids {
+            client.send(order(id, 4));
+        }
+        for id in &ids {
+            let reply = client.next_answer();
+            assert_eq!(reply["id"].as_str(), Some(id.as_str()), "{reply}");
+            assert_eq!(reply["result"]["status"], "accepted", "{reply}");
+        }
+    }
+
+    #[test]
+    fn cancel_all_is_answered_after_the_orders_sent_before_it() {
+        let venue = testing::venue("ws-cancel-all");
+        let mut client = Client::connect(&venue.ws_url);
+        client.login(json!({}));
+        for i in 0..10 {
+            client.send(order(&format!("m{i}"), 4));
+        }
+        client.send(json!({"op": "cancelAll", "id": "all"}));
+        for i in 0..10 {
+            let reply = client.next_answer();
+            assert_eq!(reply["id"].as_str(), Some(format!("m{i}").as_str()), "{reply}");
+        }
+        let all = client.next_answer();
+        assert_eq!((all["type"].as_str(), all["id"].as_str()), (Some("reply"), Some("all")), "{all}");
+        assert_eq!(all["result"]["executions"].as_array().map(Vec::len), Some(10), "{all}");
+    }
+
+    #[test]
+    fn a_book_subscription_starts_with_a_snapshot_and_then_carries_changes() {
+        let venue = testing::venue("ws-book");
+        let mut watcher = Client::connect(&venue.ws_url);
+        watcher.send(json!({"op": "subscribe", "id": "s", "topics": [format!("book.{MARKET}")]}));
+        let image = watcher.next_book(|_| true);
+        assert_eq!(image["snapshot"], true, "{image}");
+        let mut trader = Client::connect(&venue.ws_url);
+        trader.login(json!({}));
+        trader.send(order("t1", 7));
+        assert_eq!(trader.next_answer()["result"]["status"], "accepted");
+        let change = watcher.next_book(|m| {
+            m["snapshot"] == false
+                && m["changes"]
+                    .as_array()
+                    .is_some_and(|c| c.iter().any(|l| l["side"] == "buy" && l["price"]["tick"] == 7))
+        });
+        assert_eq!(change["instrumentId"], MARKET.to_string(), "{change}");
+    }
+
+    #[test]
+    fn a_session_that_is_not_streamed_to_still_gets_its_changes() {
+        let venue = testing::venue("ws-unstreamed");
+        let mut watcher = Client::connect(&venue.ws_url);
+        watcher.login(json!({"stream": false}));
+        watcher.send(json!({"op": "subscribe", "id": "s", "topics": [format!("book.{MARKET}")]}));
+        watcher.next_book(|m| m["snapshot"] == true);
+        let mut trader = Client::connect(&venue.ws_url);
+        trader.login(json!({}));
+        trader.send(order("u1", 8));
+        assert_eq!(trader.next_answer()["result"]["status"], "accepted");
+        watcher.next_book(|m| m["changes"].as_array().is_some_and(|c| c.iter().any(|l| l["price"]["tick"] == 8)));
+    }
+
+    #[test]
+    fn a_heartbeat_is_answered_and_a_missed_one_cancels_and_closes() {
+        let venue = testing::venue("ws-heartbeat");
+        let mut client = Client::connect(&venue.ws_url);
+        client.login(json!({"heartbeatSeconds": 1}));
+        client.send(json!({"op": "heartbeat", "id": "h"}));
+        let beat = client.next_answer();
+        assert_eq!((beat["type"].as_str(), beat["id"].as_str()), (Some("reply"), Some("h")), "{beat}");
+        client.send(order("hb1", 4));
+        let id: u64 = order_id(&client.next_answer()).parse().expect("a numeric order ID");
+        // Silence past the heartbeat: the gateway pulls the session's orders and closes the connection.
+        assert!(client.closed_within(5), "the gateway kept a silent session past its heartbeat");
+        eventually("the silent session's order is cancelled", || venue.gateway.hub().order(id).is_none());
+    }
+
+    #[test]
+    fn disconnecting_pulls_orders_only_when_the_session_asked() {
+        let venue = testing::venue("ws-disconnect");
+        let mut pulled = Client::connect(&venue.ws_url);
+        pulled.login(json!({"cancelOnDisconnect": true}));
+        pulled.send(order("d1", 4));
+        let pulled_id: u64 = order_id(&pulled.next_answer()).parse().expect("a numeric order ID");
+        let mut kept = Client::connect(&venue.ws_url);
+        kept.send(json!({"op": "login", "id": "login", "token": RETAIL_TOKEN}));
+        assert_eq!(kept.next_answer()["type"], "welcome");
+        kept.send(order("d2", 4));
+        let kept_id: u64 = order_id(&kept.next_answer()).parse().expect("a numeric order ID");
+        drop(pulled);
+        drop(kept);
+        eventually("the order of the session that asked is cancelled", || {
+            venue.gateway.hub().order(pulled_id).is_none()
+        });
+        assert!(venue.gateway.hub().order(kept_id).is_some(), "an order was cancelled though its session did not ask");
+    }
+
+    #[test]
+    fn malformed_messages_get_errors_and_the_session_carries_on() {
+        let venue = testing::venue("ws-malformed");
+        let mut client = Client::connect(&venue.ws_url);
+        client.socket.send(Message::text("not json")).expect("sent");
+        assert_eq!(client.next_answer()["type"], "error");
+        client.socket.send(Message::binary(vec![1, 2, 3])).expect("sent");
+        assert_eq!(client.next_answer()["type"], "error");
+        client.send(json!({"op": "nonsense", "id": "x"}));
+        assert_eq!(client.next_answer()["id"], "x");
+        client.send(order("before-login", 4));
+        let unauthorized = client.next_answer();
+        assert_eq!((unauthorized["type"].as_str(), unauthorized["id"].as_str()), (Some("error"), Some("before-login")));
+        client.send(json!({"op": "heartbeat", "id": "still-here"}));
+        assert_eq!(client.next_answer()["id"], "still-here");
+    }
+}

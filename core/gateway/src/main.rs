@@ -7,6 +7,8 @@ mod hub;
 mod limits;
 mod price;
 mod rest;
+#[cfg(test)]
+mod testing;
 mod ws;
 
 use api::{Gateway, Limits};
@@ -76,25 +78,39 @@ fn run(args: &Args) -> Result<(), Error> {
         logons_per_minute: args.number("logons-per-minute", 30)?,
     };
     let gateway = Arc::new(Gateway::new(Hub::new(catalogue), Submit::spawn(&args.get("ingress", None)?), limits));
-    let feed = args.get("feed", None)?;
-    let follower = Arc::clone(&gateway);
+    follow_feed(&gateway, args.get("feed", None)?);
+    conflate(&gateway);
+    let listener = TcpListener::bind(args.get("listen", Some("127.0.0.1:8081"))?)?;
+    eprintln!("gateway on {}: REST /v4, WebSocket /v4/ws", listener.local_addr()?);
+    serve(&gateway, &listener);
+    Ok(())
+}
+
+/// Keeps the hub's view of the venue current from the node's feed, reconnecting for ever.
+fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
+    let follower = Arc::clone(gateway);
     thread::spawn(move || {
         wire::follow(&feed, || follower.hub().restart(), |unit| follower.hub().apply(&unit));
     });
-    let conflater = Arc::clone(&gateway);
+}
+
+/// Sends book subscribers what changed, at a fixed rate.
+fn conflate(gateway: &Arc<Gateway>) {
+    let conflater = Arc::clone(gateway);
     thread::spawn(move || loop {
         // Book topics carry at most ten snapshots a second (interface 1 README, market data).
         thread::sleep(Duration::from_millis(100));
         conflater.hub().flush_books();
     });
-    let listener = TcpListener::bind(args.get("listen", Some("127.0.0.1:8081"))?)?;
-    eprintln!("gateway on {}: REST /v4, WebSocket /v4/ws", listener.local_addr()?);
+}
+
+/// Accepts connections for ever and serves each one.
+fn serve(gateway: &Arc<Gateway>, listener: &TcpListener) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let gateway = Arc::clone(&gateway);
+        let gateway = Arc::clone(gateway);
         thread::spawn(move || connection(&gateway, stream));
     }
-    Ok(())
 }
 
 /// Routes a connection by its request line without consuming it, so the WebSocket handshake reads it whole.
