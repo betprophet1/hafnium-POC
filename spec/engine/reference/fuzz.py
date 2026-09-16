@@ -10,6 +10,9 @@ books, non-negative available cash, lock and reservation consistency, lot steps)
   readers     positions, sleeves and book levels rebuilt only from emitted results equal the model's state
   replay      the same seed produces the same results, byte for byte
 
+Fees are on from the start (a 7% taker fee and a maker rebate), and schedules and overrides change at random, so
+fills charge, rebate and take accounts below zero (E-10.11, E-3.3).
+
 It ends with a coverage line naming every result kind, reject reason and cancel reason never produced, so a
 passing run that exercised little is visible as such.
 """
@@ -43,6 +46,7 @@ ALL_CANCELS = {"CLIENT_REQUEST", "MASS_CANCEL", "SESSION_DISCONNECT", "HEARTBEAT
                "IOC_REMAINDER", "SELF_MATCH_PREVENTED", "MAKER_AUTO_PULL", "KILL_SWITCH", "MARKET_RESOLVED",
                "POSITION_CLOSED", "MARKET_CLOSED", "ORDER_GROUP_TRIGGERED", "SPEND_CAP_REACHED"}
 FILL_KINDS = {"mint", "burn", "transfer", "mixed"}
+FEE_KINDS = {"charged", "rebated", "free", "below zero by fees"}
 
 
 def setup_inputs():
@@ -64,6 +68,7 @@ def setup_inputs():
         {"msg": "SetMarketState", "instrumentId": 4002, "state": "OPEN"},
         {"msg": "SetRuleLimits", "accountId": 0, "maxRestingOrders": 12, "maxNewOrdersPerSecond": 0,
          "maxOrderToTradeRatioMilli": 0, "ratioFreeOrdersPerSecond": 0},
+        {"msg": "SetFeeSchedule", "makerRateMicros": -17_500, "takerRateMicros": 70_000},
     ]
     for a in ACCOUNTS:
         items.append({"op": "fund", "accountId": a, "cents": FUNDING[a]})
@@ -86,6 +91,7 @@ class Fuzzer:
         self.mirror_pos, self.mirror_sleeve, self.mirror_level = {}, {}, {}
         self.transcript = []
         self.compiled = []
+        self.below_zero_by_fees = 0
 
     # ---- input generators
 
@@ -151,8 +157,9 @@ class Fuzzer:
             return dict(msg="SetVenueMode", commandId=self.next_cmd(), mode="NORMAL"), None
         kind = r.choices(
             ["new", "cancel", "amend", "mass", "batch", "sweep", "tick", "grant", "reclaim", "controls",
-             "protect", "group", "reset", "market", "phase", "venue", "limits", "params", "seed"],
-            [40, 10, 8, 2, 4, 3, 8, 2, 2, 1, 3, 3, 1, 2, 1, 1, 1, 1, 1])[0]
+             "protect", "group", "reset", "market", "phase", "venue", "limits", "params", "seed", "fees",
+             "override", "unoverride"],
+            [40, 10, 8, 2, 4, 3, 8, 2, 2, 1, 3, 3, 1, 2, 1, 1, 1, 1, 1, 1, 2, 1])[0]
         if kind == "new":
             e = self.order_fields(a)
             e.pop("entryType")
@@ -253,6 +260,21 @@ class Fuzzer:
                         maxRestingOrders=r.randint(0, 6), maxNewOrdersPerSecond=r.choice([0, 0, 3, 10]),
                         maxOrderToTradeRatioMilli=r.choice([0, 0, 2000, 5000]),
                         ratioFreeOrdersPerSecond=r.randint(0, 5)), None
+        if kind == "fees":                                           # E-7.9, rates out of range included
+            return dict(msg="SetFeeSchedule", commandId=self.next_cmd(),
+                        makerRateMicros=r.choice([0, -17_500, 10_000, -1_000_000, -1_000_001, 1_000_000]),
+                        takerRateMicros=r.choice([0, 70_000, 35_000, 1_000_000, -1, 1_000_001])), None
+        if kind == "override":                                       # E-7.10: a few IDs, so overrides replace
+            expiry = r.choice([None, None, 0, r.randint(1, 60) * 1_000_000, -1_000_000])
+            e = self.engine
+            return dict(msg="SetFeeOverride", commandId=self.next_cmd(), overrideId=r.randint(1, 6),
+                        priority=r.randint(0, 4), accountId=r.choice([0, 0] + ACCOUNTS),
+                        instrumentId=r.choice([0, 0, 0] + INSTRUMENTS), eventId=r.choice([0, 0, 0] + list(STATES)),
+                        makerRateMicros=r.choice([0, -50_000, 20_000, -1_000_000, 2_000_000]),
+                        takerRateMicros=r.choice([0, 10_000, 140_000, 1_000_000]),
+                        expiresAt=None if expiry is None else e.now + 1_000_000 + expiry), None
+        if kind == "unoverride":                                     # E-7.11
+            return dict(msg="RemoveFeeOverride", commandId=self.next_cmd(), overrideId=r.randint(1, 6)), None
         if kind == "params":
             return dict(msg="SetGroupParameters", commandId=self.next_cmd(),
                         activeOrderLimit=r.choice([0, 0, 8, 30]),
@@ -329,7 +351,12 @@ class Fuzzer:
                 inp, adv = self.resolution(), None
             else:
                 inp, adv = self.random_input()
+            before = {a: acc.balance - acc.reserved for a, acc in self.engine.accounts.items()}
             results = self.driver.send(inp, adv)
+            if not self.engine.voided and any(
+                    a and before.get(a, 0) >= 0 > acc.balance - acc.reserved
+                    for a, acc in self.engine.accounts.items()):
+                self.below_zero_by_fees += 1
             self.compiled.append(dict(input=self.driver.last_input, expect=results, expectFailStop=False))
             self.transcript.append(results)
             self.absorb(inp, results)
@@ -354,7 +381,7 @@ def main(argv):
     ap.add_argument("--first", type=int, default=1)
     ap.add_argument("--export", help="write each seed's transcript as a compiled scenario into this directory")
     args = ap.parse_args(argv)
-    results, rejects, cancels, fills = Counter(), Counter(), Counter(), Counter()
+    results, rejects, cancels, fills, fees = Counter(), Counter(), Counter(), Counter(), Counter()
     for seed in range(args.first, args.first + args.seeds):
         try:
             fz = Fuzzer(seed)
@@ -370,6 +397,7 @@ def main(argv):
         except (FailStop, AssertionError) as exc:
             print(f"FAIL seed {seed}: {type(exc).__name__}: {exc}")
             return 1
+        fees["below zero by fees"] += fz.below_zero_by_fees
         if seed == args.first and Fuzzer(seed).run(args.steps) != transcript:
             print(f"FAIL seed {seed}: replay produced different results")
             return 1
@@ -382,12 +410,16 @@ def main(argv):
                     cancels[res["reason"]] += 1
                 elif res["msg"] == "Fill":
                     fills[fill_kind(res)] += 1
+                    for side in ("makerFeeCents", "takerFeeCents"):
+                        fees["charged" if res[side] > 0 else "rebated" if res[side] < 0 else "free"] += 1
     print(f"{args.seeds} seeds x {args.steps} steps: PASS")
     print(f"  fills {dict(fills)}; set burns {results['CollateralReleased']}; payouts {results['SettlementPayout']}")
     print(f"  rejects {dict(rejects.most_common())}")
     print(f"  cancels {dict(cancels.most_common())}")
+    print(f"  fees {dict(fees)}")
     missing = sorted(ALL_RESULTS - set(results)) + sorted("reject:" + x for x in ALL_REJECTS - set(rejects)) + \
-        sorted("cancel:" + x for x in ALL_CANCELS - set(cancels)) + sorted("fill:" + x for x in FILL_KINDS - set(fills))
+        sorted("cancel:" + x for x in ALL_CANCELS - set(cancels)) + sorted("fill:" + x for x in FILL_KINDS - set(fills)) + \
+        sorted("fees:" + x for x in FEE_KINDS - {k for k, v in fees.items() if v})
     print(f"  never produced: {missing if missing else 'nothing'}")
     return 0
 

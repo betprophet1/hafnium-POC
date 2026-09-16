@@ -28,7 +28,8 @@ scenario disagree, decide from the specification which is wrong, fix that, and s
   `t` is `t + 1` cents), `binary`, `categorical`, `parlay` and `fund`. Setup commands must all apply.
 - **Defaults** for inputs: `sessionId` is `accountId × 10`; a `NewOrder` is `GTC`, entered as `YES`,
   cancelled at event start, with no flags, protection, spend cap, stake, group or expiry; `expiresAfterNs`
-  sets `expiresAt` relative to the input's time; an `AmendOrder` leaves `atEventStart` `UNCHANGED`.
+  sets `expiresAt` relative to the input's time, for a `SetFeeOverride` too, which otherwise never expires; an
+  `AmendOrder` leaves `atEventStart` `UNCHANGED`.
 - **Defaults** for expected results: `sessionId` as above, fees 0, `originalOrderId` null and `rejectReason`
   `NONE` unless given.
 - **IDs.** `"O3"` in an order ID field is the group's third order ID and `"T2"` in `tradeId` its second trade

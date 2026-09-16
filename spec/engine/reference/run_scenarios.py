@@ -110,6 +110,10 @@ def with_defaults(inp, now):
         inp.setdefault("atEventStart", "UNCHANGED")
     if inp["msg"] == "BatchOrders":
         inp["entries"] = [order_defaults(e, now) if e["entryType"] == "NEW" else e for e in inp["entries"]]
+    if inp["msg"] == "SetFeeOverride":
+        inp.setdefault("expiresAt", None)
+        if "expiresAfterNs" in inp:
+            inp["expiresAt"] = now + inp.pop("expiresAfterNs")
     if inp["msg"] == "ResolveEvent":
         inp.setdefault("winningState", 0)
         inp.setdefault("caseId", 0)
