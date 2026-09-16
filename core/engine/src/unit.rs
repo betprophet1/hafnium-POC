@@ -5,6 +5,9 @@
 //! start-of-unit value; keys whose final value differs are reported in key order. The log lives in
 //! caller-provided storage and is cleared for every unit.
 
+/// How many of the latest records a new record is checked against before it is kept.
+pub const RECENT: usize = 8;
+
 /// The touch log ran out of room: a fail-stop `Capacity`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LogFull;
@@ -32,9 +35,12 @@ impl<'a, K: Ord + Copy, V: Copy + PartialEq> Touches<'a, K, V> {
         &self.log[..self.len]
     }
 
-    /// Records `key` with its value before a change. Repeated touches are harmless.
+    /// Records `key` with its value before a change. Only a key's first record is ever read (`finish` sorts by key,
+    /// then by record), so a key already among the last few records is skipped: a walk touches the buyer, the
+    /// seller and the buyer again on every fill, and checking only the last record let the log grow with every fill
+    /// instead of with what the unit touched.
     pub fn touch(&mut self, key: K, value: V) -> Result<(), LogFull> {
-        if self.len > 0 && self.log[self.len - 1].0 == key {
+        if self.log[self.len.saturating_sub(RECENT)..self.len].iter().any(|e| e.0 == key) {
             return Ok(());
         }
         let slot = self.log.get_mut(self.len).ok_or(LogFull)?;

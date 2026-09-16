@@ -273,6 +273,65 @@ impl Capacities {
             undo: 65_536,
         }
     }
+
+    /// A first production group: a quarter of a million resting orders and accounts, about 1.5 GiB.
+    ///
+    /// Every size is a power of two, so no map pays for rounding: a map of `n` entries gets exactly `2n` slots.
+    /// `touches` is four times `orders`, as it is in [`Self::small`]: one message can fill against every resting
+    /// order, and with repeated keys skipped (`unit.rs`, `orders.rs`) each fill adds at most a few records for an
+    /// account not already among the last few. `undo` stays small, because only the dry-run oracle uses it.
+    pub const fn launch() -> Self {
+        Self {
+            tick_tables: 64,
+            tick_rows: 16_384,
+            events: 4_096,
+            instruments: 2_048,
+            levels: 524_288,
+            accounts: 262_144,
+            holdings: 2_097_152,
+            orders: 262_144,
+            duplicates: 4_194_304,
+            commands: 1_048_576,
+            order_groups: 65_536,
+            maker_settings: 65_536,
+            maker_counters: 262_144,
+            event_cash: 1_048_576,
+            touches: 1_048_576,
+            undo: 65_536,
+        }
+    }
+
+    /// A million resting orders and accounts, about 6 GiB. Sized the same way as [`Self::launch`].
+    pub const fn scale() -> Self {
+        Self {
+            tick_tables: 64,
+            tick_rows: 65_536,
+            events: 16_384,
+            instruments: 8_192,
+            levels: 2_097_152,
+            accounts: 1_048_576,
+            holdings: 8_388_608,
+            orders: 1_048_576,
+            duplicates: 16_777_216,
+            commands: 4_194_304,
+            order_groups: 262_144,
+            maker_settings: 262_144,
+            maker_counters: 1_048_576,
+            event_cash: 4_194_304,
+            touches: 4_194_304,
+            undo: 65_536,
+        }
+    }
+
+    /// The profile a node was started with, by name: `small`, `launch` or `scale`.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "small" => Some(Self::small()),
+            "launch" => Some(Self::launch()),
+            "scale" => Some(Self::scale()),
+            _ => None,
+        }
+    }
 }
 
 /// Every table the engine uses. Map slices must have [`Capacities::slots`] entries; pools have exactly the

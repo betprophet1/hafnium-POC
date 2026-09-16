@@ -198,6 +198,10 @@ impl<'a> Engine<'a> {
         if self.dry {
             return Ok(());
         }
+        // `finish_order_unit` acts on each distinct mark once, so a mark already among the latest is not kept again.
+        if self.marks[self.marks_len.saturating_sub(crate::unit::RECENT)..self.marks_len].contains(&mark) {
+            return Ok(());
+        }
         let slot = self.marks.get_mut(self.marks_len).ok_or(FailStop::Capacity)?;
         *slot = mark;
         self.marks_len += 1;
