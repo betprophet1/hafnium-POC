@@ -379,6 +379,28 @@ impl Hub {
             });
             self.send_to_topic("markets", &phase.to_string());
         }
+        // After each market's own state change, the event's resolution as a whole: a void and a settlement both
+        // show as markets leaving trading, and only this says which, and which state occurred.
+        if input["msg"] == "ResolveEvent" && unit.results.iter().any(|r| r["outcome"] == "APPLIED") {
+            let event = u(&input["eventId"]);
+            let resolved = json!({
+                "type": "market", "sequence": id(sequence), "eventId": id(event), "resolution": self.resolution(event)
+            });
+            self.send_to_topic("markets", &resolved.to_string());
+        }
+    }
+
+    /// How an event was resolved, as `GET /v4/markets` and the `markets` topic show it; null while it is not.
+    fn resolution(&self, event: u64) -> Value {
+        let Some(r) = self.view.events.get(&event).and_then(|e| e.resolution.as_ref()) else { return Value::Null };
+        if r.kind == "VOID" {
+            return json!({"kind": "void", "at": price::format_timestamp(r.at)});
+        }
+        let outcome = self.catalogue.states(event, r.winning_state + 1).pop();
+        json!({
+            "kind": "resolved", "winningState": r.winning_state, "outcome": outcome,
+            "at": price::format_timestamp(r.at)
+        })
     }
 
     fn send_to_account(&mut self, account: u64, sequence: u64, message: String) {
@@ -539,11 +561,14 @@ impl Hub {
         }))
     }
 
-    pub fn markets(&self) -> Value {
+    /// Every event, or with `resolved` only those that are (or are not) resolved: a venue that lists rounds on a
+    /// calendar accumulates settled events, and a client that trades wants the live ones without every old ladder.
+    pub fn markets(&self, resolved: Option<bool>) -> Value {
         let events: Vec<Value> = self
             .view
             .events
             .iter()
+            .filter(|(_, e)| resolved.is_none_or(|r| e.resolved == r))
             .map(|(&event, e)| {
                 let markets: Vec<Value> = e
                     .instruments
@@ -561,7 +586,9 @@ impl Hub {
                 json!({
                     "eventId": id(event), "title": self.catalogue.title(event),
                     "outcomes": self.catalogue.states(event, e.state_count), "started": e.started,
-                    "suspended": e.suspended, "ended": e.ended, "resolved": e.resolved, "markets": markets
+                    "suspended": e.suspended, "ended": e.ended, "resolved": e.resolved, "markets": markets,
+                    "scheduledStart": (e.scheduled_start > 0).then(|| price::format_timestamp(e.scheduled_start)),
+                    "resolution": self.resolution(event)
                 })
             })
             .collect();

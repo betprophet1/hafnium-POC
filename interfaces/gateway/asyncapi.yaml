@@ -136,7 +136,7 @@ operations:
   sendMarket:
     action: send
     channel: { $ref: '#/channels/public' }
-    summary: 'Topic markets: market states and event phases as they change.'
+    summary: 'Topic markets: market states, event phases and event resolutions as they change.'
     messages: [{ $ref: '#/channels/public/messages/market' }]
   sendExecution:
     action: send
@@ -361,6 +361,11 @@ components:
           instrumentId: { $ref: './openapi.yaml#/components/schemas/Id' }
           state: { $ref: './openapi.yaml#/components/schemas/MarketState' }
           phase: { type: string, enum: [started, suspended, resumed, ended], description: Set for an event phase change. }
+          resolution:
+            $ref: './openapi.yaml#/components/schemas/Resolution'
+            description: >
+              Set once an event is resolved or voided, after each of its markets' own state change: the markets
+              show only that trading ended, and this says which, and which outcome occurred.
     execution:
       payload:
         allOf:

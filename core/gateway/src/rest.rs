@@ -88,7 +88,15 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Res
         } else {
             Err(ApiError::unavailable("catching up with the feed"))
         })),
-        ("GET", ["v4", "markets"]) => Ok(Routed::Now(Ok(gateway.hub().markets()))),
+        ("GET", ["v4", "markets"]) => {
+            let resolved = match request.query.get("resolved").map(String::as_str) {
+                None => None,
+                Some("true") => Some(true),
+                Some("false") => Some(false),
+                Some(_) => return Err(ApiError::bad("resolved must be true or false")),
+            };
+            Ok(Routed::Now(Ok(gateway.hub().markets(resolved))))
+        }
         ("GET", ["v4", "markets", instrument, "book"]) => {
             let instrument = parse_id(instrument, "instrumentId")?;
             let depth = match request.query.get("depth") {
@@ -179,6 +187,40 @@ mod tests {
         assert_eq!((status, book["instrumentId"].as_str()), (200, Some(MARKET.to_string().as_str())), "{book}");
         let (status, _) = request(&venue.address, "GET", "/v4/markets/99999/book", None, None);
         assert_eq!(status, 404);
+    }
+
+    /// A settled event stays listed, says how it was resolved, and can be left out by a client that only trades.
+    #[test]
+    fn markets_say_how_an_event_was_resolved_and_can_leave_resolved_events_out() {
+        let venue = testing::venue("rest-resolved");
+        let event = venue_link::catalogue::event_id(1, 1);
+        let resolve = venue_link::wire::command(
+            "ResolveEvent",
+            "test-resolve".into(),
+            json!({"eventId": event, "kind": "RESOLVED", "caseId": 7, "winningState": 1, "voidWeights": []}),
+        );
+        venue_link::submit::Submit::spawn(&venue.ingress).send(resolve).expect("resolved");
+        let listed = |query: &str| {
+            let (status, markets) = request(&venue.address, "GET", &format!("/v4/markets{query}"), None, None);
+            assert_eq!(status, 200, "{markets}");
+            markets["events"].as_array().cloned().unwrap_or_default()
+        };
+        let named = event.to_string();
+        let has = |events: &[Value]| events.iter().any(|e| e["eventId"].as_str() == Some(named.as_str()));
+        testing::eventually("the feed shows the resolution", || has(&listed("?resolved=true")));
+        let settled = listed("?resolved=true")
+            .into_iter()
+            .find(|e| e["eventId"].as_str() == Some(named.as_str()))
+            .expect("listed");
+        assert_eq!(settled["resolution"]["kind"], "resolved", "{settled}");
+        assert_eq!(
+            (settled["resolution"]["winningState"].as_u64(), settled["resolution"]["outcome"].as_str()),
+            (Some(1), Some("Rain"))
+        );
+        assert!(!has(&listed("?resolved=false")));
+        assert!(has(&listed("")));
+        assert!(listed("?resolved=false").iter().all(|e| e["resolution"].is_null()));
+        assert_eq!(request(&venue.address, "GET", "/v4/markets?resolved=maybe", None, None).0, 400);
     }
 
     #[test]

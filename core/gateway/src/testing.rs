@@ -34,6 +34,8 @@ pub struct Venue {
     /// Where each half's WebSocket is served, as a client would dial it.
     pub ws_public: String,
     pub ws_private: String,
+    /// The node's ingress, for a test that acts as an operator.
+    pub ingress: String,
 }
 
 /// A seeded node, a treasury on it with a fake bank that decides `dummy_bank` transfers within half a second and never
@@ -144,7 +146,7 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
         thread::sleep(Duration::from_millis(20));
     }
     let (ws_public, ws_private) = (format!("ws://{address}/v4/ws_public"), format!("ws://{address}/v4/ws_private"));
-    Venue { gateway, address, ws_public, ws_private }
+    Venue { gateway, address, ws_public, ws_private, ingress }
 }
 
 /// Starts a treasury of the test's own on the node, with a fresh book, and returns where it listens.

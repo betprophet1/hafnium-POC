@@ -41,9 +41,16 @@ paths:
       tags: [markets]
       summary: Events, their markets and price ladders
       security: []
+      parameters:
+        - name: resolved
+          in: query
+          description: |
+            Only events that are (`true`) or are not (`false`) resolved. A venue that lists rounds on a calendar keeps
+            every settled event, so a client that trades asks for `false`. Omitted, every event.
+          schema: { type: boolean }
       responses:
         '200':
-          description: Every event the gateway knows, with its markets.
+          description: Every event the gateway knows, or those `resolved` selects, with its markets.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Markets' }
@@ -598,6 +605,25 @@ components:
         ended: { type: boolean }
         resolved: { type: boolean }
         markets: { type: array, items: { $ref: '#/components/schemas/Market' } }
+        scheduledStart:
+          type: [string, 'null']
+          format: date-time
+          description: When the event is scheduled to start, as listed; null if it was listed without one.
+        resolution:
+          oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/Resolution'
+    Resolution:
+      type: object
+      description: |
+        How an event was resolved (spec E-15.4). A void reverses every trade in the event; anything built on the event,
+        such as a parlay with it as a leg, follows this rather than the markets' states alone.
+      required: [kind, at]
+      properties:
+        kind: { type: string, enum: [resolved, void] }
+        winningState: { type: integer, minimum: 0, description: The index into `outcomes` that occurred. Resolved only. }
+        outcome: { type: string, description: That outcome's name. Resolved only. }
+        at: { type: string, format: date-time, description: The sequencer's time. }
     Markets:
       type: object
       required: [sequence, events]

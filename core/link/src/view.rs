@@ -18,6 +18,27 @@ pub struct EventView {
     pub ended: bool,
     pub resolved: bool,
     pub instruments: Vec<u64>,
+    /// Sequencer times, in nanoseconds since the epoch, of the inputs that defined, started and ended the event, and
+    /// the start `DefineEvent` scheduled (0 for none). A calendar counts its stages from these.
+    pub defined_at: u64,
+    pub scheduled_start: u64,
+    pub started_at: Option<u64>,
+    pub ended_at: Option<u64>,
+    /// Whether the event has ever been suspended, so a calendar suspends a round at most once.
+    pub suspended_ever: bool,
+    /// How the event was resolved, once it has been: what a follower of settled events (a parlay's legs, say) needs.
+    pub resolution: Option<Resolution>,
+}
+
+/// An applied `ResolveEvent` (E-15.4), as the feed recorded it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolution {
+    /// `RESOLVED` or `VOID`.
+    pub kind: String,
+    /// The state that occurred; 0 for a void.
+    pub winning_state: u64,
+    pub case_id: u64,
+    pub at: u64,
 }
 
 #[derive(Clone, Default)]
@@ -65,6 +86,9 @@ pub struct OrderView {
 pub struct View {
     /// The last input applied; a reader has seen an input's effects once this reaches its sequence.
     pub sequence: u64,
+    /// The sequencer's time at that input, in nanoseconds since the epoch. The node ticks (E-17.3), so this keeps
+    /// moving while nothing else happens: it is the clock anything scheduled on sequencer time reads.
+    pub now: u64,
     pub version: u64,
     /// Each table's ticks as basis points of probability, for display.
     pub tables: BTreeMap<u64, Vec<u64>>,
@@ -99,6 +123,12 @@ impl View {
     pub fn apply(&mut self, unit: &Unit) {
         let input = &unit.input;
         self.sequence = u(&input["record"]["sequence"]);
+        self.now = u(&input["record"]["sequencedAt"]);
+        let now = self.now;
+        // A tick changes nothing a reader shows, so it does not wake anyone waiting for a change.
+        if input["msg"] == "TimeTick" && unit.results.is_empty() {
+            return;
+        }
         self.version += 1;
         let applied = unit.results.iter().any(|r| r["msg"] == "CommandApplied" && r["outcome"] == "APPLIED");
         match input["msg"].as_str().unwrap_or("") {
@@ -119,7 +149,12 @@ impl View {
                 self.ladders.insert(table, rows);
             }
             "DefineEvent" if applied => {
-                let event = EventView { state_count: u(&input["stateCount"]), ..EventView::default() };
+                let event = EventView {
+                    state_count: u(&input["stateCount"]),
+                    defined_at: now,
+                    scheduled_start: u(&input["scheduledStart"]),
+                    ..EventView::default()
+                };
                 self.events.insert(u(&input["eventId"]), event);
             }
             "ListInstrument" if applied => {
@@ -142,12 +177,31 @@ impl View {
             "SetEventPhase" if applied => {
                 if let Some(e) = self.events.get_mut(&u(&input["eventId"])) {
                     match input["phase"].as_str() {
-                        Some("STARTED") => e.started = true,
-                        Some("SUSPENDED") => e.suspended = true,
+                        Some("STARTED") => {
+                            e.started = true;
+                            e.started_at = Some(now);
+                        }
+                        Some("SUSPENDED") => {
+                            e.suspended = true;
+                            e.suspended_ever = true;
+                        }
                         Some("RESUMED") => e.suspended = false,
-                        Some("ENDED") => e.ended = true,
+                        Some("ENDED") => {
+                            e.ended = true;
+                            e.ended_at.get_or_insert(now);
+                        }
                         _ => {}
                     }
+                }
+            }
+            "ResolveEvent" if applied => {
+                if let Some(e) = self.events.get_mut(&u(&input["eventId"])) {
+                    e.resolution = Some(Resolution {
+                        kind: s(&input["kind"]),
+                        winning_state: if input["kind"] == "VOID" { 0 } else { u(&input["winningState"]) },
+                        case_id: u(&input["caseId"]),
+                        at: now,
+                    });
                 }
             }
             _ => {}
@@ -338,5 +392,53 @@ impl Live {
             );
         });
         live
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit(msg: Value, at: u64, applied: bool) -> Unit {
+        let mut input = msg;
+        input["record"] = json!({"sequence": at, "sequencedAt": at, "sequencerGroup": 1});
+        let results = if applied { vec![json!({"msg": "CommandApplied", "outcome": "APPLIED"})] } else { Vec::new() };
+        Unit { input, results }
+    }
+
+    #[test]
+    fn an_event_remembers_when_things_happened_to_it_and_how_it_was_resolved() {
+        let mut view = View::default();
+        view.apply(&unit(json!({"msg": "DefineEvent", "eventId": 5, "stateCount": 3, "scheduledStart": 90}), 10, true));
+        let phase = |p: &str| json!({"msg": "SetEventPhase", "eventId": 5, "phase": p, "source": "DUMMY_ORACLE"});
+        view.apply(&unit(phase("STARTED"), 100, true));
+        view.apply(&unit(phase("SUSPENDED"), 110, true));
+        view.apply(&unit(phase("RESUMED"), 120, true));
+        view.apply(&unit(phase("ENDED"), 200, true));
+        let resolve =
+            json!({"msg": "ResolveEvent", "eventId": 5, "kind": "RESOLVED", "caseId": 501, "winningState": 2});
+        view.apply(&unit(resolve, 300, true));
+        let e = &view.events[&5];
+        assert_eq!((e.defined_at, e.scheduled_start, e.started_at, e.ended_at), (10, 90, Some(100), Some(200)));
+        assert!(e.suspended_ever && !e.suspended);
+        let expected = Resolution { kind: "RESOLVED".into(), winning_state: 2, case_id: 501, at: 300 };
+        assert_eq!(e.resolution, Some(expected));
+    }
+
+    #[test]
+    fn a_rejected_resolution_resolves_nothing() {
+        let mut view = View::default();
+        view.apply(&unit(json!({"msg": "DefineEvent", "eventId": 5, "stateCount": 2, "scheduledStart": 0}), 1, true));
+        view.apply(&unit(json!({"msg": "ResolveEvent", "eventId": 5, "kind": "VOID", "caseId": 0}), 2, false));
+        assert_eq!(view.events[&5].resolution, None);
+    }
+
+    #[test]
+    fn a_quiet_tick_moves_the_clock_but_changes_nothing_a_reader_shows() {
+        let mut view = View::default();
+        view.apply(&unit(json!({"msg": "DefineEvent", "eventId": 5, "stateCount": 2, "scheduledStart": 0}), 1, true));
+        let version = view.version;
+        view.apply(&unit(json!({"msg": "TimeTick"}), 7, false));
+        assert_eq!((view.now, view.sequence, view.version), (7, 7, version));
     }
 }
