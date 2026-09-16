@@ -533,7 +533,10 @@ pub fn maker(api: &Api, gateway: &str, token: &str, config: &Maker, mut ids: Ids
                             } else {
                                 (f + spread + k <= top).then_some(f + spread + k)?
                             };
-                            Some((tick, config.size * (k + 1) * m.lot))
+                            // Deeper levels carry more, and every requote sizes them afresh: a real maker's
+                            // ladder moves in size as well as in price, and a demo where it does not makes the
+                            // book look frozen even while it is changing.
+                            Some((tick, config.size * (k + 1) * m.lot * (1 + rng.below(4))))
                         })
                         .filter(|(tick, _)| {
                             if side == "buy" {
@@ -552,7 +555,9 @@ pub fn maker(api: &Api, gateway: &str, token: &str, config: &Maker, mut ids: Ids
                     }
                     for (k, o) in mine.iter().enumerate() {
                         match desired.get(k) {
-                            Some(&(tick, size)) if o.tick != tick || o.remaining < size => {
+                            // Any difference in size, not only a shortfall: a level that shrinks has to be
+                            // amended too, or half of the sizing never reaches the book.
+                            Some(&(tick, size)) if o.tick != tick || o.remaining != size => {
                                 out.push(Action::Amend(o.id, json!({"price": {"tick": tick}, "quantity": size})));
                             }
                             Some(_) => {}
