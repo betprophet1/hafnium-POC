@@ -31,6 +31,13 @@ pub fn capacity_profile(profile: &str) -> Result<Capacities, Error> {
 /// D-12's window, restated here because E-7.4 replaces both group parameters together: see `group_parameters`.
 pub const CLIENT_ORDER_ID_WINDOW_SECONDS: u64 = 7_200;
 
+/// The demo default fee rates, in millionths: see `Catalogue::fees`.
+pub const DEMO_MAKER_RATE_MICROS: i64 = 17_500;
+pub const DEMO_TAKER_RATE_MICROS: i64 = 70_000;
+
+/// The catalogue's synthetic maker, whose demo override makes it a rebated market maker.
+const SYNTHETIC_MAKER: u64 = 10;
+
 pub struct Catalogue {
     accounts: Vec<Value>,
     markets: Vec<Value>,
@@ -125,10 +132,36 @@ impl Catalogue {
         )
     }
 
-    /// Everything a fresh venue needs: the group settings, the tick table, funded accounts and round 1 of every
-    /// market. The settings come first, so no order can exist before the limit that bounds them.
+    /// The demo fee schedule (spec E-10.11, D-2), in the form prediction-market exchanges publish: a taker pays
+    /// 7% and a maker 1.75% of `contracts × P × (1 − P)` dollars. The synthetic maker, standing in for a market
+    /// maker on a programme, instead earns a 0.5% maker rebate and pays no taker fee, for as long as the venue runs
+    /// (an override with no expiry, D-27), when the catalogue has it. Rates are millionths.
+    fn fees(&self) -> Vec<Value> {
+        let mut inputs = vec![command(
+            "SetFeeSchedule",
+            "seed-fees".into(),
+            json!({"makerRateMicros": DEMO_MAKER_RATE_MICROS, "takerRateMicros": DEMO_TAKER_RATE_MICROS}),
+        )];
+        if self.accounts.iter().any(|a| a["id"].as_u64() == Some(SYNTHETIC_MAKER)) {
+            inputs.push(command(
+                "SetFeeOverride",
+                "seed-fee-maker-programme".into(),
+                json!({
+                    "overrideId": 1, "priority": 10, "accountId": SYNTHETIC_MAKER, "instrumentId": 0, "eventId": 0,
+                    "makerRateMicros": -5_000, "takerRateMicros": 0, "expiresAt": null
+                }),
+            ));
+        }
+        inputs
+    }
+
+    /// Everything a fresh venue needs: the group settings, the fee schedule, the tick table, funded accounts and
+    /// round 1 of every market. The settings come first, so no order can exist before the limit that bounds them,
+    /// and no fill before the fees that apply to it.
     pub fn seed(&self, order_ceiling: usize) -> Result<Vec<Value>, Error> {
-        let mut inputs = vec![Self::group_parameters(order_ceiling), Self::cent_table()];
+        let mut inputs = vec![Self::group_parameters(order_ceiling)];
+        inputs.extend(self.fees());
+        inputs.push(Self::cent_table());
         for a in &self.accounts {
             let id = a["id"].as_u64().ok_or("an account needs an id")?;
             inputs.push(command(
