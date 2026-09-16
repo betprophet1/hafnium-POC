@@ -1,0 +1,395 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Interface 4: the venue's FIX 4.4 dialect, as a dictionary (QuickFIX format, which Artio reads). Draft v0.
+
+  Only what the venue supports is here: a message, field or enum value that is absent is refused (README.md beside
+  this file, rejects). Tag numbers and names are standard FIX 4.4; there are no user-defined tags. The adapter in
+  adapters/fix generates its codecs from this file, so the dictionary and the implementation cannot drift apart.
+-->
+<fix type="FIX" major="4" minor="4" servicepack="0">
+  <header>
+    <field name="BeginString" required="Y"/>
+    <field name="BodyLength" required="Y"/>
+    <field name="MsgType" required="Y"/>
+    <field name="SenderCompID" required="Y"/>
+    <field name="TargetCompID" required="Y"/>
+    <field name="MsgSeqNum" required="Y"/>
+    <field name="SenderSubID" required="N"/>
+    <field name="SenderLocationID" required="N"/>
+    <field name="TargetSubID" required="N"/>
+    <field name="TargetLocationID" required="N"/>
+    <field name="PossDupFlag" required="N"/>
+    <field name="PossResend" required="N"/>
+    <field name="SendingTime" required="Y"/>
+    <field name="OrigSendingTime" required="N"/>
+    <field name="LastMsgSeqNumProcessed" required="N"/>
+  </header>
+  <trailer>
+    <field name="CheckSum" required="Y"/>
+  </trailer>
+  <messages>
+    <!-- Session layer: served by the FIX engine (Artio), including resend and gap fill. -->
+    <message name="Heartbeat" msgtype="0" msgcat="admin">
+      <field name="TestReqID" required="N"/>
+    </message>
+    <message name="TestRequest" msgtype="1" msgcat="admin">
+      <field name="TestReqID" required="Y"/>
+    </message>
+    <message name="ResendRequest" msgtype="2" msgcat="admin">
+      <field name="BeginSeqNo" required="Y"/>
+      <field name="EndSeqNo" required="Y"/>
+    </message>
+    <message name="Reject" msgtype="3" msgcat="admin">
+      <field name="RefSeqNum" required="Y"/>
+      <field name="RefTagID" required="N"/>
+      <field name="RefMsgType" required="N"/>
+      <field name="SessionRejectReason" required="N"/>
+      <field name="Text" required="N"/>
+    </message>
+    <message name="SequenceReset" msgtype="4" msgcat="admin">
+      <field name="GapFillFlag" required="N"/>
+      <field name="NewSeqNo" required="Y"/>
+    </message>
+    <message name="Logout" msgtype="5" msgcat="admin">
+      <field name="Text" required="N"/>
+    </message>
+    <message name="Logon" msgtype="A" msgcat="admin">
+      <field name="EncryptMethod" required="Y"/>
+      <field name="HeartBtInt" required="Y"/>
+      <field name="ResetSeqNumFlag" required="N"/>
+      <field name="NextExpectedMsgSeqNum" required="N"/>
+      <field name="MaxMessageSize" required="N"/>
+      <field name="Username" required="N"/>
+      <!-- The account's dev token in test environments. -->
+      <field name="Password" required="N"/>
+    </message>
+
+    <!-- Application: orders in. -->
+    <message name="NewOrderSingle" msgtype="D" msgcat="app">
+      <field name="ClOrdID" required="Y"/>
+      <field name="Account" required="N"/>
+      <field name="ExecInst" required="N"/>
+      <component name="Instrument" required="Y"/>
+      <field name="Side" required="Y"/>
+      <field name="TransactTime" required="Y"/>
+      <field name="OrderQty" required="Y"/>
+      <field name="OrdType" required="Y"/>
+      <field name="Price" required="Y"/>
+      <field name="TimeInForce" required="N"/>
+      <field name="ExpireTime" required="N"/>
+    </message>
+    <message name="OrderCancelReplaceRequest" msgtype="G" msgcat="app">
+      <field name="OrderID" required="N"/>
+      <field name="ClOrdID" required="Y"/>
+      <field name="OrigClOrdID" required="Y"/>
+      <field name="Account" required="N"/>
+      <component name="Instrument" required="Y"/>
+      <field name="Side" required="Y"/>
+      <field name="TransactTime" required="Y"/>
+      <field name="OrderQty" required="Y"/>
+      <field name="OrdType" required="Y"/>
+      <field name="Price" required="Y"/>
+    </message>
+    <message name="OrderCancelRequest" msgtype="F" msgcat="app">
+      <field name="OrigClOrdID" required="Y"/>
+      <field name="OrderID" required="N"/>
+      <field name="ClOrdID" required="Y"/>
+      <field name="Account" required="N"/>
+      <component name="Instrument" required="Y"/>
+      <field name="Side" required="Y"/>
+      <field name="TransactTime" required="Y"/>
+      <field name="OrderQty" required="N"/>
+    </message>
+    <message name="OrderMassCancelRequest" msgtype="q" msgcat="app">
+      <field name="ClOrdID" required="Y"/>
+      <field name="MassCancelRequestType" required="Y"/>
+      <!-- Symbol alone rather than the Instrument component, whose Symbol is required. -->
+      <field name="Symbol" required="N"/>
+      <field name="UnderlyingSymbol" required="N"/>
+      <field name="TransactTime" required="Y"/>
+    </message>
+    <message name="SecurityListRequest" msgtype="x" msgcat="app">
+      <field name="SecurityReqID" required="Y"/>
+      <field name="SecurityListRequestType" required="Y"/>
+      <field name="Symbol" required="N"/>
+    </message>
+
+    <!-- Application: answers and executions out. -->
+    <message name="ExecutionReport" msgtype="8" msgcat="app">
+      <field name="OrderID" required="Y"/>
+      <field name="ClOrdID" required="N"/>
+      <field name="OrigClOrdID" required="N"/>
+      <field name="ExecID" required="Y"/>
+      <field name="ExecType" required="Y"/>
+      <field name="OrdStatus" required="Y"/>
+      <field name="OrdRejReason" required="N"/>
+      <field name="ExecRestatementReason" required="N"/>
+      <component name="Instrument" required="Y"/>
+      <field name="Side" required="Y"/>
+      <field name="OrderQty" required="N"/>
+      <field name="OrdType" required="N"/>
+      <field name="Price" required="N"/>
+      <field name="TimeInForce" required="N"/>
+      <field name="ExecInst" required="N"/>
+      <field name="LastQty" required="N"/>
+      <field name="LastPx" required="N"/>
+      <field name="LeavesQty" required="Y"/>
+      <field name="CumQty" required="Y"/>
+      <field name="AvgPx" required="Y"/>
+      <field name="TransactTime" required="N"/>
+      <field name="LastLiquidityInd" required="N"/>
+      <field name="Text" required="N"/>
+    </message>
+    <message name="OrderCancelReject" msgtype="9" msgcat="app">
+      <field name="OrderID" required="Y"/>
+      <field name="ClOrdID" required="Y"/>
+      <field name="OrigClOrdID" required="Y"/>
+      <field name="OrdStatus" required="Y"/>
+      <field name="CxlRejResponseTo" required="Y"/>
+      <field name="CxlRejReason" required="N"/>
+      <field name="Text" required="N"/>
+    </message>
+    <message name="OrderMassCancelReport" msgtype="r" msgcat="app">
+      <field name="ClOrdID" required="N"/>
+      <field name="OrderID" required="Y"/>
+      <field name="MassCancelRequestType" required="Y"/>
+      <field name="MassCancelResponse" required="Y"/>
+      <field name="MassCancelRejectReason" required="N"/>
+      <field name="TotalAffectedOrders" required="N"/>
+      <field name="Symbol" required="N"/>
+      <field name="UnderlyingSymbol" required="N"/>
+      <field name="TransactTime" required="N"/>
+      <field name="Text" required="N"/>
+    </message>
+    <message name="SecurityList" msgtype="y" msgcat="app">
+      <field name="SecurityReqID" required="Y"/>
+      <field name="SecurityResponseID" required="Y"/>
+      <field name="SecurityRequestResult" required="Y"/>
+      <field name="TotNoRelatedSym" required="N"/>
+      <field name="LastFragment" required="N"/>
+      <group name="NoRelatedSym" required="N">
+        <component name="Instrument" required="N"/>
+        <field name="UnderlyingSymbol" required="N"/>
+        <field name="RoundLot" required="N"/>
+      </group>
+      <field name="Text" required="N"/>
+    </message>
+    <message name="BusinessMessageReject" msgtype="j" msgcat="app">
+      <field name="RefSeqNum" required="N"/>
+      <field name="RefMsgType" required="Y"/>
+      <field name="BusinessRejectRefID" required="N"/>
+      <field name="BusinessRejectReason" required="Y"/>
+      <field name="Text" required="N"/>
+    </message>
+  </messages>
+  <components>
+    <!-- A market is named by its instrument ID, a decimal string, in Symbol; SecurityID may repeat it. -->
+    <component name="Instrument">
+      <field name="Symbol" required="Y"/>
+      <field name="SecurityID" required="N"/>
+      <field name="SecurityIDSource" required="N"/>
+      <field name="SecurityDesc" required="N"/>
+      <field name="SecurityStatus" required="N"/>
+    </component>
+  </components>
+  <fields>
+    <field number="1" name="Account" type="STRING"/>
+    <field number="6" name="AvgPx" type="PRICE"/>
+    <field number="7" name="BeginSeqNo" type="SEQNUM"/>
+    <field number="8" name="BeginString" type="STRING"/>
+    <field number="9" name="BodyLength" type="LENGTH"/>
+    <field number="10" name="CheckSum" type="STRING"/>
+    <field number="11" name="ClOrdID" type="STRING"/>
+    <field number="14" name="CumQty" type="QTY"/>
+    <field number="16" name="EndSeqNo" type="SEQNUM"/>
+    <field number="17" name="ExecID" type="STRING"/>
+    <field number="18" name="ExecInst" type="MULTIPLEVALUESTRING">
+      <value enum="6" description="PARTICIPANT_DONT_INITIATE"/>
+      <value enum="E" description="DO_NOT_INCREASE"/>
+    </field>
+    <field number="22" name="SecurityIDSource" type="STRING">
+      <value enum="8" description="EXCHANGE_SYMBOL"/>
+    </field>
+    <field number="31" name="LastPx" type="PRICE"/>
+    <field number="32" name="LastQty" type="QTY"/>
+    <field number="34" name="MsgSeqNum" type="SEQNUM"/>
+    <field number="35" name="MsgType" type="STRING">
+      <value enum="0" description="HEARTBEAT"/>
+      <value enum="1" description="TEST_REQUEST"/>
+      <value enum="2" description="RESEND_REQUEST"/>
+      <value enum="3" description="REJECT"/>
+      <value enum="4" description="SEQUENCE_RESET"/>
+      <value enum="5" description="LOGOUT"/>
+      <value enum="8" description="EXECUTION_REPORT"/>
+      <value enum="9" description="ORDER_CANCEL_REJECT"/>
+      <value enum="A" description="LOGON"/>
+      <value enum="D" description="ORDER_SINGLE"/>
+      <value enum="F" description="ORDER_CANCEL_REQUEST"/>
+      <value enum="G" description="ORDER_CANCEL_REPLACE_REQUEST"/>
+      <value enum="j" description="BUSINESS_MESSAGE_REJECT"/>
+      <value enum="q" description="ORDER_MASS_CANCEL_REQUEST"/>
+      <value enum="r" description="ORDER_MASS_CANCEL_REPORT"/>
+      <value enum="x" description="SECURITY_LIST_REQUEST"/>
+      <value enum="y" description="SECURITY_LIST"/>
+    </field>
+    <field number="36" name="NewSeqNo" type="SEQNUM"/>
+    <field number="37" name="OrderID" type="STRING"/>
+    <field number="38" name="OrderQty" type="QTY"/>
+    <field number="39" name="OrdStatus" type="CHAR">
+      <value enum="0" description="NEW"/>
+      <value enum="1" description="PARTIALLY_FILLED"/>
+      <value enum="2" description="FILLED"/>
+      <value enum="4" description="CANCELED"/>
+      <value enum="8" description="REJECTED"/>
+    </field>
+    <field number="40" name="OrdType" type="CHAR">
+      <value enum="2" description="LIMIT"/>
+    </field>
+    <field number="41" name="OrigClOrdID" type="STRING"/>
+    <field number="43" name="PossDupFlag" type="BOOLEAN"/>
+    <field number="44" name="Price" type="PRICE"/>
+    <field number="45" name="RefSeqNum" type="SEQNUM"/>
+    <field number="48" name="SecurityID" type="STRING"/>
+    <field number="49" name="SenderCompID" type="STRING"/>
+    <field number="50" name="SenderSubID" type="STRING"/>
+    <field number="52" name="SendingTime" type="UTCTIMESTAMP"/>
+    <field number="54" name="Side" type="CHAR">
+      <value enum="1" description="BUY"/>
+      <value enum="2" description="SELL"/>
+    </field>
+    <field number="55" name="Symbol" type="STRING"/>
+    <field number="56" name="TargetCompID" type="STRING"/>
+    <field number="57" name="TargetSubID" type="STRING"/>
+    <field number="58" name="Text" type="STRING"/>
+    <field number="59" name="TimeInForce" type="CHAR">
+      <value enum="1" description="GOOD_TILL_CANCEL"/>
+      <value enum="3" description="IMMEDIATE_OR_CANCEL"/>
+      <value enum="4" description="FILL_OR_KILL"/>
+      <value enum="6" description="GOOD_TILL_DATE"/>
+    </field>
+    <field number="60" name="TransactTime" type="UTCTIMESTAMP"/>
+    <field number="97" name="PossResend" type="BOOLEAN"/>
+    <field number="98" name="EncryptMethod" type="INT">
+      <value enum="0" description="NONE_OTHER"/>
+    </field>
+    <field number="102" name="CxlRejReason" type="INT">
+      <value enum="0" description="TOO_LATE_TO_CANCEL"/>
+      <value enum="1" description="UNKNOWN_ORDER"/>
+      <value enum="3" description="ORDER_ALREADY_IN_PENDING_STATUS"/>
+      <value enum="99" description="OTHER"/>
+    </field>
+    <field number="103" name="OrdRejReason" type="INT">
+      <value enum="1" description="UNKNOWN_SYMBOL"/>
+      <value enum="2" description="EXCHANGE_CLOSED"/>
+      <value enum="3" description="ORDER_EXCEEDS_LIMIT"/>
+      <value enum="5" description="UNKNOWN_ORDER"/>
+      <value enum="6" description="DUPLICATE_ORDER"/>
+      <value enum="11" description="UNSUPPORTED_ORDER_CHARACTERISTIC"/>
+      <value enum="13" description="INCORRECT_QUANTITY"/>
+      <value enum="99" description="OTHER"/>
+    </field>
+    <field number="107" name="SecurityDesc" type="STRING"/>
+    <field number="108" name="HeartBtInt" type="INT"/>
+    <field number="112" name="TestReqID" type="STRING"/>
+    <field number="122" name="OrigSendingTime" type="UTCTIMESTAMP"/>
+    <field number="123" name="GapFillFlag" type="BOOLEAN"/>
+    <field number="126" name="ExpireTime" type="UTCTIMESTAMP"/>
+    <field number="141" name="ResetSeqNumFlag" type="BOOLEAN"/>
+    <field number="142" name="SenderLocationID" type="STRING"/>
+    <field number="143" name="TargetLocationID" type="STRING"/>
+    <field number="146" name="NoRelatedSym" type="NUMINGROUP"/>
+    <field number="150" name="ExecType" type="CHAR">
+      <value enum="0" description="NEW"/>
+      <value enum="4" description="CANCELED"/>
+      <value enum="5" description="REPLACED"/>
+      <value enum="8" description="REJECTED"/>
+      <value enum="D" description="RESTATED"/>
+      <value enum="F" description="TRADE"/>
+    </field>
+    <field number="151" name="LeavesQty" type="QTY"/>
+    <field number="311" name="UnderlyingSymbol" type="STRING"/>
+    <field number="320" name="SecurityReqID" type="STRING"/>
+    <field number="322" name="SecurityResponseID" type="STRING"/>
+    <field number="369" name="LastMsgSeqNumProcessed" type="SEQNUM"/>
+    <field number="371" name="RefTagID" type="INT"/>
+    <field number="372" name="RefMsgType" type="STRING"/>
+    <field number="373" name="SessionRejectReason" type="INT">
+      <value enum="0" description="INVALID_TAG_NUMBER"/>
+      <value enum="1" description="REQUIRED_TAG_MISSING"/>
+      <value enum="2" description="TAG_NOT_DEFINED_FOR_THIS_MESSAGE_TYPE"/>
+      <value enum="3" description="UNDEFINED_TAG"/>
+      <value enum="4" description="TAG_SPECIFIED_WITHOUT_A_VALUE"/>
+      <value enum="5" description="VALUE_IS_INCORRECT"/>
+      <value enum="6" description="INCORRECT_DATA_FORMAT_FOR_VALUE"/>
+      <value enum="7" description="DECRYPTION_PROBLEM"/>
+      <value enum="8" description="SIGNATURE_PROBLEM"/>
+      <value enum="9" description="COMPID_PROBLEM"/>
+      <value enum="10" description="SENDINGTIME_ACCURACY_PROBLEM"/>
+      <value enum="11" description="INVALID_MSGTYPE"/>
+      <value enum="13" description="TAG_APPEARS_MORE_THAN_ONCE"/>
+      <value enum="14" description="TAG_SPECIFIED_OUT_OF_REQUIRED_ORDER"/>
+      <value enum="15" description="REPEATING_GROUP_FIELDS_OUT_OF_ORDER"/>
+      <value enum="16" description="INCORRECT_NUMINGROUP_COUNT_FOR_REPEATING_GROUP"/>
+      <value enum="17" description="NON_DATA_VALUE_INCLUDES_FIELD_DELIMITER"/>
+      <value enum="99" description="OTHER"/>
+    </field>
+    <field number="379" name="BusinessRejectRefID" type="STRING"/>
+    <field number="380" name="BusinessRejectReason" type="INT">
+      <value enum="0" description="OTHER"/>
+      <value enum="1" description="UNKOWN_ID"/>
+      <value enum="2" description="UNKNOWN_SECURITY"/>
+      <value enum="3" description="UNSUPPORTED_MESSAGE_TYPE"/>
+      <value enum="4" description="APPLICATION_NOT_AVAILABLE"/>
+      <value enum="5" description="CONDITIONALLY_REQUIRED_FIELD_MISSING"/>
+      <value enum="6" description="NOT_AUTHORIZED"/>
+    </field>
+    <field number="383" name="MaxMessageSize" type="LENGTH"/>
+    <field number="393" name="TotNoRelatedSym" type="INT"/>
+    <field number="434" name="CxlRejResponseTo" type="CHAR">
+      <value enum="1" description="ORDER_CANCEL_REQUEST"/>
+      <value enum="2" description="ORDER_CANCEL_REPLACE_REQUEST"/>
+    </field>
+    <field number="530" name="MassCancelRequestType" type="CHAR">
+      <value enum="1" description="CANCEL_ORDERS_FOR_A_SECURITY"/>
+      <value enum="2" description="CANCEL_ORDERS_FOR_AN_UNDERLYING_SECURITY"/>
+      <value enum="7" description="CANCEL_ALL_ORDERS"/>
+    </field>
+    <field number="531" name="MassCancelResponse" type="CHAR">
+      <value enum="0" description="CANCEL_REQUEST_REJECTED"/>
+      <value enum="1" description="CANCEL_ORDERS_FOR_A_SECURITY"/>
+      <value enum="2" description="CANCEL_ORDERS_FOR_AN_UNDERLYING_SECURITY"/>
+      <value enum="7" description="CANCEL_ALL_ORDERS"/>
+    </field>
+    <field number="532" name="MassCancelRejectReason" type="INT">
+      <value enum="1" description="INVALID_OR_UNKNOWN_SECURITY"/>
+      <value enum="2" description="INVALID_OR_UNKNOWN_UNDERLYING"/>
+      <value enum="99" description="OTHER"/>
+    </field>
+    <field number="533" name="TotalAffectedOrders" type="INT"/>
+    <field number="553" name="Username" type="STRING"/>
+    <field number="554" name="Password" type="STRING"/>
+    <field number="559" name="SecurityListRequestType" type="INT">
+      <value enum="0" description="SYMBOL"/>
+      <value enum="4" description="ALL_SECURITIES"/>
+    </field>
+    <field number="560" name="SecurityRequestResult" type="INT">
+      <value enum="0" description="VALID_REQUEST"/>
+      <value enum="2" description="NO_INSTRUMENTS_FOUND"/>
+      <value enum="5" description="INSTRUMENT_DATA_TEMPORARILY_UNAVAILABLE"/>
+    </field>
+    <field number="561" name="RoundLot" type="QTY"/>
+    <field number="789" name="NextExpectedMsgSeqNum" type="SEQNUM"/>
+    <field number="851" name="LastLiquidityInd" type="INT">
+      <value enum="1" description="ADDED_LIQUIDITY"/>
+      <value enum="2" description="REMOVED_LIQUIDITY"/>
+    </field>
+    <field number="893" name="LastFragment" type="BOOLEAN"/>
+    <field number="965" name="SecurityStatus" type="STRING">
+      <value enum="1" description="ACTIVE"/>
+      <value enum="2" description="INACTIVE"/>
+    </field>
+    <field number="378" name="ExecRestatementReason" type="INT">
+      <value enum="99" description="OTHER"/>
+    </field>
+  </fields>
+</fix>

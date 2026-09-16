@@ -43,6 +43,7 @@ carries = "FIX 4.4, translated to the canonical message"
 guarantees = "Session-layer resend and gap fill from the adopted engine (&sect;13)"
 format = "FIX 4.4 dictionary and rules of engagement"
 status = "after-mm-review"
+spec = "interfaces/fix"
 
 [[interface]]
 id = 5

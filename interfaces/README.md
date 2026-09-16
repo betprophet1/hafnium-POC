@@ -14,6 +14,7 @@ One specification per interface between components of the venue, and one catalog
 | What | Format | Location |
 |---|---|---|
 | Journal inputs, engine results, binary messages | SBE 2.0 XML | `sbe/` |
+| FIX 4.4 dialect (interface 4) | QuickFIX XML dictionary, rules of engagement in Markdown | `fix/` |
 | REST and WebSocket | OpenAPI 3.1, AsyncAPI 3 | `openapi/`, `asyncapi/` (not started) |
 | Payment and oracle contracts | Rust traits plus conformance suites | `contracts/` (not started) |
 | Stores read by more than one component | ClickHouse DDL, Valkey key layout | `stores/` (not started) |
