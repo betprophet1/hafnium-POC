@@ -26,6 +26,7 @@ COMMANDS = {
     "SetAccountControls", "SetMakerProtection", "TransferOut", "TransferIn",
 }
 SEQUENCER_EVENTS = {"TimeTick", "EngineStarted", "SeedSet"}
+COMMAND_ID_WINDOW_SECONDS = 604_800                                  # D-25
 
 CANCEL_CAUSE_REASON = {
     "CLIENT_REQUEST": "MASS_CANCEL",
@@ -172,7 +173,7 @@ class Engine:
         self.maker_counters = {}
         self.order_groups = {}
         self.duplicates = {}
-        self.commands = set()
+        self.commands = {}                                     # commandId -> expiry (E-7.1)
         self.next_order = 1
         self.next_trade = 1
         self.results = []
@@ -404,11 +405,11 @@ class Engine:
         """E-7.1"""
         self.begin_unit()
         cid = inp["commandId"]
-        if cid in self.commands:
+        if cid in self.commands and self.now < self.commands[cid]:
             self.emit_outcome("CommandApplied", commandId=cid, outcome="DUPLICATE", rejectReason="NONE")
             self.end_unit()
             return
-        self.commands.add(cid)
+        self.commands[cid] = self.now + COMMAND_ID_WINDOW_SECONDS * NS_PER_SECOND   # D-25
         try:
             body(inp, cid)
         except Reject as r:

@@ -96,7 +96,7 @@ orders and for trades within the group *(D-13)*.
 | Maker protection | by `(accountId, eventId)` with `eventId` 0 as the account's default: threshold and window; per `(accountId, eventId)` a counter and window start |
 | Order groups | by `(accountId, clientOrderGroup)`: threshold, window, counter, window start, `triggered` |
 | Duplicates | by `(accountId, clientOrderId)`: expiry, and the order ID it created or none |
-| Commands | the set of every `commandId` processed |
+| Commands | by `commandId`: expiry, seven days after the command was processed *(D-25)* |
 | Counters | next order number and next trade number [1] |
 
 **E-3.2** An account exists from its first mention; until then every field has its initial value. Account 0
@@ -190,9 +190,9 @@ is listed.
 
 ## 7. Service commands
 
-**E-7.1** Every command carries a `commandId`. If it is already in the command set, the outcome is
-`CommandApplied` with `DUPLICATE`, reason `NONE`, and nothing else happens. Otherwise the ID is added to the
-set whatever the outcome. An applied command's outcome is `CommandApplied` `APPLIED` with reason `NONE`,
+**E-7.1** Every command carries a `commandId`. If the command set holds it with an expiry later than `now`,
+the outcome is `CommandApplied` with `DUPLICATE`, reason `NONE`, and nothing else happens. Otherwise the ID is
+recorded whatever the outcome, with expiry `now + 604 800 · 10⁹` *(D-25)*. An applied command's outcome is `CommandApplied` `APPLIED` with reason `NONE`,
 emitted before any result the command causes.
 
 **E-7.2 `SleeveAdjust`.** `deltaCents` must be positive, else rejected `INVALID_COMMAND`. `GRANT` adds it
@@ -226,8 +226,9 @@ version applies from the next input.
 `EXPIRED`, in ascending `(expiresAt, orderId)` order (E-12.1 applies to each). Expiry happens only on a
 tick, so its precision is the tick interval *(D-5)*.
 
-**E-8.2** Duplicate-table entries whose expiry is at or before `now` may be removed on a tick. Removal is not
-observable, because E-9.2 compares `now` with the expiry recorded, which a later change of window does not move.
+**E-8.2** Duplicate-table entries and command-set entries whose expiry is at or before `now` may be removed on a
+tick. Removal is not observable, because E-9.2 and E-7.1 compare `now` with the expiry recorded, which a later
+change of window does not move.
 
 **E-8.3 `EngineStarted`, `SeedSet`.** No state change visible in results. `SeedSet` seeds the keyed hash
 or PRNG; no rule in v0 draws randomness.
