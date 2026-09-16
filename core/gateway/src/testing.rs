@@ -4,7 +4,7 @@
 
 use crate::api::{Gateway, Limits};
 use crate::hub::Hub;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -40,8 +40,10 @@ fn free_address() -> String {
 }
 
 /// Starts a node on ports of its own and returns its ingress and feed addresses. A free port is found by binding it
-/// and letting it go, so another test can take it before the node binds it; a node that cannot bind stops at once,
-/// so a node still running after a moment has its ports, and one that stopped is tried again on fresh ones.
+/// and letting it go, so another test can take it before the node binds it. A node is taken as started only once its
+/// ingress accepts a connection; one that stops first, however long it took to get there, is tried again on fresh
+/// ports. Under a loaded machine a node can take well over a moment to reach its bind, and one taken as started before
+/// it had would leave the test's seeder waiting for ever on a node that is gone.
 fn start_node(name: &str) -> (String, String) {
     for attempt in 0..5 {
         let (ingress, feed) = (free_address(), free_address());
@@ -62,10 +64,23 @@ fn start_node(name: &str) -> (String, String) {
             let outcome = node::serve(&config).map_err(|e| e.to_string());
             let _ = stopped.send(outcome);
         });
-        match stop.recv_timeout(Duration::from_millis(300)) {
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return (ingress, feed),
-            Ok(Err(e)) => eprintln!("test node for {name} could not start, trying other ports: {e}"),
-            _ => eprintln!("test node for {name} stopped at once, trying other ports"),
+        // Up to a minute, counted in waits rather than read off a clock.
+        for _ in 0..3000 {
+            match stop.recv_timeout(Duration::from_millis(20)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if TcpStream::connect(&ingress).is_ok() {
+                        return (ingress, feed);
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("test node for {name} could not start, trying other ports: {e}");
+                    break;
+                }
+                _ => {
+                    eprintln!("test node for {name} stopped, trying other ports");
+                    break;
+                }
+            }
         }
     }
     panic!("no test node for {name} could start in five attempts");
