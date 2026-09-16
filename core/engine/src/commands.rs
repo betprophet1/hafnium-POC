@@ -130,7 +130,11 @@ impl<'a> Engine<'a> {
             set_group_parameters_codec::SBE_TEMPLATE_ID => {
                 let dec = set_group_parameters_codec::SetGroupParametersDecoder::default().header(header(input), 0);
                 self.active_order_limit = dec.active_order_limit();
-                self.client_order_id_window_seconds = dec.client_order_id_window_seconds();
+                let window = dec.client_order_id_window_seconds();
+                if window < self.client_order_id_window_seconds {
+                    self.expiry_window_shortened();
+                }
+                self.client_order_id_window_seconds = window;
                 Ok(())
             }
             activate_protocol_codec::SBE_TEMPLATE_ID => {

@@ -351,8 +351,9 @@ pub struct Memory<'a> {
     pub orders: &'a mut [Order],
     pub order_index: &'a mut [Slot<u64, u32>],
     pub duplicates: &'a mut [Slot<(u64, ClientOrderId), Duplicate>],
-    /// One `(expiresAt, key)` record per recorded client order ID, oldest first, so E-8.2 removes expired entries
-    /// from the front instead of scanning the table. At least `duplicates` slots: a full table and a tick's
+    /// One `(expiresAt, key)` record per recorded client order ID, so E-8.2 removes expired entries from the front
+    /// instead of scanning the table: a queue in recording order, or a min-heap by expiry while entries recorded
+    /// under a longer window outlive a shortened one. At least `duplicates` slots: a full table and a tick's
     /// recordings must both fit.
     pub expiry: &'a mut [(u64, (u64, ClientOrderId))],
     /// An `(expiresAt, orderId)` min-heap of the resting orders that expire, so E-8.1 takes them from the front

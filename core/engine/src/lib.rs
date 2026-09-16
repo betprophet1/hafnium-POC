@@ -117,10 +117,19 @@ pub struct Engine<'a> {
     order_index: FixedMap<'a, u64, u32>,
     resting_orders: u32,
     duplicates: FixedMap<'a, (u64, [u8; 32]), Duplicate>,
-    /// `(expiresAt, key)` for every recorded client order ID, oldest first (E-8.2).
+    /// `(expiresAt, key)` for every recorded client order ID (E-8.2). Normally a queue in recording order, which is
+    /// expiry order while the window never shrinks, so a tick removes from the front at no more than it costs to
+    /// look. Entries keep the window in force when they were recorded (E-7.4), though, so once the window is
+    /// shortened a later entry can expire before an earlier one, and a queue would strand it behind the earlier one
+    /// until the table filled. From then until everything recorded under the longer window has gone, the records are
+    /// a min-heap in `expiry[..expiry_len]` instead.
     expiry: &'a mut [(u64, (u64, [u8; 32]))],
     expiry_head: usize,
     expiry_len: usize,
+    /// While the records are a heap: the latest expiry recorded before the window was last shortened.
+    expiry_heap_until: Option<u64>,
+    /// The latest expiry recorded so far.
+    expiry_latest: u64,
     /// `(expiresAt, orderId)` for the resting orders that expire, as a min-heap, so E-8.1 costs what expires
     /// rather than what rests.
     gtd: &'a mut [(u64, u64)],
@@ -223,6 +232,8 @@ impl<'a> Engine<'a> {
             expiry: memory.expiry,
             expiry_head: 0,
             expiry_len: 0,
+            expiry_heap_until: None,
+            expiry_latest: 0,
             gtd: memory.gtd,
             gtd_len: 0,
             commands: cap(FixedMap::new(memory.commands, seed))?,
@@ -330,21 +341,35 @@ impl<'a> Engine<'a> {
                 self.remove(slot, emit::CancelReason::EXPIRED, sink)?;
             }
         }
-        // E-8.2: the expiry queue is in recording order, so expired entries are always at its front and the work
-        // is what actually expired, never the size of the table.
+        // E-8.2: expired records are always at the front, of the queue or of the heap, so the work is what actually
+        // expired, never the size of the table. The ID may have been recorded again under a later expiry; that
+        // recording is its own record, so only an entry that has itself expired goes.
         let now = self.now;
-        while self.expiry_len > 0 {
-            let (expires_at, key) = self.expiry[self.expiry_head];
-            if now < expires_at {
-                break;
+        if let Some(until) = self.expiry_heap_until {
+            while let Some((_, key)) = book::heap_pop_due(self.expiry, &mut self.expiry_len, now) {
+                if self.duplicates.get(&key).is_some_and(|d| d.expires_at <= now) {
+                    self.duplicates.remove(&key);
+                }
             }
-            // The ID may have been recorded again under a later expiry; that recording is its own, later queue
-            // record, so only an entry that has itself expired goes.
-            if self.duplicates.get(&key).is_some_and(|d| d.expires_at <= now) {
-                self.duplicates.remove(&key);
+            if now >= until {
+                // Everything recorded under a longer window has gone. What is left was recorded under windows no
+                // longer than the current one, so sorted it is in recording order again, and a queue again.
+                self.expiry[..self.expiry_len].sort_unstable();
+                self.expiry_head = 0;
+                self.expiry_heap_until = None;
             }
-            self.expiry_head = (self.expiry_head + 1) % self.expiry.len();
-            self.expiry_len -= 1;
+        } else {
+            while self.expiry_len > 0 {
+                let (expires_at, key) = self.expiry[self.expiry_head];
+                if now < expires_at {
+                    break;
+                }
+                if self.duplicates.get(&key).is_some_and(|d| d.expires_at <= now) {
+                    self.duplicates.remove(&key);
+                }
+                self.expiry_head = (self.expiry_head + 1) % self.expiry.len();
+                self.expiry_len -= 1;
+            }
         }
         // E-8.2 for command IDs, the same way.
         while self.command_expiry_len > 0 {
@@ -432,10 +457,28 @@ impl<'a> Engine<'a> {
             return Err(FailStop::Capacity);
         }
         cap(self.duplicates.insert(key, entry))?;
-        let at = (self.expiry_head + self.expiry_len) % self.expiry.len();
-        self.expiry[at] = (entry.expires_at, key);
-        self.expiry_len += 1;
+        let record = (entry.expires_at, key);
+        if self.expiry_heap_until.is_some() {
+            // Cannot be full: checked above, before the map was touched.
+            book::heap_push(self.expiry, &mut self.expiry_len, record);
+        } else {
+            let at = (self.expiry_head + self.expiry_len) % self.expiry.len();
+            self.expiry[at] = record;
+            self.expiry_len += 1;
+        }
+        self.expiry_latest = self.expiry_latest.max(entry.expires_at);
         Ok(())
+    }
+
+    /// The client order ID window is about to shrink (E-7.4): records made from now on can expire before ones
+    /// already made, so they are kept as a heap until the last of those has expired (see `expiry`).
+    pub(crate) fn expiry_window_shortened(&mut self) {
+        if self.expiry_heap_until.is_none() {
+            // The queue is in expiry order, and a sorted array is already a min-heap once it starts at the front.
+            self.expiry.rotate_left(self.expiry_head);
+            self.expiry_head = 0;
+        }
+        self.expiry_heap_until = Some(self.expiry_heap_until.map_or(self.expiry_latest, |u| u.max(self.expiry_latest)));
     }
 
     fn holding(&self, account_id: u64, instrument_id: u64) -> Holding {

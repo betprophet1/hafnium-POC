@@ -578,12 +578,13 @@ impl<'a> Engine<'a> {
 
 // -------------------------------------------------------------------------- the expiry heap (E-8.1)
 //
-// A min-heap of `(expiresAt, orderId)` in `heap[..len]`. Ordering by the pair is what makes the expiries happen in
-// the order the rules require, and the smallest is always at the front, so a tick pays for what expired rather
-// than for every order that rests.
+// A min-heap of `(expiresAt, key)` in `heap[..len]`. For resting orders the key is the order ID, and ordering by the
+// pair is what makes the expiries happen in the order the rules require; for client order IDs (E-8.2) the key is
+// the duplicate entry's. The smallest is always at the front, so a tick pays for what expired rather than for
+// everything recorded.
 
 /// Adds `entry`. False if the heap is full, which is the caller's signal to compact.
-fn heap_push(heap: &mut [(u64, u64)], len: &mut usize, entry: (u64, u64)) -> bool {
+pub(crate) fn heap_push<K: Ord + Copy>(heap: &mut [(u64, K)], len: &mut usize, entry: (u64, K)) -> bool {
     if *len == heap.len() {
         return false;
     }
@@ -602,7 +603,7 @@ fn heap_push(heap: &mut [(u64, u64)], len: &mut usize, entry: (u64, u64)) -> boo
 }
 
 /// The smallest entry, taken off the heap, if it has expired by `now`.
-fn heap_pop_due(heap: &mut [(u64, u64)], len: &mut usize, now: u64) -> Option<(u64, u64)> {
+pub(crate) fn heap_pop_due<K: Ord + Copy>(heap: &mut [(u64, K)], len: &mut usize, now: u64) -> Option<(u64, K)> {
     if *len == 0 {
         return None;
     }
@@ -616,7 +617,7 @@ fn heap_pop_due(heap: &mut [(u64, u64)], len: &mut usize, now: u64) -> Option<(u
     Some(first)
 }
 
-fn heap_sift_down(heap: &mut [(u64, u64)], len: usize, mut i: usize) {
+fn heap_sift_down<K: Ord + Copy>(heap: &mut [(u64, K)], len: usize, mut i: usize) {
     loop {
         let (left, right) = (2 * i + 1, 2 * i + 2);
         let mut smallest = i;
