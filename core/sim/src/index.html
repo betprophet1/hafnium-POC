@@ -94,6 +94,15 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
 .event.done { opacity: .75; }
 .ehead { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; }
 .badge { font-size: 11px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; color: var(--muted); }
+.state { font-size: 11px; border-radius: 999px; padding: 1px 8px; border: 1px solid var(--line); white-space: nowrap; }
+.state.pending { color: var(--warn); border-color: var(--warn); }
+.state.settled { color: var(--ok); border-color: var(--ok); }
+.state.failed { color: var(--bad); border-color: var(--bad); }
+.state.cancelled { color: var(--muted); }
+.money { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 520px) { .money { grid-template-columns: 1fr; } }
+.money form { border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin: 0; }
+.money h4 { width: 100%; margin: 0; font-size: 13px; }
 #toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 5; }
 .toast { background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--muted); border-radius: 6px; padding: 8px 12px; box-shadow: 0 4px 16px rgba(0,0,0,.12); max-width: 360px; }
 .toast.bad { border-left-color: var(--bad); } .toast.ok { border-left-color: var(--ok); }
@@ -120,6 +129,7 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
     <div class="tabs" role="tablist">
       <button data-tab="maker" class="on">Market maker</button>
       <button data-tab="retail">Retail customer</button>
+      <button data-tab="account">Account</button>
       <button data-tab="settle">Settlement</button>
     </div>
 
@@ -141,7 +151,6 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
         <label class="check"><input type="checkbox" id="postOnly" checked> Post only</label>
         <button id="placeBoth">Place both</button>
         <button id="cancelAll" class="ghost">Cancel all</button>
-        <button data-grant="maker" class="ghost">Add $10,000</button>
       </div>
       <p class="note">Orders go through the gateway's WebSocket as this account. Click a level in the book to copy its price; a dot marks your own orders.</p>
       <h3>Open orders</h3><div id="makerOrders"></div>
@@ -159,13 +168,34 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
         <label id="rPxWrap" hidden>Limit price (¢)<input id="rPx" type="number" min="1" max="99"></label>
         <label>Amount<select id="rUnit"><option value="contracts">Contracts</option><option value="stake">Spend ($)</option></select></label>
         <label id="rQtyLabel">Contracts<input id="rQty" type="number" min="1" value="10"></label>
-        <button data-grant="retail" class="ghost">Add $100</button>
       </div>
       <p id="rCost" class="note"></p>
       <button id="rPlace" class="primary wide">Place order</button>
       <p class="muted small">A contract pays $1 if its outcome happens. Buying NO while holding YES closes the YES position. Market orders fill up to five ticks through the best price and cancel any remainder. Spending an amount needs a limit price, and the gateway refuses an amount that does not buy whole contracts.</p>
       <h3>Your positions</h3><div id="retailPositions"></div>
       <h3>Open orders</h3><div id="retailOrders"></div>
+    </div>
+
+    <div id="tab-account" hidden>
+      <div class="pills" id="acctPick"></div>
+      <div id="acctCash"></div>
+      <div class="money">
+        <form id="depositForm">
+          <h4>Deposit</h4>
+          <label>Amount ($)<input id="depAmount" type="number" min="0.01" step="0.01" value="100"></label>
+          <label>From<select id="depMethod"></select></label>
+          <button class="primary">Deposit</button>
+        </form>
+        <form id="withdrawForm">
+          <h4>Withdraw</h4>
+          <label>Amount ($)<input id="wdAmount" type="number" min="0.01" step="0.01" value="50"></label>
+          <label>To<select id="wdMethod"></select></label>
+          <button>Withdraw</button>
+        </form>
+      </div>
+      <p class="note">Money moves through the treasury and a fake bank, never straight into the core. A deposit reaches available cash once the bank settles it; a withdrawal leaves available cash at once and comes back if the bank fails it or you cancel it while the bank has it.</p>
+      <h3>Transfers</h3><div id="acctTransfers"></div>
+      <h3>Positions</h3><div id="acctPositions"></div>
     </div>
 
     <div id="tab-settle" hidden>
@@ -180,7 +210,7 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
 <script>
 const $ = s => document.querySelector(s);
 let C = null, M = null, S = null;
-let tab = 'maker', selEvent = null, selInst = null, retailSide = 'yes';
+let tab = 'maker', selEvent = null, selInst = null, retailSide = 'yes', acctName = 'retail';
 const books = {}, trades = {}, sessions = {}, winning = {}, announced = new Set();
 
 // A book arrives as levels: every one of them when the message is flagged a snapshot, and only the ones that
@@ -334,8 +364,10 @@ function onMessage(s, msg) {
       s.open = true;
       renderStatus();
       refreshAccount(s);
+      loadTransfers(s);
       break;
     case 'resync': refreshAccount(s); break;
+    case 'transfer': onTransfer(s, msg.transfer); break;
     case 'reply': if (msg.id === 'heartbeat') break; report(msg.result); soon(s); break;
     case 'error': toast(`${words(msg.error.code)}: ${msg.error.message}`, 'bad'); break;
     case 'execution': {
@@ -404,7 +436,7 @@ function render() {
   renderStatus();
   if (!M) return;
   setHTML($('#event'), M.events.map(e => `<option value="${e.eventId}" ${e.eventId === selEvent ? 'selected' : ''}>${esc(e.title)}${e.resolved ? ' — settled' : ''}</option>`).join(''));
-  renderPills(); renderBook(); renderTrades(); renderMaker(); renderRetail(); renderSettle();
+  renderPills(); renderBook(); renderTrades(); renderMaker(); renderRetail(); renderAccount(); renderSettle();
 }
 
 function renderBook() {
@@ -510,6 +542,69 @@ function renderRetail() {
   $('#rPlace').disabled = !m || m.state !== 'open';
 }
 
+// ------------------------------------------------------------------------------------------ account and transfers
+
+const METHODS = [['dummy_bank', 'Bank (a few seconds, sometimes fails)'], ['dummy_instant', 'Instant'], ['dummy_failing', 'Bank that always fails']];
+const FINAL = {settled: 'ok', failed: 'bad', cancelled: ''};
+
+// Transfer messages are not replayed on resume, so every login reads the list again and the messages keep it current.
+async function loadTransfers(s) {
+  try {
+    const r = await fetch('/v4/transfers?limit=50', {headers: {Authorization: 'Bearer ' + s.token}});
+    const j = await r.json();
+    if (!r.ok) { s.transfersError = j.error ? j.error.message : r.statusText; return renderAccount(); }
+    s.transfersError = null;
+    s.transfers = new Map(j.transfers.map(t => [t.transferId, t]));
+    renderAccount();
+  } catch (e) { /* retried on the next login */ }
+}
+
+function onTransfer(s, t) {
+  if (!s.transfers) s.transfers = new Map();
+  const before = s.transfers.get(t.transferId);
+  s.transfers.set(t.transferId, t);
+  if (t.state in FINAL && (!before || before.state !== t.state)) {
+    const what = `${s.label}: ${t.kind} of ${money(t.amountCents)} ${t.state}`;
+    toast(t.reason ? `${what}: ${words(t.reason)}` : what, FINAL[t.state]);
+  }
+  soon(s);
+  renderAccount();
+}
+
+async function transferCall(s, method, path, body) {
+  try {
+    const r = await fetch(path, {method, headers: {Authorization: 'Bearer ' + s.token, 'Content-Type': 'application/json'}, body: body && JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) return toast(`${words(j.error.code)}: ${j.error.message}`, 'bad');
+    onTransfer(s, j);
+  } catch (e) { toast(String(e), 'bad'); }
+}
+
+function requestTransfer(kind) {
+  const s = sessions[acctName];
+  const dollars = +$(kind === 'deposit' ? '#depAmount' : '#wdAmount').value;
+  const cents = Math.round(dollars * 100);
+  if (!s || !(cents > 0)) return toast('Enter an amount', 'bad');
+  const body = {clientTransferId: `${acctName}-${Date.now().toString(36)}-${++orderCount}`, kind, amountCents: cents, method: $(kind === 'deposit' ? '#depMethod' : '#wdMethod').value};
+  transferCall(s, 'POST', '/v4/transfers', body);
+}
+
+function renderAccount() {
+  const s = sessions[acctName];
+  setHTML($('#acctPick'), Object.values(sessions).map(x => `<button class="pill ${x.name === acctName ? 'on' : ''}" data-acct="${x.name}">${esc(x.label)}</button>`).join(''));
+  setHTML($('#acctCash'), acctHtml(s));
+  setHTML($('#acctPositions'), positionsHtml(s));
+  for (const id of ['#depMethod', '#wdMethod']) if (!$(id).options.length) setHTML($(id), METHODS.map(([v, l]) => `<option value="${v}">${l}</option>`).join(''));
+  if (!s) return setHTML($('#acctTransfers'), '');
+  if (s.transfersError) return setHTML($('#acctTransfers'), `<p class="muted">${esc(s.transfersError)}</p>`);
+  const list = [...(s.transfers || new Map()).values()].sort((a, b) => Number(BigInt(b.transferId) - BigInt(a.transferId)));
+  setHTML($('#acctTransfers'), list.length ? '<table><thead><tr><th>When</th><th>Kind</th><th class="r">Amount</th><th>Method</th><th>State</th><th></th></tr></thead><tbody>'
+    + list.map(t => `<tr><td class="muted">${new Date(t.createdAt).toLocaleTimeString()}</td><td>${t.kind}</td><td class="r ${t.kind === 'deposit' ? 'pos' : 'neg'}">${money(t.amountCents)}</td><td class="muted">${esc((METHODS.find(m => m[0] === t.method) || [0, t.method])[1])}</td>`
+      + `<td><span class="state ${t.state}">${t.state}</span>${t.reason ? ` <span class="muted small">${words(t.reason)}</span>` : ''}</td>`
+      + `<td class="r">${t.state === 'pending' ? `<button class="link" data-cancel-transfer="${t.transferId}">Cancel</button>` : ''}</td></tr>`).join('')
+    + '</tbody></table>' : '<p class="muted">None yet.</p>');
+}
+
 function renderSettle() {
   if (!S) return setHTML($('#events'), '<p class="muted">Connecting…</p>');
   setHTML($('#events'), S.events.map(e => {
@@ -575,7 +670,7 @@ function placeRetail() {
 function showTab(name) {
   tab = name;
   for (const b of document.querySelectorAll('[data-tab]')) b.classList.toggle('on', b.dataset.tab === name);
-  for (const t of ['maker', 'retail', 'settle']) $('#tab-' + t).hidden = t !== name;
+  for (const t of ['maker', 'retail', 'account', 'settle']) $('#tab-' + t).hidden = t !== name;
   render();
 }
 
@@ -586,7 +681,8 @@ document.addEventListener('click', ev => {
   if (t.dataset.tab) return showTab(t.dataset.tab);
   if (t.dataset.pick) { selInst = t.dataset.pick; subscribeMarket(); return render(); }
   if (t.dataset.cancel) return send(t.dataset.session, 'cancel', {orderId: t.dataset.cancel});
-  if (t.dataset.grant) { const a = C.accounts.find(x => x.tab === t.dataset.grant); return a && operator('grant', {account: a.id, cents: t.dataset.grant === 'maker' ? 1000000 : 10000}); }
+  if (t.dataset.acct) { acctName = t.dataset.acct; return renderAccount(); }
+  if (t.dataset.cancelTransfer) return transferCall(sessions[acctName], 'DELETE', '/v4/transfers/' + t.dataset.cancelTransfer);
   if (t.dataset.oracle) {
     const action = t.dataset.oracle, event = +t.dataset.event, e = S.events.find(x => x.id === event), body = {action, event};
     if (action === 'resolve') {
@@ -612,6 +708,12 @@ document.addEventListener('click', ev => {
     case 'pickNo': retailSide = 'no'; return render();
     case 'rPlace': return placeRetail();
   }
+});
+
+document.addEventListener('submit', ev => {
+  ev.preventDefault();
+  if (ev.target.id === 'depositForm') requestTransfer('deposit');
+  else if (ev.target.id === 'withdrawForm') requestTransfer('withdrawal');
 });
 
 document.addEventListener('change', ev => {

@@ -2,8 +2,8 @@
 //! or a test cluster.
 //!
 //! Trading goes through the gateway: this server passes `/v4` through to it untouched, WebSocket upgrades included,
-//! and hands the page the dev tokens of the accounts it shows. Settlement and grants are operator actions, sequenced
-//! as commands through the core's ingress. The dummy oracle here sequences directly; blueprint §16 routes a dummy
+//! and hands the page the dev tokens of the accounts it shows, so deposits and withdrawals go through the gateway to
+//! the treasury too. Settlement is an operator action, sequenced as commands through the core's ingress. The dummy oracle here sequences directly; blueprint §16 routes a dummy
 //! resolution through a proposal, the resolution console and an auto-approver, which do not exist yet.
 
 use serde_json::{json, Value};
@@ -56,16 +56,12 @@ impl Web {
         json!({"accounts": accounts})
     }
 
-    /// Operator actions: funding an account, and the dummy oracle.
+    /// Operator actions: the dummy oracle. Accounts are funded by deposits through the gateway and the treasury, never
+    /// by a grant from here (blueprint §16: demo balances come from a fake provider, never a ledger shortcut).
     fn action(&self, name: &str, r: &Value) -> Result<Value, Error> {
         let mut guard = self.ingress.lock().map_err(poisoned)?;
         let (ingress, ids) = &mut *guard;
         let inputs = match name {
-            "grant" => vec![wire::command(
-                "SleeveAdjust",
-                ids.fresh(),
-                json!({"accountId": r["account"], "deltaCents": r["cents"], "reason": "GRANT"}),
-            )],
             "oracle" => self.oracle(r, ids)?,
             _ => return Err(format!("no action {name}").into()),
         };
