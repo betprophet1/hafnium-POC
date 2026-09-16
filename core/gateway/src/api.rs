@@ -509,3 +509,162 @@ impl Gateway {
         json!({"status": status, "sequence": id(sequence), "orderId": order, "rejectReason": reason, "executions": executions})
     }
 }
+
+/// The request path end to end: order entry through `Gateway`, a real node's ingress, and that node's feed back into
+/// the hub. A stub would say whatever the test told it; this says what the engine decides.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::thread;
+    use venue_link::catalogue::{self, Catalogue};
+    use venue_node::node::{self, Config};
+
+    const CATALOGUE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/charts/venue-mini/files/markets.json");
+    const MARKET: u64 = 10010;
+    /// The mini venue's market maker, funded with 5 000 000 cents.
+    const MAKER: u64 = 1;
+    /// Its retail customer, funded with 50 000 cents.
+    const RETAIL: u64 = 2;
+    const SESSION: u64 = 42;
+
+    fn free_address() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
+        listener.local_addr().expect("its address").to_string()
+    }
+
+    /// A seeded node of the test's own, and a gateway that sends to it and follows its feed.
+    fn venue(name: &str) -> Arc<Gateway> {
+        let (ingress, feed) = (free_address(), free_address());
+        let data_dir = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let config = Config {
+            listen: ingress.parse().expect("an ingress address"),
+            feed: feed.parse().expect("a feed address"),
+            data_dir,
+            group: 1,
+            node_id: 1,
+            tick: Duration::from_millis(100),
+            fsync: false,
+            capacity: "small".into(),
+        };
+        thread::spawn(move || {
+            if let Err(e) = node::serve(&config) {
+                eprintln!("test node: {e}");
+            }
+        });
+        // Sends wait for the forwarder's first connection, so seeding can start before the node is listening.
+        let seeder = Submit::spawn(&ingress);
+        let catalogue = Catalogue::load(CATALOGUE).expect("the mini venue's catalogue");
+        let ceiling = catalogue::capacity_profile("small").expect("a known profile").orders;
+        for input in catalogue.seed(ceiling).expect("the seed") {
+            seeder.send(input).expect("seeded");
+        }
+        let limits = Limits { per_second: 1_000_000, burst: 1_000_000, logons_per_minute: 1_000_000 };
+        let hub = Hub::new(Catalogue::load(CATALOGUE).expect("the mini venue's catalogue"));
+        let gateway = Arc::new(Gateway::new(hub, Submit::spawn(&ingress), limits));
+        let follower = Arc::clone(&gateway);
+        thread::spawn(move || wire::follow(&feed, || follower.hub().restart(), |unit| follower.hub().apply(&unit)));
+        // Up to ten seconds for the feed to deliver the listing, counted in waits rather than read off a clock.
+        for wait in 0.. {
+            if gateway.hub().market(MARKET).is_some() {
+                break;
+            }
+            assert!(wait < 500, "the feed never listed market {MARKET}");
+            thread::sleep(Duration::from_millis(20));
+        }
+        gateway
+    }
+
+    fn order(client_order_id: &str, action: &str, tick: u64, quantity: u64) -> Value {
+        json!({"clientOrderId": client_order_id, "instrumentId": MARKET.to_string(), "action": action,
+               "outcome": "yes", "price": {"tick": tick}, "quantity": quantity})
+    }
+
+    fn order_id(result: &Value) -> u64 {
+        result["orderId"].as_str().and_then(|s| s.parse().ok()).unwrap_or_else(|| panic!("no order ID in {result}"))
+    }
+
+    #[test]
+    fn an_order_rests_and_its_resend_is_a_duplicate_of_it() {
+        let gateway = venue("duplicate");
+        let placed = gateway.place(MAKER, SESSION, &order("a", "buy", 4, 10)).expect("placed");
+        assert_eq!(placed["status"], "accepted", "{placed}");
+        let resent = gateway.place(MAKER, SESSION, &order("a", "buy", 4, 10)).expect("resent");
+        assert_eq!(resent["status"], "duplicate", "{resent}");
+        assert_eq!(resent["orderId"], placed["orderId"]);
+        assert_eq!(resent["rejectReason"], "duplicate_client_order_id");
+    }
+
+    #[test]
+    fn a_resting_order_can_be_amended_and_then_cancelled() {
+        let gateway = venue("amend-cancel");
+        let placed = gateway.place(MAKER, SESSION, &order("b", "buy", 4, 10)).expect("placed");
+        let id = order_id(&placed);
+        // Straight after the reply, before the feed need have delivered the order (see `Hub::accept`).
+        let amended = gateway.amend(MAKER, SESSION, id, &json!({"quantity": 20})).expect("amended");
+        assert_eq!(amended["status"], "amended", "{amended}");
+        assert_eq!(order_id(&amended), id);
+        let cancelled = gateway.cancel(MAKER, SESSION, id).expect("cancelled");
+        assert_eq!(cancelled["status"], "cancelled", "{cancelled}");
+        assert_eq!(order_id(&cancelled), id);
+    }
+
+    #[test]
+    fn another_accounts_order_is_not_found() {
+        let gateway = venue("ownership");
+        let id = order_id(&gateway.place(MAKER, SESSION, &order("c", "buy", 4, 10)).expect("placed"));
+        let amend = gateway.amend(RETAIL, SESSION, id, &json!({"quantity": 1})).expect_err("not the retail account's");
+        assert_eq!(amend.status, 404);
+        let cancel = gateway.cancel(RETAIL, SESSION, id).expect_err("not the retail account's");
+        assert_eq!(cancel.status, 404);
+    }
+
+    #[test]
+    fn the_engine_refuses_what_an_account_cannot_pay_for_or_fill() {
+        let gateway = venue("engine-refusals");
+        // 1 000 000 contracts at 99c is far beyond the retail account's 50 000 cents.
+        let broke = gateway.place(RETAIL, SESSION, &order("d", "buy", 98, 1_000_000)).expect("answered");
+        assert_eq!(broke["status"], "rejected", "{broke}");
+        assert_eq!(broke["rejectReason"], "insufficient_sleeve");
+        // Nothing rests on this fresh node, so a fill-or-kill buy has nothing to fill against.
+        let mut fok = order("e", "buy", 50, 5);
+        fok["timeInForce"] = json!("FOK");
+        let unfilled = gateway.place(MAKER, SESSION, &fok).expect("answered");
+        assert_eq!(unfilled["status"], "rejected", "{unfilled}");
+        assert_eq!(unfilled["rejectReason"], "fok_not_fillable");
+    }
+
+    #[test]
+    fn malformed_orders_are_refused_before_anything_is_sent() {
+        let gateway = venue("malformed");
+        let mut no_action = order("f", "buy", 4, 1);
+        no_action.as_object_mut().expect("an object").remove("action");
+        assert_eq!(gateway.place(MAKER, SESSION, &no_action).expect_err("no action").status, 400);
+        let mut unknown = order("g", "buy", 4, 1);
+        unknown["instrumentId"] = json!("99999");
+        assert_eq!(gateway.place(MAKER, SESSION, &unknown).expect_err("no such market").status, 404);
+        let off_ladder = order("h", "buy", 5_000, 1);
+        assert_eq!(gateway.place(MAKER, SESSION, &off_ladder).expect_err("off the ladder").status, 400);
+        // None of those reached the node, so the IDs are unused and can still place orders.
+        let placed = gateway.place(MAKER, SESSION, &order("f", "buy", 4, 1)).expect("placed");
+        assert_eq!(placed["status"], "accepted", "{placed}");
+    }
+
+    #[test]
+    fn pipelined_orders_are_answered_in_the_order_they_were_sent() {
+        let gateway = venue("pipelined");
+        let pending: Vec<Pending> = (0..20)
+            .map(|i| gateway.place_pending(MAKER, SESSION, &order(&format!("p{i}"), "buy", 4, 1)).expect("submitted"))
+            .collect();
+        let mut last = 0;
+        for p in pending {
+            let result = gateway.wait_for(p).expect("answered");
+            assert_eq!(result["status"], "accepted", "{result}");
+            let sequence: u64 = result["sequence"].as_str().and_then(|s| s.parse().ok()).expect("a sequence");
+            assert!(sequence > last, "sequence {sequence} after {last}");
+            last = sequence;
+        }
+    }
+}
