@@ -22,6 +22,10 @@ pub const MAKER_TOKEN: &str = "dev-market-maker";
 pub const RETAIL: u64 = 2;
 pub const RETAIL_TOKEN: &str = "dev-retail-customer";
 
+/// How far behind a test's clients may fall before the gateway drops them: small, so a test can get there quickly,
+/// and still past tungstenite's own 128 KiB of batching.
+pub const MAX_BEHIND: usize = 256 * 1024;
+
 pub struct Venue {
     pub gateway: Arc<Gateway>,
     /// Where the gateway's WebSocket is served, as a client would dial it.
@@ -84,7 +88,7 @@ pub fn venue(name: &str) -> Venue {
     let ws_url = format!("ws://{}/v4/ws", listener.local_addr().expect("its address"));
     {
         let gateway = Arc::clone(&gateway);
-        thread::spawn(move || crate::serve(&gateway, &listener));
+        thread::spawn(move || crate::serve_with(&gateway, &listener, MAX_BEHIND));
     }
     // Up to ten seconds for the feed to deliver the listing, counted in waits rather than read off a clock.
     for wait in 0.. {

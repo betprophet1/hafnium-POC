@@ -105,11 +105,20 @@ fn conflate(gateway: &Arc<Gateway>) {
     });
 }
 
+/// How far behind on what it has been sent a WebSocket client may fall before it is disconnected: a few seconds of
+/// busy market data, far more than a client that is reading ever holds.
+const MAX_BEHIND: usize = 4 * 1024 * 1024;
+
 /// Accepts connections for ever and serves each one: WebSocket sessions from a few event loops, REST requests on a
 /// thread of their own.
 fn serve(gateway: &Arc<Gateway>, listener: &TcpListener) {
+    serve_with(gateway, listener, MAX_BEHIND);
+}
+
+/// `serve`, with a client allowed to fall `max_behind` bytes behind.
+fn serve_with(gateway: &Arc<Gateway>, listener: &TcpListener, max_behind: usize) {
     let threads = thread::available_parallelism().map_or(2, |n| n.get().min(4));
-    let reactors = match reactor::Reactors::start(gateway, threads) {
+    let reactors = match reactor::Reactors::start(gateway, threads, max_behind) {
         Ok(reactors) => Arc::new(reactors),
         Err(e) => {
             eprintln!("venue-gateway: event loops: {e}");

@@ -81,8 +81,9 @@ pub struct Reactors {
 }
 
 impl Reactors {
-    /// Starts `threads` loops serving connections for `gateway`.
-    pub fn start(gateway: &Arc<Gateway>, threads: usize) -> std::io::Result<Self> {
+    /// Starts `threads` loops serving connections for `gateway`. A client more than `max_behind` bytes behind on
+    /// what it has been sent is disconnected.
+    pub fn start(gateway: &Arc<Gateway>, threads: usize, max_behind: usize) -> std::io::Result<Self> {
         let mut loops = Vec::new();
         for _ in 0..threads.max(1) {
             let poll = Poll::new()?;
@@ -94,7 +95,7 @@ impl Reactors {
                 woken: AtomicBool::new(false),
             });
             let (gateway, own) = (Arc::clone(gateway), Arc::clone(&shared));
-            thread::spawn(move || run(poll, &own, &gateway));
+            thread::spawn(move || run(poll, &own, &gateway, max_behind));
             loops.push(shared);
         }
         Ok(Self { loops, next: AtomicUsize::new(0) })
@@ -126,7 +127,7 @@ struct Conn {
 }
 
 /// One loop, for ever.
-fn run(mut poll: Poll, shared: &Arc<Shared>, gateway: &Arc<Gateway>) {
+fn run(mut poll: Poll, shared: &Arc<Shared>, gateway: &Arc<Gateway>, max_behind: usize) {
     let mut events = Events::with_capacity(1024);
     let mut conns: Vec<Option<Conn>> = Vec::new();
     let mut free: Vec<usize> = Vec::new();
@@ -153,7 +154,7 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, gateway: &Arc<Gateway>) {
         shared.woken.store(false, Ordering::SeqCst);
         let arrived = std::mem::take(&mut *locked(&shared.incoming));
         for stream in arrived {
-            if let Some(token) = take_on(&poll, shared, &mut conns, &mut free, stream) {
+            if let Some(token) = take_on(&poll, shared, &mut conns, &mut free, stream, max_behind) {
                 due.push(token);
             }
         }
@@ -177,10 +178,17 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, gateway: &Arc<Gateway>) {
     }
 }
 
-/// How a connection's socket buffers. tungstenite allocates each connection a 128 KiB read buffer up front, which
-/// made an idle connection cost ~130 kB; a client's frames are small, and the buffer grows for one that is not.
-fn socket_config() -> WebSocketConfig {
-    WebSocketConfig::default().read_buffer_size(READ_BUFFER)
+/// How a connection's socket buffers.
+///
+/// tungstenite allocates each connection a 128 KiB read buffer up front, which made an idle connection cost
+/// ~130 kB; a client's frames are small, and the buffer grows for one that is not.
+///
+/// Everything bound for a client waits in its write buffer until the socket takes it, and by default that buffer
+/// has no limit, so a client that stopped reading — gone quiet, or simply slow — grew the gateway's memory for as
+/// long as it stayed connected. `max_behind` is that limit: past it a write is refused and the connection is
+/// dropped (`queue`). It must leave room for tungstenite's own batching, 128 KiB, and a message.
+fn socket_config(max_behind: usize) -> WebSocketConfig {
+    WebSocketConfig::default().read_buffer_size(READ_BUFFER).max_write_buffer_size(max_behind)
 }
 
 /// Registers a new connection and starts its handshake. None if it could not be taken on.
@@ -190,6 +198,7 @@ fn take_on(
     conns: &mut Vec<Option<Conn>>,
     free: &mut Vec<usize>,
     stream: TcpStream,
+    max_behind: usize,
 ) -> Option<usize> {
     stream.set_nonblocking(true).ok()?;
     let _ = stream.set_nodelay(true);
@@ -208,7 +217,7 @@ fn take_on(
         Arc::new(move || shared.ready(token))
     };
     let (tx, queue) = mpsc::channel();
-    let socket = match tungstenite::accept_with_config(stream, Some(socket_config())) {
+    let socket = match tungstenite::accept_with_config(stream, Some(socket_config(max_behind))) {
         Ok(ws) => Socket::Open(ws),
         Err(HandshakeError::Interrupted(mid)) => Socket::Handshake(mid),
         Err(HandshakeError::Failure(_)) => {
@@ -325,6 +334,13 @@ fn queue(socket: &mut WebSocket<Stream>, message: String) -> bool {
     match socket.write(Message::text(message)) {
         Ok(()) => true,
         Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => true,
+        // A slow consumer: further behind than a connection may be (`socket_config`). Dropped rather than buffered
+        // for without limit; a client that reconnects starts again from a fresh image.
+        Err(tungstenite::Error::WriteBufferFull(_)) => {
+            let peer = socket.get_ref().peer_addr().map_or_else(|_| "a client".to_string(), |a| a.to_string());
+            eprintln!("gateway: disconnected {peer}: too far behind on what it has been sent");
+            false
+        }
         Err(_) => false,
     }
 }

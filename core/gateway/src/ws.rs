@@ -563,6 +563,46 @@ mod tests {
     }
 
     #[test]
+    fn a_client_that_stops_reading_is_disconnected_rather_than_buffered_for() {
+        let venue = testing::venue("ws-slow");
+        let mut client = Client::connect(&venue.ws_url);
+        client.login(json!({}));
+        // Replies and executions for these come to megabytes, far past what the gateway lets a client fall behind
+        // by (`testing::MAX_BEHIND`) and past the kernel's socket buffers too. The client sends and never reads.
+        const ORDERS: usize = 40_000;
+        let mut sent = 0;
+        for i in 0..ORDERS {
+            // A failed send means the gateway has already let the connection go.
+            if client.socket.send(Message::text(order(&format!("s{i}"), 4).to_string())).is_err() {
+                break;
+            }
+            sent += 1;
+        }
+        // Now it reads: what the kernel still holds arrives, and then the connection ends, well short of every reply.
+        let mut replies = 0;
+        let dropped = loop {
+            match client.socket.read() {
+                Ok(Message::Text(text)) => {
+                    if text.as_str().contains(r#""type":"reply""#) {
+                        replies += 1;
+                    }
+                }
+                Ok(Message::Close(_)) => break true,
+                Ok(_) => {}
+                // Silence, with the connection still open: the gateway kept buffering for a client not reading.
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                {
+                    break false
+                }
+                Err(_) => break true,
+            }
+        };
+        assert!(dropped, "a client that stopped reading was kept, having been sent {replies} of {sent} replies");
+        assert!(replies < sent, "the client got all {replies} replies, so it was never behind");
+    }
+
+    #[test]
     fn malformed_messages_get_errors_and_the_session_carries_on() {
         let venue = testing::venue("ws-malformed");
         let mut client = Client::connect(&venue.ws_url);
