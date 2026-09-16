@@ -377,6 +377,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "venue-treasury"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "venue-link",
+]
+
+[[package]]
 name = "venue_journal"
 version = "0.1.0"
 
