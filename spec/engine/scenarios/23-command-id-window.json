@@ -1,0 +1,54 @@
+{
+  "name": "Command IDs are remembered for seven days, rejected ones included",
+  "rules": ["E-7.1", "E-8.2"],
+  "notes": [
+    "Step 1 grants 500 to account 5 under g1, recorded at t with expiry t + 7 days (D-25).",
+    "Step 2, six days later: a resend of g1 is a duplicate.",
+    "Steps 3 and 4: r1 reclaims more than is available and is rejected; its ID is still consumed, so its resend is a duplicate.",
+    "Step 5 ticks 1 ms before g1 expires: nothing is removed and nothing is emitted.",
+    "Step 6 resends g1 at exactly its expiry, which is no longer later than now, so it applies again and grants a second 500: why a sender must never resend a command older than the window.",
+    "Step 7 ticks: g1's first queue record is due, but g1 was just recorded again, so its entry stays.",
+    "Step 8: a resend of g1 is a duplicate under its new record. Step 9: r1 is still inside its own window."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000}
+  ],
+  "steps": [
+    {"input": {"msg": "SleeveAdjust", "commandId": "g1", "accountId": 5, "deltaCents": 500, "reason": "GRANT"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "g1", "outcome": "APPLIED"},
+       {"msg": "SleeveChanged", "accountId": 5, "availableCents": 500, "reservedCents": 0}
+     ]},
+    {"input": {"msg": "SleeveAdjust", "commandId": "g1", "accountId": 5, "deltaCents": 500, "reason": "GRANT"},
+     "advanceNs": 518400000000000,
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "g1", "outcome": "DUPLICATE"}
+     ]},
+    {"input": {"msg": "SleeveAdjust", "commandId": "r1", "accountId": 5, "deltaCents": 1000, "reason": "RECLAIM"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "r1", "outcome": "REJECTED", "rejectReason": "INSUFFICIENT_SLEEVE"}
+     ]},
+    {"input": {"msg": "SleeveAdjust", "commandId": "r1", "accountId": 5, "deltaCents": 1000, "reason": "RECLAIM"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "r1", "outcome": "DUPLICATE"}
+     ]},
+    {"input": {"msg": "TimeTick"}, "advanceNs": 86399997000000,
+     "expect": []},
+    {"input": {"msg": "SleeveAdjust", "commandId": "g1", "accountId": 5, "deltaCents": 500, "reason": "GRANT"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "g1", "outcome": "APPLIED"},
+       {"msg": "SleeveChanged", "accountId": 5, "availableCents": 1000, "reservedCents": 0}
+     ]},
+    {"input": {"msg": "TimeTick"},
+     "expect": []},
+    {"input": {"msg": "SleeveAdjust", "commandId": "g1", "accountId": 5, "deltaCents": 500, "reason": "GRANT"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "g1", "outcome": "DUPLICATE"}
+     ]},
+    {"input": {"msg": "SleeveAdjust", "commandId": "r1", "accountId": 5, "deltaCents": 1000, "reason": "RECLAIM"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "r1", "outcome": "DUPLICATE"}
+     ]}
+  ]
+}
