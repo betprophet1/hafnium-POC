@@ -9,9 +9,11 @@
 
 use crate::bots::Rng;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use venue_link::catalogue::TICK_TABLE;
-use venue_link::wire::{self, Error, Ids, Ingress};
+use venue_link::submit::{Pending, Submit};
+use venue_link::wire::{self, Error, Ids};
 
 pub struct Config {
     pub books: u64,
@@ -27,6 +29,9 @@ pub struct Config {
     /// duplicate table fills, because nothing leaves it until its window is up (E-8.2, E-9.2, D-12).
     pub order_limit: u64,
     pub id_window_seconds: u64,
+    /// Inputs given to the node before waiting for the first one's results. One at a time measures the generator
+    /// waiting on round trips as much as it measures the venue; several at a time measures the venue.
+    pub depth: usize,
     pub seconds: u64,
     pub seed: u64,
 }
@@ -77,7 +82,7 @@ fn cent_table(ids: &mut Ids) -> Value {
 }
 
 /// Lists every book and funds every account. Sent one at a time, like everything else here.
-fn setup(ingress: &mut Ingress, ids: &mut Ids, c: &Config, counts: &mut Counts) -> Result<Vec<Book>, Error> {
+fn setup(ingress: &Submit, ids: &mut Ids, c: &Config, counts: &mut Counts) -> Result<Vec<Book>, Error> {
     send(ingress, cent_table(ids), counts)?;
     let limits = json!({
         "activeOrderLimit": c.order_limit, "clientOrderIdWindowSeconds": c.id_window_seconds
@@ -106,9 +111,10 @@ fn setup(ingress: &mut Ingress, ids: &mut Ids, c: &Config, counts: &mut Counts) 
     Ok(books)
 }
 
-fn send(ingress: &mut Ingress, input: Value, counts: &mut Counts) -> Result<Vec<Value>, Error> {
+/// One input, waited for. Setup is sequential on purpose: a market has to exist before anything trades on it.
+fn send(submit: &Submit, input: Value, counts: &mut Counts) -> Result<Vec<Value>, Error> {
     counts.sent += 1;
-    ingress.send(input)
+    submit.send(input)
 }
 
 /// Which book this input is for: most of the flow to the hot books, some to the warm, a little to the long tail.
@@ -195,7 +201,7 @@ fn absorb(book: &mut Book, results: &[Value], counts: &mut Counts) {
     }
 }
 
-pub fn run(ingress: &mut Ingress, c: &Config) -> Result<(), Error> {
+pub fn run(ingress: &Submit, c: &Config) -> Result<(), Error> {
     let mut ids = Ids::new('k')?;
     let mut rng = Rng::new(c.seed);
     let mut counts = Counts::default();
@@ -212,6 +218,13 @@ pub fn run(ingress: &mut Ingress, c: &Config) -> Result<(), Error> {
 
     let flow = now();
     let mut reported = 0u64;
+    // Inputs the node has been given and not yet answered, with the book each was for, oldest first. A node
+    // answers a connection in commit order, so taking them from the front takes them in the order they were sent.
+    //
+    // One consequence worth knowing when reading the counts: with several in flight the next action is chosen
+    // from a book that is a little out of date, so the generator sometimes amends or cancels an order an earlier
+    // request has already removed, and those come back rejected. Real participants race in exactly this way.
+    let mut in_flight: VecDeque<(usize, Pending)> = VecDeque::new();
     while flow.elapsed() < Duration::from_secs(c.seconds) {
         // Most of what arrives is a market maker's; the crowd is many accounts each doing very little.
         let maker = rng.chance(700);
@@ -244,13 +257,22 @@ pub fn run(ingress: &mut Ingress, c: &Config) -> Result<(), Error> {
                 "scopeRef": book.instrument, "cause": "CLIENT_REQUEST"
             })
         };
-        let results = send(ingress, input, &mut counts)?;
-        absorb(book, &results, &mut counts);
+        // Given to the node without waiting for it. The book it was for travels with it, because its results only
+        // mean anything against that book.
+        counts.sent += 1;
+        in_flight.push_back((which, ingress.submit(input)?));
+        while in_flight.len() >= c.depth.max(1) {
+            take_oldest(&mut in_flight, &mut books, &mut counts)?;
+        }
 
         if counts.sent - reported >= 100_000 {
             reported = counts.sent;
             println!("  {} inputs, {} fills, {}/s", counts.sent, counts.fills, rate(counts.sent, &flow));
         }
+    }
+    // Whatever is still outstanding when the clock runs out still counts.
+    while !in_flight.is_empty() {
+        take_oldest(&mut in_flight, &mut books, &mut counts)?;
     }
 
     let resting: usize = books.iter().map(|b| b.resting.len()).sum();
@@ -267,6 +289,20 @@ pub fn run(ingress: &mut Ingress, c: &Config) -> Result<(), Error> {
         counts.fills,
         c.books
     );
+    Ok(())
+}
+
+/// Waits for the oldest outstanding input and puts its results into the book it was for.
+fn take_oldest(
+    in_flight: &mut VecDeque<(usize, Pending)>,
+    books: &mut [Book],
+    counts: &mut Counts,
+) -> Result<(), Error> {
+    let Some((which, pending)) = in_flight.pop_front() else { return Ok(()) };
+    let results = pending.wait()?;
+    if let Some(book) = books.get_mut(which) {
+        absorb(book, &results, counts);
+    }
     Ok(())
 }
 

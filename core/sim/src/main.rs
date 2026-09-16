@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use venue_link::catalogue::Catalogue;
+use venue_link::submit::Submit;
 use venue_link::view;
 use venue_link::wire::{Error, Ids, Ingress};
 
@@ -24,7 +25,7 @@ const USAGE: &str = "usage:
                   [--sweep-chance 30] [--interval-ms 1000] [--seed 2]
   venue-sim workload --ingress ADDR [--books 600] [--hot 15] [--warm 100] [--accounts 500]
                   [--makers 5] [--seconds 60] [--seed 7] [--order-limit 12000]
-                  [--id-window-seconds 15]
+                  [--id-window-seconds 10] [--depth 16]
 
 The bots are clients of the gateway. seed, workload and the web page's settlement tab are operator tools and use
 the core's ingress and feed. workload puts a venue-shaped load on a core on its own, with no gateway in the way.
@@ -95,11 +96,13 @@ fn workload(args: &Args) -> Result<(), Error> {
         // Beneath the engine's order slab, and a window the order rate can live inside: see Config.
         order_limit: args.number("order-limit", 12_000)?,
         id_window_seconds: args.number("id-window-seconds", 10)?,
+        depth: usize::try_from(args.number("depth", 16)?)?,
         seconds: args.number("seconds", 60)?,
         seed: args.number("seed", 7)?,
     };
-    let mut ingress = Ingress::new(&args.get("ingress", None)?);
-    workload::run(&mut ingress, &config)
+    // Pipelined, so the generator measures the venue rather than its own waiting: see Config::depth.
+    let ingress = Submit::spawn(&args.get("ingress", None)?);
+    workload::run(&ingress, &config)
 }
 
 /// Lists the demo markets and funds the accounts, waiting up to two minutes for the core to accept connections.
