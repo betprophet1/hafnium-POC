@@ -14,6 +14,8 @@ workspace = true
 venue-link = { path = "../link" }
 serde_json = "1"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# epoll for the WebSocket event loops (reactor.rs): the OS poller and TCP types, no runtime and no logging.
+mio = { version = "1", default-features = false, features = ["os-poll", "net"] }
 
 [dev-dependencies]
 # The request-path tests run order entry against a real node rather than a stub of one.

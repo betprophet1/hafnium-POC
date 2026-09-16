@@ -6,6 +6,7 @@ mod http;
 mod hub;
 mod limits;
 mod price;
+mod reactor;
 mod rest;
 #[cfg(test)]
 mod testing;
@@ -104,17 +105,26 @@ fn conflate(gateway: &Arc<Gateway>) {
     });
 }
 
-/// Accepts connections for ever and serves each one.
+/// Accepts connections for ever and serves each one: WebSocket sessions from a few event loops, REST requests on a
+/// thread of their own.
 fn serve(gateway: &Arc<Gateway>, listener: &TcpListener) {
+    let threads = thread::available_parallelism().map_or(2, |n| n.get().min(4));
+    let reactors = match reactor::Reactors::start(gateway, threads) {
+        Ok(reactors) => Arc::new(reactors),
+        Err(e) => {
+            eprintln!("venue-gateway: event loops: {e}");
+            return;
+        }
+    };
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let gateway = Arc::clone(gateway);
-        thread::spawn(move || connection(&gateway, stream));
+        let (gateway, reactors) = (Arc::clone(gateway), Arc::clone(&reactors));
+        thread::spawn(move || connection(&gateway, &reactors, stream));
     }
 }
 
 /// Routes a connection by its request line without consuming it, so the WebSocket handshake reads it whole.
-fn connection(gateway: &Gateway, stream: TcpStream) {
+fn connection(gateway: &Gateway, reactors: &reactor::Reactors, stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     const WS: &[u8] = b"GET /v4/ws";
     let mut head = [0u8; WS.len()];
@@ -126,7 +136,7 @@ fn connection(gateway: &Gateway, stream: TcpStream) {
         }
     }
     if head == WS {
-        ws::serve(gateway, stream);
+        reactors.adopt(stream);
     } else {
         rest::handle(gateway, &stream);
     }

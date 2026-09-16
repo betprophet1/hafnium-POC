@@ -5,9 +5,10 @@ use crate::limits::monotonic;
 use crate::price;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{SendError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use venue_link::catalogue::Catalogue;
+use venue_link::submit::Notify;
 use venue_link::view::{Row, View};
 use venue_link::wire::Unit;
 
@@ -119,9 +120,29 @@ pub fn executions(view: &View, results: &[Value], sequence: u64) -> Vec<(u64, Va
     out
 }
 
+/// Where a session's messages go: its queue, and a way to tell whatever serves the session that something is waiting
+/// there, so nothing has to keep looking.
+#[derive(Clone)]
+pub struct Outbox {
+    queue: Sender<String>,
+    notify: Notify,
+}
+
+impl Outbox {
+    pub fn new(queue: Sender<String>, notify: Notify) -> Self {
+        Self { queue, notify }
+    }
+
+    pub fn send(&self, message: String) -> Result<(), SendError<String>> {
+        self.queue.send(message)?;
+        (self.notify)();
+        Ok(())
+    }
+}
+
 struct Session {
     account: Option<u64>,
-    tx: Sender<String>,
+    tx: Outbox,
     topics: BTreeSet<String>,
     depth: usize,
 }
@@ -356,7 +377,7 @@ impl Hub {
         }
     }
 
-    pub fn add_session(&mut self, tx: Sender<String>) -> u64 {
+    pub fn add_session(&mut self, tx: Outbox) -> u64 {
         self.next_key += 1;
         self.sessions.insert(self.next_key, Session { account: None, tx, topics: BTreeSet::new(), depth: 20 });
         self.next_key

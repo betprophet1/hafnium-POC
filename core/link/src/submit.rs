@@ -35,7 +35,25 @@ const INPUT_SEQUENCE: usize = 8;
 
 /// What the node said: one raw SBE frame per result, decoded by whoever asked.
 type Frames = Vec<Vec<u8>>;
-type Answer = SyncSender<Result<Frames, String>>;
+
+/// Called once a request's results, or its failure, can be taken from its `Pending`. A caller that waits on many
+/// requests at once, such as an event loop, is told this way rather than waiting on any one of them.
+pub type Notify = Arc<dyn Fn() + Send + Sync>;
+
+/// Where a request's results go, and who to tell once they are there.
+struct Answer {
+    results: SyncSender<Result<Frames, String>>,
+    notify: Option<Notify>,
+}
+
+impl Answer {
+    fn send(self, outcome: Result<Frames, String>) {
+        let _ = self.results.send(outcome);
+        if let Some(notify) = self.notify {
+            notify();
+        }
+    }
+}
 
 struct Request {
     bytes: Vec<u8>,
@@ -53,8 +71,9 @@ fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Fails every request whose results can no longer arrive.
 fn fail_pending(pending: &Mutex<VecDeque<Answer>>) {
-    for answer in locked(pending).drain(..) {
-        let _ = answer.send(Err("the connection to the sequencer group ended".to_string()));
+    let failed: Vec<Answer> = locked(pending).drain(..).collect();
+    for answer in failed {
+        answer.send(Err("the connection to the sequencer group ended".to_string()));
     }
 }
 
@@ -73,7 +92,12 @@ impl Submit {
 
     /// Hands one input to the forwarder, with a zeroed record header (the sequencer stamps it, spec E-17.2), and
     /// returns without waiting for it. A caller with several to send need not take them one at a time.
-    pub fn submit(&self, mut input: Value) -> Result<Pending, Error> {
+    pub fn submit(&self, input: Value) -> Result<Pending, Error> {
+        self.submit_notifying(input, None)
+    }
+
+    /// As `submit`, calling `notify` once the results, or the request's failure, can be taken.
+    pub fn submit_notifying(&self, mut input: Value, notify: Option<Notify>) -> Result<Pending, Error> {
         let object = input.as_object_mut().ok_or("an input must be a JSON object")?;
         object.insert("record".into(), json!({"sequence": 0, "sequencedAt": 0, "sequencerGroup": 0}));
         let bytes = ENCODED.with(|buffer| {
@@ -81,7 +105,8 @@ impl Submit {
             let n = codec::encode(&input, &mut buffer)?;
             Ok::<Vec<u8>, Error>(buffer[..n].to_vec())
         })?;
-        let (answer, wait) = sync_channel(1);
+        let (results, wait) = sync_channel(1);
+        let answer = Answer { results, notify };
         self.queue.send(Request { bytes, answer }).map_err(|_| "the ingress forwarder stopped")?;
         Ok(Pending { wait })
     }
@@ -213,9 +238,7 @@ fn read_results(stream: TcpStream, pending: &Mutex<VecDeque<Answer>>) {
         }
         let waiting = locked(pending).pop_front();
         match waiting {
-            Some(answer) => {
-                let _ = answer.send(Ok(batch));
-            }
+            Some(answer) => answer.send(Ok(batch)),
             // Results with nothing waiting for them mean the stream is not what this thread thinks it is.
             None => return fail_pending(pending),
         }

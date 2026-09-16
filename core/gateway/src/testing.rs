@@ -33,26 +33,41 @@ fn free_address() -> String {
     listener.local_addr().expect("its address").to_string()
 }
 
+/// Starts a node on ports of its own and returns its ingress and feed addresses. A free port is found by binding it
+/// and letting it go, so another test can take it before the node binds it; a node that cannot bind stops at once,
+/// so a node still running after a moment has its ports, and one that stopped is tried again on fresh ones.
+fn start_node(name: &str) -> (String, String) {
+    for attempt in 0..5 {
+        let (ingress, feed) = (free_address(), free_address());
+        let data_dir = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}-{attempt}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let config = Config {
+            listen: ingress.parse().expect("an ingress address"),
+            feed: feed.parse().expect("a feed address"),
+            data_dir,
+            group: 1,
+            node_id: 1,
+            tick: Duration::from_millis(100),
+            fsync: false,
+            capacity: "small".into(),
+        };
+        let (stopped, stop) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let outcome = node::serve(&config).map_err(|e| e.to_string());
+            let _ = stopped.send(outcome);
+        });
+        match stop.recv_timeout(Duration::from_millis(300)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return (ingress, feed),
+            Ok(Err(e)) => eprintln!("test node for {name} could not start, trying other ports: {e}"),
+            _ => eprintln!("test node for {name} stopped at once, trying other ports"),
+        }
+    }
+    panic!("no test node for {name} could start in five attempts");
+}
+
 /// A seeded node and a serving gateway, both private to the test that asked. `name` keeps data directories apart.
 pub fn venue(name: &str) -> Venue {
-    let (ingress, feed) = (free_address(), free_address());
-    let data_dir = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&data_dir);
-    let config = Config {
-        listen: ingress.parse().expect("an ingress address"),
-        feed: feed.parse().expect("a feed address"),
-        data_dir,
-        group: 1,
-        node_id: 1,
-        tick: Duration::from_millis(100),
-        fsync: false,
-        capacity: "small".into(),
-    };
-    thread::spawn(move || {
-        if let Err(e) = node::serve(&config) {
-            eprintln!("test node: {e}");
-        }
-    });
+    let (ingress, feed) = start_node(name);
     // Sends wait for the forwarder's first connection, so seeding can start before the node is listening.
     let seeder = Submit::spawn(&ingress);
     let catalogue = Catalogue::load(CATALOGUE).expect("the mini venue's catalogue");

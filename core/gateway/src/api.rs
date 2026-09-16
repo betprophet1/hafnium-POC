@@ -8,7 +8,7 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
-use venue_link::submit::{self, Submit};
+use venue_link::submit::{self, Notify, Submit};
 use venue_link::wire;
 
 /// What a caller is told when the node did not answer: the outcome is genuinely unknown, so the only safe advice
@@ -19,9 +19,28 @@ fn unavailable() -> ApiError {
     )
 }
 
-/// A request the node has been given and has not answered yet, with the account whose result it will be.
+/// The input for a mass cancel of one account's orders in `scope` (spec E-12.6).
+fn mass_cancel_input(account: u64, session: u64, scope: &str, reference: u64, cause: &str) -> Value {
+    json!({
+        "msg": "MassCancel", "sessionId": session, "accountId": account, "scope": scope, "scopeRef": reference,
+        "cause": cause
+    })
+}
+
+/// What a request's results are made into for the client.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// An `OrderResult`: an order, an amendment or a cancel.
+    Order,
+    /// A mass cancel's sequence and executions.
+    MassCancel,
+}
+
+/// A request the node has been given and has not answered yet, with the account whose result it will be and what
+/// kind of answer its results make.
 pub struct Pending {
     account: u64,
+    answer: Answer,
     inner: submit::Pending,
 }
 
@@ -210,13 +229,22 @@ impl Gateway {
     }
 
     /// Hands an input to the node without waiting for it, so a client with several to send is not held to one at a
-    /// time. The account travels with it because the results are only an `OrderResult` once `result` has seen them.
-    fn submit(&self, account: u64, input: Value) -> Result<Pending, ApiError> {
-        let inner = self.ingress.submit(input).map_err(|e| {
+    /// time. The account travels with it because the results are only an answer once they have been made into one.
+    /// `notify` is called once they can be taken, for a caller that waits on many requests at once.
+    fn submit(&self, account: u64, input: Value, answer: Answer, notify: Option<Notify>) -> Result<Pending, ApiError> {
+        let inner = self.ingress.submit_notifying(input, notify).map_err(|e| {
             eprintln!("gateway: ingress: {e}");
             unavailable()
         })?;
-        Ok(Pending { account, inner })
+        Ok(Pending { account, answer, inner })
+    }
+
+    /// The client's answer from a request's results.
+    fn outcome(&self, account: u64, answer: Answer, results: &[Value]) -> Value {
+        match answer {
+            Answer::Order => self.result(account, results),
+            Answer::MassCancel => self.mass_cancel_result(account, results),
+        }
     }
 
     fn send(&self, input: Value) -> Result<Vec<Value>, ApiError> {
@@ -228,9 +256,11 @@ impl Gateway {
 
     /// The `OrderResult` for a pending request, waiting however long the node takes. For when something must be
     /// answered in one go and cannot be left outstanding.
+    #[cfg(test)]
     pub fn wait_for(&self, pending: Pending) -> Result<Value, ApiError> {
+        let (account, answer) = (pending.account, pending.answer);
         match pending.inner.wait() {
-            Ok(results) => Ok(self.result(pending.account, &results)),
+            Ok(results) => Ok(self.outcome(account, answer, &results)),
             Err(e) => {
                 eprintln!("gateway: ingress: {e}");
                 Err(unavailable())
@@ -238,22 +268,11 @@ impl Gateway {
         }
     }
 
-    /// The `OrderResult` for a pending request, waiting up to `limit` for the node to answer it. A session with
-    /// nothing else to do waits here, so a reply leaves as soon as it exists rather than at the next poll.
-    pub fn finish_within(&self, pending: &Pending, limit: Duration) -> Option<Result<Value, ApiError>> {
-        Some(match pending.inner.wait_for(limit)? {
-            Ok(results) => Ok(self.result(pending.account, &results)),
-            Err(e) => {
-                eprintln!("gateway: ingress: {e}");
-                Err(unavailable())
-            }
-        })
-    }
-
-    /// The `OrderResult` for a request the node has answered, or `None` while it has not.
+    /// The answer to a request the node has answered, or `None` while it has not. A caller that submitted with a
+    /// notify asks again when it is told.
     pub fn finish(&self, pending: &Pending) -> Option<Result<Value, ApiError>> {
         Some(match pending.inner.take()? {
-            Ok(results) => Ok(self.result(pending.account, &results)),
+            Ok(results) => Ok(self.outcome(pending.account, pending.answer, &results)),
             Err(e) => {
                 eprintln!("gateway: ingress: {e}");
                 Err(unavailable())
@@ -355,10 +374,17 @@ impl Gateway {
         Ok(self.result(account, &results))
     }
 
-    /// The same, given to the node without waiting for it: `finish` collects the result later.
-    pub fn place_pending(&self, account: u64, session: u64, body: &Value) -> Result<Pending, ApiError> {
+    /// The same, given to the node without waiting for it: `finish` collects the result later, and `notify` is
+    /// called once it can.
+    pub fn place_pending(
+        &self,
+        account: u64,
+        session: u64,
+        body: &Value,
+        notify: Option<Notify>,
+    ) -> Result<Pending, ApiError> {
         let input = self.place_input(account, session, body)?;
-        self.submit(account, input)
+        self.submit(account, input, Answer::Order, notify)
     }
 
     /// The input for an amendment, once it has passed every check. The order is resolved here, before anything is
@@ -406,9 +432,16 @@ impl Gateway {
     }
 
     /// The same, given to the node without waiting for it: `finish` collects the result later.
-    pub fn amend_pending(&self, account: u64, session: u64, order: u64, body: &Value) -> Result<Pending, ApiError> {
+    pub fn amend_pending(
+        &self,
+        account: u64,
+        session: u64,
+        order: u64,
+        body: &Value,
+        notify: Option<Notify>,
+    ) -> Result<Pending, ApiError> {
         let input = self.amend_input(account, session, order, body)?;
-        self.submit(account, input)
+        self.submit(account, input, Answer::Order, notify)
     }
 
     /// The input for a cancellation, once the order has been resolved to this account's.
@@ -431,21 +464,45 @@ impl Gateway {
     }
 
     /// The same, given to the node without waiting for it.
-    pub fn cancel_pending(&self, account: u64, session: u64, order: u64) -> Result<Pending, ApiError> {
+    pub fn cancel_pending(
+        &self,
+        account: u64,
+        session: u64,
+        order: u64,
+        notify: Option<Notify>,
+    ) -> Result<Pending, ApiError> {
         let input = self.cancel_input(account, session, order)?;
-        self.submit(account, input)
+        self.submit(account, input, Answer::Order, notify)
+    }
+
+    /// The scope of a `cancelAll`: the whole account, one market, or one event.
+    fn cancel_all_scope(body: &Value) -> Result<(&'static str, u64), ApiError> {
+        let fields = only(body, &["instrumentId", "eventId"])?;
+        match (optional_id(fields, "instrumentId")?, optional_id(fields, "eventId")?) {
+            (None, None) => Ok(("ACCOUNT", 0)),
+            (Some(instrument), None) => Ok(("INSTRUMENT", instrument)),
+            (None, Some(event)) => Ok(("EVENT", event)),
+            _ => Err(ApiError::bad("give at most one of instrumentId and eventId")),
+        }
     }
 
     /// DELETE /v4/orders and the WebSocket `cancelAll` op.
     pub fn cancel_all(&self, account: u64, session: u64, body: &Value) -> Result<Value, ApiError> {
-        let fields = only(body, &["instrumentId", "eventId"])?;
-        let (scope, reference) = match (optional_id(fields, "instrumentId")?, optional_id(fields, "eventId")?) {
-            (None, None) => ("ACCOUNT", 0),
-            (Some(instrument), None) => ("INSTRUMENT", instrument),
-            (None, Some(event)) => ("EVENT", event),
-            _ => return Err(ApiError::bad("give at most one of instrumentId and eventId")),
-        };
+        let (scope, reference) = Self::cancel_all_scope(body)?;
         self.mass_cancel(account, session, scope, reference, "CLIENT_REQUEST")
+    }
+
+    /// The same, given to the node without waiting for it. Its answer is a mass cancel's, not an `OrderResult`.
+    pub fn cancel_all_pending(
+        &self,
+        account: u64,
+        session: u64,
+        body: &Value,
+        notify: Option<Notify>,
+    ) -> Result<Pending, ApiError> {
+        let (scope, reference) = Self::cancel_all_scope(body)?;
+        let input = mass_cancel_input(account, session, scope, reference, "CLIENT_REQUEST");
+        self.submit(account, input, Answer::MassCancel, notify)
     }
 
     /// Cancel-on-disconnect and missed heartbeats, keyed to the client session (blueprint §5).
@@ -461,19 +518,20 @@ impl Gateway {
         reference: u64,
         cause: &str,
     ) -> Result<Value, ApiError> {
-        let input = json!({
-            "msg": "MassCancel", "sessionId": session, "accountId": account, "scope": scope, "scopeRef": reference,
-            "cause": cause
-        });
-        let results = self.send(input)?;
+        let results = self.send(mass_cancel_input(account, session, scope, reference, cause))?;
+        Ok(self.mass_cancel_result(account, &results))
+    }
+
+    /// A mass cancel's answer: its sequence and the account's cancellations.
+    fn mass_cancel_result(&self, account: u64, results: &[Value]) -> Value {
         let hub = self.hub();
         let sequence = results.iter().find_map(|r| r["result"]["inputSequence"].as_u64()).unwrap_or(hub.view.sequence);
-        let executions: Vec<Value> = hub::executions(&hub.view, &results, sequence)
+        let executions: Vec<Value> = hub::executions(&hub.view, results, sequence)
             .into_iter()
             .filter(|(a, _)| *a == account)
             .map(|(_, e)| e)
             .collect();
-        Ok(json!({"sequence": id(sequence), "executions": executions}))
+        json!({"sequence": id(sequence), "executions": executions})
     }
 
     /// An `OrderResult` from one input's results.
@@ -604,7 +662,9 @@ mod tests {
     fn pipelined_orders_are_answered_in_the_order_they_were_sent() {
         let gateway = venue("pipelined");
         let pending: Vec<Pending> = (0..20)
-            .map(|i| gateway.place_pending(MAKER, SESSION, &order(&format!("p{i}"), "buy", 4, 1)).expect("submitted"))
+            .map(|i| {
+                gateway.place_pending(MAKER, SESSION, &order(&format!("p{i}"), "buy", 4, 1), None).expect("submitted")
+            })
             .collect();
         let mut last = 0;
         for p in pending {
