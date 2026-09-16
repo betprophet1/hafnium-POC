@@ -120,6 +120,20 @@ pub fn executions(view: &View, results: &[Value], sequence: u64) -> Vec<(u64, Va
     out
 }
 
+/// Takes a session out of one entry of an index, dropping the entry once it is empty.
+fn unindex<K, Q>(index: &mut BTreeMap<Q, BTreeSet<u64>>, name: &K, key: u64)
+where
+    K: Ord + ?Sized,
+    Q: Ord + std::borrow::Borrow<K>,
+{
+    if let Some(keys) = index.get_mut(name) {
+        keys.remove(&key);
+        if keys.is_empty() {
+            index.remove(name);
+        }
+    }
+}
+
 /// Where a session's messages go: its queue, and a way to tell whatever serves the session that something is waiting
 /// there, so nothing has to keep looking.
 #[derive(Clone)]
@@ -162,6 +176,10 @@ pub struct Hub {
     catalogue: Catalogue,
     tokens: BTreeMap<String, u64>,
     sessions: BTreeMap<u64, Session>,
+    /// Session keys by the account they are logged in as, and by topic, so a message reaches its sessions without
+    /// looking at every session: at tens of thousands of connections a scan per message is most of the work.
+    by_account: BTreeMap<u64, BTreeSet<u64>>,
+    by_topic: BTreeMap<String, BTreeSet<u64>>,
     next_key: u64,
     /// Book levels that have moved since the last flush: instrument, then `(buy, tick)` to that level's latest
     /// quantity and order count. Writing the same key again is what conflates — a level that moves several times
@@ -190,6 +208,8 @@ impl Hub {
             catalogue,
             tokens,
             sessions: BTreeMap::new(),
+            by_account: BTreeMap::new(),
+            by_topic: BTreeMap::new(),
             next_key: 0,
             dirty: BTreeMap::new(),
             history: BTreeMap::new(),
@@ -366,14 +386,18 @@ impl Hub {
                 history.dropped_through = dropped;
             }
         }
-        for s in self.sessions.values().filter(|s| s.account == Some(account)) {
-            let _ = s.tx.send(message.clone());
+        for key in self.by_account.get(&account).into_iter().flatten() {
+            if let Some(s) = self.sessions.get(key) {
+                let _ = s.tx.send(message.clone());
+            }
         }
     }
 
     fn send_to_topic(&self, topic: &str, message: &str) {
-        for s in self.sessions.values().filter(|s| s.topics.contains(topic)) {
-            let _ = s.tx.send(message.to_string());
+        for key in self.by_topic.get(topic).into_iter().flatten() {
+            if let Some(s) = self.sessions.get(key) {
+                let _ = s.tx.send(message.to_string());
+            }
         }
     }
 
@@ -384,12 +408,19 @@ impl Hub {
     }
 
     pub fn remove_session(&mut self, key: u64) {
-        self.sessions.remove(&key);
+        let Some(s) = self.sessions.remove(&key) else { return };
+        if let Some(account) = s.account {
+            unindex(&mut self.by_account, &account, key);
+        }
+        for topic in &s.topics {
+            unindex(&mut self.by_topic, topic, key);
+        }
     }
 
     pub fn log_in(&mut self, key: u64, account: u64) {
         if let Some(s) = self.sessions.get_mut(&key) {
             s.account = Some(account);
+            self.by_account.entry(account).or_default().insert(key);
         }
     }
 
@@ -407,6 +438,9 @@ impl Hub {
             topics.iter().filter_map(|t| t.strip_prefix("book.")?.parse().ok()).map(|i| self.image(i)).collect();
         if let Some(s) = self.sessions.get_mut(&key) {
             s.topics.extend(topics.iter().cloned());
+            for topic in topics {
+                self.by_topic.entry(topic.clone()).or_default().insert(key);
+            }
             s.depth = depth;
             for image in images {
                 let _ = s.tx.send(image);
@@ -417,7 +451,9 @@ impl Hub {
     pub fn unsubscribe(&mut self, key: u64, topics: &[String]) {
         if let Some(s) = self.sessions.get_mut(&key) {
             for t in topics {
-                s.topics.remove(t);
+                if s.topics.remove(t) {
+                    unindex(&mut self.by_topic, t, key);
+                }
             }
         }
     }
@@ -427,7 +463,8 @@ impl Hub {
     pub fn flush_books(&mut self) {
         for (instrument, levels) in std::mem::take(&mut self.dirty) {
             let topic = format!("book.{instrument}");
-            if !self.sessions.values().any(|s| s.topics.contains(&topic)) {
+            // An entry leaves the index with its last session, so a topic in it has someone to send to.
+            if !self.by_topic.contains_key(&topic) {
                 continue;
             }
             let message = self.levels_message(instrument, &levels, false);
@@ -553,6 +590,38 @@ fn typed(kind: &str, mut body: Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{mpsc, Arc};
+
+    /// A session's outbox, and what arrives in it.
+    fn outbox() -> (Outbox, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel();
+        (Outbox::new(tx, Arc::new(|| {})), rx)
+    }
+
+    #[test]
+    fn private_messages_reach_the_accounts_sessions_and_no_others() {
+        let mut hub = hub();
+        let (first, first_rx) = outbox();
+        let (other, other_rx) = outbox();
+        let (anonymous, anonymous_rx) = outbox();
+        let first = hub.add_session(first);
+        let other = hub.add_session(other);
+        hub.add_session(anonymous);
+        hub.log_in(first, 1);
+        hub.log_in(other, 2);
+        hub.apply(&unit(1, vec![accepted(7)]));
+        assert!(first_rx.try_iter().count() > 0, "account 1's session was not told");
+        assert_eq!(other_rx.try_iter().count(), 0, "another account's session was told");
+        assert_eq!(anonymous_rx.try_iter().count(), 0, "a session logged in as nobody was told");
+        // Removing a session leaves the account's entry usable for the next session to log in as it.
+        hub.remove_session(first);
+        let (next, next_rx) = outbox();
+        let next = hub.add_session(next);
+        hub.log_in(next, 1);
+        hub.apply(&unit(2, vec![accepted(8)]));
+        assert!(next_rx.try_iter().count() > 0, "a later session for the account was not told");
+        assert_eq!(other_rx.try_iter().count(), 0);
+    }
 
     /// The mini venue's catalogue: a hub needs one, and these tests need nothing from it.
     fn hub() -> Hub {
