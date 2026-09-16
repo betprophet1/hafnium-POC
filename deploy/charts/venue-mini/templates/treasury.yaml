@@ -1,0 +1,136 @@
+{{- if .Values.treasury.enabled }}
+{{- $name := include "venue-mini.fullname" . }}
+{{- $core := printf "%s-core" $name }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-treasury
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: treasury
+spec:
+  selector:
+    {{- include "venue-mini.selector" (dict "ctx" . "component" "treasury") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8083
+      targetPort: http
+---
+# The ledger's book outlives the pod, as the core's journal does: a treasury that forgot its transfers would forget
+# money in flight.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-treasury
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: treasury
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.treasury.storage.className }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.treasury.storage.size }}
+---
+# The dummy treasury (core/treasury): deposits and withdrawals, a double-entry ledger and a fake bank. One writer to
+# its book, so an old pod stops before a new one starts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-treasury
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: treasury
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "treasury") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" . | nindent 8 }}
+        app.kubernetes.io/component: treasury
+    spec:
+      securityContext:
+        {{- include "venue-mini.podSecurity" . | nindent 8 }}
+      containers:
+        - name: treasury
+          image: {{ include "venue-mini.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["tini", "--", "venue-treasury"]
+          env:
+            - name: VENUE_LISTEN
+              value: "0.0.0.0:8083"
+            - name: VENUE_INGRESS
+              value: "{{ $core }}:7101"
+            - name: VENUE_FEED
+              value: "{{ $core }}:7102"
+            - name: VENUE_CATALOGUE
+              value: /catalogue/markets.json
+            - name: VENUE_LEDGER
+              value: /var/lib/treasury/ledger.jsonl
+            - name: VENUE_FSYNC
+              value: {{ .Values.core.fsync | quote }}
+            - name: VENUE_SEED
+              value: {{ .Values.treasury.bank.seed | int64 | quote }}
+            - name: VENUE_MIN_DELAY_MS
+              value: {{ .Values.treasury.bank.minDelayMs | int64 | quote }}
+            - name: VENUE_MAX_DELAY_MS
+              value: {{ .Values.treasury.bank.maxDelayMs | int64 | quote }}
+            - name: VENUE_FAILURE_PER_MILLE
+              value: {{ .Values.treasury.bank.failurePerMille | int64 | quote }}
+            - name: VENUE_MAX_CENTS
+              value: {{ .Values.treasury.maxCents | int64 | quote }}
+          ports:
+            - name: http
+              containerPort: 8083
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          securityContext:
+            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: catalogue
+              mountPath: /catalogue
+            - name: ledger
+              mountPath: /var/lib/treasury
+      volumes:
+        - name: catalogue
+          configMap:
+            name: {{ $name }}-catalogue
+        - name: ledger
+          persistentVolumeClaim:
+            claimName: {{ $name }}-treasury
+---
+# The treasury trusts the account a request names, because only the gateway's private half, which authenticated it,
+# may reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-treasury
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "treasury") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "venue-mini.selector" (dict "ctx" $ "component" "gateway") | nindent 14 }}
+      ports:
+        - port: 8083
+{{- end }}

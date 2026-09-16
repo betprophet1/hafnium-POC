@@ -5,8 +5,8 @@ through ArgoCD. There is no compose file; the laptop runs the same chart.
 
 | Path | What it is |
 |---|---|
-| `images/venue-node.Dockerfile` | The image `venue`: `venue-node`, `venue-gateway` and `venue-sim`, built from the repository root |
-| `charts/venue-mini/` | The chart: the core, the gateway, a seed job for the demo markets, synthetic maker and taker, the web page, a network policy and a `helm test` smoke test |
+| `images/venue-node.Dockerfile` | The image `venue`: `venue-node`, `venue-gateway`, `venue-sim` and `venue-treasury`, built from the repository root |
+| `charts/venue-mini/` | The chart: the core, the gateway, the dummy treasury, a seed job for the demo markets, synthetic maker and taker, the web page, network policies and a `helm test` smoke test |
 | `charts/venue-mini/files/markets.json` | The demo catalogue: accounts with their dev tokens and tabs, markets and their outcome names |
 | `laptop.sh` | `up`, `web`, `restart` and `down` for a local k3d cluster |
 
@@ -19,9 +19,10 @@ deploy/laptop.sh up     # build, install, seed, smoke test
 deploy/laptop.sh web    # then open http://127.0.0.1:8080
 ```
 
-The page has an order book and three tabs. The market maker and retail customer tabs are private WebSocket sessions on
+The page has an order book and four tabs. The market maker and retail customer tabs are private WebSocket sessions on
 the gateway (`/v4/ws_private`), each logged in with its account's dev token, and the book comes from a public one
-(`/v4/ws_public`); settlement drives the dummy oracle (start, suspend, end, close,
+(`/v4/ws_public`); the account tab deposits and withdraws for either account through the dummy treasury and shows its
+cash, positions and transfers; settlement drives the dummy oracle (start, suspend, end, close,
 resolve, void, and list a new round). The synthetic maker quotes over a WebSocket session with cancel-on-disconnect
 (delete its pod and its quotes leave the book until the new pod logs in), and the synthetic taker trades over REST.
 The same port also serves the gateway itself under `/v4`:
@@ -29,6 +30,8 @@ The same port also serves the gateway itself under `/v4`:
 ```sh
 curl -s localhost:8080/v4/markets
 curl -s -H 'Authorization: Bearer dev-retail-customer' localhost:8080/v4/account
+curl -s -H 'Authorization: Bearer dev-retail-customer' localhost:8080/v4/transfers \
+  -d '{"clientTransferId": "d1", "kind": "deposit", "amountCents": 10000, "method": "dummy_bank"}'
 ```
 
 `up` is safe to repeat. After rebuilding, it replaces every pod, the core included, which replays its journal before
@@ -41,6 +44,10 @@ it is ready. `down` deletes the cluster and the journal with it.
 - **One writer.** The core is `replicas: 1` with `updateStrategy: OnDelete`: a sequencer group never rolls on its own.
 - **No liveness probe on the core.** A fail-stop (spec §18) exits the process; the restart replays to the same stop
   and shows as `CrashLoopBackOff`, which is the signal to look at the journal (`venue-node dump`).
+- **Money through the treasury.** With `treasury.enabled` (the default) the gateway passes `/v4/transfers` to the dummy
+  treasury, which keeps its ledger on a volume of its own and moves buying power in the core only as sequenced grants
+  and reclaims; only the gateway may reach it. Its fake bank's delays and failure rate are `treasury.bank` values.
+  The seed's grants are still how accounts start.
 - **Seeding is idempotent.** The seed job runs after every install and upgrade; its commands have fixed IDs.
 - **Not production.** Production runs the core on dedicated hosts behind Aeron Cluster (blueprint §5, §9). Tokens are
   fixed dev tokens, and the page and operator actions are unauthenticated; never expose them outside the cluster.

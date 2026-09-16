@@ -1,4 +1,4 @@
-The mini venue {{ .Release.Name }} is installed: the core, the gateway (interface 1), the demo markets{{ if .Values.web.enabled }}, the web page{{ end }} and synthetic traders.
+The mini venue {{ .Release.Name }} is installed: the core, the gateway (interface 1), {{ if .Values.treasury.enabled }}the dummy treasury, {{ end }}the demo markets{{ if .Values.web.enabled }}, the web page{{ end }} and synthetic traders.
 
   deploy/laptop.sh web                      then open http://127.0.0.1:8080 (the page, and the gateway under /v4)
   helm test {{ .Release.Name }} --logs                 smoke test through the core's ingress

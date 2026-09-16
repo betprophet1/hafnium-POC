@@ -31,9 +31,28 @@ core:
     limits:
       memory: 512Mi
 
-# The order book, market maker, retail customer and settlement tabs. Reach it with deploy/laptop.sh web.
+# The order book, market maker, retail customer, account and settlement tabs. Reach it with deploy/laptop.sh web.
 web:
   enabled: true
+
+# The dummy treasury (core/treasury): deposits and withdrawals on the gateway's private half (/v4/transfers), a
+# double-entry ledger kept on a volume of its own, and a fake bank. Without it the page's account tab cannot move money
+# and /v4/transfers answers 503.
+treasury:
+  enabled: true
+  bank:
+    # dummy_bank transfers are decided after a delay drawn from this range, and this many in a thousand fail. The
+    # decisions depend only on the seed and the transfer, so a run can be repeated.
+    seed: 1
+    minDelayMs: 2000
+    maxDelayMs: 8000
+    failurePerMille: 100
+  # The largest single transfer, in cents: $1,000,000.
+  maxCents: 100000000
+  storage:
+    size: 256Mi
+    # Empty uses the cluster's default class (k3d: local-path).
+    className: ""
 
 # Interface 1. Flood limits per WebSocket session, and per account for REST: messages a second and burst, logons a
 # minute per account (blueprint §12). Set well above what the page and bots need: a maker requoting every market can

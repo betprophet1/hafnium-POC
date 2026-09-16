@@ -50,6 +50,10 @@ spec:
               value: "{{ $core }}:7102"
             - name: VENUE_CATALOGUE
               value: /catalogue/markets.json
+            {{- if .Values.treasury.enabled }}
+            - name: VENUE_TREASURY
+              value: "{{ $name }}-treasury:8083"
+            {{- end }}
             - name: VENUE_PER_SECOND
               value: {{ .Values.gateway.perSecond | quote }}
             - name: VENUE_BURST
@@ -79,8 +83,8 @@ spec:
           configMap:
             name: {{ $name }}-catalogue
 ---
-# Only the gateway, the operator tools (seed job, the web page's settlement side) and the core's own smoke test may
-# reach the core's ingress and feed. Everything a customer or bot does goes through the gateway (blueprint §16).
+# Only the gateway, the treasury, the operator tools (seed job, the web page's settlement side) and the core's own
+# smoke test may reach the core's ingress and feed. Everything a customer or bot does goes through the gateway (blueprint §16).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -94,7 +98,7 @@ spec:
   policyTypes: [Ingress]
   ingress:
     - from:
-        {{- range list "gateway" "web" "seed" "smoke" }}
+        {{- range list "gateway" "treasury" "web" "seed" "smoke" }}
         - podSelector:
             matchLabels:
               {{- include "venue-mini.selector" (dict "ctx" $ "component" .) | nindent 14 }}
