@@ -15,6 +15,10 @@ venue-engine = { path = "../engine" }
 venue_journal = { path = "../journal" }
 serde_json = "1"
 
+[features]
+# Holds the engine's read-only fill check to the logged dry run on every vector (venue-engine/dry-run-oracle).
+oracle = ["venue-engine/dry-run-oracle"]
+
 [[bin]]
 name = "run-scenarios"
 path = "src/bin/run_scenarios.rs"

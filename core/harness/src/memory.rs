@@ -30,6 +30,8 @@ pub struct OwnedMemory {
     scratch: Vec<(u64, u64)>,
     marks: Vec<Mark>,
     undo: Vec<Undo>,
+    check_orders: Vec<CheckOrder>,
+    check_holdings: Vec<CheckHolding>,
 }
 
 impl OwnedMemory {
@@ -62,6 +64,8 @@ impl OwnedMemory {
             scratch: vec![(0, 0); c.orders.max(s(c.holdings) / 2).max(s(c.event_cash) / 2)],
             marks: vec![(0, 0, 0); c.touches],
             undo: vec![Undo::default(); c.undo],
+            check_orders: vec![CheckOrder::default(); c.orders],
+            check_holdings: vec![CheckHolding::default(); c.accounts],
         }
     }
 
@@ -94,6 +98,8 @@ impl OwnedMemory {
             scratch: &mut self.scratch,
             marks: &mut self.marks,
             undo: &mut self.undo,
+            check_orders: &mut self.check_orders,
+            check_holdings: &mut self.check_holdings,
         }
     }
 }

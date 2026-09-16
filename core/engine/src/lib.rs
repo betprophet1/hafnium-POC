@@ -18,6 +18,7 @@
 pub use venue_journal;
 
 mod book;
+mod check;
 mod commands;
 pub mod emit;
 pub mod fixed;
@@ -141,6 +142,10 @@ pub struct Engine<'a> {
     dry: bool,
     undo: &'a mut [Undo],
     undo_len: usize,
+    /// The fill check's views of orders and holdings (E-10.9), valid where stamped with `check_stamp`.
+    check_orders: &'a mut [CheckOrder],
+    check_holdings: &'a mut [CheckHolding],
+    check_stamp: u32,
     emitter: Emitter,
 }
 
@@ -156,9 +161,14 @@ impl<'a> Engine<'a> {
         let orders = memory.orders;
         let order_count = orders.len();
         let scratch_needed = order_count.max(memory.holdings.len() / 2).max(memory.event_cash.len() / 2);
-        if order_count >= NONE as usize || memory.scratch.len() < scratch_needed {
+        let check_short =
+            memory.check_orders.len() < order_count || memory.check_holdings.len() < memory.accounts.len();
+        if order_count >= NONE as usize || memory.scratch.len() < scratch_needed || check_short {
             return Err(FailStop::Capacity);
         }
+        let (check_orders, check_holdings) = (memory.check_orders, memory.check_holdings);
+        check_orders.fill(CheckOrder::default());
+        check_holdings.fill(CheckHolding::default());
         for (i, o) in orders.iter_mut().enumerate() {
             *o = Order {
                 prev: NONE,
@@ -220,6 +230,9 @@ impl<'a> Engine<'a> {
             dry: false,
             undo: memory.undo,
             undo_len: 0,
+            check_orders,
+            check_holdings,
+            check_stamp: 0,
             emitter: Emitter::new(config.sequencer_group),
         })
     }

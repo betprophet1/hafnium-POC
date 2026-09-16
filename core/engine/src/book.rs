@@ -42,6 +42,7 @@ fn capacity<T>(r: Result<T, crate::fixed::Full>) -> Result<T, FailStop> {
     r.map_err(|_| FailStop::Capacity)
 }
 
+#[cfg_attr(not(feature = "dry-run-oracle"), allow(dead_code))]
 fn restore<K: MapKey + Copy + Eq, V: Copy>(
     map: &mut FixedMap<'_, K, V>,
     key: K,
@@ -165,6 +166,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Starts a dry run: until [`Self::rollback`], writes are logged, and nothing is emitted, touched or marked.
+    #[cfg_attr(not(feature = "dry-run-oracle"), allow(dead_code))]
     pub(crate) fn begin_dry_run(&mut self) -> Result<(), FailStop> {
         self.dry = true;
         self.undo_len = 0;
@@ -177,6 +179,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Ends a dry run, restoring every logged write in reverse order.
+    #[cfg_attr(not(feature = "dry-run-oracle"), allow(dead_code))]
     pub(crate) fn rollback(&mut self) -> Result<(), FailStop> {
         while self.undo_len > 0 {
             self.undo_len -= 1;

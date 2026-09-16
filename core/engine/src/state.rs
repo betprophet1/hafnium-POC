@@ -162,6 +162,25 @@ pub struct Duplicate {
     pub order_id: Option<u64>,
 }
 
+/// An order as the fill check (E-10.9) sees it partway through its walk: what remains of it, what it locks, and
+/// whether it still rests. Stands only while `stamp` is the engine's current check; otherwise the order's own
+/// record does.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CheckOrder {
+    pub stamp: u32,
+    pub remaining: u32,
+    pub lock: u32,
+    pub resting: bool,
+}
+
+/// An account's holding in the instrument being checked, as the fill check sees it partway through its walk.
+/// Stands only while `stamp` is the engine's current check. One instrument per walk, so one per account.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CheckHolding {
+    pub stamp: u32,
+    pub holding: Holding,
+}
+
 /// A value a dry run (E-10.9) overwrote, restored when the dry run ends.
 #[derive(Clone, Copy, Debug)]
 pub enum Undo {
@@ -297,4 +316,9 @@ pub struct Memory<'a> {
     pub marks: &'a mut [Mark],
     /// `undo` entries.
     pub undo: &'a mut [Undo],
+    /// One per order slot: the fill check's view of each order (E-10.9), so it never writes the book. At least as
+    /// long as `orders`.
+    pub check_orders: &'a mut [CheckOrder],
+    /// One per account slot: the fill check's view of each account's holding. At least as long as `accounts`.
+    pub check_holdings: &'a mut [CheckHolding],
 }

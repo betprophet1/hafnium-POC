@@ -52,10 +52,12 @@ step "Dependencies: bans, licenses and sources"
 step "Rust: format and lints on handwritten crates; build and test the workspace"
 (cd "$CORE" && cargo fmt --check "${HANDWRITTEN[@]}" -p proto-l3book -p proto-maskbench)
 (cd "$CORE" && cargo clippy "${HANDWRITTEN[@]}" --all-targets -- -D warnings)
+(cd "$CORE" && cargo clippy -p venue-engine --features dry-run-oracle -- -D warnings)
 (cd "$CORE" && cargo test --workspace)
 
 step "Rust engine against normative scenarios and differential vectors"
-if (cd "$CORE" && cargo run -q --release -p venue-harness --bin run-scenarios -- target/compiled target/differential); then
+# With the oracle, every fill check (E-10.9) is answered twice and a disagreement fails the run.
+if (cd "$CORE" && cargo run -q --release -p venue-harness --features oracle --bin run-scenarios -- target/compiled target/differential); then
   echo "engine: PASS"
 elif [[ "${ENGINE_REQUIRED:-1}" == "1" ]]; then
   fail "the engine does not pass its scenarios"

@@ -13,3 +13,8 @@ workspace = true
 # The engine may depend on nothing but the generated journal codecs (blueprint §4; checked by core/ci.sh).
 [dependencies]
 venue_journal = { path = "../journal" }
+
+[features]
+# Answers every fill check (E-10.9) twice, with the read-only check and with the logged dry run, and fail-stops if
+# they differ. For the scenario and vector runs in core/ci.sh; never for a node.
+dry-run-oracle = []

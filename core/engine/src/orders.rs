@@ -25,7 +25,7 @@ use venue_journal::{
 pub(crate) const NS_PER_SECOND: u64 = 1_000_000_000;
 const NS_PER_MILLI: u64 = 1_000_000;
 pub(crate) const NO_CLIENT_ORDER_ID: ClientOrderId = [0; 32];
-const EXTRA_LOT: u64 = 1 << 63;
+pub(crate) const EXTRA_LOT: u64 = 1 << 63;
 
 /// `(slot, tick, quantity, priorityKept)` for an amendment that passes its checks.
 type AmendPlan = (u32, u16, u32, bool);
@@ -486,14 +486,14 @@ impl<'a> Engine<'a> {
         let tif = o.time_in_force;
         let may_rest = matches!(tif, TimeInForce::GTC | TimeInForce::GTD);
         // The dry run is evaluated only where its answer can change the outcome. Checks 16 and 17 compare counts
-        // that are already known here, and the dry run restores both through `Undo::Scalars`, so a venue below
-        // either limit cannot reject however much the order would fill: arming it there is pure cost, which is
-        // what made a non-zero `activeOrderLimit` expensive enough to leave unset.
+        // that are already known here, and the dry run leaves both as it found them, so a venue below either limit
+        // cannot reject however much the order would fill: arming it there is pure cost, which is what made a
+        // non-zero `activeOrderLimit` expensive enough to leave unset.
         let at_account_limit = limits.max_resting_orders > 0
             && self.accounts[o.account_slot as usize].resting_orders >= limits.max_resting_orders;
         let at_group_limit = self.active_order_limit > 0 && self.resting_orders >= self.active_order_limit;
         let needs_dry_run = tif == TimeInForce::FOK || (may_rest && (at_account_limit || at_group_limit));
-        let filled = if needs_dry_run { self.dry_run(slot, sink)? } else { 0 };
+        let filled = if needs_dry_run { self.walk_answer(slot, sink)? } else { 0 };
         if tif == TimeInForce::FOK && filled < o.remaining {
             return Ok(Some(R::FOK_NOT_FILLABLE));
         }
@@ -517,7 +517,25 @@ impl<'a> Engine<'a> {
         Ok(None)
     }
 
-    /// E-10.9: the quantity the walk would fill for the order in `slot`, with its lock taken.
+    /// E-10.9, answered by the fill check, which writes nothing (`check.rs`). With `dry-run-oracle`, the logged
+    /// dry run answers as well and a disagreement is a fail-stop: that is how the scenarios and differential vectors
+    /// hold the check to the real walk. The node is never built with it.
+    fn walk_answer<S: ResultSink>(&mut self, slot: u32, sink: &mut S) -> Result<u32, FailStop> {
+        let filled = self.fill_check(slot)?;
+        #[cfg(feature = "dry-run-oracle")]
+        {
+            if self.dry_run(slot, sink)? != filled {
+                return Err(FailStop::Inconsistent);
+            }
+        }
+        #[cfg(not(feature = "dry-run-oracle"))]
+        let _ = sink;
+        Ok(filled)
+    }
+
+    /// E-10.9 the exact way: the real walk with every write logged and rolled back. It logs twenty-odd writes a
+    /// fill into a fixed undo log, so it stays only as the oracle `walk_answer` checks against.
+    #[cfg_attr(not(feature = "dry-run-oracle"), allow(dead_code))]
     fn dry_run<S: ResultSink>(&mut self, slot: u32, sink: &mut S) -> Result<u32, FailStop> {
         let o = self.orders[slot as usize];
         let instrument_id = self.instruments[o.instrument_slot as usize].id;
