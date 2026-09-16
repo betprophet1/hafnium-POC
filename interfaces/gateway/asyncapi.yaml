@@ -170,6 +170,15 @@ components:
           resumeFrom:
             $ref: './openapi.yaml#/components/schemas/Id'
             description: Replay the account's executions, account updates and payouts after this sequence.
+          stream:
+            type: boolean
+            default: true
+            description: >
+              Whether this session is streamed to as things happen. A session that sets this false is woken rarely
+              rather than promptly: messages for it collect and arrive together, up to a second later. Meant for
+              screens, where nobody minds, and not for trading, where a fill should arrive at once. Replies to the
+              session's own requests are unaffected either way, and anything the client sends makes the gateway
+              attentive again at once.
     subscribe:
       payload:
         type: object

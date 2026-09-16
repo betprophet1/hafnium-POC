@@ -94,6 +94,23 @@ A `heartbeat` that carries an `id` is answered with an empty `reply`. A client t
 hears back from a gateway that is alive, so it can close and reconnect a session that has gone silent instead of
 mistaking a lost gateway for a quiet market. The mini venue's web page does this every 15 seconds.
 
+## Sessions: being streamed to, or not
+
+`stream` in `login` says whether a session is streamed to as things happen. It is true unless a client says
+otherwise, and a session that leaves it alone behaves exactly as it always has.
+
+A session that sets it false is woken rarely rather than promptly: messages for it collect and arrive together, up
+to a second later. That is the right trade for a screen, where nobody can tell, and the wrong one for trading,
+where a fill should arrive at once. Two things are unaffected either way. A reply to the session's own request is
+written as the request is handled, so round trips never wait on this. And anything the client sends makes the
+gateway attentive again immediately, so a session becomes prompt the moment its user does something.
+
+The point of it is what a connection costs when nothing is happening. A gateway holds a thread per connection and
+wakes each one on a timer, so a thousand connections waiting 50 ms at a time cost a quarter of a core between them
+while entirely idle, and five thousand cost more than the machine can schedule. Letting the sessions that do not
+need promptness wait a second instead is what keeps that affordable. A session's wait never grows past half its
+own `heartbeatSeconds`, so setting `stream` false never delays noticing that the session has gone silent.
+
 ## Flood limits
 
 Per session, in the gateway's memory, as generic cell rate buckets (blueprint §12): messages per second, and logons

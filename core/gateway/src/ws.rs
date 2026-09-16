@@ -11,6 +11,15 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket};
 
+/// How long a read waits for a session being streamed to, which is every session that does not say otherwise.
+/// This is what every session always waited before.
+const POLL_MIN: Duration = Duration::from_millis(50);
+
+/// The longest a session that asked not to be streamed to waits while its client says nothing. A connection costs
+/// the gateway a wakeup every interval whether or not anything arrives, and across thousands of connections that
+/// is much its largest cost: a thousand of them waiting 50ms at a time cost 25% of a core doing nothing else.
+const POLL_IDLE_MAX: Duration = Duration::from_secs(1);
+
 struct Session {
     key: u64,
     engine_session: u64,
@@ -19,6 +28,20 @@ struct Session {
     heartbeat: Option<Duration>,
     last_heard: Instant,
     bucket: Bucket,
+    /// How long this session's next quiet read waits, and the most it may ever grow to (`stream` at logon).
+    poll: Duration,
+    poll_ceiling: Duration,
+}
+
+impl Session {
+    /// The most a quiet read may wait: never so long that this session's own heartbeat would be missed late,
+    /// however patient its client said it was willing to be.
+    fn ceiling(&self) -> Duration {
+        match self.heartbeat {
+            Some(limit) => self.poll_ceiling.min(limit / 2),
+            None => self.poll_ceiling,
+        }
+    }
 }
 
 /// A session ID unique across gateway restarts, below 2^53 so every client holds it exactly. A mass cancel by session
@@ -32,7 +55,7 @@ fn session_id() -> Option<u64> {
 pub fn serve(gateway: &Gateway, stream: TcpStream) {
     let _ = stream.set_nodelay(true);
     let Ok(mut socket) = tungstenite::accept(stream) else { return };
-    let _ = socket.get_ref().set_read_timeout(Some(Duration::from_millis(50)));
+    let _ = socket.get_ref().set_read_timeout(Some(POLL_MIN));
     let _ = socket.get_ref().set_write_timeout(Some(Duration::from_secs(5)));
     let Some(engine_session) = session_id() else { return };
     let (tx, rx) = mpsc::channel();
@@ -45,6 +68,9 @@ pub fn serve(gateway: &Gateway, stream: TcpStream) {
         heartbeat: None,
         last_heard: monotonic(),
         bucket: Bucket::per_second(gateway.limits.per_second, gateway.limits.burst),
+        // Until a client says otherwise it is streamed to, and its wait never grows past where it starts.
+        poll: POLL_MIN,
+        poll_ceiling: POLL_MIN,
     };
     run(gateway, &mut socket, &mut session, &rx);
     gateway.hub().remove_session(key);
@@ -57,8 +83,13 @@ pub fn serve(gateway: &Gateway, stream: TcpStream) {
 
 fn run(gateway: &Gateway, socket: &mut WebSocket<TcpStream>, session: &mut Session, rx: &Receiver<String>) {
     loop {
+        // Only what the client sends shortens the wait again. What the gateway sends does not: a session that
+        // asked not to be streamed to would rather collect its messages and take them in one go, and a session
+        // that is streamed to has a ceiling of POLL_MIN, so its wait cannot grow whatever happens here.
+        let mut heard = false;
         match socket.read() {
             Ok(Message::Text(text)) => {
+                heard = true;
                 session.last_heard = monotonic();
                 for reply in handle(gateway, session, text.as_str()) {
                     if socket.send(Message::text(reply)).is_err() {
@@ -67,13 +98,17 @@ fn run(gateway: &Gateway, socket: &mut WebSocket<TcpStream>, session: &mut Sessi
                 }
             }
             Ok(Message::Binary(_)) => {
+                heard = true;
                 let refusal = error(&Value::Null, &ApiError::bad("send JSON as text frames"));
                 if socket.send(Message::text(refusal)).is_err() {
                     return;
                 }
             }
             Ok(Message::Close(_)) => return,
-            Ok(_) => session.last_heard = monotonic(),
+            Ok(_) => {
+                heard = true;
+                session.last_heard = monotonic();
+            }
             Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(_) => return,
         }
@@ -95,6 +130,12 @@ fn run(gateway: &Gateway, socket: &mut WebSocket<TcpStream>, session: &mut Sessi
                 let _ = socket.flush();
                 return;
             }
+        }
+        let next = if heard { POLL_MIN } else { (session.poll * 2).min(session.ceiling()) };
+        if next != session.poll {
+            session.poll = next;
+            // Only when it actually changes: this is a syscall, and it would otherwise run on every quiet read.
+            let _ = socket.get_ref().set_read_timeout(Some(next));
         }
     }
 }
@@ -210,7 +251,8 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
 }
 
 fn login(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<Vec<String>, ApiError> {
-    let fields = only(message, &["op", "id", "token", "cancelOnDisconnect", "heartbeatSeconds", "resumeFrom"])?;
+    let fields =
+        only(message, &["op", "id", "token", "cancelOnDisconnect", "heartbeatSeconds", "resumeFrom", "stream"])?;
     if session.account.is_some() {
         return Err(ApiError::bad("this session is already logged in"));
     }
@@ -228,9 +270,17 @@ fn login(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<Ve
         }
     };
     let resume_from = fields.get("resumeFrom").map(|v| parse_id(v.as_str().unwrap_or(""), "resumeFrom")).transpose()?;
+    // A client that says it is not streamed to would rather be woken rarely than promptly: its messages collect
+    // and arrive together. A screen does not mind; anything trading should leave this alone.
+    let streamed = match fields.get("stream") {
+        None => true,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(ApiError::bad("stream must be true or false")),
+    };
     session.account = Some(account);
     session.cancel_on_disconnect = cancel_on_disconnect;
     session.heartbeat = (heartbeat > 0).then(|| Duration::from_secs(heartbeat));
+    session.poll_ceiling = if streamed { POLL_MIN } else { POLL_IDLE_MAX };
     let (sequence, resumed) = {
         let mut hub = gateway.hub();
         hub.log_in(session.key, account);
