@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
@@ -71,8 +71,9 @@ impl Submit {
         Self { queue }
     }
 
-    /// Sends one input with a zeroed record header (the sequencer stamps it, spec E-17.2) and returns its results.
-    pub fn send(&self, mut input: Value) -> Result<Vec<Value>, Error> {
+    /// Hands one input to the forwarder, with a zeroed record header (the sequencer stamps it, spec E-17.2), and
+    /// returns without waiting for it. A caller with several to send need not take them one at a time.
+    pub fn submit(&self, mut input: Value) -> Result<Pending, Error> {
         let object = input.as_object_mut().ok_or("an input must be a JSON object")?;
         object.insert("record".into(), json!({"sequence": 0, "sequencedAt": 0, "sequencerGroup": 0}));
         let bytes = ENCODED.with(|buffer| {
@@ -82,9 +83,52 @@ impl Submit {
         })?;
         let (answer, wait) = sync_channel(1);
         self.queue.send(Request { bytes, answer }).map_err(|_| "the ingress forwarder stopped")?;
-        let frames = wait.recv().map_err(|_| "the ingress forwarder dropped the request")??;
-        frames.iter().map(|frame| codec::decode(frame).map_err(Error::from)).collect()
+        Ok(Pending { wait })
     }
+
+    /// Sends one input and waits for its results.
+    pub fn send(&self, input: Value) -> Result<Vec<Value>, Error> {
+        self.submit(input)?.wait()
+    }
+}
+
+/// An input the node has been given and has not answered yet.
+pub struct Pending {
+    wait: Receiver<Result<Frames, String>>,
+}
+
+impl Pending {
+    /// The results, if the node has answered by now. `None` means not yet, and the caller may ask again.
+    pub fn take(&self) -> Option<Result<Vec<Value>, Error>> {
+        match self.wait.try_recv() {
+            Ok(frames) => Some(decode(frames)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(Error::from("the ingress forwarder dropped the request"))),
+        }
+    }
+
+    /// The results, waiting for them however long they take.
+    pub fn wait(self) -> Result<Vec<Value>, Error> {
+        match self.wait.recv() {
+            Ok(frames) => decode(frames),
+            Err(_) => Err(Error::from("the ingress forwarder dropped the request")),
+        }
+    }
+
+    /// The results, waiting up to `limit` for them. `None` means they had not arrived by then, and the caller may
+    /// ask again. A caller with nothing else to do should wait here rather than on a timer: a reply left sitting
+    /// until the next time round the loop is a reply delivered late.
+    pub fn wait_for(&self, limit: Duration) -> Option<Result<Vec<Value>, Error>> {
+        match self.wait.recv_timeout(limit) {
+            Ok(frames) => Some(decode(frames)),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => Some(Err(Error::from("the ingress forwarder dropped the request"))),
+        }
+    }
+}
+
+fn decode(frames: Result<Frames, String>) -> Result<Vec<Value>, Error> {
+    frames?.iter().map(|frame| codec::decode(frame).map_err(Error::from)).collect()
 }
 
 /// Owns the connection: one generation at a time, reconnecting for ever.
