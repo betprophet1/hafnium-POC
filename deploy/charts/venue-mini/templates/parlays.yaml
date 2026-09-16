@@ -1,0 +1,81 @@
+{{- if .Values.parlays.enabled }}
+{{- $name := include "venue-mini.fullname" . }}
+{{- $core := printf "%s-core" $name }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-parlays
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: parlays
+spec:
+  selector:
+    {{- include "venue-mini.selector" (dict "ctx" . "component" "parlays") | nindent 4 }}
+  ports:
+    - name: gateways
+      port: 7103
+      targetPort: gateways
+---
+# The parlay service (core/parlays): lists a parlay on its first request for quote, relays requests to the
+# catalogue's responders and their quotes to the requester through the gateway, and settles parlays from their legs.
+# It sequences as an operator, like the seed job, and holds open requests in memory: replacing its pod forgets them,
+# while parlays and quotes, which are listings and orders, stay in the journal.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-parlays
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: parlays
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "parlays") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" . | nindent 8 }}
+        app.kubernetes.io/component: parlays
+    spec:
+      securityContext:
+        {{- include "venue-mini.podSecurity" . | nindent 8 }}
+      containers:
+        - name: parlays
+          image: {{ include "venue-mini.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["tini", "--", "venue-parlays"]
+          env:
+            - name: VENUE_LISTEN
+              value: "0.0.0.0:7103"
+            - name: VENUE_INGRESS
+              value: "{{ $core }}:7101"
+            - name: VENUE_FEED
+              value: "{{ $core }}:7102"
+            - name: VENUE_CATALOGUE
+              value: /catalogue/markets.json
+            - name: VENUE_WINDOW_SECONDS
+              value: {{ .Values.parlays.windowSeconds | quote }}
+            - name: VENUE_MAX_PARLAYS
+              value: {{ .Values.parlays.maxParlays | quote }}
+          ports:
+            - name: gateways
+              containerPort: 7103
+          readinessProbe:
+            tcpSocket:
+              port: gateways
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+          securityContext:
+            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: catalogue
+              mountPath: /catalogue
+      volumes:
+        - name: catalogue
+          configMap:
+            name: {{ $name }}-catalogue
+{{- end }}

@@ -69,6 +69,15 @@ gateway:
   burst: 400
   logonsPerMinute: 30
 
+# The parlay service: parlays listed on request, requests for quote routed to the catalogue's responders, and
+# settlement from the legs. A request accepts quotes for windowSeconds of sequencer time. Every book reserves its
+# levels for as long as the core runs, and running out is a fail-stop, so the service lists at most maxParlays: a
+# parlay's ladder has 279 rows, 558 levels, of the small profile's 131 072.
+parlays:
+  enabled: true
+  windowSeconds: 30
+  maxParlays: 100
+
 # Synthetic traders, clients of the gateway. Each acts as the catalogue account its dev token names. The maker holds a
 # WebSocket session with cancel-on-disconnect, so replacing its pod pulls its quotes; the taker uses REST.
 bots:
@@ -83,6 +92,8 @@ bots:
     spread: 1
     intervalMs: 700
     seed: 1
+    # As a registered responder, what it adds to a parlay's price from its legs' books, in thousandths.
+    margin: 100
   taker:
     enabled: true
     token: dev-synthetic-taker

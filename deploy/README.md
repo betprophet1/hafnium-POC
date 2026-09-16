@@ -5,9 +5,9 @@ through ArgoCD. There is no compose file; the laptop runs the same chart.
 
 | Path | What it is |
 |---|---|
-| `images/venue-node.Dockerfile` | The image `venue`: `venue-node`, `venue-gateway`, `venue-sim` and `venue-treasury`, built from the repository root |
-| `charts/venue-mini/` | The chart: the core, the gateway, the dummy treasury, a seed job for the demo markets, the dummy oracle, synthetic maker and taker, the web page, network policies and a `helm test` smoke test |
-| `charts/venue-mini/files/markets.json` | The demo catalogue: accounts with their dev tokens and tabs, markets and their outcome names |
+| `images/venue-node.Dockerfile` | The image `venue`: `venue-node`, `venue-gateway`, `venue-parlays`, `venue-sim` and `venue-treasury`, built from the repository root |
+| `charts/venue-mini/` | The chart: the core, the gateway, the dummy treasury, the parlay service, a seed job for the demo markets, the dummy oracle, synthetic maker and taker, the web page, network policies and a `helm test` smoke test |
+| `charts/venue-mini/files/markets.json` | The demo catalogue: accounts with their dev tokens, tabs and whether they respond to requests for quote, markets and their outcome names |
 | `charts/venue-mini/files/calendar.json` | The dummy oracle's calendar: how often each market lists a new round, its timings, and the resolution timers (`core/sim/README.md`) |
 | `laptop.sh` | `up`, `web`, `restart` and `down` for a local k3d cluster |
 
@@ -20,15 +20,20 @@ deploy/laptop.sh up     # build, install, seed, smoke test
 deploy/laptop.sh web    # then open http://127.0.0.1:8080
 ```
 
-The page has an order book and four tabs. The market maker and retail customer tabs are private WebSocket sessions on
+The page has an order book and five tabs. The market maker and retail customer tabs are private WebSocket sessions on
 the gateway (`/v4/ws_private`), each logged in with its account's dev token, and the book comes from a public one
 (`/v4/ws_public`); the account tab deposits and withdraws for either account through the dummy treasury and shows its
-cash, positions and transfers. Markets run on their own: the dummy oracle (`oracle.enabled`, on by default) lists a new round of
-each market every few minutes and starts, ends, closes and settles it through two dummy sources, an auto-approver and
-a 30 s dispute window, voiding one now and then. The settlement tab shows its schedule, countdowns and resolution
-cases, and acts through it: start, suspend, end, close, postpone, propose an outcome or a void, dispute, and list a
-round now. The synthetic maker quotes over a WebSocket session with cancel-on-disconnect
-(delete its pod and its quotes leave the book until the new pod logs in), and the synthetic taker trades over REST.
+cash, positions and transfers; the parlays tab builds a parlay from open markets and requests quotes for it as the
+retail customer, shows the quotes as they arrive and lapse, takes one, and lists every parlay with its legs and how it
+settled. Markets run on their own: the dummy oracle (`oracle.enabled`, on by default) lists a new round of each market
+every few minutes and starts, ends, closes and settles it through two dummy sources, an auto-approver and a 30 s
+dispute window, voiding one now and then. The settlement tab shows its schedule, countdowns and resolution cases, and
+acts through it: start, suspend, end, close, postpone, propose an outcome or a void, dispute, and list a round now.
+The synthetic maker quotes over a WebSocket session with cancel-on-disconnect (delete its pod and its quotes leave the
+book until the new pod logs in) and answers requests for quote as the catalogue's registered responder, and the
+synthetic taker trades over REST, leaving parlays alone. The parlay service (`venue-parlays`) lists a parlay on its
+first request, routes requests and quotes for the gateway, and expires, resolves or voids each parlay as its legs
+resolve (interfaces/gateway/README.md, parlays).
 The same port also serves the gateway itself under `/v4`:
 
 ```sh
@@ -59,5 +64,8 @@ it is ready. `down` deletes the cluster and the journal with it.
 - **One oracle, bounded by the core's capacity.** The oracle is `replicas: 1` with `Recreate`, so two never act on a
   round. The engine never frees a market, so with the `small` profile the calendar lists for about ten hours before
   the oracle stops listing short of the ceiling; `down` and `up` start a fresh journal.
-- **Not yet in the chart:** the resolution console behind the dummy oracle (its cases live in the oracle process), RFQ
-  responders, the scenario player and the environment manifest of §16.
+- **Requests for quote are not journaled.** Open requests live in the parlay service's memory; replacing its pod
+  forgets them, while parlays and quotes (listings and orders) stay in the journal. It lists at most
+  `parlays.maxParlays` parlays, because every book reserves its levels for as long as the core runs.
+- **Not yet in the chart:** the resolution console behind the dummy oracle (its cases live in the oracle process), the
+  scenario player and the environment manifest of §16.
