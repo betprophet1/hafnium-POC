@@ -1,0 +1,93 @@
+// The venue's FIX 4.4 adapter: an Artio acceptor in front of the gateway's private WebSocket (README.md).
+plugins {
+    id 'java'
+    id 'application'
+}
+
+group = 'venue'
+version = '0.1.0'
+
+// Pinned: the engine this adapter adopts, and what it needs beside it.
+def artioVersion = '0.183'
+def jacksonVersion = '2.20.0'
+def junitVersion = '5.13.4'
+
+java {
+    toolchain {
+        // bootstrap.sh provides this JDK; Gradle is never allowed to fetch or pick another.
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+configurations {
+    codecGeneration
+}
+
+dependencies {
+    codecGeneration "uk.co.real-logic:artio-codecs:$artioVersion"
+
+    implementation "uk.co.real-logic:artio-codecs:$artioVersion"
+    implementation "uk.co.real-logic:artio-core:$artioVersion"
+    implementation "com.fasterxml.jackson.core:jackson-databind:$jacksonVersion"
+
+    testImplementation platform("org.junit:junit-bom:$junitVersion")
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// Agrona and Aeron read internal JDK classes; these opens keep Java 21 from refusing them.
+def jvmOpens = [
+    '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED',
+    '--add-opens=java.base/java.nio=ALL-UNNAMED',
+    '--add-exports=java.base/jdk.internal.misc=ALL-UNNAMED',
+]
+
+// The codecs come from the interface's dictionary, never from a copy of it: the dialect document and the adapter
+// cannot disagree about a tag.
+def dictionary = file('../../interfaces/fix/venue-fix44.xml')
+def generatedSources = layout.buildDirectory.dir('generated-src/codecs')
+
+tasks.register('generateCodecs', JavaExec) {
+    inputs.file dictionary
+    outputs.dir generatedSources
+    classpath = configurations.codecGeneration
+    mainClass = 'uk.co.real_logic.artio.dictionary.CodecGenerationTool'
+    systemProperty 'fix.codecs.parent_package', 'venue.fix.codecs'
+    maxHeapSize = '256m'
+    jvmArgs jvmOpens
+    args generatedSources.get().asFile.absolutePath, dictionary.absolutePath
+    doFirst { delete generatedSources }
+}
+
+sourceSets.main.java.srcDir generatedSources
+tasks.named('compileJava') { dependsOn 'generateCodecs' }
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    // Generated codecs are not ours to lint; our own code compiles with every warning shown.
+    options.compilerArgs += ['-Xlint:all,-processing,-serial', '-Xlint:-options']
+}
+
+application {
+    mainClass = 'venue.fix.FixAdapter'
+    applicationDefaultJvmArgs = jvmOpens + ['-Xmx256m']
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+    jvmArgs jvmOpens
+    maxHeapSize = '512m'
+    // The integration test starts a node and a gateway from core/target/release and needs them built first
+    // (test.sh does that); it skips itself when they are missing.
+    systemProperty 'venue.root', file('../..').absolutePath
+    systemProperty 'venue.scratch', layout.buildDirectory.dir('it').get().asFile.absolutePath
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat = 'full'
+        showStandardStreams = true
+    }
+}

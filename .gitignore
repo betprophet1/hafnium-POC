@@ -16,3 +16,9 @@ __pycache__/
 
 # Claude Code worktrees and local state
 .claude/
+
+# The FIX adapter's toolchain (adapters/fix/bootstrap.sh), Gradle state and build output
+adapters/fix/.toolchain/
+adapters/fix/.gradle/
+adapters/fix/build/
+adapters/fix/gradle/wrapper/gradle-wrapper.jar
