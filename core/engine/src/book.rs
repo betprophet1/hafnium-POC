@@ -428,6 +428,31 @@ impl<'a> Engine<'a> {
         n
     }
 
+    /// [`Self::collect`] over one account's resting orders instead of the whole order index, into `scratch` as
+    /// `(orderId, orderId)` in ascending order. The account's list is kept in no useful order — new orders go to
+    /// its head, and an order that loses priority re-rests under its old ID — so the matches are sorted the same
+    /// way. `scratch` holds at least as many entries as there can be orders (`Engine::new`).
+    pub(crate) fn collect_account(
+        &mut self,
+        account_id: u64,
+        mut keep: impl FnMut(&Order, &Instrument) -> bool,
+    ) -> usize {
+        let Some(&account_slot) = self.account_index.get(&account_id) else { return 0 };
+        let Self { accounts, orders, instruments, scratch, .. } = self;
+        let mut n = 0;
+        let mut cur = accounts[account_slot as usize].first_order;
+        while cur != NONE {
+            let o = &orders[cur as usize];
+            if keep(o, &instruments[o.instrument_slot as usize]) {
+                scratch[n] = (o.id, o.id);
+                n += 1;
+            }
+            cur = o.account_next;
+        }
+        scratch[..n].sort_unstable();
+        n
+    }
+
     // ------------------------------------------------------------------ orders that expire (E-8.1)
 
     /// Records that a resting order expires, compacting first if there is no room.

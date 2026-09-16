@@ -288,6 +288,29 @@ impl<'a> Engine<'a> {
         sink: &mut S,
     ) -> Result<(), FailStop> {
         let n = self.collect(keep, |o| o.id);
+        self.remove_collected(n, reason, sink)
+    }
+
+    /// [`Self::remove_where`] for scopes confined to one account (E-12.6): walks that account's resting orders
+    /// rather than every order in the venue, so the cost follows the account and not the venue.
+    fn remove_account_where<S: ResultSink>(
+        &mut self,
+        account_id: u64,
+        keep: impl FnMut(&Order, &Instrument) -> bool,
+        reason: CancelReason,
+        sink: &mut S,
+    ) -> Result<(), FailStop> {
+        let n = self.collect_account(account_id, keep);
+        self.remove_collected(n, reason, sink)
+    }
+
+    /// Removes the first `n` orders `scratch` holds, in the order it holds them.
+    fn remove_collected<S: ResultSink>(
+        &mut self,
+        n: usize,
+        reason: CancelReason,
+        sink: &mut S,
+    ) -> Result<(), FailStop> {
         for i in 0..n {
             let id = self.scratch[i].1;
             let slot = *self.order_index.get(&id).ok_or(FailStop::Inconsistent)?;
@@ -1229,18 +1252,16 @@ impl<'a> Engine<'a> {
             self.out(sink, &reject)?;
             return self.end_unit(sink);
         };
-        let keep = |o: &Order, inst: &Instrument| {
-            o.account_id == account_id
-                && match scope {
-                    MassCancelScope::SESSION => o.session_id == session_id,
-                    MassCancelScope::ACCOUNT => true,
-                    MassCancelScope::INSTRUMENT => inst.id == scope_ref,
-                    MassCancelScope::EVENT => inst.event_id == scope_ref,
-                    MassCancelScope::CLIENT_ORDER_GROUP => o.group.is_some_and(|g| u64::from(g) == scope_ref),
-                    MassCancelScope::NullVal => false,
-                }
+        // Every scope is within the account, so only the account's own orders are looked at.
+        let keep = |o: &Order, inst: &Instrument| match scope {
+            MassCancelScope::SESSION => o.session_id == session_id,
+            MassCancelScope::ACCOUNT => true,
+            MassCancelScope::INSTRUMENT => inst.id == scope_ref,
+            MassCancelScope::EVENT => inst.event_id == scope_ref,
+            MassCancelScope::CLIENT_ORDER_GROUP => o.group.is_some_and(|g| u64::from(g) == scope_ref),
+            MassCancelScope::NullVal => false,
         };
-        self.remove_where(keep, reason, sink)?;
+        self.remove_account_where(account_id, keep, reason, sink)?;
         self.end_unit(sink)
     }
 
