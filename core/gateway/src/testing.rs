@@ -28,6 +28,8 @@ pub const MAX_BEHIND: usize = 256 * 1024;
 
 pub struct Venue {
     pub gateway: Arc<Gateway>,
+    /// Where the gateway listens, as `host:port`, for REST.
+    pub address: String,
     /// Where the gateway's WebSocket is served, as a client would dial it.
     pub ws_url: String,
 }
@@ -85,7 +87,8 @@ pub fn venue(name: &str) -> Venue {
     crate::follow_feed(&gateway, feed);
     crate::conflate(&gateway);
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
-    let ws_url = format!("ws://{}/v4/ws", listener.local_addr().expect("its address"));
+    let address = listener.local_addr().expect("its address").to_string();
+    let ws_url = format!("ws://{address}/v4/ws");
     {
         let gateway = Arc::clone(&gateway);
         thread::spawn(move || crate::serve_with(&gateway, &listener, MAX_BEHIND));
@@ -98,7 +101,7 @@ pub fn venue(name: &str) -> Venue {
         assert!(wait < 500, "the feed never listed market {MARKET}");
         thread::sleep(Duration::from_millis(20));
     }
-    Venue { gateway, ws_url }
+    Venue { gateway, address, ws_url }
 }
 
 /// Waits up to five seconds, in 20 ms steps, for `ready` to hold.
