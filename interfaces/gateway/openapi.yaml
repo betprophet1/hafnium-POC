@@ -336,7 +336,8 @@ components:
         reason: { type: string, description: 'rejected and cancelled: the engine reason in lower snake case.' }
         tradeId: { $ref: '#/components/schemas/Id' }
         role: { type: string, enum: [maker, taker] }
-        cashCents: { type: integer, description: 'fill: the change in this account''s cash.' }
+        cashCents: { type: integer, description: 'fill: the change in this account''s cash, before its fee.' }
+        feeCents: { type: integer, description: 'fill: the fee this account paid at its own maker or taker rate, taken from its cash on top of cashCents; negative for a rebate (spec E-10.11). Fees are not reserved, so one can leave available cash below zero.' }
     Position:
       type: object
       required: [instrumentId, position]

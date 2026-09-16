@@ -206,6 +206,8 @@ let orderCount = 0;
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
 const money = c => (c < 0 ? '−' : '') + '$' + (Math.abs(c) / 100).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const words = s => String(s).replaceAll('_', ' ').toLowerCase();
+// A fill's fee as the toast states it: a charge, a rebate, or nothing when it rounded to zero.
+const feeText = c => c > 0 ? `, fee ${money(c)}` : c < 0 ? `, rebate ${money(-c)}` : '';
 const later = (a, b) => (a == null || BigInt(b) > BigInt(a)) ? b : a;
 function setHTML(el, html) { if (el._h !== html) { el.innerHTML = html; el._h = html; } }
 function toast(msg, kind) { const d = document.createElement('div'); d.className = 'toast ' + (kind || ''); d.textContent = msg; $('#toasts').append(d); setTimeout(() => d.remove(), 4500); }
@@ -342,7 +344,7 @@ function onMessage(s, msg) {
       if (e.type === 'fill' && !announced.has(key)) {
         announced.add(key);
         const [, m] = find(e.instrumentId);
-        toast(`${s.label}: ${e.role === 'maker' ? 'resting order' : 'order'} filled ${e.quantity} at ${e.price.cents}¢ (YES ${e.side})`, 'ok');
+        toast(`${s.label}: ${e.role === 'maker' ? 'resting order' : 'order'} filled ${e.quantity} at ${e.price.cents}¢ (YES ${e.side})${feeText(e.feeCents || 0)}`, 'ok');
         if (!m) loadMarkets();
       }
       soon(s);
@@ -361,12 +363,12 @@ function onMessage(s, msg) {
 
 function report(result) {
   const [, m] = result.executions && result.executions[0] ? find(result.executions[0].instrumentId) : [null, null];
-  let filled = 0;
+  let filled = 0, fees = 0;
   for (const e of result.executions || []) {
-    if (e.type === 'fill') { filled += e.quantity; announced.add(e.tradeId + ':' + e.orderId); }
+    if (e.type === 'fill') { filled += e.quantity; fees += e.feeCents || 0; announced.add(e.tradeId + ':' + e.orderId); }
   }
   const first = (result.executions || [])[0];
-  if (result.status === 'accepted') toast(`Order accepted: ${first.quantity} at ${first.price.cents}¢ (YES ${first.side})${filled ? `, ${filled} filled` : ''}`, 'ok');
+  if (result.status === 'accepted') toast(`Order accepted: ${first.quantity} at ${first.price.cents}¢ (YES ${first.side})${filled ? `, ${filled} filled${feeText(fees)}` : ''}`, 'ok');
   else if (result.status === 'rejected') toast('Rejected: ' + words(result.rejectReason), 'bad');
   else if (result.status === 'duplicate') toast('Duplicate client order ID', 'bad');
   else if (result.status === 'cancelled') toast(`Cancelled ${first ? first.quantity : ''}`);

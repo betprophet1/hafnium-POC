@@ -82,6 +82,9 @@ pub fn executions(view: &View, results: &[Value], sequence: u64) -> Vec<(u64, Va
                     e["tradeId"] = id(u(&r["tradeId"]));
                     e["role"] = json!(role);
                     e["cashCents"] = if buys { r["buyerCashCents"].clone() } else { r["sellerCashCents"].clone() };
+                    // Charged on top of the cash change, to the maker and taker at their own rates (spec E-10.11).
+                    let fee = if role == "maker" { &r["makerFeeCents"] } else { &r["takerFeeCents"] };
+                    e["feeCents"] = fee.clone();
                     out.push((u(account), e));
                 }
             }
@@ -664,5 +667,19 @@ mod tests {
         // There is nothing to remember: the view has applied input 6, so it has already seen whatever input 3 did.
         hub.accept(8, 3, 1, 1000);
         assert_eq!(hub.order(8), None);
+    }
+
+    #[test]
+    fn each_party_to_a_fill_sees_its_own_fee() {
+        let fill = json!({
+            "msg": "Fill", "tradeId": 5, "instrumentId": 1000, "tick": 29, "quantity": 10, "makerOrderId": 1,
+            "makerAccountId": 1, "makerRemaining": 0, "takerOrderId": 2, "takerAccountId": 2, "takerRemaining": 0,
+            "takerSide": "SELL", "mintedPairs": 10, "burnedPairs": 0, "buyerCashCents": -300, "sellerCashCents": -700,
+            "makerFeeCents": -3, "takerFeeCents": 15
+        });
+        let out = executions(&View::default(), &[fill], 9);
+        let fee = |account: u64| out.iter().find(|(a, _)| *a == account).map(|(_, e)| e["feeCents"].clone());
+        assert_eq!(fee(1), Some(json!(-3)));
+        assert_eq!(fee(2), Some(json!(15)));
     }
 }
