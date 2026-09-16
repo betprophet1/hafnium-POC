@@ -45,6 +45,9 @@ pub fn encode(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
         Some("SetMakerProtection") => encode_set_maker_protection(v, buf),
         Some("TransferOut") => encode_transfer_out(v, buf),
         Some("TransferIn") => encode_transfer_in(v, buf),
+        Some("SetFeeSchedule") => encode_set_fee_schedule(v, buf),
+        Some("SetFeeOverride") => encode_set_fee_override(v, buf),
+        Some("RemoveFeeOverride") => encode_remove_fee_override(v, buf),
         Some("OrderAccepted") => encode_order_accepted(v, buf),
         Some("OrderRejected") => encode_order_rejected(v, buf),
         Some("Fill") => encode_fill(v, buf),
@@ -96,6 +99,9 @@ pub fn decode(buf: &[u8]) -> Result<Value, String> {
         set_maker_protection_codec::SBE_TEMPLATE_ID => decode_set_maker_protection(header, buf),
         transfer_out_codec::SBE_TEMPLATE_ID => decode_transfer_out(header, buf),
         transfer_in_codec::SBE_TEMPLATE_ID => decode_transfer_in(header, buf),
+        set_fee_schedule_codec::SBE_TEMPLATE_ID => decode_set_fee_schedule(header, buf),
+        set_fee_override_codec::SBE_TEMPLATE_ID => decode_set_fee_override(header, buf),
+        remove_fee_override_codec::SBE_TEMPLATE_ID => decode_remove_fee_override(header, buf),
         order_accepted_codec::SBE_TEMPLATE_ID => decode_order_accepted(header, buf),
         order_rejected_codec::SBE_TEMPLATE_ID => decode_order_rejected(header, buf),
         fill_codec::SBE_TEMPLATE_ID => decode_fill(header, buf),
@@ -1429,6 +1435,115 @@ fn decode_transfer_in<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: &'a [u
     m.insert("sourceGroup".into(), json!(dec.source_group()));
     let (offset, len) = dec.state_decoder();
     m.insert("state".into(), json!(String::from_utf8_lossy(&buf[offset..offset + len])));
+    let _ = &mut dec;
+    Ok(Value::Object(m))
+}
+
+fn encode_set_fee_schedule(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
+    let mut enc = set_fee_schedule_codec::SetFeeScheduleEncoder::default().wrap(WriteBuf::new(buf), message_header_codec::ENCODED_LENGTH);
+    enc = enc.header(0).parent().map_err(sbe_err)?;
+    let cv = &v["record"];
+    let mut c = enc.record_encoder();
+    c.sequence(ju(cv, "sequence") as u64);
+    c.sequenced_at(ju(cv, "sequencedAt") as u64);
+    c.sequencer_group(ju(cv, "sequencerGroup") as u16);
+    enc = c.parent().map_err(sbe_err)?;
+    enc.command_id_zero_padded(js(v, "commandId").as_bytes());
+    enc.maker_rate_micros(ji(v, "makerRateMicros") as i32);
+    enc.taker_rate_micros(ji(v, "takerRateMicros") as i32);
+    Ok(enc.get_limit())
+}
+
+fn decode_set_fee_schedule<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: &'a [u8]) -> Result<Value, String> {
+    let mut m = Map::new();
+    m.insert("msg".into(), json!("SetFeeSchedule"));
+    let mut dec = set_fee_schedule_codec::SetFeeScheduleDecoder::default().header(header, 0);
+    let mut c = dec.record_decoder();
+    let mut cm = Map::new();
+    cm.insert("sequence".into(), json!(c.sequence()));
+    cm.insert("sequencedAt".into(), json!(c.sequenced_at()));
+    cm.insert("sequencerGroup".into(), json!(c.sequencer_group()));
+    dec = c.parent().map_err(sbe_err)?;
+    m.insert("record".into(), Value::Object(cm));
+    m.insert("commandId".into(), json!(bytes_str(&dec.command_id())));
+    m.insert("makerRateMicros".into(), json!(dec.maker_rate_micros()));
+    m.insert("takerRateMicros".into(), json!(dec.taker_rate_micros()));
+    let _ = &mut dec;
+    Ok(Value::Object(m))
+}
+
+fn encode_set_fee_override(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
+    let mut enc = set_fee_override_codec::SetFeeOverrideEncoder::default().wrap(WriteBuf::new(buf), message_header_codec::ENCODED_LENGTH);
+    enc = enc.header(0).parent().map_err(sbe_err)?;
+    let cv = &v["record"];
+    let mut c = enc.record_encoder();
+    c.sequence(ju(cv, "sequence") as u64);
+    c.sequenced_at(ju(cv, "sequencedAt") as u64);
+    c.sequencer_group(ju(cv, "sequencerGroup") as u16);
+    enc = c.parent().map_err(sbe_err)?;
+    enc.command_id_zero_padded(js(v, "commandId").as_bytes());
+    enc.override_id(ju(v, "overrideId") as u64);
+    enc.priority(ju(v, "priority") as u32);
+    enc.account_id(ju(v, "accountId") as u64);
+    enc.instrument_id(ju(v, "instrumentId") as u64);
+    enc.event_id(ju(v, "eventId") as u64);
+    enc.maker_rate_micros(ji(v, "makerRateMicros") as i32);
+    enc.taker_rate_micros(ji(v, "takerRateMicros") as i32);
+    enc.expires_at_opt(v.get("expiresAt").and_then(|x| x.as_u64()).map(|x| x as u64));
+    Ok(enc.get_limit())
+}
+
+fn decode_set_fee_override<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: &'a [u8]) -> Result<Value, String> {
+    let mut m = Map::new();
+    m.insert("msg".into(), json!("SetFeeOverride"));
+    let mut dec = set_fee_override_codec::SetFeeOverrideDecoder::default().header(header, 0);
+    let mut c = dec.record_decoder();
+    let mut cm = Map::new();
+    cm.insert("sequence".into(), json!(c.sequence()));
+    cm.insert("sequencedAt".into(), json!(c.sequenced_at()));
+    cm.insert("sequencerGroup".into(), json!(c.sequencer_group()));
+    dec = c.parent().map_err(sbe_err)?;
+    m.insert("record".into(), Value::Object(cm));
+    m.insert("commandId".into(), json!(bytes_str(&dec.command_id())));
+    m.insert("overrideId".into(), json!(dec.override_id()));
+    m.insert("priority".into(), json!(dec.priority()));
+    m.insert("accountId".into(), json!(dec.account_id()));
+    m.insert("instrumentId".into(), json!(dec.instrument_id()));
+    m.insert("eventId".into(), json!(dec.event_id()));
+    m.insert("makerRateMicros".into(), json!(dec.maker_rate_micros()));
+    m.insert("takerRateMicros".into(), json!(dec.taker_rate_micros()));
+    m.insert("expiresAt".into(), dec.expires_at().map_or(Value::Null, |x| json!(x)));
+    let _ = &mut dec;
+    Ok(Value::Object(m))
+}
+
+fn encode_remove_fee_override(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
+    let mut enc = remove_fee_override_codec::RemoveFeeOverrideEncoder::default().wrap(WriteBuf::new(buf), message_header_codec::ENCODED_LENGTH);
+    enc = enc.header(0).parent().map_err(sbe_err)?;
+    let cv = &v["record"];
+    let mut c = enc.record_encoder();
+    c.sequence(ju(cv, "sequence") as u64);
+    c.sequenced_at(ju(cv, "sequencedAt") as u64);
+    c.sequencer_group(ju(cv, "sequencerGroup") as u16);
+    enc = c.parent().map_err(sbe_err)?;
+    enc.command_id_zero_padded(js(v, "commandId").as_bytes());
+    enc.override_id(ju(v, "overrideId") as u64);
+    Ok(enc.get_limit())
+}
+
+fn decode_remove_fee_override<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: &'a [u8]) -> Result<Value, String> {
+    let mut m = Map::new();
+    m.insert("msg".into(), json!("RemoveFeeOverride"));
+    let mut dec = remove_fee_override_codec::RemoveFeeOverrideDecoder::default().header(header, 0);
+    let mut c = dec.record_decoder();
+    let mut cm = Map::new();
+    cm.insert("sequence".into(), json!(c.sequence()));
+    cm.insert("sequencedAt".into(), json!(c.sequenced_at()));
+    cm.insert("sequencerGroup".into(), json!(c.sequencer_group()));
+    dec = c.parent().map_err(sbe_err)?;
+    m.insert("record".into(), Value::Object(cm));
+    m.insert("commandId".into(), json!(bytes_str(&dec.command_id())));
+    m.insert("overrideId".into(), json!(dec.override_id()));
     let _ = &mut dec;
     Ok(Value::Object(m))
 }

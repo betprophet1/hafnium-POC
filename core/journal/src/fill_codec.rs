@@ -287,7 +287,7 @@ pub mod encoder {
         }
 
         /// primitive field 'buyerCashCents'
-        /// - description: Change to the buyer's sleeve balance; negative when paid
+        /// - description: Change to the buyer's sleeve balance before fees; negative when paid
         /// - min value: -9223372036854775807
         /// - max value: 9223372036854775807
         /// - null value: -9223372036854775808_i64
@@ -304,7 +304,7 @@ pub mod encoder {
         }
 
         /// primitive field 'sellerCashCents'
-        /// - description: Change to the seller's sleeve balance; negative when paid
+        /// - description: Change to the seller's sleeve balance before fees; negative when paid
         /// - min value: -9223372036854775807
         /// - max value: 9223372036854775807
         /// - null value: -9223372036854775808_i64
@@ -321,6 +321,7 @@ pub mod encoder {
         }
 
         /// primitive field 'makerFeeCents'
+        /// - description: Taken from the maker's balance and credited to account 0; negative for a rebate paid from account 0 (spec E-10.11)
         /// - min value: -9223372036854775807
         /// - max value: 9223372036854775807
         /// - null value: -9223372036854775808_i64
@@ -337,6 +338,7 @@ pub mod encoder {
         }
 
         /// primitive field 'takerFeeCents'
+        /// - description: Taken from the taker's balance and credited to account 0 (spec E-10.11)
         /// - min value: -9223372036854775807
         /// - max value: 9223372036854775807
         /// - null value: -9223372036854775808_i64
@@ -521,26 +523,28 @@ pub mod decoder {
         }
 
         /// primitive field - 'REQUIRED'
-        /// - description: Change to the buyer's sleeve balance; negative when paid
+        /// - description: Change to the buyer's sleeve balance before fees; negative when paid
         #[inline]
         pub fn buyer_cash_cents(&self) -> i64 {
             self.get_buf().get_i64_at(self.offset + 93)
         }
 
         /// primitive field - 'REQUIRED'
-        /// - description: Change to the seller's sleeve balance; negative when paid
+        /// - description: Change to the seller's sleeve balance before fees; negative when paid
         #[inline]
         pub fn seller_cash_cents(&self) -> i64 {
             self.get_buf().get_i64_at(self.offset + 101)
         }
 
         /// primitive field - 'REQUIRED'
+        /// - description: Taken from the maker's balance and credited to account 0; negative for a rebate paid from account 0 (spec E-10.11)
         #[inline]
         pub fn maker_fee_cents(&self) -> i64 {
             self.get_buf().get_i64_at(self.offset + 109)
         }
 
         /// primitive field - 'REQUIRED'
+        /// - description: Taken from the taker's balance and credited to account 0 (spec E-10.11)
         #[inline]
         pub fn taker_fee_cents(&self) -> i64 {
             self.get_buf().get_i64_at(self.offset + 117)

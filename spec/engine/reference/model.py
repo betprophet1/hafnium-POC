@@ -23,10 +23,13 @@ CLIENT_MESSAGES = {
 COMMANDS = {
     "ActivateProtocol", "SleeveAdjust", "DefineTickTable", "DefineEvent", "ListInstrument", "SetEventPhase",
     "SetMarketState", "SetVenueMode", "ResolveEvent", "ExpireParlay", "SetRuleLimits", "SetGroupParameters",
-    "SetAccountControls", "SetMakerProtection", "TransferOut", "TransferIn",
+    "SetAccountControls", "SetMakerProtection", "SetFeeSchedule", "SetFeeOverride", "RemoveFeeOverride",
+    "TransferOut", "TransferIn",
 }
 SEQUENCER_EVENTS = {"TimeTick", "EngineStarted", "SeedSet"}
 COMMAND_ID_WINDOW_SECONDS = 604_800                                  # D-25
+FEE_RATE_LIMIT = 1_000_000                                           # E-7.9: rates are millionths, at most 100%
+FEE_ACCOUNT = 0                                                      # D-21
 
 CANCEL_CAUSE_REASON = {
     "CLIENT_REQUEST": "MASS_CANCEL",
@@ -174,6 +177,9 @@ class Engine:
         self.order_groups = {}
         self.duplicates = {}
         self.commands = {}                                     # commandId -> expiry (E-7.1)
+        self.fee_schedule = (0, 0)                             # (makerRateMicros, takerRateMicros) (D-2)
+        self.fee_overrides = {}                                # overrideId -> override (E-7.10, D-27)
+        self.fees_charged = {}                                 # E-3.3, per input: positive fees by account
         self.next_order = 1
         self.next_trade = 1
         self.results = []
@@ -313,6 +319,7 @@ class Engine:
         self.now = record["sequencedAt"]
         self.results = []
         self.available_before = {a: acc.balance - acc.reserved for a, acc in self.accounts.items()}
+        self.fees_charged = {}
         self.voided = False
         if record["sequencerGroup"] != self.group:
             if msg in CLIENT_MESSAGES:
@@ -358,8 +365,9 @@ class Engine:
             if acc.reserved != sum(o.reserved for o in orders):
                 raise FailStop(f"reserved mismatch for {a}")
             available = acc.balance - acc.reserved
-            if available < min(0, self.available_before.get(a, 0)) and not self.voided:
-                raise FailStop(f"available cash fell below zero for {a} (E-3.3)")
+            floor = min(0, self.available_before.get(a, 0)) - self.fees_charged.get(a, 0)
+            if a != FEE_ACCOUNT and available < floor and not self.voided:
+                raise FailStop(f"available cash fell below its bound for {a} (E-3.3)")
             for i in set(acc.positions) | set(acc.yes_locked) | set(acc.no_locked):
                 yl = sum(o.lock for o in orders if o.instrument_id == i and o.side == "SELL")
                 nl = sum(o.lock for o in orders if o.instrument_id == i and o.side == "BUY")
@@ -537,6 +545,40 @@ class Engine:
                 self.maker_protection.pop(key, None)
             else:
                 self.maker_protection[key] = (inp["maxContractsFilledPerWindow"], inp["windowMillis"])
+            self.applied(cid)
+        self.command(inp, body)
+
+    @staticmethod
+    def fee_rates_valid(maker, taker):                                   # E-7.9
+        return -FEE_RATE_LIMIT <= maker <= FEE_RATE_LIMIT and 0 <= taker <= FEE_RATE_LIMIT
+
+    def on_SetFeeSchedule(self, inp):                                    # E-7.9
+        def body(inp, cid):
+            if not self.fee_rates_valid(inp["makerRateMicros"], inp["takerRateMicros"]):
+                raise Reject("INVALID_COMMAND")
+            self.fee_schedule = (inp["makerRateMicros"], inp["takerRateMicros"])
+            self.applied(cid)
+        self.command(inp, body)
+
+    def on_SetFeeOverride(self, inp):                                    # E-7.10
+        def body(inp, cid):
+            expires = inp.get("expiresAt")
+            if not self.fee_rates_valid(inp["makerRateMicros"], inp["takerRateMicros"]) or \
+                    (expires is not None and expires <= self.now):
+                raise Reject("INVALID_COMMAND")
+            self.fee_overrides[inp["overrideId"]] = dict(
+                priority=inp["priority"], accountId=inp["accountId"], instrumentId=inp["instrumentId"],
+                eventId=inp["eventId"], makerRateMicros=inp["makerRateMicros"],
+                takerRateMicros=inp["takerRateMicros"], expiresAt=expires)
+            self.applied(cid)
+        self.command(inp, body)
+
+    def on_RemoveFeeOverride(self, inp):                                 # E-7.11
+        def body(inp, cid):
+            o = self.fee_overrides.get(inp["overrideId"])
+            if o is None or not self.fee_override_active(o):
+                raise Reject("INVALID_COMMAND")
+            del self.fee_overrides[inp["overrideId"]]
             self.applied(cid)
         self.command(inp, body)
 
@@ -1042,6 +1084,10 @@ class Engine:
         self.add_event_cash(b, ev.event_id, buyer_cash)
         self.add_event_cash(s, ev.event_id, seller_cash)
         ev.collateral += 100 * (minted - burned)
+        maker_fee = self.fee(inst, tick, f, self.fee_rate(maker.account_id, inst, "maker"))
+        taker_fee = self.fee(inst, tick, f, self.fee_rate(taker.account_id, inst, "taker"))
+        self.charge_fee(maker.account_id, ev.event_id, maker_fee)
+        self.charge_fee(taker.account_id, ev.event_id, taker_fee)
         for x in (taker, maker):                                         # E-11.3
             used = min(f, x.lock)
             if used:
@@ -1055,7 +1101,7 @@ class Engine:
                         makerRemaining=maker.remaining, takerOrderId=taker.order_id,
                         takerAccountId=taker.account_id, takerRemaining=taker.remaining, takerSide=taker.side,
                         mintedPairs=minted, burnedPairs=burned, buyerCashCents=buyer_cash,
-                        sellerCashCents=seller_cash, makerFeeCents=0, takerFeeCents=0)
+                        sellerCashCents=seller_cash, makerFeeCents=maker_fee, takerFeeCents=taker_fee)
         for a in sorted({b, s}):                                         # E-11.4
             self.restore_locks(a, inst)
         if maker.remaining == 0 and maker.resting:
@@ -1075,6 +1121,39 @@ class Engine:
                 self.release(x)
         self.unit.filled.add((inst.event_id, b))
         self.unit.filled.add((inst.event_id, s))
+
+    # ---- fees (E-10.11, E-10.12)
+
+    def fee_override_active(self, o):
+        return o["expiresAt"] is None or self.now < o["expiresAt"]
+
+    def fee_rate(self, account_id, inst, role):                          # E-10.12
+        """The rate of the winning override for this party, or the default schedule's."""
+        matching = [(o["priority"], oid, o) for oid, o in self.fee_overrides.items()
+                    if self.fee_override_active(o)
+                    and o["accountId"] in (0, account_id)
+                    and o["instrumentId"] in (0, inst.instrument_id)
+                    and o["eventId"] in (0, inst.event_id)]
+        if matching:
+            winner = min(matching, key=lambda m: (m[0], m[1]))[2]
+            return winner["makerRateMicros"] if role == "maker" else winner["takerRateMicros"]
+        return self.fee_schedule[0] if role == "maker" else self.fee_schedule[1]
+
+    def fee(self, inst, tick, quantity, rate):                           # E-10.11
+        """ceil(rate * yesCost * noCost / (10^8 * q)): the quotient is exact, then rounded toward +infinity."""
+        yes = self.yes_cost(inst, tick, quantity)
+        no = 100 * quantity - yes
+        numerator = rate * yes * no
+        denominator = 100_000_000 * quantity
+        return -((-numerator) // denominator)
+
+    def charge_fee(self, account_id, event_id, cents):                  # E-10.11
+        if cents == 0:
+            return
+        self.add_event_cash(account_id, event_id, -cents)
+        self.add_event_cash(FEE_ACCOUNT, event_id, cents)
+        if cents > 0:                                                    # E-3.3 counts charges, not rebates
+            self.fees_charged[account_id] = self.fees_charged.get(account_id, 0) + cents
 
     def restore_locks(self, account_id, inst):                           # E-11.4
         p = self.position(account_id, inst.instrument_id)

@@ -91,7 +91,8 @@ orders and for trades within the group *(D-13)*.
 | Instruments | by `instrumentId`: `eventId`, `instrumentClass`, `tickTableId`, `lotStep`, `allocationPolicy`, `stateMask`, `positionLimit`, `legs`, `marketState` [`LISTED`] |
 | Books | per instrument, per side, per tick: a FIFO of order IDs |
 | Orders | by `orderId`: `accountId`, `sessionId`, `clientOrderId`, `instrumentId`, `side`, `enteredContract`, `tick` (effective limit), `remaining`, `timeInForce`, `expiresAt`, `atEventStart`, `postOnly`, `reduceOnly`, `spendCapRemaining` (or none), `clientOrderGroup` (or none), `lock`, `reserved`, `acceptedAt` (input sequence) |
-| Accounts | by `accountId`: `balance` [0], `reserved` [0] (always the sum of its orders' `reserved`); per instrument `position` [0], `yesLocked` [0], `noLocked` [0]; per event `eventCash` [0], the net cash the event has paid the account *(D-1)*; `closedOnly` [false], `selfMatchPrevention` [`CANCEL_INCOMING`] *(D-3)* |
+| Accounts | by `accountId`: `balance` [0], `reserved` [0] (always the sum of its orders' `reserved`); per instrument `position` [0], `yesLocked` [0], `noLocked` [0]; per event `eventCash` [0], the net cash the event has paid the account, fees included *(D-1, D-28)*; `closedOnly` [false], `selfMatchPrevention` [`CANCEL_INCOMING`] *(D-3)* |
+| Fees | the default schedule: `makerRateMicros` [0], `takerRateMicros` [0] *(D-2)*; overrides by `overrideId`: `priority`, `accountId`, `instrumentId`, `eventId`, `makerRateMicros`, `takerRateMicros`, `expiresAt` (or none) *(D-27)* |
 | Rule limits | by `accountId` (0 is the default for accounts without their own): the four fields of `SetRuleLimits` [all 0 = none]; per account, per second of sequencer time, counts of new orders and of fills |
 | Maker protection | by `(accountId, eventId)` with `eventId` 0 as the account's default: threshold and window; per `(accountId, eventId)` a counter and window start |
 | Order groups | by `(accountId, clientOrderGroup)`: threshold, window, counter, window start, `triggered` |
@@ -100,12 +101,15 @@ orders and for trades within the group *(D-13)*.
 | Counters | next order number and next trade number [1] |
 
 **E-3.2** An account exists from its first mention; until then every field has its initial value. Account 0
-is the settlement reserve *(D-21)* and may not submit orders.
+is the exchange's own account, the settlement reserve and the fee account *(D-21)*, and may not submit orders.
 
-**E-3.3** **Available cash** is `balance − reserved`. Only a void (E-15.5) makes it negative, by taking back
-cash an account has already received *(D-1)*. For every other input, each account's available cash afterwards
-is at least the lesser of 0 and its value before, so an account below zero can receive cash but not spend it; an
-implementation must treat anything else as a fail-stop (§18). Wherever a rule compares an amount with available
+**E-3.3** **Available cash** is `balance − reserved`. Two things make it negative: a void (E-15.5), by taking
+back cash an account has already received *(D-1)*, and a fee, which is charged at fill time without being
+reserved (E-10.11) *(D-26)*. For every input other than a void, each account other than 0 has available cash
+afterwards at least the lesser of 0 and its value before, less the fees the input's fills charged it (the sum of
+its positive `makerFeeCents` and `takerFeeCents`; rebates are not counted). So an account below zero can receive
+cash but not spend it, and only fees take it further below. An implementation must treat anything else as a
+fail-stop (§18). Account 0 is exempt, because it pays rebates. Wherever a rule compares an amount with available
 cash, it compares with `max(0, available cash)`.
 
 ---
@@ -150,7 +154,9 @@ that input's results, counting from 0 across all units of the input.
 **E-5.3** A rejected unit emits only its outcome, and changes no state except the duplicate table (E-9.2),
 the command set (E-7.1) and rule-limit counters (E-9.3 step 10).
 
-**E-5.4** Fees are zero in v0: every `makerFeeCents` and `takerFeeCents` is 0 *(D-2)*.
+**E-5.4** Every `Fill` carries the fees E-10.11 charged its maker and taker in `makerFeeCents` and
+`takerFeeCents`: positive when the party pays, negative for a rebate. Account 0's sleeve is reported in block 4 like
+any other account's.
 
 ---
 
@@ -218,6 +224,15 @@ version applies from the next input.
 **E-7.8 `SetEventPhase`, `SetMarketState`, `SetVenueMode`** — §16. **`ResolveEvent`, `ExpireParlay`** —
 §15. **`TransferOut`, `TransferIn`** — §19.
 
+**E-7.9 `SetFeeSchedule`.** Rejected if `makerRateMicros` is below −1 000 000 or above 1 000 000, or
+`takerRateMicros` is below 0 or above 1 000 000. Otherwise replaces the default rates *(D-2)*. Fills already
+emitted are not changed.
+
+**E-7.10 `SetFeeOverride`.** Rejected if its rates fail the ranges of E-7.9, or `expiresAt` is present and not
+later than `now`. Otherwise stores the override under `overrideId`, replacing any override with that ID *(D-27)*.
+
+**E-7.11 `RemoveFeeOverride`.** Rejected if no active override (E-10.12) has `overrideId`. Otherwise removes it.
+
 ---
 
 ## 8. Time
@@ -228,7 +243,8 @@ tick, so its precision is the tick interval *(D-5)*.
 
 **E-8.2** Duplicate-table entries and command-set entries whose expiry is at or before `now` may be removed on a
 tick. Removal is not observable, because E-9.2 and E-7.1 compare `now` with the expiry recorded, which a later
-change of window does not move.
+change of window does not move. Fee overrides whose `expiresAt` is at or before `now` may be removed at any time:
+an expired override never wins (E-10.12), E-7.11 treats it as absent, and E-7.10 replaces it as if it were.
 
 **E-8.3 `EngineStarted`, `SeedSet`.** No state change visible in results. `SeedSet` seeds the keyed hash
 or PRNG; no rule in v0 draws randomness.
@@ -350,8 +366,9 @@ sellerCash =  yes − 100 · (q − sReduce)
 
 Then `position(B) += q`, `position(S) −= q`, `balance(B) += buyerCash`, `balance(S) += sellerCash`,
 the same amounts are added to each account's `eventCash` for the event, and the event's `collateralCents += 100 · (minted − burned)`, which always equals
-`−(buyerCash + sellerCash)`. A `Fill` is emitted with the trade ID, both orders' remaining quantities after
-the fill, `mintedPairs`, `burnedPairs` and both cash changes.
+`−(buyerCash + sellerCash)`. Fees are then charged (E-10.11). A `Fill` is emitted with the trade ID, both orders'
+remaining quantities after the fill, `mintedPairs`, `burnedPairs`, both cash changes, which exclude fees, and both
+fees.
 
 **E-10.7** After each fill, in this order: both orders' locks are consumed (E-11.3); lock restoration runs
 for both accounts (E-11.4); a resting order with nothing remaining leaves the book; rule-limit fill counters
@@ -371,6 +388,30 @@ use an undo log rather than a copy; only the answer is specified.
 **E-10.10** After every unit the best bid is strictly below the best ask in every book. A violation is a
 fail-stop.
 
+**E-10.11 Fees.** The maker of a fill is the resting order's account and the taker the incoming order's. For `q`
+contracts at tick `t`, a party whose rate is `r` (E-10.12) is charged
+
+```
+fee(r, t, q) = ⌈ r · yesCost(t, q) · noCost(t, q) / (100 000 000 · q) ⌉      cents
+```
+
+which is `r / 10⁶ × q × P(t) × (1 − P(t))` dollars. The quotient is exact and then rounded toward positive
+infinity to a whole cent, for both signs: a charge is never less than the formula and a rebate, from a negative
+`r`, never more (`⌈−1.3⌉ = −1`) *(D-2)*. With `makerFee` and `takerFee` so computed: `balance(maker) −= makerFee`,
+`balance(taker) −= takerFee` and `balance(0) += makerFee + takerFee`, and the same changes are made to each of the
+three accounts' `eventCash` for the event, so the fees change no event's `collateralCents` *(D-28)*. Fees are
+neither reserved (E-11.2) nor compared with available cash: no order is rejected, reduced or stopped for a fee it
+would pay, and a fee may take available cash below zero (E-3.3) *(D-26)*. A spend cap counts gross spend without
+fees (E-11.3). Fees play no part in the dry run's answer (E-10.9).
+
+**E-10.12 Rates.** The maker pays at the `makerRateMicros` and the taker at the `takerRateMicros` of the override
+that wins for that party, or of the default schedule if none does; each party is resolved on its own. An override
+**matches** a party when its `accountId` is 0 or the party's account, its `instrumentId` is 0 or the fill's
+instrument, and its `eventId` is 0 or the instrument's event. It is **active** while it has no `expiresAt` or
+`now < expiresAt`. Of the active overrides that match, the lowest `priority` wins, and of equal priorities the
+lowest `overrideId` *(D-27)*. Which fields an override names does not count: one naming the account beats one
+naming only the instrument only by a lower priority.
+
 ---
 
 ## 11. Holdings locks and reservations
@@ -383,7 +424,7 @@ already cut to that amount. Locks are never increased later *(D-7)*.
 
 **E-11.2 Reservation.** An order's reservation is its unit cost at its effective limit for
 `remaining − lock` contracts, capped at `spendCapRemaining` if it has one. The account's `reserved` is the
-sum of its orders' reservations at all times.
+sum of its orders' reservations at all times. A reservation includes no fee (E-10.11) *(D-26)*.
 
 **E-11.3 Consuming a lock.** When `f` contracts of an order fill, `min(f, lock)` is removed from the
 order's lock and from the account's `yesLocked` or `noLocked`; the order's `remaining` falls by `f`; and a
@@ -508,9 +549,9 @@ violation is a fail-stop.
 `RESOLVED`, if `winningState >= stateCount`; for `VOID`, if `voidWeights` is not empty *(D-1)*.
 
 **E-15.4 Payouts.** `RESOLVED` pays each position its E-15.1 payout in `winningState`. `VOID` reverses the
-event: each account is paid `−eventCash` for the event, undoing every fill and set burn in it whether or
+event: each account is paid `−eventCash` for the event, undoing every fill, fee and set burn in it whether or
 not the account still holds a position. The payment is negative for an account that took more cash out of the
-event than it put in *(D-1)*.
+event than it put in, and for account 0 when the event's fees exceeded its rebates *(D-1, D-28)*.
 
 **E-15.5 Effect.** In order: `CommandApplied`; every resting order in the event's instruments is removed
 with `MARKET_RESOLVED`, ascending order ID; each instrument, ascending ID, takes `marketState` `SETTLED`
@@ -526,7 +567,8 @@ with `MARKET_RESOLVED`, ascending order ID; each instrument, ascending ID, takes
 Every account's `eventCash` for the event is then discarded.
 
 **E-15.6 Conservation at settlement.** The payouts sum to the event's `collateralCents` exactly: for `RESOLVED`
-by E-15.2, and for `VOID` because every change to `eventCash` moved `collateralCents` by its negation. Anything
+by E-15.2, and for `VOID` because every change to `eventCash` either moved `collateralCents` by its negation or,
+for a fee, was matched by the opposite change to account 0's `eventCash` (E-10.11). Anything
 else is a fail-stop. The event is marked resolved and its `collateralCents` set to 0 *(D-1, D-21)*.
 
 **E-15.7 `ExpireParlay`.** Rejected `INVALID_COMMAND` unless the instrument exists, is a `PARLAY` and its
@@ -578,8 +620,8 @@ and its outcome result exists.
 ## 18. Fail-stop
 
 **E-18.1** The engine stops, emitting nothing further, on: a sequence or time violation (E-4.1); a malformed
-command or sequencer event (E-4.3); an arithmetic overflow (E-2.2); available cash falling below zero other
-than by a void (E-3.3); a crossed book (E-10.10); a conservation violation (E-15.2, E-15.6); an unsupported protocol activation (E-7.7).
+command or sequencer event (E-4.3); an arithmetic overflow (E-2.2); available cash falling below the bound of
+E-3.3; a crossed book (E-10.10); a conservation violation (E-15.2, E-15.6); an unsupported protocol activation (E-7.7).
 
 **E-18.2** Stopping is deterministic: every replica stops at the same input. Recovery is an operator
 decision — a fixed engine replaying the journal, or the quarantine path of blueprint §5.
@@ -595,7 +637,7 @@ These are required eventually and deliberately absent from v0, so that nothing i
 - Canonical snapshot encoding and the snapshot-equivalence property.
 - RFQ requests, quotes and acceptances (blueprint §2).
 - Risk-group margining and floor advances across separate mints (blueprint §8).
-- Fee schedules, designated-maker allocation privileges, split FIFO and top-order allocation.
+- Designated-maker allocation privileges, split FIFO and top-order allocation.
 - Quote lifespans, per-event notional caps, move-based halts, maximum GTC lifetime.
 - Dormant book paging (blueprint §10), which must not change any result when added.
 - Order-level (L3) market data.

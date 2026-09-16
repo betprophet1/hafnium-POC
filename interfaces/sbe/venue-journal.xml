@@ -16,7 +16,7 @@
   - Prices are tick ordinals into the instrument's tick table, always for YES. Quantities are
     whole contracts on the instrument's lot step. Money is integer cents. Nothing is a float.
   - Account identifiers are pseudonymous. No personal data enters this schema (blueprint §12).
-    AccountId 0 is reserved for the settlement reserve, which receives rounding remainders.
+    AccountId 0 is reserved for the exchange: the settlement reserve and the fee account.
   - Behaviour is specified in spec/engine/engine-spec.md; this file fixes only the encoding.
   - Additive only within a schema version: new fields go at the end of a block with sinceVersion,
     nothing is removed, retyped or repurposed. Engine behaviour is gated separately by
@@ -91,6 +91,9 @@
     <type name="GroupRef" primitiveType="uint32" description="Client order group, chosen by the account"/>
     <type name="Ratio" primitiveType="uint32" description="Integer numerator or denominator of an exact rational"/>
     <type name="ScopeRef" primitiveType="uint64" description="Instrument, event or client order group, by scope; 0 when the scope needs none"/>
+    <type name="FeeRateMicros" primitiveType="int32" description="Fee coefficient in millionths: 70000 is 0.07; negative is a rebate (spec E-10.11)"/>
+    <type name="FeeOverrideId" primitiveType="uint64" description="Chosen by the issuing service; setting an ID in use replaces that override"/>
+    <type name="FeePriority" primitiveType="uint32" description="Lower wins; ties go to the lower override ID (spec E-10.12)"/>
 
     <enum name="BooleanType" encodingType="uint8">
       <validValue name="FALSE">0</validValue>
@@ -504,6 +507,32 @@
     <data name="state" id="5" type="varDataEncoding"/>
   </sbe:message>
 
+  <sbe:message name="SetFeeSchedule" id="96" description="The default maker and taker rates, for every fill party no active override matches (spec E-7.9, E-10.12)">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="makerRateMicros" id="3" type="FeeRateMicros" description="From -1000000 to 1000000"/>
+    <field name="takerRateMicros" id="4" type="FeeRateMicros" description="From 0 to 1000000"/>
+  </sbe:message>
+
+  <sbe:message name="SetFeeOverride" id="97" description="Creates or replaces an override of the fee schedule. accountId, instrumentId and eventId of 0 match any (spec E-7.10, E-10.12)">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="overrideId" id="3" type="FeeOverrideId"/>
+    <field name="priority" id="4" type="FeePriority"/>
+    <field name="accountId" id="5" type="AccountId"/>
+    <field name="instrumentId" id="6" type="InstrumentId"/>
+    <field name="eventId" id="7" type="EventId"/>
+    <field name="makerRateMicros" id="8" type="FeeRateMicros"/>
+    <field name="takerRateMicros" id="9" type="FeeRateMicros"/>
+    <field name="expiresAt" id="10" type="OptionalEpochNanos" description="Sequencer time from which the override no longer applies; null for never"/>
+  </sbe:message>
+
+  <sbe:message name="RemoveFeeOverride" id="98" description="Rejected unless an unexpired override has this ID (spec E-7.11)">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="overrideId" id="3" type="FeeOverrideId"/>
+  </sbe:message>
+
   <!-- ===== Results (interface 20), read by every reader (interface 12) ===== -->
 
   <sbe:message name="OrderAccepted" id="100">
@@ -529,7 +558,7 @@
     <field name="originalOrderId" id="7" type="OptionalOrderId" description="For DUPLICATE_CLIENT_ORDER_ID: the order the client order ID first created, if it was accepted"/>
   </sbe:message>
 
-  <sbe:message name="Fill" id="102" description="Cash deltas are stated so no reader re-implements clearing">
+  <sbe:message name="Fill" id="102" description="Cash deltas and fees are stated so no reader re-implements clearing">
     <field name="result" id="1" type="ResultHeader"/>
     <field name="tradeId" id="2" type="TradeId"/>
     <field name="instrumentId" id="3" type="InstrumentId"/>
@@ -544,10 +573,10 @@
     <field name="takerSide" id="12" type="Side"/>
     <field name="mintedPairs" id="13" type="Quantity" description="New YES and NO pairs created; open interest rises by mintedPairs - burnedPairs"/>
     <field name="burnedPairs" id="14" type="Quantity" description="Complete sets destroyed"/>
-    <field name="buyerCashCents" id="15" type="Cents" description="Change to the buyer's sleeve balance; negative when paid"/>
-    <field name="sellerCashCents" id="16" type="Cents" description="Change to the seller's sleeve balance; negative when paid"/>
-    <field name="makerFeeCents" id="17" type="Cents"/>
-    <field name="takerFeeCents" id="18" type="Cents"/>
+    <field name="buyerCashCents" id="15" type="Cents" description="Change to the buyer's sleeve balance before fees; negative when paid"/>
+    <field name="sellerCashCents" id="16" type="Cents" description="Change to the seller's sleeve balance before fees; negative when paid"/>
+    <field name="makerFeeCents" id="17" type="Cents" description="Taken from the maker's balance and credited to account 0; negative for a rebate paid from account 0 (spec E-10.11)"/>
+    <field name="takerFeeCents" id="18" type="Cents" description="Taken from the taker's balance and credited to account 0 (spec E-10.11)"/>
   </sbe:message>
 
   <sbe:message name="OrderCancelled" id="103">
