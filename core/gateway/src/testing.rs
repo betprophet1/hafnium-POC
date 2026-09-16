@@ -14,7 +14,7 @@ use venue_node::node::{self, Config};
 
 const CATALOGUE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/charts/venue-mini/files/markets.json");
 /// A binary market the catalogue lists and opens.
-pub const MARKET: u64 = 10010;
+pub const MARKET: u64 = catalogue::instrument_id(catalogue::event_id(1, 1), 0);
 /// The mini venue's market maker, funded with 5 000 000 cents; its dev token.
 pub const MAKER: u64 = 1;
 pub const MAKER_TOKEN: &str = "dev-market-maker";

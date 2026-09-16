@@ -16,7 +16,9 @@ from customers, which is the point of §16's rule that activity arrives through 
 
 `deploy/charts/venue-mini/files/markets.json` names the accounts, their dev tokens, which tab shows each, and the
 markets. The engine never sees titles or outcome names, so IDs carry where they came from: event
-`template × 1000 + round`, instrument `event × 10 + index`. "List a new round" on the settlement tab lists the same
+`template × 1 000 000 + round`, instrument `event × 100 + index`, so a template has a million rounds and an event a
+hundred markets. Events below a million were listed under the first scheme (`template × 1000 + round`, instrument
+`event × 10 + index`) and are still labelled. "List a new round" on the settlement tab lists the same
 market again under the next round.
 
 ## Running it without a cluster

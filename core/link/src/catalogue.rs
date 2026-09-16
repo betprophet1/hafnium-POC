@@ -1,8 +1,13 @@
 //! The demo markets: titles and outcome names the engine never sees, the accounts, and the inputs that create them.
 //!
-//! IDs encode where they came from, so any reader can label them after a restart: event `template × 1000 + round`,
-//! instrument `event × 10 + index`. Every seeding command has a fixed ID, so seeding twice within seven days changes
-//! nothing (E-7.1). After that the IDs have expired (D-25), and seeding again would grant the accounts' money again.
+//! IDs encode where they came from, so any reader can label them after a restart: event
+//! `template × 1 000 000 + round`, instrument `event × 100 + index`. A calendar lists a round every few minutes for as
+//! long as a venue runs, so a template has a million rounds, and an event up to a hundred markets. Journals recorded
+//! under the first scheme, event `template × 1000 + round` and instrument `event × 10 + index`, are still labelled:
+//! every event of the current scheme is at least a million, and every earlier one below it.
+//!
+//! Every seeding command has a fixed ID, so seeding twice within seven days changes nothing (E-7.1). After that the
+//! IDs have expired (D-25), and seeding again would grant the accounts' money again.
 
 use crate::wire::{command, Error};
 use serde_json::{json, Value};
@@ -43,8 +48,32 @@ pub struct Catalogue {
     markets: Vec<Value>,
 }
 
+/// Rounds a template can have, and so the factor between a template and its events' IDs.
+pub const ROUNDS: u64 = 1_000_000;
+/// Markets an event can have, and so the factor between an event and its instruments' IDs.
+pub const MARKETS: u64 = 100;
+
 pub const fn event_id(template: u64, round: u64) -> u64 {
-    template * 1000 + round
+    template * ROUNDS + round
+}
+
+pub const fn instrument_id(event: u64, index: u64) -> u64 {
+    event * MARKETS + index
+}
+
+/// The template and round an event ID encodes, under whichever scheme it was listed.
+pub const fn split_event(event: u64) -> (u64, u64) {
+    if event < ROUNDS {
+        (event / 1000, event % 1000)
+    } else {
+        (event / ROUNDS, event % ROUNDS)
+    }
+}
+
+/// Where an instrument sits among its event's markets, under the scheme its event was listed with.
+pub fn market_index(event: u64, instrument: u64) -> Option<usize> {
+    let factor = if event < ROUNDS { 10 } else { MARKETS };
+    instrument.checked_sub(event.checked_mul(factor)?).filter(|i| *i < factor).map(|i| i as usize)
 }
 
 impl Catalogue {
@@ -63,23 +92,24 @@ impl Catalogue {
     }
 
     pub fn title(&self, event: u64) -> String {
-        match self.market(event / 1000) {
-            Some(m) if event % 1000 > 1 => format!("{} (round {})", m["title"].as_str().unwrap_or(""), event % 1000),
+        let (template, round) = split_event(event);
+        match self.market(template) {
+            Some(m) if round > 1 => format!("{} (round {round})", m["title"].as_str().unwrap_or("")),
             Some(m) => m["title"].as_str().unwrap_or("").to_string(),
             None => format!("Event {event}"),
         }
     }
 
     pub fn states(&self, event: u64, count: u64) -> Vec<String> {
-        let named = self.market(event / 1000).and_then(|m| m["states"].as_array());
+        let named = self.market(split_event(event).0).and_then(|m| m["states"].as_array());
         (0..count as usize)
             .map(|s| named.and_then(|n| n.get(s)).and_then(Value::as_str).map_or(format!("State {s}"), str::to_string))
             .collect()
     }
 
     pub fn label(&self, event: u64, instrument: u64) -> String {
-        let index = instrument.checked_sub(event * 10).map(|i| i as usize);
-        self.market(event / 1000)
+        let index = market_index(event, instrument);
+        self.market(split_event(event).0)
             .and_then(|m| m["instruments"].get(index?))
             .and_then(|i| i["label"].as_str())
             .map_or(format!("Instrument {instrument}"), str::to_string)
@@ -92,18 +122,35 @@ impl Catalogue {
         command("DefineTickTable", "seed-cents".into(), json!({"tickTableId": TICK_TABLE, "ticks": ticks}))
     }
 
-    /// The inputs that list one round of a market and open it.
-    pub fn listing(&self, template: u64, round: u64) -> Result<Vec<Value>, Error> {
+    /// The templates, in catalogue order.
+    pub fn templates(&self) -> Vec<u64> {
+        self.markets.iter().filter_map(|m| m["template"].as_u64()).collect()
+    }
+
+    /// How many markets one round of a template lists.
+    pub fn market_count(&self, template: u64) -> usize {
+        self.market(template).and_then(|m| m["instruments"].as_array()).map_or(0, Vec::len)
+    }
+
+    /// The inputs that list one round of a market and open it. `scheduled_start` is the sequencer time the event is
+    /// expected to start, in nanoseconds since the epoch, or 0 for none.
+    pub fn listing(&self, template: u64, round: u64, scheduled_start: u64) -> Result<Vec<Value>, Error> {
         let market = self.market(template).ok_or_else(|| format!("no market template {template}"))?;
         let states = market["states"].as_array().map_or(0, Vec::len);
+        let instruments = market["instruments"].as_array().map_or(&[][..], Vec::as_slice);
+        if !(1..ROUNDS).contains(&round) || instruments.len() as u64 > MARKETS {
+            return Err(
+                format!("template {template} cannot list round {round} of {} markets", instruments.len()).into()
+            );
+        }
         let event = event_id(template, round);
         let mut inputs = vec![command(
             "DefineEvent",
             format!("ev-{event}"),
-            json!({"eventId": event, "stateCount": states, "scheduledStart": 0}),
+            json!({"eventId": event, "stateCount": states, "scheduledStart": scheduled_start}),
         )];
-        for (index, inst) in market["instruments"].as_array().into_iter().flatten().enumerate() {
-            let id = event * 10 + index as u64;
+        for (index, inst) in instruments.iter().enumerate() {
+            let id = instrument_id(event, index as u64);
             inputs.push(command(
                 "ListInstrument",
                 format!("in-{id}"),
@@ -171,8 +218,37 @@ impl Catalogue {
             ));
         }
         for m in &self.markets {
-            inputs.extend(self.listing(m["template"].as_u64().ok_or("a market needs a template")?, 1)?);
+            inputs.extend(self.listing(m["template"].as_u64().ok_or("a market needs a template")?, 1, 0)?);
         }
         Ok(inputs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_event_id_names_its_template_and_round_under_either_scheme() {
+        assert_eq!(event_id(3, 1), 3_000_001);
+        assert_eq!(split_event(event_id(3, 1)), (3, 1));
+        assert_eq!(split_event(event_id(2, 999_999)), (2, 999_999));
+        // Recorded before the scheme widened.
+        assert_eq!(split_event(2_017), (2, 17));
+    }
+
+    #[test]
+    fn rounds_go_past_a_thousand() {
+        let event = event_id(1, 1_000);
+        assert_eq!(split_event(event), (1, 1_000));
+        assert_eq!(market_index(event, instrument_id(event, 2)), Some(2));
+    }
+
+    #[test]
+    fn an_instrument_names_its_place_in_the_event_under_either_scheme() {
+        assert_eq!(market_index(2_001, 20_012), Some(2));
+        assert_eq!(market_index(event_id(2, 1), instrument_id(event_id(2, 1), 99)), Some(99));
+        assert_eq!(market_index(event_id(2, 1), 7), None);
+        assert_eq!(market_index(2_001, 20_010 + 10), None);
     }
 }

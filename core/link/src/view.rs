@@ -270,8 +270,9 @@ impl View {
                         }))
                     })
                     .collect();
+                let (template, round) = crate::catalogue::split_event(id);
                 json!({
-                    "id": id, "title": catalogue.title(id), "template": id / 1000, "round": id % 1000,
+                    "id": id, "title": catalogue.title(id), "template": template, "round": round,
                     "states": catalogue.states(id, e.state_count), "started": e.started, "suspended": e.suspended,
                     "ended": e.ended, "resolved": e.resolved, "instruments": instruments
                 })

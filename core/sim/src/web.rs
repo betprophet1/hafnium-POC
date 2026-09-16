@@ -12,7 +12,7 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use venue_link::catalogue::Catalogue;
+use venue_link::catalogue::{split_event, Catalogue};
 use venue_link::view::Live;
 use venue_link::wire::{self, Error, Ids, Ingress};
 
@@ -85,8 +85,9 @@ impl Web {
                 .copied()
                 .filter(|i| view.instruments.get(i).is_some_and(|i| matches!(i.state.as_str(), "OPEN" | "HALTED")))
                 .collect();
-            let template = event / 1000;
-            let round = view.events.keys().filter(|id| **id / 1000 == template).map(|id| id % 1000).max();
+            let template = split_event(event).0;
+            let round =
+                view.events.keys().map(|id| split_event(*id)).filter(|(t, _)| *t == template).map(|(_, r)| r).max();
             (tradable, round.unwrap_or(0) + 1)
         };
         let phase = |phase: &str, ids: &mut Ids| {
@@ -110,7 +111,7 @@ impl Web {
                 .collect(),
             "resolve" => vec![resolve("RESOLVED", r["state"].as_u64().ok_or("a winning state is required")?, ids)],
             "void" => vec![resolve("VOID", 0, ids)],
-            "relist" => self.catalogue.listing(event / 1000, next_round)?,
+            "relist" => self.catalogue.listing(split_event(event).0, next_round, 0)?,
             other => return Err(format!("no oracle action {other}").into()),
         })
     }
