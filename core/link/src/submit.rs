@@ -180,20 +180,82 @@ fn read_results(stream: TcpStream, pending: &Mutex<VecDeque<Answer>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{input_sequence, INPUT_SEQUENCE};
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc::channel;
 
-    /// A result frame: SBE's message header, then the body, which starts with `ResultHeader.inputSequence`.
-    fn result_frame(sequence: u64) -> Vec<u8> {
+    /// A frame shaped like a result without going through the codec: the message header, then the input sequence.
+    fn synthetic_frame(sequence: u64) -> Vec<u8> {
         let mut frame = vec![0u8; INPUT_SEQUENCE];
         frame.extend_from_slice(&sequence.to_le_bytes());
         frame.extend_from_slice(&[0u8; 14]); // the rest of ResultHeader and the body
         frame
     }
 
+    /// A real `OrderAccepted`, encoded by the codec a node encodes its results with.
+    fn encoded_result(sequence: u64, order_id: u64) -> Vec<u8> {
+        let result = json!({
+            "msg": "OrderAccepted",
+            "result": {"inputSequence": sequence, "resultIndex": 0, "sequencedAt": 0, "sequencerGroup": 1},
+            "sessionId": 10, "orderId": order_id, "accountId": 1, "clientOrderId": "a1",
+            "instrumentId": 1000, "side": "BUY", "tick": 9, "quantity": 1, "reservedCents": 10
+        });
+        let mut buffer = vec![0u8; MAX_FRAME];
+        let n = codec::encode(&result, &mut buffer).expect("a result the codec can encode");
+        buffer[..n].to_vec()
+    }
+
+    /// A node that answers each request with the next batch and then closes; no batches means it closes at once.
+    /// Enough of the protocol to drive a `Submit`, and nothing else: no engine, no journal, no feed.
+    fn stub_node(batches: Vec<Vec<Vec<u8>>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+        let addr = listener.local_addr().expect("an address").to_string();
+        thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else { return };
+            let Ok(clone) = stream.try_clone() else { return };
+            let mut reader = BufReader::new(clone);
+            let mut writer = BufWriter::new(stream);
+            let mut frame = Vec::new();
+            for batch in batches {
+                if !matches!(read_frame(&mut reader, &mut frame), Ok(Some(_))) {
+                    return;
+                }
+                for f in &batch {
+                    let _ = write_frame(&mut writer, f);
+                }
+                let _ = write_frame(&mut writer, &[]); // the empty frame ends the batch
+                let _ = writer.flush();
+            }
+        });
+        addr
+    }
+
+    /// Sends on another thread, so a stub that never answers fails the test instead of hanging the run.
+    fn send(submit: &Arc<Submit>, input: Value) -> Result<Vec<Value>, String> {
+        let submit = Arc::clone(submit);
+        let (tx, rx) = channel();
+        thread::spawn(move || {
+            let _ = tx.send(submit.send(input).map_err(|e| e.to_string()));
+        });
+        rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| Err("nothing answered within 5s".to_string()))
+    }
+
+    /// The smallest input there is: the stub never looks at it.
+    fn tick() -> Value {
+        json!({"msg": "TimeTick"})
+    }
+
     #[test]
     fn a_result_names_the_input_it_answers() {
-        assert_eq!(input_sequence(&result_frame(1)), Some(1));
-        assert_eq!(input_sequence(&result_frame(u64::MAX)), Some(u64::MAX));
+        assert_eq!(input_sequence(&synthetic_frame(1)), Some(1));
+        assert_eq!(input_sequence(&synthetic_frame(u64::MAX)), Some(u64::MAX));
+    }
+
+    /// Where the input sequence sits is a claim about the schema, so read it out of what the codec really writes.
+    #[test]
+    fn the_input_sequence_is_where_the_schema_says_it_is() {
+        assert_eq!(input_sequence(&encoded_result(7, 1)), Some(7));
+        assert_eq!(input_sequence(&encoded_result(4_000_000_000, 1)), Some(4_000_000_000));
     }
 
     #[test]
@@ -202,5 +264,34 @@ mod tests {
         for len in 0..INPUT_SEQUENCE + 8 {
             assert_eq!(input_sequence(&vec![0u8; len]), None, "length {len}");
         }
+    }
+
+    #[test]
+    fn a_batch_reaches_the_caller_that_asked_for_it() {
+        let addr = stub_node(vec![vec![encoded_result(1, 4242)]]);
+        let submit = Arc::new(Submit::spawn(&addr));
+        let results = send(&submit, tick()).expect("the stub's results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["msg"], "OrderAccepted");
+        assert_eq!(results[0]["orderId"].as_u64(), Some(4242));
+    }
+
+    /// Requests are answered by position, so the stream has to stay in step with the queue of waiting callers. A
+    /// node commits inputs in order and answers each with one batch; an input sequence that stops climbing means
+    /// the two have come apart, and passing that batch on would hand this caller someone else's results.
+    #[test]
+    fn a_stream_that_stops_climbing_is_dropped_rather_than_delivered() {
+        let addr = stub_node(vec![vec![encoded_result(5, 1)], vec![encoded_result(5, 2)]]);
+        let submit = Arc::new(Submit::spawn(&addr));
+        assert!(send(&submit, tick()).is_ok(), "the first batch answers input 5 and is fine");
+        let second = send(&submit, tick());
+        assert!(second.is_err(), "the second batch repeats input 5: {second:?}");
+    }
+
+    #[test]
+    fn a_node_that_answers_nothing_fails_the_request() {
+        let addr = stub_node(Vec::new());
+        let submit = Arc::new(Submit::spawn(&addr));
+        assert!(send(&submit, tick()).is_err());
     }
 }
