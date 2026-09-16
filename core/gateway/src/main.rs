@@ -15,7 +15,7 @@ mod ws;
 use api::{Gateway, Limits};
 use hub::Hub;
 use std::collections::BTreeMap;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
@@ -109,17 +109,17 @@ fn conflate(gateway: &Arc<Gateway>) {
 /// busy market data, far more than a client that is reading ever holds.
 const MAX_BEHIND: usize = 4 * 1024 * 1024;
 
-/// Accepts connections for ever and serves each one: WebSocket sessions from a few event loops, REST requests on a
-/// thread of their own.
+/// Accepts connections for ever and hands each one to an event loop, which serves it whether it is a WebSocket
+/// session or a REST request.
 fn serve(gateway: &Arc<Gateway>, listener: &TcpListener) {
     serve_with(gateway, listener, MAX_BEHIND);
 }
 
-/// `serve`, with a client allowed to fall `max_behind` bytes behind.
+/// `serve`, with a WebSocket client allowed to fall `max_behind` bytes behind.
 fn serve_with(gateway: &Arc<Gateway>, listener: &TcpListener, max_behind: usize) {
     let threads = thread::available_parallelism().map_or(2, |n| n.get().min(4));
     let reactors = match reactor::Reactors::start(gateway, threads, max_behind) {
-        Ok(reactors) => Arc::new(reactors),
+        Ok(reactors) => reactors,
         Err(e) => {
             eprintln!("venue-gateway: event loops: {e}");
             return;
@@ -127,26 +127,6 @@ fn serve_with(gateway: &Arc<Gateway>, listener: &TcpListener, max_behind: usize)
     };
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let (gateway, reactors) = (Arc::clone(gateway), Arc::clone(&reactors));
-        thread::spawn(move || connection(&gateway, &reactors, stream));
-    }
-}
-
-/// Routes a connection by its request line without consuming it, so the WebSocket handshake reads it whole.
-fn connection(gateway: &Gateway, reactors: &reactor::Reactors, stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    const WS: &[u8] = b"GET /v4/ws";
-    let mut head = [0u8; WS.len()];
-    for _ in 0..400 {
-        match stream.peek(&mut head) {
-            Ok(n) if n >= WS.len() => break,
-            Ok(0) | Err(_) => return,
-            Ok(_) => thread::sleep(Duration::from_millis(5)),
-        }
-    }
-    if head == WS {
         reactors.adopt(stream);
-    } else {
-        rest::handle(gateway, &stream);
     }
 }

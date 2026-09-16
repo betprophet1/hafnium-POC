@@ -1,4 +1,4 @@
-//! WebSocket connections served from a few event loops, rather than from a thread each.
+//! Every connection served from a few event loops, rather than from a thread each.
 //!
 //! A thread per connection could wait on one thing only — its socket — so it could not notice a book change or a
 //! reply without waking to look: every connection woke on an interval whether anything had happened or not. A
@@ -11,15 +11,18 @@
 //! puts the connection's token on that loop's ready list and wakes it, unless a wake is already on its way. A book
 //! reaching five thousand subscribers costs each loop one wakeup, not five thousand.
 //!
-//! The protocol is `ws.rs`; this only reads, writes and waits.
+//! A connection arrives undecided. Its first bytes say what it is: a WebSocket upgrade becomes a session (`ws.rs`),
+//! anything else one REST request (`rest.rs`), answered — at once, or when the node answers — and closed. This file
+//! only reads, writes and waits.
 
-use crate::api::Gateway;
+use crate::api::{Gateway, Pending};
 use crate::hub::Outbox;
 use crate::limits::monotonic;
 use crate::ws::{self, Session};
+use crate::{http, rest};
 use mio::net::TcpStream as Stream;
 use mio::{Events, Interest, Poll, Token, Waker};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -35,8 +38,8 @@ use venue_link::submit::Notify;
 /// The token of a loop's own waker, which no connection can have.
 const WAKER: Token = Token(usize::MAX);
 
-/// How often a loop checks its connections' heartbeats. A missed heartbeat is noticed within this of being missed,
-/// and a loop with nothing at all to do wakes this often and no more.
+/// How often a loop checks its connections' heartbeats and deadlines. A missed heartbeat is noticed within this of
+/// being missed, and a loop with nothing at all to do wakes this often and no more.
 const SWEEP: Duration = Duration::from_millis(100);
 
 /// Passes a connection gets per turn. A pass that answers requests can make room for more, which the next pass reads;
@@ -45,6 +48,13 @@ const PASSES: usize = 8;
 
 /// Bytes read from a socket at a time.
 const READ_BUFFER: usize = 4 * 1024;
+
+/// How long a connection has to say what it is, complete a WebSocket handshake, or send a whole REST request. A
+/// client that trickles its bytes holds only its buffers while it does, but it does not hold them for ever.
+const ARRIVAL: Duration = Duration::from_secs(10);
+
+/// What every WebSocket upgrade request starts with, and nothing else the gateway serves does.
+const WS: &[u8] = b"GET /v4/ws";
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -81,8 +91,8 @@ pub struct Reactors {
 }
 
 impl Reactors {
-    /// Starts `threads` loops serving connections for `gateway`. A client more than `max_behind` bytes behind on
-    /// what it has been sent is disconnected.
+    /// Starts `threads` loops serving connections for `gateway`. A WebSocket client more than `max_behind` bytes
+    /// behind on what it has been sent is disconnected.
     pub fn start(gateway: &Arc<Gateway>, threads: usize, max_behind: usize) -> std::io::Result<Self> {
         let mut loops = Vec::new();
         for _ in 0..threads.max(1) {
@@ -101,7 +111,7 @@ impl Reactors {
         Ok(Self { loops, next: AtomicUsize::new(0) })
     }
 
-    /// Hands a connection whose request is a WebSocket upgrade to one of the loops, which does the handshake.
+    /// Hands a newly accepted connection to one of the loops.
     pub fn adopt(&self, stream: TcpStream) {
         let shared = &self.loops[self.next.fetch_add(1, Ordering::Relaxed) % self.loops.len()];
         locked(&shared.incoming).push(stream);
@@ -109,14 +119,27 @@ impl Reactors {
     }
 }
 
+/// One REST request's connection: what has arrived of the request, the node's answer if it went there, and the
+/// response while it is being written.
+struct Http {
+    stream: Stream,
+    request: Vec<u8>,
+    pending: Option<Pending>,
+    response: Vec<u8>,
+    written: usize,
+}
+
 enum Socket {
+    /// Accepted; its first bytes have not said what it is yet.
+    Undecided(Stream),
     Handshake(MidHandshake<ServerHandshake<Stream, NoCallback>>),
     Open(WebSocket<Stream>),
+    Http(Http),
 }
 
 struct Conn {
     socket: Option<Socket>,
-    /// Opened once the handshake completes; until then the outbox waits here for it.
+    /// Opened once a WebSocket handshake completes; until then the outbox waits here for it.
     session: Option<Session>,
     outbox: Option<Outbox>,
     queue: Receiver<String>,
@@ -124,6 +147,8 @@ struct Conn {
     /// Whether the socket may hold input not yet read. The loop is told when new input arrives, not that input is
     /// still there, so a session that stopped reading at its limit remembers it has more to read.
     unread: bool,
+    /// When the connection was accepted, for `ARRIVAL`.
+    accepted: Instant,
 }
 
 /// One loop, for ever.
@@ -154,7 +179,7 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, gateway: &Arc<Gateway>, max_behind:
         shared.woken.store(false, Ordering::SeqCst);
         let arrived = std::mem::take(&mut *locked(&shared.incoming));
         for stream in arrived {
-            if let Some(token) = take_on(&poll, shared, &mut conns, &mut free, stream, max_behind) {
+            if let Some(token) = take_on(&poll, shared, &mut conns, &mut free, stream) {
                 due.push(token);
             }
         }
@@ -163,7 +188,7 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, gateway: &Arc<Gateway>, max_behind:
         due.dedup();
         for token in due {
             let alive = match conns.get_mut(token).and_then(Option::as_mut) {
-                Some(conn) => serve(gateway, conn),
+                Some(conn) => serve(gateway, conn, max_behind),
                 None => continue,
             };
             if !alive {
@@ -178,7 +203,7 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, gateway: &Arc<Gateway>, max_behind:
     }
 }
 
-/// How a connection's socket buffers.
+/// How a WebSocket connection's socket buffers.
 ///
 /// tungstenite allocates each connection a 128 KiB read buffer up front, which made an idle connection cost
 /// ~130 kB; a client's frames are small, and the buffer grows for one that is not.
@@ -191,18 +216,16 @@ fn socket_config(max_behind: usize) -> WebSocketConfig {
     WebSocketConfig::default().read_buffer_size(READ_BUFFER).max_write_buffer_size(max_behind)
 }
 
-/// Registers a new connection and starts its handshake. None if it could not be taken on.
+/// Registers a newly accepted connection, undecided. None if it could not be taken on.
 fn take_on(
     poll: &Poll,
     shared: &Arc<Shared>,
     conns: &mut Vec<Option<Conn>>,
     free: &mut Vec<usize>,
     stream: TcpStream,
-    max_behind: usize,
 ) -> Option<usize> {
     stream.set_nonblocking(true).ok()?;
     let _ = stream.set_nodelay(true);
-    let _ = stream.set_read_timeout(None);
     let mut stream = Stream::from_std(stream);
     let token = free.pop().unwrap_or_else(|| {
         conns.push(None);
@@ -217,27 +240,101 @@ fn take_on(
         Arc::new(move || shared.ready(token))
     };
     let (tx, queue) = mpsc::channel();
-    let socket = match tungstenite::accept_with_config(stream, Some(socket_config(max_behind))) {
-        Ok(ws) => Socket::Open(ws),
-        Err(HandshakeError::Interrupted(mid)) => Socket::Handshake(mid),
-        Err(HandshakeError::Failure(_)) => {
-            free.push(token);
-            return None;
-        }
-    };
     conns[token] = Some(Conn {
-        socket: Some(socket),
+        socket: Some(Socket::Undecided(stream)),
         session: None,
         outbox: Some(Outbox::new(tx, Arc::clone(&notify))),
         queue,
         notify,
         unread: true,
+        accepted: monotonic(),
     });
     Some(token)
 }
 
 /// Does everything a connection has waiting, and says whether it is still worth keeping.
-fn serve(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
+fn serve(gateway: &Arc<Gateway>, conn: &mut Conn, max_behind: usize) -> bool {
+    if matches!(conn.socket, Some(Socket::Undecided(_))) {
+        let Some(Socket::Undecided(stream)) = conn.socket.take() else { return false };
+        let mut head = [0u8; WS.len()];
+        conn.socket = match stream.peek(&mut head) {
+            Ok(0) => return false,
+            // A prefix of an upgrade so far: the next bytes decide.
+            Ok(n) if n < WS.len() && head[..n] == WS[..n] => {
+                conn.socket = Some(Socket::Undecided(stream));
+                return true;
+            }
+            Ok(n) if n == WS.len() && head == *WS => {
+                match tungstenite::accept_with_config(stream, Some(socket_config(max_behind))) {
+                    Ok(ws) => Some(Socket::Open(ws)),
+                    Err(HandshakeError::Interrupted(mid)) => Some(Socket::Handshake(mid)),
+                    Err(HandshakeError::Failure(_)) => return false,
+                }
+            }
+            Ok(_) => Some(Socket::Http(Http {
+                stream,
+                request: Vec::new(),
+                pending: None,
+                response: Vec::new(),
+                written: 0,
+            })),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                conn.socket = Some(Socket::Undecided(stream));
+                return true;
+            }
+            Err(_) => return false,
+        };
+    }
+    if let Some(Socket::Http(request)) = conn.socket.as_mut() {
+        return serve_http(gateway, request, &conn.notify);
+    }
+    serve_ws(gateway, conn)
+}
+
+/// A REST connection: read until the request is whole, answer it — now, or when the node has — write the response,
+/// and let the connection go.
+fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify) -> bool {
+    if http.pending.is_none() && http.response.is_empty() {
+        let mut chunk = [0u8; READ_BUFFER];
+        loop {
+            match http.stream.read(&mut chunk) {
+                // The client stopped sending before its request was whole.
+                Ok(0) => return false,
+                Ok(n) => http.request.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+        match http::parse(&http.request) {
+            Ok(None) => return true,
+            Ok(Some(request)) => match rest::route(gateway, &request, notify) {
+                rest::Routed::Now(answer) => http.response = rest::response(answer),
+                rest::Routed::Later(pending) => http.pending = Some(pending),
+            },
+            Err(reason) => http.response = rest::unreadable(&reason),
+        }
+    }
+    if let Some(pending) = &http.pending {
+        let Some(answer) = gateway.finish(pending) else { return true };
+        http.response = rest::response(answer);
+        http.pending = None;
+    }
+    while http.written < http.response.len() {
+        match http.stream.write(&http.response[http.written..]) {
+            Ok(0) => return false,
+            Ok(n) => http.written += n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return true,
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    // Answered in full: one request a connection, so the connection is done.
+    false
+}
+
+/// A WebSocket connection: finish its handshake, then read, answer and send.
+fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
     if matches!(conn.socket, Some(Socket::Handshake(_))) {
         let Some(Socket::Handshake(mid)) = conn.socket.take() else { return false };
         match mid.handshake() {
@@ -300,10 +397,22 @@ fn serve(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
     flushed(socket)
 }
 
-/// Closes the connections of logged-in clients silent past their heartbeat.
+/// Closes the connections of logged-in clients silent past their heartbeat, and of clients that have not managed to
+/// say what they want within `ARRIVAL`.
 fn sweep(gateway: &Arc<Gateway>, conns: &mut [Option<Conn>], free: &mut Vec<usize>, now: Instant) {
     for token in 0..conns.len() {
         let Some(conn) = conns[token].as_mut() else { continue };
+        let arriving = match &conn.socket {
+            Some(Socket::Undecided(_) | Socket::Handshake(_)) => true,
+            Some(Socket::Http(http)) => http.pending.is_none() && http.response.is_empty(),
+            _ => false,
+        };
+        if arriving {
+            if now.duration_since(conn.accepted) > ARRIVAL {
+                close_slot(gateway, conns, free, token);
+            }
+            continue;
+        }
         let Some(session) = conn.session.as_mut() else { continue };
         if !session.heartbeat_missed(now) {
             continue;

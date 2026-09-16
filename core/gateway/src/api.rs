@@ -368,6 +368,7 @@ impl Gateway {
     }
 
     /// POST /v4/orders and the WebSocket `order` op.
+    #[cfg(test)]
     pub fn place(&self, account: u64, session: u64, body: &Value) -> Result<Value, ApiError> {
         let input = self.place_input(account, session, body)?;
         let results = self.send(input)?;
@@ -425,6 +426,7 @@ impl Gateway {
     }
 
     /// PATCH /v4/orders/{orderId} and the WebSocket `amend` op.
+    #[cfg(test)]
     pub fn amend(&self, account: u64, session: u64, order: u64, body: &Value) -> Result<Value, ApiError> {
         let input = self.amend_input(account, session, order, body)?;
         let results = self.send(input)?;
@@ -457,6 +459,7 @@ impl Gateway {
     }
 
     /// DELETE /v4/orders/{orderId} and the WebSocket `cancel` op.
+    #[cfg(test)]
     pub fn cancel(&self, account: u64, session: u64, order: u64) -> Result<Value, ApiError> {
         let input = self.cancel_input(account, session, order)?;
         let results = self.send(input)?;
@@ -486,13 +489,8 @@ impl Gateway {
         }
     }
 
-    /// DELETE /v4/orders and the WebSocket `cancelAll` op.
-    pub fn cancel_all(&self, account: u64, session: u64, body: &Value) -> Result<Value, ApiError> {
-        let (scope, reference) = Self::cancel_all_scope(body)?;
-        self.mass_cancel(account, session, scope, reference, "CLIENT_REQUEST")
-    }
-
-    /// The same, given to the node without waiting for it. Its answer is a mass cancel's, not an `OrderResult`.
+    /// DELETE /v4/orders and the WebSocket `cancelAll` op, given to the node without waiting for it. Its answer is a
+    /// mass cancel's, not an `OrderResult`.
     pub fn cancel_all_pending(
         &self,
         account: u64,

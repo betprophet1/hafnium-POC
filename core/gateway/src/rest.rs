@@ -1,25 +1,35 @@
-//! The REST half of interface 1 (interfaces/gateway/openapi.yaml).
+//! The REST half of interface 1 (interfaces/gateway/openapi.yaml): what a request comes to. `reactor.rs` reads the
+//! request and writes the response; nothing here waits, and a request that goes to the node is answered when the
+//! node answers it.
 
-use crate::api::{parse_id, ApiError, Gateway};
+use crate::api::{parse_id, ApiError, Gateway, Pending};
 use crate::http::{self, Request};
 use serde_json::{json, Map, Value};
-use std::net::TcpStream;
+use std::sync::Arc;
+use venue_link::submit::Notify;
 
-pub fn handle(gateway: &Gateway, stream: &TcpStream) {
-    let outcome = http::read(stream)
-        .map_err(|e| ApiError::bad(format!("unreadable request: {e}")))
-        .and_then(|request| route(gateway, &request));
-    let written = match outcome {
-        Ok(body) => http::respond(stream, 200, &body, &[]),
+/// What a request comes to: its answer now, or a request given to the node whose answer `Gateway::finish` has once
+/// the notify it was given is called.
+pub enum Routed {
+    Now(Result<Value, ApiError>),
+    Later(Pending),
+}
+
+/// The response for an answer.
+pub fn response(answer: Result<Value, ApiError>) -> Vec<u8> {
+    match answer {
+        Ok(body) => http::response(200, &body, &[]),
         Err(e) => {
             let retry: Vec<(&str, String)> =
                 e.retry_after.map(|s| ("Retry-After", s.to_string())).into_iter().collect();
-            http::respond(stream, e.status, &e.body(), &retry)
+            http::response(e.status, &e.body(), &retry)
         }
-    };
-    if let Err(e) = written {
-        eprintln!("gateway: rest: {e}");
     }
+}
+
+/// The response to bytes that can never be a request.
+pub fn unreadable(reason: &str) -> Vec<u8> {
+    response(Err(ApiError::bad(format!("unreadable request: {reason}"))))
 }
 
 /// REST calls have no session. Their orders carry a fixed session ID per account, which no disconnect ever cancels.
@@ -42,17 +52,21 @@ fn body(request: &Request) -> Result<Value, ApiError> {
     serde_json::from_slice(&request.body).map_err(|e| ApiError::bad(format!("the body is not JSON: {e}")))
 }
 
-fn route(gateway: &Gateway, request: &Request) -> Result<Value, ApiError> {
+/// What `request` comes to. A request for the node is given `notify` to call once its answer can be taken.
+pub fn route(gateway: &Gateway, request: &Request, notify: &Notify) -> Routed {
+    route_or_refuse(gateway, request, notify).unwrap_or_else(|e| Routed::Now(Err(e)))
+}
+
+fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Result<Routed, ApiError> {
     let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
+    let later = || Some(Arc::clone(notify));
     match (request.method.as_str(), segments.as_slice()) {
-        ("GET", ["healthz"]) => {
-            if gateway.hub().ready() {
-                Ok(json!({"ready": true}))
-            } else {
-                Err(ApiError::unavailable("catching up with the feed"))
-            }
-        }
-        ("GET", ["v4", "markets"]) => Ok(gateway.hub().markets()),
+        ("GET", ["healthz"]) => Ok(Routed::Now(if gateway.hub().ready() {
+            Ok(json!({"ready": true}))
+        } else {
+            Err(ApiError::unavailable("catching up with the feed"))
+        })),
+        ("GET", ["v4", "markets"]) => Ok(Routed::Now(Ok(gateway.hub().markets()))),
         ("GET", ["v4", "markets", instrument, "book"]) => {
             let instrument = parse_id(instrument, "instrumentId")?;
             let depth = match request.query.get("depth") {
@@ -63,29 +77,32 @@ fn route(gateway: &Gateway, request: &Request) -> Result<Value, ApiError> {
                     .filter(|d| (1..=100).contains(d))
                     .ok_or_else(|| ApiError::bad("depth must be from 1 to 100"))?,
             };
-            gateway.hub().book(instrument, depth).ok_or_else(|| ApiError::not_found("no such market"))
+            Ok(Routed::Now(gateway.hub().book(instrument, depth).ok_or_else(|| ApiError::not_found("no such market"))))
         }
         ("GET", ["v4", "account"]) => {
             let account = account(gateway, request)?;
-            Ok(gateway.hub().account(account))
+            Ok(Routed::Now(Ok(gateway.hub().account(account))))
         }
         ("POST", ["v4", "orders"]) => {
             let account = account(gateway, request)?;
-            gateway.place(account, rest_session(account), &body(request)?)
+            Ok(Routed::Later(gateway.place_pending(account, rest_session(account), &body(request)?, later())?))
         }
         ("DELETE", ["v4", "orders"]) => {
             let account = account(gateway, request)?;
             let scope: Map<String, Value> =
                 request.query.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
-            gateway.cancel_all(account, rest_session(account), &Value::Object(scope))
+            let body = Value::Object(scope);
+            Ok(Routed::Later(gateway.cancel_all_pending(account, rest_session(account), &body, later())?))
         }
         ("PATCH", ["v4", "orders", order]) => {
             let account = account(gateway, request)?;
-            gateway.amend(account, rest_session(account), parse_id(order, "orderId")?, &body(request)?)
+            let order = parse_id(order, "orderId")?;
+            Ok(Routed::Later(gateway.amend_pending(account, rest_session(account), order, &body(request)?, later())?))
         }
         ("DELETE", ["v4", "orders", order]) => {
             let account = account(gateway, request)?;
-            gateway.cancel(account, rest_session(account), parse_id(order, "orderId")?)
+            let order = parse_id(order, "orderId")?;
+            Ok(Routed::Later(gateway.cancel_pending(account, rest_session(account), order, later())?))
         }
         _ => Err(ApiError::not_found("no such route")),
     }
@@ -177,6 +194,45 @@ mod tests {
         let (status, all) = request(a, "DELETE", &format!("/v4/orders?instrumentId={MARKET}"), Some(MAKER_TOKEN), None);
         assert_eq!(status, 200, "{all}");
         assert_eq!(all["executions"].as_array().map(Vec::len), Some(3), "{all}");
+    }
+
+    #[test]
+    fn a_request_that_arrives_in_pieces_is_answered_once_whole() {
+        let venue = testing::venue("rest-pieces");
+        let mut stream = TcpStream::connect(&venue.address).expect("the gateway accepts a connection");
+        stream.set_read_timeout(Some(Duration::from_secs(5))).expect("a read timeout");
+        let body = order("pieces");
+        let whole = format!(
+            "POST /v4/orders HTTP/1.1\r\nAuthorization: Bearer {MAKER_TOKEN}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        // Cut inside what could still be a WebSocket upgrade's first bytes, inside the head, and inside the body.
+        let cuts = [0, 3, 40, whole.len() - 5, whole.len()];
+        for piece in cuts.windows(2) {
+            stream.write_all(&whole.as_bytes()[piece[0]..piece[1]]).expect("a piece is sent");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("a whole response before the timeout");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"accepted\""), "{response}");
+    }
+
+    #[test]
+    fn many_orders_at_once_are_each_answered() {
+        let venue = testing::venue("rest-many");
+        let answers: Vec<_> = (0..40)
+            .map(|i| {
+                let address = venue.address.clone();
+                std::thread::spawn(move || {
+                    request(&address, "POST", "/v4/orders", Some(MAKER_TOKEN), Some(&order(&format!("many{i}"))))
+                })
+            })
+            .collect();
+        for answer in answers {
+            let (status, placed) = answer.join().expect("a request thread");
+            assert_eq!((status, placed["status"].as_str()), (200, Some("accepted")), "{placed}");
+        }
     }
 
     #[test]
