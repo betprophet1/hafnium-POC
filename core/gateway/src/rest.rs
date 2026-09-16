@@ -137,6 +137,25 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Res
         ("POST" | "GET", ["v4", "transfers"]) | ("GET" | "DELETE", ["v4", "transfers", _]) => {
             transfer(gateway, request, notify)
         }
+        ("POST", ["v4", "rfqs"]) => {
+            let account = account(gateway, request)?;
+            Ok(Routed::Later(gateway.request_quote_pending(account, &body(request)?, later())?))
+        }
+        ("GET", ["v4", "rfqs", rfq]) => {
+            let account = account(gateway, request)?;
+            Ok(Routed::Later(gateway.rfq_pending(account, rfq, later())?))
+        }
+        ("POST", ["v4", "rfqs", rfq, "quotes"]) => {
+            let account = account(gateway, request)?;
+            let mut body = body(request)?;
+            if let Some(fields) = body.as_object_mut() {
+                if fields.contains_key("requestId") {
+                    return Err(ApiError::bad("unknown field requestId: the request is named by the path"));
+                }
+                fields.insert("requestId".into(), Value::String((*rfq).to_string()));
+            }
+            Ok(Routed::Later(gateway.attach_quote_pending(account, &body, later())?))
+        }
         _ => Err(ApiError::not_found("no such route")),
     }
 }
@@ -145,7 +164,7 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Res
 /// nothing about how requests are served.
 #[cfg(test)]
 mod tests {
-    use crate::testing::{self, MAKER_TOKEN, MARKET};
+    use crate::testing::{self, MAKER_TOKEN, MARKET, RETAIL_TOKEN};
     use serde_json::{json, Value};
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -325,6 +344,123 @@ mod tests {
         assert_eq!(request(a, "GET", "/v4/account", Some(MAKER_TOKEN), None).0, 200);
         assert!(tungstenite::connect(&venue.ws_public).is_err(), "a private-only gateway took a public session");
         assert!(tungstenite::connect(&venue.ws_private).is_ok(), "a private-only gateway refused a private session");
+    }
+
+    fn legs(legs: &[(u64, &str)], quantity: u64) -> String {
+        let legs: Vec<Value> = legs
+            .iter()
+            .map(|(market, outcome)| json!({"instrumentId": market.to_string(), "outcome": outcome}))
+            .collect();
+        json!({"legs": legs, "quantity": quantity}).to_string()
+    }
+
+    /// A market in `GET /v4/markets` by instrument, with its event.
+    fn listed(address: &str, instrument: &str) -> Option<(Value, Value)> {
+        let (_, markets) = request(address, "GET", "/v4/markets", None, None);
+        markets["events"].as_array()?.iter().find_map(|e| {
+            let m = e["markets"].as_array()?.iter().find(|m| m["instrumentId"].as_str() == Some(instrument))?;
+            Some((e.clone(), m.clone()))
+        })
+    }
+
+    #[test]
+    fn a_request_names_one_parlay_whatever_the_leg_order_and_bad_ones_are_refused() {
+        let venue = testing::venue("rest-rfq");
+        let a = &venue.address;
+        let (arsenal, draw, bitcoin) = (testing::market(2, 0), testing::market(2, 1), testing::market(3, 0));
+        let ask = |body: &str| request(a, "POST", "/v4/rfqs", Some(RETAIL_TOKEN), Some(body));
+        for (why, body, status) in [
+            ("two legs on one event", legs(&[(arsenal, "yes"), (draw, "no")], 10), 400),
+            ("one leg", legs(&[(arsenal, "yes")], 10), 400),
+            ("a quantity off the lot step", legs(&[(arsenal, "yes"), (MARKET, "yes")], 15), 400),
+            ("a market that does not exist", legs(&[(arsenal, "yes"), (99_999, "yes")], 10), 404),
+            ("an outcome that is neither", r#"{"legs": [{"instrumentId": "1", "outcome": "maybe"}, {"instrumentId": "2", "outcome": "yes"}], "quantity": 10}"#.to_string(), 400),
+        ] {
+            let (got, body) = ask(&body);
+            assert_eq!(got, status, "{why}: {body}");
+        }
+        assert_eq!(request(a, "POST", "/v4/rfqs", None, Some(&legs(&[(arsenal, "yes"), (MARKET, "yes")], 10))).0, 401);
+
+        let (status, first) = ask(&legs(&[(bitcoin, "no"), (arsenal, "yes"), (MARKET, "yes")], 10));
+        assert_eq!((status, &first["listed"]), (200, &json!(true)), "{first}");
+        let (status, again) = ask(&legs(&[(MARKET, "yes"), (bitcoin, "no"), (arsenal, "yes")], 30));
+        assert_eq!((status, &again["listed"]), (200, &json!(false)), "{again}");
+        assert_eq!(first["instrumentId"], again["instrumentId"]);
+        assert_ne!(first["requestId"], again["requestId"]);
+        let parlay = first["instrumentId"].as_str().expect("an instrument").to_string();
+
+        let (event, market) = listed(a, &parlay).expect("the parlay is listed");
+        assert_eq!(
+            (market["class"].as_str(), market["state"].as_str(), market["lotStep"].as_u64()),
+            (Some("parlay"), Some("open"), Some(10))
+        );
+        assert_eq!(market["legs"].as_array().map(Vec::len), Some(3), "{market}");
+        assert_eq!(event["outcomes"], json!(["Loses", "Wins"]));
+        assert!(event["title"].as_str().is_some_and(|t| t.starts_with("Parlay: ")), "{event}");
+        assert_eq!(market["ladder"][0]["cents"], "0.1", "{market}");
+
+        let request_id = first["requestId"].as_str().expect("a request ID");
+        let (status, own) = request(a, "GET", &format!("/v4/rfqs/{request_id}"), Some(RETAIL_TOKEN), None);
+        assert_eq!((status, &own["open"], &own["quotes"]), (200, &json!(true), &json!([])), "{own}");
+        assert_eq!(request(a, "GET", &format!("/v4/rfqs/{request_id}"), Some(MAKER_TOKEN), None).0, 404);
+        let attach = request(
+            a,
+            "POST",
+            &format!("/v4/rfqs/{request_id}/quotes"),
+            Some(MAKER_TOKEN),
+            Some(r#"{"orderId": "5"}"#),
+        );
+        assert_eq!(attach.0, 400, "the market maker tab's account is not a responder: {}", attach.1);
+    }
+
+    /// Each settlement rule against a real node: a lost leg expires a parlay, a voided leg voids one, and a parlay
+    /// whose legs all won resolves to Wins once the last of them does, having closed when the first one stopped.
+    #[test]
+    fn parlays_settle_from_their_legs() {
+        let venue = testing::venue("rest-rfq-settle");
+        let a = &venue.address;
+        let (arsenal, bitcoin) = (testing::market(2, 0), testing::market(3, 0));
+        let parlay = |legs_asked: &[(u64, &str)]| {
+            let (status, rfq) = request(a, "POST", "/v4/rfqs", Some(RETAIL_TOKEN), Some(&legs(legs_asked, 10)));
+            assert_eq!(status, 200, "{rfq}");
+            rfq["instrumentId"].as_str().expect("an instrument").to_string()
+        };
+        let loses = parlay(&[(MARKET, "yes"), (bitcoin, "yes")]);
+        let voided = parlay(&[(arsenal, "yes"), (bitcoin, "no")]);
+        let wins = parlay(&[(MARKET, "no"), (bitcoin, "yes")]);
+        let operator = venue_link::submit::Submit::spawn(&venue.ingress);
+        let resolve = |template: u64, kind: &str, state: u64| {
+            let event = venue_link::catalogue::event_id(template, 1);
+            let input = venue_link::wire::command(
+                "ResolveEvent",
+                format!("t-{template}-{kind}"),
+                json!({"eventId": event, "kind": kind, "caseId": 0, "winningState": state, "voidWeights": []}),
+            );
+            operator.send(input).expect("resolved");
+        };
+        let resolution = |parlay: &str| listed(a, parlay).map(|(e, m)| (e["resolution"].clone(), m["state"].clone()));
+        // No rain: the first parlay's rain leg lost, and the third's won.
+        resolve(1, "RESOLVED", 0);
+        testing::eventually("the lost parlay expires", || resolution(&loses).is_some_and(|(r, _)| !r.is_null()));
+        let (expired, _) = resolution(&loses).expect("listed");
+        assert_eq!(
+            (expired["kind"].as_str(), expired["outcome"].as_str()),
+            (Some("resolved"), Some("Loses")),
+            "{expired}"
+        );
+        testing::eventually("the winning parlay closes", || resolution(&wins).is_some_and(|(_, s)| s == "closed"));
+        resolve(2, "VOID", 0);
+        testing::eventually("the voided parlay voids", || {
+            resolution(&voided).is_some_and(|(r, _)| r["kind"] == "void")
+        });
+        resolve(3, "RESOLVED", 1);
+        testing::eventually("the last parlay wins", || resolution(&wins).is_some_and(|(r, _)| !r.is_null()));
+        let (won, state) = resolution(&wins).expect("listed");
+        assert_eq!((won["outcome"].as_str(), state.as_str()), (Some("Wins"), Some("settled")), "{won}");
+        assert!(
+            resolution(&loses).is_some_and(|(r, _)| r["outcome"] == "Loses"),
+            "a later leg changed a settled parlay"
+        );
     }
 
     #[test]

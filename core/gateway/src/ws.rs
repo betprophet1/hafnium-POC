@@ -199,7 +199,7 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
     // Market data and order entry are separate endpoints, possibly separate gateways (README, public and private).
     let belongs = match op {
         "subscribe" | "unsubscribe" => Some(Half::Public),
-        "login" | "order" | "amend" | "cancel" | "cancelAll" => Some(Half::Private),
+        "login" | "order" | "amend" | "cancel" | "cancelAll" | "requestQuote" | "attachQuote" => Some(Half::Private),
         _ => None,
     };
     if let Some(half) = belongs.filter(|half| *half != gateway.half) {
@@ -253,6 +253,20 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
                         gateway.amend_pending(account, s, order, &body, notify)?
                     }
                 }
+            };
+            session.in_flight.push_back((request_id, pending));
+            Ok(Vec::new())
+        }
+        "requestQuote" | "attachQuote" => {
+            let account = session.account.ok_or_else(ApiError::unauthorized)?;
+            let notify = Some(Arc::clone(&session.notify));
+            let body = body_of(message);
+            // Answered in turn with the session's orders, so a responder that rests an order and then attaches it
+            // hears about the order first.
+            let pending = if op == "requestQuote" {
+                gateway.request_quote_pending(account, &body, notify)?
+            } else {
+                gateway.attach_quote_pending(account, &body, notify)?
             };
             session.in_flight.push_back((request_id, pending));
             Ok(Vec::new())
@@ -317,7 +331,7 @@ fn login(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<Ve
 /// not how connections are served, so they hold whichever way the gateway waits on its sockets.
 #[cfg(test)]
 mod tests {
-    use crate::testing::{self, eventually, MAKER_TOKEN, MARKET, RETAIL_TOKEN};
+    use crate::testing::{self, eventually, MAKER_TOKEN, MARKET, RESPONDER_TOKEN, RETAIL_TOKEN};
     use serde_json::{json, Value};
     use std::net::TcpStream;
     use std::time::Duration;
@@ -370,13 +384,17 @@ mod tests {
 
         /// Waits for a private execution of `kind` for the order with `client_order_id`.
         fn execution(&mut self, client_order_id: &str, kind: &str) -> Value {
-            let matches = |m: &Value| {
+            self.streamed_message(|m| {
                 m["type"] == "execution"
                     && m["execution"]["clientOrderId"] == client_order_id
                     && m["execution"]["type"] == kind
-            };
+            })
+        }
+
+        /// Waits for a streamed message `wanted` accepts, whether it has already arrived or not.
+        fn streamed_message(&mut self, wanted: impl Fn(&Value) -> bool) -> Value {
             loop {
-                if let Some(found) = self.streamed.iter().find(|m| matches(m)) {
+                if let Some(found) = self.streamed.iter().find(|m| wanted(m)) {
                     return found.clone();
                 }
                 let m = self.next();
@@ -392,6 +410,13 @@ mod tests {
                     return m;
                 }
             }
+        }
+
+        /// Logs in as the account whose dev token this is.
+        fn login_as(&mut self, token: &str) {
+            self.send(json!({"op": "login", "id": "login", "token": token}));
+            let welcome = self.next_answer();
+            assert_eq!(welcome["type"], "welcome", "{welcome}");
         }
 
         fn login(&mut self, extra: Value) -> Value {
@@ -629,6 +654,106 @@ mod tests {
         };
         assert!(dropped, "a client that stopped reading was kept, having been sent {replies} of {sent} replies");
         assert!(replies < sent, "the client got all {replies} replies, so it was never behind");
+    }
+
+    /// The whole request for quote: the requester asks, a responder hears without learning who asked, rests a sell and
+    /// attaches it, the requester sees the quote and takes it with an ordinary order, and sees it leave the book.
+    #[test]
+    fn a_request_reaches_responders_and_their_quotes_reach_the_requester() {
+        let venue = testing::venue("ws-rfq");
+        let mut responder = Client::connect(&venue.ws_private);
+        responder.login_as(RESPONDER_TOKEN);
+        let mut requester = Client::connect(&venue.ws_private);
+        requester.login_as(RETAIL_TOKEN);
+        let bitcoin = testing::market(3, 0).to_string();
+        let legs =
+            json!([{"instrumentId": bitcoin, "outcome": "yes"}, {"instrumentId": MARKET.to_string(), "outcome": "no"}]);
+        requester.send(json!({"op": "requestQuote", "id": "rq", "legs": legs, "quantity": 20}));
+        let opened = requester.next_answer();
+        assert_eq!((opened["type"].as_str(), opened["id"].as_str()), (Some("reply"), Some("rq")), "{opened}");
+        let rfq = &opened["result"];
+        assert_eq!(rfq["listed"], true, "{rfq}");
+        // Canonical order is by event: rain (template 1) before bitcoin (template 3).
+        assert_eq!(rfq["legs"][0]["instrumentId"], MARKET.to_string(), "{rfq}");
+        assert_eq!((rfq["legs"][0]["outcome"].as_str(), rfq["lotStep"].as_u64()), (Some("no"), Some(10)));
+        let (request, parlay) = (rfq["requestId"].as_str().expect("a request ID"), rfq["instrumentId"].clone());
+        let expires = rfq["expiresAt"].as_str().expect("a window").to_string();
+
+        let heard = responder.streamed_message(|m| m["type"] == "rfq");
+        assert_eq!((heard["requestId"].as_str(), &heard["instrumentId"]), (Some(request), &parlay), "{heard}");
+        assert!(!heard.to_string().contains("accountId"), "the requester was named: {heard}");
+        let sell = json!({"op": "order", "id": "sell", "clientOrderId": "quote-1", "instrumentId": parlay,
+                          "action": "sell", "outcome": "yes", "price": {"cents": "0.8"}, "quantity": 20,
+                          "timeInForce": "GTD", "expiresAt": expires});
+        responder.send(sell);
+        let placed = responder.next_answer();
+        assert_eq!(placed["result"]["status"], "accepted", "{placed}");
+        let order = order_id(&placed);
+        responder.send(json!({"op": "attachQuote", "id": "attach", "requestId": request, "orderId": order}));
+        let attached = responder.next_answer();
+        assert_eq!((attached["id"].as_str(), attached["result"]["state"].as_str()), (Some("attach"), Some("open")));
+        assert_eq!(attached["result"]["price"]["cents"], "0.8", "{attached}");
+
+        let quote = requester.streamed_message(|m| m["type"] == "quote");
+        assert_eq!(
+            (quote["orderId"].as_str(), quote["quantity"].as_u64()),
+            (Some(order.as_str()), Some(20)),
+            "{quote}"
+        );
+        assert_eq!(
+            (quote["price"]["probability"].as_str(), quote["expiresAt"].as_str()),
+            (Some("1/125"), Some(expires.as_str()))
+        );
+        let take = json!({"op": "order", "id": "take", "clientOrderId": "take-1", "instrumentId": parlay,
+                          "action": "buy", "outcome": "yes", "price": quote["price"]["probability"].as_str().map(|p| json!({"probability": p})),
+                          "quantity": 20, "timeInForce": "FOK"});
+        requester.send(take);
+        let taken = requester.next_answer();
+        assert_eq!(taken["result"]["status"], "accepted", "{taken}");
+        let filled: u64 = taken["result"]["executions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["type"] == "fill")
+            .filter_map(|e| e["quantity"].as_u64())
+            .sum();
+        assert_eq!(filled, 20, "{taken}");
+        let gone = requester.streamed_message(|m| m["type"] == "quote" && m["state"] != "open");
+        assert_eq!((gone["state"].as_str(), gone["quantity"].as_u64()), (Some("filled"), Some(0)), "{gone}");
+    }
+
+    #[test]
+    fn only_a_responders_own_resting_sell_on_the_parlay_is_a_quote() {
+        let venue = testing::venue("ws-rfq-attach");
+        let mut requester = Client::connect(&venue.ws_private);
+        requester.login_as(RETAIL_TOKEN);
+        let legs = json!([{"instrumentId": MARKET.to_string(), "outcome": "yes"},
+                          {"instrumentId": testing::market(2, 1).to_string(), "outcome": "yes"}]);
+        requester.send(json!({"op": "requestQuote", "id": "rq", "legs": legs, "quantity": 10}));
+        let rfq = requester.next_answer()["result"].clone();
+        let (request, parlay) = (rfq["requestId"].clone(), rfq["instrumentId"].clone());
+        // The requester is no responder, whatever it rests.
+        requester.send(json!({"op": "order", "id": "own", "clientOrderId": "own-1", "instrumentId": parlay,
+                              "action": "sell", "outcome": "yes", "price": {"cents": "50"}, "quantity": 10}));
+        let own = order_id(&requester.next_answer());
+        requester.send(json!({"op": "attachQuote", "id": "a1", "requestId": request, "orderId": own}));
+        assert_eq!(requester.next_answer()["error"]["code"], "BAD_REQUEST");
+        let mut responder = Client::connect(&venue.ws_private);
+        responder.login_as(RESPONDER_TOKEN);
+        // Someone else's order, a buy, and an order on another market are all refused.
+        responder.send(json!({"op": "attachQuote", "id": "a2", "requestId": request, "orderId": own}));
+        assert_eq!(responder.next_answer()["error"]["code"], "NOT_FOUND");
+        responder.send(json!({"op": "order", "id": "buy", "clientOrderId": "buy-1", "instrumentId": parlay,
+                              "action": "buy", "outcome": "yes", "price": {"cents": "1"}, "quantity": 10}));
+        let buy = order_id(&responder.next_answer());
+        responder.send(json!({"op": "attachQuote", "id": "a3", "requestId": request, "orderId": buy}));
+        assert_eq!(responder.next_answer()["error"]["code"], "BAD_REQUEST");
+        responder.send(order("elsewhere", 4));
+        let elsewhere = order_id(&responder.next_answer());
+        responder.send(json!({"op": "attachQuote", "id": "a4", "requestId": request, "orderId": elsewhere}));
+        assert_eq!(responder.next_answer()["error"]["code"], "BAD_REQUEST");
+        responder.send(json!({"op": "attachQuote", "id": "a5", "requestId": "nosuchrequest", "orderId": buy}));
+        assert_eq!(responder.next_answer()["error"]["code"], "NOT_FOUND");
     }
 
     #[test]

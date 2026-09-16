@@ -9,7 +9,7 @@ use std::sync::mpsc::{SendError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use venue_link::catalogue::Catalogue;
 use venue_link::submit::Notify;
-use venue_link::view::{Row, View};
+use venue_link::view::{InstrumentView, Row, View};
 use venue_link::wire::Unit;
 
 /// Private messages kept per account for sessions resuming by sequence.
@@ -381,13 +381,93 @@ impl Hub {
         }
         // After each market's own state change, the event's resolution as a whole: a void and a settlement both
         // show as markets leaving trading, and only this says which, and which state occurred.
-        if input["msg"] == "ResolveEvent" && unit.results.iter().any(|r| r["outcome"] == "APPLIED") {
-            let event = u(&input["eventId"]);
+        let resolved = match input["msg"].as_str() {
+            Some("ResolveEvent") => Some(u(&input["eventId"])),
+            // Expiring a parlay resolves its event (E-15.7).
+            Some("ExpireParlay") => self.view.instruments.get(&u(&input["instrumentId"])).map(|i| i.event),
+            _ => None,
+        };
+        if let Some(event) = resolved.filter(|_| unit.results.iter().any(|r| r["outcome"] == "APPLIED")) {
             let resolved = json!({
                 "type": "market", "sequence": id(sequence), "eventId": id(event), "resolution": self.resolution(event)
             });
             self.send_to_topic("markets", &resolved.to_string());
         }
+    }
+
+    /// The parlay an event was listed for, if it was. The catalogue knows nothing of parlays: they are listed on
+    /// request, and their names come from their legs.
+    fn parlay(&self, event: u64) -> Option<&InstrumentView> {
+        let e = self.view.events.get(&event)?;
+        e.instruments.iter().filter_map(|i| self.view.instruments.get(i)).find(|i| i.class == "PARLAY")
+    }
+
+    /// An event's outcome names. A parlay's event has two, and its YES pays in the second (spec D-22).
+    fn outcomes(&self, event: u64, count: u64) -> Vec<String> {
+        match self.parlay(event) {
+            Some(_) => vec!["Loses".into(), "Wins".into()],
+            None => self.catalogue.states(event, count),
+        }
+    }
+
+    fn title(&self, event: u64) -> String {
+        let Some(parlay) = self.parlay(event) else { return self.catalogue.title(event) };
+        let legs: Vec<String> = parlay
+            .legs
+            .iter()
+            .map(|l| format!("{} {}", self.catalogue.label(l.event, l.instrument), if l.yes { "yes" } else { "no" }))
+            .collect();
+        format!("Parlay: {}", legs.join(" + "))
+    }
+
+    /// A parlay's legs as `GET /v4/markets` shows them, each named from the catalogue.
+    fn legs(&self, market: &InstrumentView) -> Vec<Value> {
+        market
+            .legs
+            .iter()
+            .map(|l| {
+                json!({
+                    "eventId": id(l.event), "instrumentId": id(l.instrument), "outcome": if l.yes { "yes" } else { "no" },
+                    "title": self.catalogue.title(l.event), "label": self.catalogue.label(l.event, l.instrument)
+                })
+            })
+            .collect()
+    }
+
+    /// A message from the parlay service for some accounts' private sessions, presented as everything else is. It is
+    /// not kept for sessions resuming by sequence: it is not from the journal and has none.
+    pub fn deliver(&self, accounts: &[u64], message: &Value) {
+        let text = self.present(message.clone()).to_string();
+        for account in accounts {
+            for key in self.by_account.get(account).into_iter().flatten() {
+                if let Some(s) = self.sessions.get(key) {
+                    let _ = s.tx.send(text.clone());
+                }
+            }
+        }
+    }
+
+    /// What the parlay service says, in interface 1's terms: a price it gives as a tick on an instrument becomes a
+    /// price quote from that instrument's ladder, and a time in nanoseconds a timestamp. The service leaves both to
+    /// the gateway, which owns how prices and times are shown.
+    pub fn present(&self, mut value: Value) -> Value {
+        let Some(object) = value.as_object_mut() else { return value };
+        let instrument = object.get("instrumentId").and_then(Value::as_str).and_then(|s| s.parse::<u64>().ok());
+        let tick = object.get("price").and_then(|p| p.get("tick")).and_then(Value::as_u64);
+        if let (Some(instrument), Some(tick)) = (instrument, tick) {
+            object.insert("price".into(), self.quote(instrument, tick));
+        }
+        for key in ["openedAt", "expiresAt"] {
+            if let Some(ns) = object.get(key).and_then(Value::as_u64) {
+                object.insert(key.into(), json!(price::format_timestamp(ns)));
+            }
+        }
+        if let Some(quotes) = object.get_mut("quotes").and_then(Value::as_array_mut) {
+            for quote in quotes.iter_mut() {
+                *quote = self.present(quote.take());
+            }
+        }
+        value
     }
 
     /// How an event was resolved, as `GET /v4/markets` and the `markets` topic show it; null while it is not.
@@ -396,7 +476,7 @@ impl Hub {
         if r.kind == "VOID" {
             return json!({"kind": "void", "at": price::format_timestamp(r.at)});
         }
-        let outcome = self.catalogue.states(event, r.winning_state + 1).pop();
+        let outcome = self.outcomes(event, r.winning_state + 1).get(r.winning_state as usize).cloned();
         json!({
             "kind": "resolved", "winningState": r.winning_state, "outcome": outcome,
             "at": price::format_timestamp(r.at)
@@ -576,16 +656,22 @@ impl Hub {
                     .filter_map(|&instrument| {
                         let i = self.view.instruments.get(&instrument)?;
                         let ladder = ladder(&self.view, instrument);
-                        Some(json!({
-                            "instrumentId": id(instrument), "label": self.catalogue.label(event, instrument),
+                        let parlay = i.class == "PARLAY";
+                        let label = if parlay { "Parlay".to_string() } else { self.catalogue.label(event, instrument) };
+                        let mut market = json!({
+                            "instrumentId": id(instrument), "label": label,
                             "class": i.class.to_lowercase(), "state": i.state.to_lowercase(), "lotStep": i.lot,
                             "ladder": (0..ladder.len() as u64).map(|t| price::quote(ladder, t)).collect::<Vec<_>>()
-                        }))
+                        });
+                        if parlay {
+                            market["legs"] = json!(self.legs(i));
+                        }
+                        Some(market)
                     })
                     .collect();
                 json!({
-                    "eventId": id(event), "title": self.catalogue.title(event),
-                    "outcomes": self.catalogue.states(event, e.state_count), "started": e.started,
+                    "eventId": id(event), "title": self.title(event),
+                    "outcomes": self.outcomes(event, e.state_count), "started": e.started,
                     "suspended": e.suspended, "ended": e.ended, "resolved": e.resolved, "markets": markets,
                     "scheduledStart": (e.scheduled_start > 0).then(|| price::format_timestamp(e.scheduled_start)),
                     "resolution": self.resolution(event)

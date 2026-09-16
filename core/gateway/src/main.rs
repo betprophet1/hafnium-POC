@@ -5,6 +5,7 @@ mod api;
 mod http;
 mod hub;
 mod limits;
+mod parlays;
 mod price;
 mod reactor;
 mod rest;
@@ -27,14 +28,15 @@ use venue_link::submit::Submit;
 use venue_link::wire::{self, Error};
 
 const USAGE: &str = "usage:
-  venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--treasury ADDR]
+  venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--treasury ADDR] [--parlays ADDR]
                 [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
 
 --serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
 /v4/ws_public and GET /v4/markets; private is orders and accounts on /v4/ws_private, /v4/account and /v4/orders,
 and needs --ingress. With --treasury, the private half also passes deposits and withdrawals (/v4/transfers) to the
-treasury there and sends its updates to private sessions; without it, /v4/transfers answers 503. Every flag can also
-be given as VENUE_<FLAG>, for example VENUE_FEED.";
+treasury there and sends its updates to private sessions; without it, /v4/transfers answers 503. --parlays is the
+parlay service (venue-parlays) the private half sends requests for quote (/v4/rfqs) to; without it they are refused
+as unavailable. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
 struct Args(BTreeMap<String, String>);
 
@@ -59,6 +61,10 @@ impl Args {
             .ok()
             .or_else(|| default.map(str::to_string))
             .ok_or_else(|| Error::from(format!("--{key} (or {env}) is required")))
+    }
+
+    fn optional(&self, key: &str) -> Option<String> {
+        self.get(key, None).ok()
     }
 
     fn number(&self, key: &str, default: u32) -> Result<u32, Error> {
@@ -109,6 +115,9 @@ fn run(args: &Args) -> Result<(), Error> {
             let half = start_half(gateway, &feed);
             if !treasury.is_empty() {
                 treasury::follow_updates(&half, treasury);
+            }
+            if let Some(parlays) = args.optional("parlays") {
+                Gateway::connect_parlays(&half, &parlays);
             }
             Some(half)
         } else {

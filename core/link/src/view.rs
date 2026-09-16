@@ -226,6 +226,17 @@ impl View {
                     });
                 }
             }
+            // E-15.7: processed as `ResolveEvent` `RESOLVED` on the parlay's event, to the lowest state outside its
+            // mask, so a follower of resolutions sees it as one.
+            "ExpireParlay" if applied => {
+                if let Some(parlay) = self.instruments.get(&u(&input["instrumentId"])) {
+                    let losing = (0..64).find(|s| parlay.mask >> s & 1 == 0).unwrap_or(0);
+                    if let Some(e) = self.events.get_mut(&parlay.event) {
+                        e.resolution =
+                            Some(Resolution { kind: "RESOLVED".into(), winning_state: losing, case_id: 0, at: now });
+                    }
+                }
+            }
             _ => {}
         }
         for r in &unit.results {
@@ -475,6 +486,18 @@ mod tests {
                               "side": "SELL", "tick": 4, "quantity": 10});
         view.apply(&Unit { input: order, results: vec![accepted] });
         assert_eq!(view.orders[&77].expires_at, Some(5_000));
+    }
+
+    #[test]
+    fn an_expired_parlay_is_resolved_to_its_losing_state() {
+        let mut view = View::default();
+        view.apply(&unit(json!({"msg": "DefineEvent", "eventId": 9, "stateCount": 2, "scheduledStart": 0}), 1, true));
+        let list = json!({"msg": "ListInstrument", "instrumentId": 9, "eventId": 9, "instrumentClass": "PARLAY",
+                          "stateMask": 2, "tickTableId": 2, "lotStep": 10, "legs": []});
+        view.apply(&unit(list, 2, true));
+        view.apply(&unit(json!({"msg": "ExpireParlay", "instrumentId": 9, "causingEventId": 1}), 3, true));
+        let expected = Resolution { kind: "RESOLVED".into(), winning_state: 0, case_id: 0, at: 3 };
+        assert_eq!(view.events[&9].resolution, Some(expected));
     }
 
     #[test]

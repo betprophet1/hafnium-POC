@@ -3,11 +3,12 @@
 
 use crate::hub::{self, id, Hub};
 use crate::limits::{monotonic, Bucket};
+use crate::parlays::{self, Parlays};
 use crate::price::{self, PriceError};
 use crate::treasury::Treasury;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 use venue_link::submit::{self, Notify, Submit};
 use venue_link::wire;
@@ -37,12 +38,17 @@ enum Answer {
     MassCancel,
 }
 
-/// A request the node has been given and has not answered yet, with the account whose result it will be and what
-/// kind of answer its results make.
+/// A request given to the node or the parlay service and not answered yet, with the account whose result it will be.
 pub struct Pending {
     account: u64,
-    answer: Answer,
-    inner: submit::Pending,
+    inner: Inner,
+}
+
+enum Inner {
+    /// Given to the node, with what kind of answer its results make.
+    Node(Answer, submit::Pending),
+    /// Given to the parlay service, which answers in interface 1's terms already.
+    Parlays(parlays::Pending),
 }
 
 #[derive(Clone, Copy)]
@@ -111,6 +117,12 @@ fn price_error(e: PriceError) -> ApiError {
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A request for quote's ID, as the parlay service chooses them.
+fn request_id(text: &str) -> Result<&str, ApiError> {
+    let ok = (1..=32).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase());
+    ok.then_some(text).ok_or_else(|| ApiError::bad("requestId must be 1 to 32 digits and lower-case letters"))
 }
 
 pub fn parse_id(text: &str, name: &str) -> Result<u64, ApiError> {
@@ -210,9 +222,11 @@ impl Half {
         let path = path.split('?').next().unwrap_or("");
         match path {
             "/v4/ws_public" | "/v4/markets" => Some(Self::Public),
-            "/v4/ws_private" | "/v4/account" | "/v4/orders" | "/v4/transfers" => Some(Self::Private),
+            "/v4/ws_private" | "/v4/account" | "/v4/orders" | "/v4/transfers" | "/v4/rfqs" => Some(Self::Private),
             p if p.starts_with("/v4/markets/") => Some(Self::Public),
-            p if p.starts_with("/v4/orders/") || p.starts_with("/v4/transfers/") => Some(Self::Private),
+            p if p.starts_with("/v4/orders/") || p.starts_with("/v4/transfers/") || p.starts_with("/v4/rfqs/") => {
+                Some(Self::Private)
+            }
             _ => None,
         }
     }
@@ -224,6 +238,8 @@ pub struct Gateway {
     /// Pipelined, so no client waits on another's round trip to the node. The public half has none: nothing it
     /// serves ever reaches the node (blueprint §9).
     ingress: Option<Submit>,
+    /// Where requests for quote go (`parlays.rs`), for a private half given one.
+    parlays: OnceLock<Parlays>,
     pub limits: Limits,
     rest_buckets: Mutex<BTreeMap<u64, Bucket>>,
     logon_buckets: Mutex<BTreeMap<u64, Bucket>>,
@@ -247,6 +263,7 @@ impl Gateway {
             half,
             hub: Mutex::new(hub),
             ingress,
+            parlays: OnceLock::new(),
             limits,
             rest_buckets: Mutex::new(BTreeMap::new()),
             logon_buckets: Mutex::new(BTreeMap::new()),
@@ -305,7 +322,7 @@ impl Gateway {
             eprintln!("gateway: ingress: {e}");
             unavailable()
         })?;
-        Ok(Pending { account, answer, inner })
+        Ok(Pending { account, inner: Inner::Node(answer, inner) })
     }
 
     /// The client's answer from a request's results.
@@ -327,26 +344,121 @@ impl Gateway {
     /// answered in one go and cannot be left outstanding.
     #[cfg(test)]
     pub fn wait_for(&self, pending: Pending) -> Result<Value, ApiError> {
-        let (account, answer) = (pending.account, pending.answer);
-        match pending.inner.wait() {
-            Ok(results) => Ok(self.outcome(account, answer, &results)),
-            Err(e) => {
-                eprintln!("gateway: ingress: {e}");
-                Err(unavailable())
-            }
+        match pending.inner {
+            Inner::Node(answer, inner) => match inner.wait() {
+                Ok(results) => Ok(self.outcome(pending.account, answer, &results)),
+                Err(e) => {
+                    eprintln!("gateway: ingress: {e}");
+                    Err(unavailable())
+                }
+            },
+            Inner::Parlays(inner) => self.parlay_answer(inner.wait()),
         }
     }
 
     /// The answer to a request the node has answered, or `None` while it has not. A caller that submitted with a
     /// notify asks again when it is told.
     pub fn finish(&self, pending: &Pending) -> Option<Result<Value, ApiError>> {
-        Some(match pending.inner.take()? {
-            Ok(results) => Ok(self.outcome(pending.account, pending.answer, &results)),
-            Err(e) => {
-                eprintln!("gateway: ingress: {e}");
-                Err(unavailable())
-            }
+        Some(match &pending.inner {
+            Inner::Node(answer, inner) => match inner.take()? {
+                Ok(results) => Ok(self.outcome(pending.account, *answer, &results)),
+                Err(e) => {
+                    eprintln!("gateway: ingress: {e}");
+                    Err(unavailable())
+                }
+            },
+            Inner::Parlays(inner) => self.parlay_answer(inner.take()?),
         })
+    }
+
+    /// Connects this half to the parlay service at `addr`: requests for quote go there, and what it sends for an
+    /// account's sessions is delivered to them. A half without one refuses requests for quote as unavailable.
+    pub fn connect_parlays(gateway: &Arc<Self>, addr: &str) {
+        let half = Arc::downgrade(gateway);
+        let deliver: parlays::Deliver = Arc::new(move |accounts, message| {
+            if let Some(gateway) = half.upgrade() {
+                gateway.hub().deliver(accounts, message);
+            }
+        });
+        let _ = gateway.parlays.set(Parlays::spawn(addr, deliver));
+    }
+
+    /// Gives a call to the parlay service for `account`, without waiting for its answer.
+    fn ask_parlays(&self, account: u64, mut call: Value, notify: Option<Notify>) -> Result<Pending, ApiError> {
+        let service = self.parlays.get().ok_or_else(|| {
+            ApiError::unavailable("requests for quote are not served here: this gateway has no parlay service")
+        })?;
+        call["accountId"] = json!(account);
+        let inner = service.call(call, notify).map_err(|e| {
+            eprintln!("gateway: parlay service: {e}");
+            ApiError::unavailable("the parlay service is not taking requests; nothing was requested")
+        })?;
+        Ok(Pending { account, inner: Inner::Parlays(inner) })
+    }
+
+    /// The client's answer from the parlay service's: its refusal is passed on as the edge refusal it is.
+    fn parlay_answer(&self, answer: parlays::Answer) -> Result<Value, ApiError> {
+        match answer {
+            Ok(result) => Ok(self.hub().present(result)),
+            Err((status, code, message)) => {
+                let code = match code.as_str() {
+                    "BAD_REQUEST" => "BAD_REQUEST",
+                    "NOT_FOUND" => "NOT_FOUND",
+                    _ => "UNAVAILABLE",
+                };
+                Err(ApiError::new(status, code, message))
+            }
+        }
+    }
+
+    /// POST /v4/rfqs and the WebSocket `requestQuote` op: the legs' shape is checked here, and whether they make a
+    /// parlay by the service, which has the venue's picture to judge it by.
+    pub fn request_quote_pending(
+        &self,
+        account: u64,
+        body: &Value,
+        notify: Option<Notify>,
+    ) -> Result<Pending, ApiError> {
+        let fields = only(body, &["legs", "quantity"])?;
+        let legs = fields
+            .get("legs")
+            .and_then(Value::as_array)
+            .filter(|legs| (2..=6).contains(&legs.len()))
+            .ok_or_else(|| ApiError::bad("legs must be a list of 2 to 6 legs"))?;
+        let legs = legs
+            .iter()
+            .map(|leg| {
+                let leg = only(leg, &["instrumentId", "outcome"])?;
+                let yes = match leg.get("outcome").and_then(Value::as_str) {
+                    Some("yes") => true,
+                    Some("no") => false,
+                    _ => return Err(ApiError::bad("a leg's outcome must be yes or no")),
+                };
+                Ok(json!({"instrumentId": id_field(leg, "instrumentId")?, "yes": yes}))
+            })
+            .collect::<Result<Vec<Value>, ApiError>>()?;
+        let quantity = integer(fields, "quantity", 1, u64::from(u32::MAX))?
+            .ok_or_else(|| ApiError::bad("quantity is required"))?;
+        self.ask_parlays(account, json!({"op": "request", "legs": legs, "quantity": quantity}), notify)
+    }
+
+    /// GET /v4/rfqs/{requestId}: one of the account's own requests.
+    pub fn rfq_pending(&self, account: u64, request: &str, notify: Option<Notify>) -> Result<Pending, ApiError> {
+        let request = request_id(request)?;
+        self.ask_parlays(account, json!({"op": "status", "requestId": request}), notify)
+    }
+
+    /// POST /v4/rfqs/{requestId}/quotes and the WebSocket `attachQuote` op.
+    pub fn attach_quote_pending(
+        &self,
+        account: u64,
+        body: &Value,
+        notify: Option<Notify>,
+    ) -> Result<Pending, ApiError> {
+        let fields = only(body, &["requestId", "orderId"])?;
+        let request = request_id(fields.get("requestId").and_then(Value::as_str).unwrap_or(""))?;
+        let order = id_field(fields, "orderId")?;
+        self.ask_parlays(account, json!({"op": "quote", "requestId": request, "orderId": order}), notify)
     }
 
     /// The input for a new order, once it has passed every check the gateway makes.

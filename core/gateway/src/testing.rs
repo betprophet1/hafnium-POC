@@ -1,6 +1,6 @@
 //! A whole gateway for tests, started the way `main` starts one: a real node of its own on free local ports,
-//! seeded with the mini venue's catalogue, and a gateway that sends to it, follows its feed, conflates its books and
-//! serves connections on a port of its own. What a test sees is what the engine and the gateway actually do.
+//! seeded with the mini venue's catalogue, a parlay service following it, and a gateway that sends to both, follows
+//! the node's feed, conflates its books and serves connections on a port of its own. What a test sees is what the engine and the gateway actually do.
 
 use crate::api::{Gateway, Limits};
 use crate::hub::Hub;
@@ -21,6 +21,14 @@ pub const MAKER_TOKEN: &str = "dev-market-maker";
 /// Its retail customer, funded with 50 000 cents; its dev token.
 pub const RETAIL: u64 = 2;
 pub const RETAIL_TOKEN: &str = "dev-retail-customer";
+/// The synthetic maker, the catalogue's registered responder to requests for quote; its dev token.
+pub const RESPONDER_TOKEN: &str = "dev-synthetic-maker";
+
+/// The first market of round 1 of a catalogue template: 1 is rain, 2 the football (Arsenal, Draw, Chelsea), 3
+/// bitcoin.
+pub const fn market(template: u64, index: u64) -> u64 {
+    catalogue::instrument_id(catalogue::event_id(template, 1), index)
+}
 
 /// How far behind a test's clients may fall before the gateway drops them: small, so a test can get there quickly,
 /// and still past tungstenite's own 128 KiB of batching.
@@ -128,6 +136,16 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
     if let Some(address) = treasury {
         crate::treasury::follow_updates(&gateway, address);
     }
+    let parlays = free_address();
+    let config = venue_parlays::service::Config {
+        ingress: ingress.clone(),
+        feed: feed.clone(),
+        listen: parlays.clone(),
+        window_seconds: 30,
+        max_parlays: 20,
+    };
+    venue_parlays::service::start(Catalogue::load(CATALOGUE).expect("the catalogue"), &config).expect("parlay service");
+    Gateway::connect_parlays(&gateway, &parlays);
     let public_half = crate::start_half(Gateway::public(hub(), limits), &feed);
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
     let address = listener.local_addr().expect("its address").to_string();

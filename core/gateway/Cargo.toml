@@ -22,3 +22,5 @@ mio = { version = "1", default-features = false, features = ["os-poll", "net"] }
 venue-node = { path = "../node" }
 # And deposits and withdrawals against a real treasury.
 venue-treasury = { path = "../treasury" }
+# Requests for quote are tested against the parlay service itself, beside the node.
+venue-parlays = { path = "../parlays" }
