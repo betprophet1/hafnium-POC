@@ -28,6 +28,11 @@ use venue_node::frames::{read_frame, write_frame, MAX_FRAME};
 /// backpressure long before memory becomes a problem.
 const QUEUE_DEPTH: usize = 1024;
 
+/// Where `ResultHeader.inputSequence` sits in a result. The schema puts that header first in every result's body
+/// (`interfaces/sbe/venue-journal.xml`), after SBE's fixed message header, which is
+/// `venue_journal::message_header_codec::ENCODED_LENGTH` bytes.
+const INPUT_SEQUENCE: usize = 8;
+
 /// What the node said: one raw SBE frame per result, decoded by whoever asked.
 type Frames = Vec<Vec<u8>>;
 type Answer = SyncSender<Result<Frames, String>>;
@@ -129,10 +134,18 @@ fn generation(stream: TcpStream, requests: &Receiver<Request>) -> Result<(), Err
     outcome
 }
 
-/// Matches each batch of results, terminated by an empty frame, to the oldest request still waiting.
+/// The input a result answers. None if the frame is too short to carry a result header at all.
+fn input_sequence(frame: &[u8]) -> Option<u64> {
+    let bytes: [u8; 8] = frame.get(INPUT_SEQUENCE..INPUT_SEQUENCE + 8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+/// Matches each batch of results, terminated by an empty frame, to the oldest request still waiting, checking as
+/// it goes that the stream still lines up with that queue.
 fn read_results(stream: TcpStream, pending: &Mutex<VecDeque<Answer>>) {
     let mut reader = BufReader::new(stream);
     let mut frame = Vec::new();
+    let mut last = 0u64;
     loop {
         let mut batch = Frames::new();
         loop {
@@ -142,6 +155,18 @@ fn read_results(stream: TcpStream, pending: &Mutex<VecDeque<Answer>>) {
                 Ok(None) | Err(_) => return fail_pending(pending),
             }
         }
+        // Requests are answered by position, so the stream has to stay in step with the queue. The node commits
+        // inputs in order and answers each with one batch, so the input a batch names must climb; if it does not,
+        // this connection is not what this thread thinks it is, and passing the batch on would hand a caller
+        // another caller's results. An empty batch names no input and is perfectly normal: a mass cancel that
+        // cancels nothing emits only its terminator, since E-5.2 gives `MassCancel` no outcome result.
+        if let Some(first) = batch.first() {
+            let Some(sequence) = input_sequence(first) else { return fail_pending(pending) };
+            if sequence <= last {
+                return fail_pending(pending);
+            }
+            last = sequence;
+        }
         let waiting = locked(pending).pop_front();
         match waiting {
             Some(answer) => {
@@ -149,6 +174,33 @@ fn read_results(stream: TcpStream, pending: &Mutex<VecDeque<Answer>>) {
             }
             // Results with nothing waiting for them mean the stream is not what this thread thinks it is.
             None => return fail_pending(pending),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{input_sequence, INPUT_SEQUENCE};
+
+    /// A result frame: SBE's message header, then the body, which starts with `ResultHeader.inputSequence`.
+    fn result_frame(sequence: u64) -> Vec<u8> {
+        let mut frame = vec![0u8; INPUT_SEQUENCE];
+        frame.extend_from_slice(&sequence.to_le_bytes());
+        frame.extend_from_slice(&[0u8; 14]); // the rest of ResultHeader and the body
+        frame
+    }
+
+    #[test]
+    fn a_result_names_the_input_it_answers() {
+        assert_eq!(input_sequence(&result_frame(1)), Some(1));
+        assert_eq!(input_sequence(&result_frame(u64::MAX)), Some(u64::MAX));
+    }
+
+    #[test]
+    fn a_frame_too_short_to_be_a_result_names_nothing() {
+        // Rather than read whatever follows in memory: the caller fails the connection instead.
+        for len in 0..INPUT_SEQUENCE + 8 {
+            assert_eq!(input_sequence(&vec![0u8; len]), None, "length {len}");
         }
     }
 }

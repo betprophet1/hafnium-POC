@@ -484,3 +484,51 @@ fn typed(kind: &str, mut body: Value) -> String {
     body["type"] = json!(kind);
     body.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The mini venue's catalogue: a hub needs one, and these tests need nothing from it.
+    fn hub() -> Hub {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/charts/venue-mini/files/markets.json");
+        Hub::new(Catalogue::load(path).expect("the mini venue's catalogue"))
+    }
+
+    /// One unit off the feed: the input with its record header, and the results it produced.
+    fn unit(sequence: u64, results: Vec<Value>) -> Unit {
+        let record = json!({"sequence": sequence, "sequencedAt": 0, "sequencerGroup": 1});
+        Unit { input: json!({"msg": "NewOrder", "record": record}), results }
+    }
+
+    fn accepted(order: u64) -> Value {
+        json!({"msg": "OrderAccepted", "orderId": order, "accountId": 1, "instrumentId": 1000,
+               "side": "BUY", "tick": 9, "quantity": 1})
+    }
+
+    #[test]
+    fn an_accepted_order_resolves_before_the_feed_has_delivered_it() {
+        let mut hub = hub();
+        assert_eq!(hub.order(7), None);
+        // The node has answered the client, and the feed has not arrived yet. Without the record the client would
+        // be told there is no such order, moments after the node accepted it.
+        hub.accept(7, 5, 1, 1000);
+        assert_eq!(hub.order(7), Some((1, 1000)));
+        // The feed catches up with that same input, and says the same thing.
+        hub.apply(&unit(5, vec![accepted(7)]));
+        assert_eq!(hub.order(7), Some((1, 1000)));
+        // Once the feed says the order has gone, it has gone: the record must not bring it back.
+        let cancelled = json!({"msg": "OrderCancelled", "orderId": 7, "accountId": 1, "instrumentId": 1000});
+        hub.apply(&unit(6, vec![cancelled]));
+        assert_eq!(hub.order(7), None);
+    }
+
+    #[test]
+    fn a_record_the_view_has_already_passed_is_not_kept() {
+        let mut hub = hub();
+        hub.apply(&unit(6, Vec::new()));
+        // There is nothing to remember: the view has applied input 6, so it has already seen whatever input 3 did.
+        hub.accept(8, 3, 1, 1000);
+        assert_eq!(hub.order(8), None);
+    }
+}
