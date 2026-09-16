@@ -53,6 +53,16 @@ pub struct InstrumentView {
     pub bids: BTreeMap<u64, (u64, u64)>,
     pub asks: BTreeMap<u64, (u64, u64)>,
     pub last: Option<u64>,
+    /// A parlay's legs, in the canonical order `ListInstrument` gave them; empty for every other class.
+    pub legs: Vec<Leg>,
+}
+
+/// One leg of a parlay: the market, and whether the parlay needs its YES (rather than its NO) to pay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Leg {
+    pub event: u64,
+    pub instrument: u64,
+    pub yes: bool,
 }
 
 impl InstrumentView {
@@ -80,6 +90,8 @@ pub struct OrderView {
     pub side: String,
     pub tick: u64,
     pub remaining: u64,
+    /// When a GTD order lapses (E-8.1), from the `NewOrder` that placed it: `OrderAccepted` does not say.
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -166,6 +178,16 @@ impl View {
                     mask: u(&input["stateMask"]),
                     class: s(&input["instrumentClass"]),
                     state: "LISTED".into(),
+                    legs: input["legs"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|l| Leg {
+                            event: u(&l["legEventId"]),
+                            instrument: u(&l["legInstrumentId"]),
+                            yes: l["legOutcome"] == "YES",
+                        })
+                        .collect(),
                     ..InstrumentView::default()
                 };
                 self.instruments.insert(id, inst);
@@ -209,6 +231,15 @@ impl View {
         for r in &unit.results {
             self.result(r);
         }
+        if input["msg"] == "NewOrder" {
+            if let Some(expires) = input["expiresAt"].as_u64() {
+                for r in unit.results.iter().filter(|r| r["msg"] == "OrderAccepted") {
+                    if let Some(o) = self.orders.get_mut(&u(&r["orderId"])) {
+                        o.expires_at = Some(expires);
+                    }
+                }
+            }
+        }
     }
 
     fn set_remaining(&mut self, order: u64, remaining: u64) {
@@ -251,6 +282,7 @@ impl View {
                     side: s(&r["side"]),
                     tick: u(&r["tick"]),
                     remaining: u(&r["quantity"]),
+                    expires_at: None,
                 };
                 self.orders.insert(u(&r["orderId"]), order);
             }
@@ -320,7 +352,8 @@ impl View {
                             "id": iid, "label": catalogue.label(id, *iid), "class": i.class, "mask": i.mask,
                             "state": i.state, "table": i.table, "lot": i.lot, "last": i.last,
                             "bids": i.bids.iter().rev().map(|(t, (q, c))| json!([t, q, c])).collect::<Vec<_>>(),
-                            "asks": i.asks.iter().map(|(t, (q, c))| json!([t, q, c])).collect::<Vec<_>>()
+                            "asks": i.asks.iter().map(|(t, (q, c))| json!([t, q, c])).collect::<Vec<_>>(),
+                            "legs": i.legs.iter().map(|l| json!({"event": l.event, "instrument": l.instrument, "yes": l.yes})).collect::<Vec<_>>()
                         }))
                     })
                     .collect();
@@ -423,6 +456,25 @@ mod tests {
         assert!(e.suspended_ever && !e.suspended);
         let expected = Resolution { kind: "RESOLVED".into(), winning_state: 2, case_id: 501, at: 300 };
         assert_eq!(e.resolution, Some(expected));
+    }
+
+    #[test]
+    fn a_parlay_keeps_its_legs_and_a_gtd_order_its_expiry() {
+        let mut view = View::default();
+        let legs = json!([{"legEventId": 1, "legInstrumentId": 100, "legOutcome": "YES"},
+                          {"legEventId": 2, "legInstrumentId": 201, "legOutcome": "NO"}]);
+        let list = json!({"msg": "ListInstrument", "instrumentId": 9, "eventId": 9, "instrumentClass": "PARLAY",
+                          "stateMask": 2, "tickTableId": 2, "lotStep": 10, "legs": legs});
+        view.apply(&unit(list, 1, true));
+        let expected =
+            vec![Leg { event: 1, instrument: 100, yes: true }, Leg { event: 2, instrument: 201, yes: false }];
+        assert_eq!(view.instruments[&9].legs, expected);
+        let mut order = json!({"msg": "NewOrder", "accountId": 10, "instrumentId": 9, "expiresAt": 5_000});
+        order["record"] = json!({"sequence": 2, "sequencedAt": 2, "sequencerGroup": 1});
+        let accepted = json!({"msg": "OrderAccepted", "orderId": 77, "accountId": 10, "instrumentId": 9,
+                              "side": "SELL", "tick": 4, "quantity": 10});
+        view.apply(&Unit { input: order, results: vec![accepted] });
+        assert_eq!(view.orders[&77].expires_at, Some(5_000));
     }
 
     #[test]

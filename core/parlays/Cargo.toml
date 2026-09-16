@@ -1,0 +1,17 @@
+[package]
+name = "venue-parlays"
+version = "0.1.0"
+description = "The parlay service: lists parlays on request, routes requests for quote, and settles parlays from their legs"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+venue-link = { path = "../link" }
+serde_json = "1"
+# The parlay's ID is a hash of its canonical legs (blueprint §6); the node already builds with this crate.
+sha2 = "0.11"

@@ -369,6 +369,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "venue-parlays"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+ "venue-link",
+]
+
+[[package]]
 name = "venue-sim"
 version = "0.1.0"
 dependencies = [
