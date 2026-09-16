@@ -18,7 +18,7 @@ RUN useradd --system --uid 10001 --home-dir /var/lib/venue venue \
 COPY --from=build /src/core/target/release/venue-node /src/core/target/release/venue-gateway /src/core/target/release/venue-sim /src/core/target/release/venue-treasury /usr/local/bin/
 USER 10001
 ENV VENUE_LISTEN=0.0.0.0:7101 VENUE_DATA=/var/lib/venue
-EXPOSE 7101 7102 8080 8081 8083
+EXPOSE 7101 7102 8080 8081 8082 8083
 VOLUME /var/lib/venue
 ENTRYPOINT ["tini", "--", "venue-node"]
 CMD ["serve"]

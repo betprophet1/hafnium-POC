@@ -6,8 +6,9 @@ through ArgoCD. There is no compose file; the laptop runs the same chart.
 | Path | What it is |
 |---|---|
 | `images/venue-node.Dockerfile` | The image `venue`: `venue-node`, `venue-gateway`, `venue-sim` and `venue-treasury`, built from the repository root |
-| `charts/venue-mini/` | The chart: the core, the gateway, the dummy treasury, a seed job for the demo markets, synthetic maker and taker, the web page, network policies and a `helm test` smoke test |
+| `charts/venue-mini/` | The chart: the core, the gateway, the dummy treasury, a seed job for the demo markets, the dummy oracle, synthetic maker and taker, the web page, network policies and a `helm test` smoke test |
 | `charts/venue-mini/files/markets.json` | The demo catalogue: accounts with their dev tokens and tabs, markets and their outcome names |
+| `charts/venue-mini/files/calendar.json` | The dummy oracle's calendar: how often each market lists a new round, its timings, and the resolution timers (`core/sim/README.md`) |
 | `laptop.sh` | `up`, `web`, `restart` and `down` for a local k3d cluster |
 
 ## On a laptop
@@ -22,13 +23,17 @@ deploy/laptop.sh web    # then open http://127.0.0.1:8080
 The page has an order book and four tabs. The market maker and retail customer tabs are private WebSocket sessions on
 the gateway (`/v4/ws_private`), each logged in with its account's dev token, and the book comes from a public one
 (`/v4/ws_public`); the account tab deposits and withdraws for either account through the dummy treasury and shows its
-cash, positions and transfers; settlement drives the dummy oracle (start, suspend, end, close,
-resolve, void, and list a new round). The synthetic maker quotes over a WebSocket session with cancel-on-disconnect
+cash, positions and transfers. Markets run on their own: the dummy oracle (`oracle.enabled`, on by default) lists a new round of
+each market every few minutes and starts, ends, closes and settles it through two dummy sources, an auto-approver and
+a 30 s dispute window, voiding one now and then. The settlement tab shows its schedule, countdowns and resolution
+cases, and acts through it: start, suspend, end, close, postpone, propose an outcome or a void, dispute, and list a
+round now. The synthetic maker quotes over a WebSocket session with cancel-on-disconnect
 (delete its pod and its quotes leave the book until the new pod logs in), and the synthetic taker trades over REST.
 The same port also serves the gateway itself under `/v4`:
 
 ```sh
-curl -s localhost:8080/v4/markets
+curl -s localhost:8080/v4/markets?resolved=false
+curl -s localhost:8080/oracle/schedule
 curl -s -H 'Authorization: Bearer dev-retail-customer' localhost:8080/v4/account
 curl -s -H 'Authorization: Bearer dev-retail-customer' localhost:8080/v4/transfers \
   -d '{"clientTransferId": "d1", "kind": "deposit", "amountCents": 10000, "method": "dummy_bank"}'
@@ -51,5 +56,8 @@ it is ready. `down` deletes the cluster and the journal with it.
 - **Seeding is idempotent.** The seed job runs after every install and upgrade; its commands have fixed IDs.
 - **Not production.** Production runs the core on dedicated hosts behind Aeron Cluster (blueprint §5, §9). Tokens are
   fixed dev tokens, and the page and operator actions are unauthenticated; never expose them outside the cluster.
-- **Not yet in the chart:** the resolution console behind the dummy oracle, RFQ responders, the scenario player and
-  the environment manifest of §16.
+- **One oracle, bounded by the core's capacity.** The oracle is `replicas: 1` with `Recreate`, so two never act on a
+  round. The engine never frees a market, so with the `small` profile the calendar lists for about ten hours before
+  the oracle stops listing short of the ceiling; `down` and `up` start a fresh journal.
+- **Not yet in the chart:** the resolution console behind the dummy oracle (its cases live in the oracle process), RFQ
+  responders, the scenario player and the environment manifest of §16.

@@ -1,8 +1,11 @@
-The mini venue {{ .Release.Name }} is installed: the core, the gateway (interface 1), {{ if .Values.treasury.enabled }}the dummy treasury, {{ end }}the demo markets{{ if .Values.web.enabled }}, the web page{{ end }} and synthetic traders.
+The mini venue {{ .Release.Name }} is installed: the core, the gateway (interface 1), {{ if .Values.treasury.enabled }}the dummy treasury, {{ end }}the demo markets{{ if .Values.oracle.enabled }} on the dummy oracle's calendar{{ end }}{{ if .Values.web.enabled }}, the web page{{ end }} and synthetic traders.
 
   deploy/laptop.sh web                      then open http://127.0.0.1:8080 (the page, and the gateway under /v4)
   helm test {{ .Release.Name }} --logs                 smoke test through the core's ingress
   kubectl logs deploy/{{ include "venue-mini.fullname" . }}-gateway     what the gateway refuses, and why
+{{- if .Values.oracle.enabled }}
+  kubectl logs deploy/{{ include "venue-mini.fullname" . }}-oracle      what the dummy oracle listed, ran and settled
+{{- end }}
 
 The core updates only when its pod is deleted (OnDelete); a new pod replays the journal before it is ready:
 

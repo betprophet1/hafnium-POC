@@ -1,0 +1,102 @@
+{{- if .Values.oracle.enabled }}
+{{- $name := include "venue-mini.fullname" . }}
+{{- $core := printf "%s-core" $name }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-calendar
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+data:
+  calendar.json: |
+    {{- .Files.Get "files/calendar.json" | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-oracle
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: oracle
+spec:
+  selector:
+    {{- include "venue-mini.selector" (dict "ctx" . "component" "oracle") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8082
+      targetPort: http
+---
+# The dummy oracle (blueprint §16): lists, runs and settles the demo markets on the calendar, through the core's
+# ingress, and serves its control API to the web page. No authentication: reach it only through the page. Exactly one
+# replica, replaced rather than rolled, so two oracles never act on the same round.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-oracle
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: oracle
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "oracle") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" . | nindent 8 }}
+        app.kubernetes.io/component: oracle
+      annotations:
+        # A changed calendar replaces the pod, which reads the file only at start.
+        checksum/calendar: {{ .Files.Get "files/calendar.json" | sha256sum }}
+    spec:
+      securityContext:
+        {{- include "venue-mini.podSecurity" . | nindent 8 }}
+      containers:
+        - name: oracle
+          image: {{ include "venue-mini.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["tini", "--", "venue-sim", "oracle"]
+          env:
+            - name: VENUE_LISTEN
+              value: "0.0.0.0:8082"
+            - name: VENUE_INGRESS
+              value: "{{ $core }}:7101"
+            - name: VENUE_FEED
+              value: "{{ $core }}:7102"
+            - name: VENUE_CATALOGUE
+              value: /catalogue/markets.json
+            - name: VENUE_CALENDAR
+              value: /calendar/calendar.json
+            # Listing stops short of the node's capacities, so the oracle reads the profile the core runs with.
+            - name: VENUE_CAPACITY
+              value: {{ .Values.core.capacity | quote }}
+          ports:
+            - name: http
+              containerPort: 8082
+          readinessProbe:
+            httpGet:
+              path: /oracle/healthz
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+          securityContext:
+            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: catalogue
+              mountPath: /catalogue
+            - name: calendar
+              mountPath: /calendar
+      volumes:
+        - name: catalogue
+          configMap:
+            name: {{ $name }}-catalogue
+        - name: calendar
+          configMap:
+            name: {{ $name }}-calendar
+{{- end }}

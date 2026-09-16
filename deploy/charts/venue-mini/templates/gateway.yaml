@@ -98,7 +98,7 @@ spec:
   policyTypes: [Ingress]
   ingress:
     - from:
-        {{- range list "gateway" "treasury" "web" "seed" "smoke" }}
+        {{- range list "gateway" "treasury" "web" "seed" "smoke" "oracle" }}
         - podSelector:
             matchLabels:
               {{- include "venue-mini.selector" (dict "ctx" $ "component" .) | nindent 14 }}
