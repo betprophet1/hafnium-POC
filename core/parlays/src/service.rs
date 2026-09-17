@@ -88,6 +88,9 @@ fn unavailable(message: impl Into<String>) -> Failure {
 struct Quote {
     tick: u64,
     remaining: u64,
+    /// Contracts of the quote bought so far, by anyone. `remaining` alone read as a fill of nothing once the quote
+    /// was taken in full: a filled quote with zero contracts.
+    filled: u64,
     expires_at: Option<u64>,
     /// `open`, `filled`, `expired` or `cancelled`.
     state: &'static str,
@@ -118,8 +121,8 @@ struct State {
 }
 
 /// A change to one order: its order ID, then what it now has remaining, its new tick, and how it left the book, each
-/// if the result says.
-type Update = (u64, Option<u64>, Option<u64>, Option<&'static str>);
+/// if the result says, and the contracts it just traded.
+type Update = (u64, Option<u64>, Option<u64>, Option<&'static str>, u64);
 
 impl State {
     /// Follows the orders that are quotes through one unit's results, and returns the requester's news.
@@ -129,22 +132,23 @@ impl State {
             let u = |name: &str| r[name].as_u64().unwrap_or(0);
             let updates: Vec<Update> = match r["msg"].as_str() {
                 Some("Fill") => vec![
-                    (u("makerOrderId"), Some(u("makerRemaining")), None, None),
-                    (u("takerOrderId"), Some(u("takerRemaining")), None, None),
+                    (u("makerOrderId"), Some(u("makerRemaining")), None, None, u("quantity")),
+                    (u("takerOrderId"), Some(u("takerRemaining")), None, None, u("quantity")),
                 ],
                 Some("OrderCancelled") => {
                     let state = if r["reason"] == "EXPIRED" { "expired" } else { "cancelled" };
-                    vec![(u("orderId"), None, None, Some(state))]
+                    vec![(u("orderId"), None, None, Some(state), 0)]
                 }
-                Some("OrderReduced") => vec![(u("orderId"), Some(u("remainingQuantity")), None, None)],
-                Some("OrderAmended") => vec![(u("orderId"), Some(u("quantity")), Some(u("tick")), None)],
+                Some("OrderReduced") => vec![(u("orderId"), Some(u("remainingQuantity")), None, None, 0)],
+                Some("OrderAmended") => vec![(u("orderId"), Some(u("quantity")), Some(u("tick")), None, 0)],
                 _ => continue,
             };
-            for (order, remaining, tick, gone) in updates {
+            for (order, remaining, tick, gone, traded) in updates {
                 let Some(request) = self.by_order.get(&order) else { continue };
                 let Some(quote) = self.requests.get_mut(request).and_then(|r| r.quotes.get_mut(&order)) else {
                     continue;
                 };
+                quote.filled += traded;
                 if let Some(remaining) = remaining {
                     quote.remaining = remaining;
                     if remaining == 0 {
@@ -180,7 +184,7 @@ impl State {
 fn quote_json(request: &str, parlay: u64, order: u64, quote: &Quote) -> Value {
     json!({
         "requestId": request, "orderId": id(order), "instrumentId": id(parlay), "price": {"tick": quote.tick},
-        "quantity": quote.remaining, "expiresAt": quote.expires_at, "state": quote.state
+        "quantity": quote.remaining, "filled": quote.filled, "expiresAt": quote.expires_at, "state": quote.state
     })
 }
 
@@ -522,8 +526,13 @@ impl Service {
         let Some(resting) = state.view.orders.get(&order).cloned() else {
             return Err(not_found("no such resting order"));
         };
-        let quote =
-            Quote { tick: resting.tick, remaining: resting.remaining, expires_at: resting.expires_at, state: "open" };
+        let quote = Quote {
+            tick: resting.tick,
+            remaining: resting.remaining,
+            filled: 0,
+            expires_at: resting.expires_at,
+            state: "open",
+        };
         let message = quote_json(&name, parlay, order, &quote);
         let requester = {
             let request = state.requests.get_mut(&name).ok_or_else(|| not_found("no such request"))?;

@@ -719,7 +719,11 @@ mod tests {
             .sum();
         assert_eq!(filled, 20, "{taken}");
         let gone = requester.streamed_message(|m| m["type"] == "quote" && m["state"] != "open");
-        assert_eq!((gone["state"].as_str(), gone["quantity"].as_u64()), (Some("filled"), Some(0)), "{gone}");
+        assert_eq!(
+            (gone["state"].as_str(), gone["quantity"].as_u64(), gone["filled"].as_u64()),
+            (Some("filled"), Some(0), Some(20)),
+            "{gone}"
+        );
     }
 
     #[test]

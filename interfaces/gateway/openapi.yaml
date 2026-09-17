@@ -739,13 +739,17 @@ components:
     Quote:
       type: object
       description: A resting sell of YES on a parlay's book, attached to a request. The responder is not named.
-      required: [requestId, orderId, instrumentId, price, quantity, state]
+      required: [requestId, orderId, instrumentId, price, quantity, filled, state]
       properties:
         requestId: { $ref: '#/components/schemas/RfqId' }
         orderId: { $ref: '#/components/schemas/Id' }
         instrumentId: { $ref: '#/components/schemas/Id' }
         price: { $ref: '#/components/schemas/PriceQuote' }
         quantity: { type: integer, minimum: 0, description: Contracts still offered. }
+        filled:
+          type: integer
+          minimum: 0
+          description: Contracts of this quote bought so far, by anyone. A quote taken in full is `filled` with `quantity` 0 and `filled` its size.
         expiresAt:
           type: [string, 'null']
           format: date-time
