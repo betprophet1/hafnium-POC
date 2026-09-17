@@ -157,7 +157,11 @@ is the setting for anything beyond a demo, and even then the page hands out dev 
 Behind the ingress every gateway connection comes from Traefik's pod, so the gateways are told to believe the
 `X-Forwarded-For` of connections from the pod network (`ingress.trustedProxies`, `10.42.0.0/16`, k3s's default
 cluster CIDR), and their audit records carry the address Traefik received the request from as `client` beside `peer`,
-the Traefik pod (interfaces/audit/README.md, the client behind a proxy).
+the Traefik pod (interfaces/audit/README.md, the client behind a proxy). On k3d that address is not the machine that
+dialled an `expose`d address: k3d's load balancer proxies TCP to the node and k3s's ServiceLB forwards it on to Traefik,
+so Traefik sees the node's pod network gateway (`10.42.0.1`), and that is what `client` says; only a load balancer that
+passes the client's address on (PROXY protocol, which k3d's does not speak) would record the address itself. Every
+pod in the network may send a forwarding header the gateways believe, which changes only what their audit records say.
 
 **Scaling each half.** The halves' replica counts are independent values:
 
