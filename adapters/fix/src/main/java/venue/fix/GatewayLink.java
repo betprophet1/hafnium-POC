@@ -46,6 +46,8 @@ final class GatewayLink implements WebSocket.Listener
     private CompletableFuture<WebSocket> sending;
     private volatile boolean closed;
     private volatile long lastSentNanos = System.nanoTime();
+    /** The credential the session logged in with, which the same account's REST calls carry too. */
+    private String token;
 
     private GatewayLink()
     {
@@ -59,6 +61,7 @@ final class GatewayLink implements WebSocket.Listener
         final HttpClient http, final URI uri, final ObjectNode login, final Duration timeout)
     {
         final GatewayLink link = new GatewayLink();
+        link.token = login.path("token").asText();
         final CompletableFuture<WebSocket> connected =
             http.newWebSocketBuilder().connectTimeout(timeout).buildAsync(uri, link);
         synchronized (link)
@@ -83,6 +86,12 @@ final class GatewayLink implements WebSocket.Listener
     JsonNode welcome()
     {
         return welcome.getNow(null);
+    }
+
+    /** The token the session logged in with, for {@code GET /v4/account} as the same account. */
+    String token()
+    {
+        return token;
     }
 
     /** The next message the gateway sent after the welcome, or null when there is none waiting. */

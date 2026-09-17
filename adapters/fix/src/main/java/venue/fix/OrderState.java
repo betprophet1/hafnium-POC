@@ -4,7 +4,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 
 /**
- * What a FIX session knows about one of its orders. The venue reports each change on its own (executions carry the
+ * What a FIX session knows about one of its orders, placed by it or taken up by a status request. The venue reports each change on its own (executions carry the
  * change and what remains); FIX reports the whole order every time (OrderQty, CumQty, LeavesQty, AvgPx), so the
  * adapter keeps the running totals the venue does not send.
  */
@@ -29,6 +29,13 @@ final class OrderState
     /** Sum of quantity times price over fills, for AvgPx. */
     BigDecimal filledNotional = BigDecimal.ZERO;
     boolean done;
+    /**
+     * Executions at or below this sequence are already counted: an order taken up from the account's snapshot
+     * ({@code GET /v4/account}) starts from the snapshot's sequence, and the stream still carries what led to it.
+     */
+    long baseSequence;
+    /** Executions of this order may have been missed (the gateway could not resume): the next snapshot is the truth. */
+    boolean stale;
 
     /** A cancel or replace sent for this order and not yet answered, or null. */
     Pending pending;

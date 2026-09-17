@@ -28,13 +28,29 @@ and nothing past the adapter knows it came from FIX.
 ### Cancel-on-disconnect
 
 When a session ends, however it ends (Logout, a dropped connection, a missed heartbeat), every order still resting
-from that session is cancelled (venue reason `session_disconnect`). The session that owned the orders has gone, so no
-ExecutionReport is sent for these cancels; after logging on again a firm finds its open orders over REST
-(`GET /v4/account`, interface 1). This is on by default; the venue can switch it off per SenderCompID (the adapter's
-`--keep-orders-for`). Only the session's own orders are cancelled, never the account's orders from other sessions.
+from that session is cancelled (venue reason `session_disconnect`). The session that owned the orders has gone; their
+ExecutionReports (150=4, Text `session_disconnect`) are sent when the same SenderCompID next logs on, as any other
+execution missed while away is (below, reconnecting). This is on by default; the venue can switch it off per
+SenderCompID (the adapter's `--keep-orders-for`). Only the session's own orders are cancelled, never the account's
+orders from other sessions.
 
 The venue also watches the adapter: if the adapter hangs, the gateway cancels the session's orders after three
 heartbeat intervals of silence (`heartbeat_missed`).
+
+### Reconnecting: what happened while a session was away
+
+The venue remembers, per SenderCompID, the orders a session knows and how far through the account's executions it
+has been reported. When the SenderCompID logs on again (after a Logout, a dropped connection or a restart of the
+adapter, with or without ResetSeqNumFlag), every execution of those orders since then is sent first, in venue order:
+fills of orders kept past the disconnect, the cancels that ended the last session, expiries. ExecIDs are the ones the
+reports would have had, so a report received twice (after a crash of the adapter, for example) can be recognised.
+Reports that were made but could not be handed to the session before it ended are sent too.
+
+This works while the venue still holds those executions (the gateway keeps a window per account). When it no longer
+does, or the SenderCompID logs on to a different account, nothing is replayed: **the firm restores its state with an
+OrderMassStatusRequest (AF)**, whose reports are the venue's current state of every open order, and which also brings
+the orders the venue now holds for it back into step. A firm that wants certainty after any reconnect sends AF anyway;
+it costs one report per open order.
 
 ## Instruments
 
@@ -88,7 +104,9 @@ SecurityRequestResult (560) is 0, 2 when nothing matched, or 5 when the venue co
 ### OrderCancelReplaceRequest (G)
 
 Changes a resting order's price or size. The order is found by OrderID (37) when given, else by OrigClOrdID (41),
-which may be the ClOrdID of the order or of any replace of it that was accepted. Symbol and Side must be the order's;
+which may be the ClOrdID of the order or of any replace of it that was accepted. The order must be one the session
+knows: one it placed, or one an order status request answered about (below), whichever session, protocol or earlier
+logon placed it; any other is rejected as unknown (102=1). Symbol and Side must be the order's;
 OrdType is 2. **OrderQty is the order's new total size, filled part included**, and must exceed CumQty; the venue
 rests OrderQty − CumQty. A reduction at the same price keeps the order's priority; anything else loses it and may
 trade at once (spec E-12.4, E-12.5). The new ClOrdID (11) answers for the order from then on.
@@ -96,6 +114,51 @@ trade at once (spec E-12.4, E-12.5). The new ClOrdID (11) answers for the order 
 ### OrderCancelRequest (F)
 
 Found as for G. The answer is an ExecutionReport (150=4) under the request's ClOrdID, with OrigClOrdID.
+
+### OrderStatusRequest (H)
+
+| Tag | Rule |
+|---|---|
+| 790 OrdStatusReqID | Optional; echoed on the report. |
+| 37 OrderID | The venue's order ID. When given, the order is found by it. |
+| 11 ClOrdID | Required by FIX. Without OrderID, the order is found by it: a ClOrdID the session knows the order by (a replace's included), or else the client order ID the order was placed with, over any protocol. |
+| 55 Symbol, 54 Side | Required by FIX; not used to find the order. |
+| 1 Account | Optional; if given, the logged-on account. |
+
+Any resting order of the account can be asked about: placed by this session, an earlier logon, another FIX session,
+REST or the web page. The answer is one ExecutionReport with **ExecType (150) = I**, OrdStatus (39), OrderQty (38, the
+whole size, filled part included), Price, CumQty (14), LeavesQty (151), AvgPx (6), ClOrdID and OrdStatusReqID (790).
+
+An order the venue does not hold as resting and the session does not know (filled or cancelled before the session
+knew it, rejected, never placed) is answered with 150=I, **OrdStatus 8 and OrdRejReason (103) 5 (unknown order)**,
+OrderID as asked or `NONE`. An order the session knows that has finished is answered with its final state (39=2 or
+4, LeavesQty 0).
+
+### OrderMassStatusRequest (AF)
+
+| MassStatusReqType (585) | Reports |
+|---|---|
+| 7 | every open order of the account |
+| 1 | the account's open orders in the market named by Symbol (55) |
+| 8 | the account's open orders in the event named by UnderlyingSymbol (311) |
+
+MassStatusReqID (584) is required; Side (54) narrows to one side. One ExecutionReport (150=I) per open order, in
+OrderID order, each with MassStatusReqID (584) and TotNumReports (911), and LastRptRequested (912) = Y on the last.
+When no order matches, the answer is a single report with **TotNumReports 0**, 912=Y, OrderID `NONE`, 39=8 and Text
+`no open orders`; its Symbol is the one asked about or `NONE`, and its Side the one asked about or 1. Symbol missing
+for type 1, or UnderlyingSymbol for type 8, is a BusinessMessageReject with 380=5.
+
+### Orders a session takes up
+
+Every order a status request (H or AF) answers about becomes **known to the session**, as if it had placed it: it can
+be cancelled (F) and replaced (G) by OrderID or by ClOrdID, it is included when the session comes back after a
+disconnect, and every later execution of it is reported on the session (150=F, 4, 5, D) under the ClOrdID it answers
+to. Nothing is taken up unasked: a session is sent executions only of orders it placed or asked about. The same order
+may be known to several sessions, and each is then told of its executions. Cancel-on-disconnect still cancels only the
+orders a session placed.
+
+A status request the venue cannot answer in time (its account view is unavailable) is answered with
+BusinessMessageReject 380=4, BusinessRejectRefID the OrdStatusReqID (or ClOrdID) or MassStatusReqID; send it again.
 
 ### OrderMassCancelRequest (q)
 
@@ -121,14 +184,17 @@ this session then has its own ExecutionReport (150=4). A mass cancel reaches the
 | 4 Canceled | a cancel request, a mass cancel, IOC remainder, expiry, event start; Text (58) gives the venue's reason | 4 |
 | D Restated | the venue reduced the order (ExecRestatementReason 378 = 99), for example a reduce-only order as the position shrinks | 0 or 1 |
 | 8 Rejected | the order never rested; OrdRejReason (103) and Text (58) | 8 |
+| I Order Status | the answer to an OrderStatusRequest (H) or OrderMassStatusRequest (AF); not an execution | 0, 1, 2, 4, or 8 for an unknown order |
 
 Every report carries OrderID (37), ClOrdID (11), ExecID (17), Symbol, Side, OrderQty, Price, OrdType, LeavesQty (151),
-CumQty (14) and AvgPx (6). OrderID is the venue's order ID, a decimal string; a rejected order has `NONE`.
+CumQty (14) and AvgPx (6). TimeInForce (59) and ExecInst (18) are sent for orders the session placed; for an order
+taken up by a status request the venue's account view does not have them, and they are left out. OrderID is the
+venue's order ID, a decimal string; a rejected order has `NONE`.
 ExecID is made from the venue's sequence number, order ID and trade ID, so it is unique and says which venue event
-the report is of.
+the report is of. A status report (150=I) is of no venue event: its ExecID starts `I-`.
 
-Executions of orders a session did not place (the same account's other sessions, the web page) are not reported on
-it. A drop copy (interface 5) is where every execution of an account is found.
+Executions of orders a session neither placed nor asked the status of (the same account's other sessions, the web
+page) are not reported on it. A drop copy (interface 5) is where every execution of an account is found.
 
 Rejections and their OrdRejReason:
 
@@ -150,6 +216,10 @@ OrdStatus is the order's status, or 8 when there is no such order.
 ### BusinessMessageReject (j)
 
 - 380=3: a message type the dialect does not have.
+- 380=4, with BusinessRejectRefID = the OrdStatusReqID, ClOrdID or MassStatusReqID: a status request could not be
+  answered because the venue's account view did not answer; send it again.
+- 380=5: an OrderMassStatusRequest without the Symbol or UnderlyingSymbol its type needs.
+- 380=0: a status request whose Account (1) is not the logged-on account.
 - 380=4, with BusinessRejectRefID = the ClOrdID: **the venue did not answer in time and the outcome is unknown**. The
   order may or may not exist. If it was taken, its ExecutionReport (150=0) still follows when the venue reports it.
   Resend it with the same ClOrdID: if the original was taken, the resend is rejected with 103=6; if not, the resend
@@ -157,6 +227,7 @@ OrdStatus is the order's status, or 8 when there is no such order.
 
 ## Not in this draft
 
-OrderStatusRequest (H), MarketDataRequest (V) and market data over FIX, quotes and RFQ, stake-based orders, NO-terms
-entry, order groups (`clientOrderGroup`), `protectionTicks` and `spendCapCents`, drop copy over FIX (interface 5), and
-positions or balances. After a disconnect a firm reconciles open orders over REST (`GET /v4/account`, interface 1).
+MarketDataRequest (V) and market data over FIX, quotes and RFQ, stake-based orders, NO-terms entry, order groups
+(`clientOrderGroup`), `protectionTicks` and `spendCapCents`, drop copy over FIX (interface 5), positions or balances,
+and the status of orders that are no longer resting and that the session never knew (the venue's account view holds
+resting orders only).

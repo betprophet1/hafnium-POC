@@ -145,6 +145,8 @@ final class FixClient implements AutoCloseable
         }
         final Session session = reply.resultIfPresent();
         inboxes.computeIfAbsent(session.id(), id -> new ArrayList<>());
+        // A session logging on again has the ID it had before: it is connected until it says otherwise.
+        disconnected.remove(session.id());
         return session;
     }
 

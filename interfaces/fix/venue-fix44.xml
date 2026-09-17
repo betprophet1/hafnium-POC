@@ -108,6 +108,24 @@
       <field name="UnderlyingSymbol" required="N"/>
       <field name="TransactTime" required="Y"/>
     </message>
+    <!-- Order status: any resting order of the account, whichever session or protocol placed it (README.md). -->
+    <message name="OrderStatusRequest" msgtype="H" msgcat="app">
+      <field name="OrderID" required="N"/>
+      <field name="ClOrdID" required="Y"/>
+      <field name="OrdStatusReqID" required="N"/>
+      <field name="Account" required="N"/>
+      <component name="Instrument" required="Y"/>
+      <field name="Side" required="Y"/>
+    </message>
+    <message name="OrderMassStatusRequest" msgtype="AF" msgcat="app">
+      <field name="MassStatusReqID" required="Y"/>
+      <field name="MassStatusReqType" required="Y"/>
+      <field name="Account" required="N"/>
+      <!-- Symbol alone rather than the Instrument component, whose Symbol is required, as for q. -->
+      <field name="Symbol" required="N"/>
+      <field name="UnderlyingSymbol" required="N"/>
+      <field name="Side" required="N"/>
+    </message>
     <message name="SecurityListRequest" msgtype="x" msgcat="app">
       <field name="SecurityReqID" required="Y"/>
       <field name="SecurityListRequestType" required="Y"/>
@@ -119,6 +137,10 @@
       <field name="OrderID" required="Y"/>
       <field name="ClOrdID" required="N"/>
       <field name="OrigClOrdID" required="N"/>
+      <field name="OrdStatusReqID" required="N"/>
+      <field name="MassStatusReqID" required="N"/>
+      <field name="TotNumReports" required="N"/>
+      <field name="LastRptRequested" required="N"/>
       <field name="ExecID" required="Y"/>
       <field name="ExecType" required="Y"/>
       <field name="OrdStatus" required="Y"/>
@@ -226,11 +248,13 @@
       <value enum="D" description="ORDER_SINGLE"/>
       <value enum="F" description="ORDER_CANCEL_REQUEST"/>
       <value enum="G" description="ORDER_CANCEL_REPLACE_REQUEST"/>
+      <value enum="H" description="ORDER_STATUS_REQUEST"/>
       <value enum="j" description="BUSINESS_MESSAGE_REJECT"/>
       <value enum="q" description="ORDER_MASS_CANCEL_REQUEST"/>
       <value enum="r" description="ORDER_MASS_CANCEL_REPORT"/>
       <value enum="x" description="SECURITY_LIST_REQUEST"/>
       <value enum="y" description="SECURITY_LIST"/>
+      <value enum="AF" description="ORDER_MASS_STATUS_REQUEST"/>
     </field>
     <field number="36" name="NewSeqNo" type="SEQNUM"/>
     <field number="37" name="OrderID" type="STRING"/>
@@ -305,6 +329,7 @@
       <value enum="8" description="REJECTED"/>
       <value enum="D" description="RESTATED"/>
       <value enum="F" description="TRADE"/>
+      <value enum="I" description="ORDER_STATUS"/>
     </field>
     <field number="151" name="LeavesQty" type="QTY"/>
     <field number="311" name="UnderlyingSymbol" type="STRING"/>
@@ -388,6 +413,15 @@
       <value enum="1" description="ACTIVE"/>
       <value enum="2" description="INACTIVE"/>
     </field>
+    <field number="584" name="MassStatusReqID" type="STRING"/>
+    <field number="585" name="MassStatusReqType" type="INT">
+      <value enum="1" description="STATUS_FOR_ORDERS_FOR_A_SECURITY"/>
+      <value enum="7" description="STATUS_FOR_ALL_ORDERS"/>
+      <value enum="8" description="STATUS_FOR_ORDERS_FOR_AN_UNDERLYING_SECURITY"/>
+    </field>
+    <field number="790" name="OrdStatusReqID" type="STRING"/>
+    <field number="911" name="TotNumReports" type="INT"/>
+    <field number="912" name="LastRptRequested" type="BOOLEAN"/>
     <field number="378" name="ExecRestatementReason" type="INT">
       <value enum="99" description="OTHER"/>
     </field>

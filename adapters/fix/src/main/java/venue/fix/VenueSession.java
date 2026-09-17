@@ -24,6 +24,8 @@ import venue.fix.codecs.decoder.NewOrderSingleDecoder;
 import venue.fix.codecs.decoder.OrderCancelReplaceRequestDecoder;
 import venue.fix.codecs.decoder.OrderCancelRequestDecoder;
 import venue.fix.codecs.decoder.OrderMassCancelRequestDecoder;
+import venue.fix.codecs.decoder.OrderMassStatusRequestDecoder;
+import venue.fix.codecs.decoder.OrderStatusRequestDecoder;
 import venue.fix.codecs.decoder.SecurityListRequestDecoder;
 
 import java.math.BigDecimal;
@@ -37,11 +39,10 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Comparator;
 import java.util.Iterator;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -58,14 +59,22 @@ import java.util.concurrent.CompletableFuture;
  * reports each execution once, the first time it sees it (keyed by sequence, type, order and trade), and holds a
  * streamed execution back while a request of this session is outstanding whose reply could come from an earlier
  * sequence. That keeps each order's reports in venue order: New before the fills of a crossing order, Replaced
- * before the fills an amendment causes. Executions of orders this session did not place (the account's other
+ * before the fills an amendment causes. Executions of orders this session does not know (the account's other
  * sessions, the web page) are not reported; that is what a drop copy is for (interface 5).
+ *
+ * <h2>Orders from elsewhere, and what was missed</h2>
+ * An OrderStatusRequest (H) or OrderMassStatusRequest (AF) is answered from the account's snapshot
+ * ({@code GET /v4/account}), and every order it answers about becomes known to the session: it can be cancelled and
+ * replaced, and its executions are reported from then on. The snapshot is taken at a sequence the stream may be
+ * behind or ahead of, so an order taken up from it ignores executions at or below that sequence, and executions of
+ * unknown orders that arrive while a snapshot is awaited are kept to be applied on top of it.
+ *
+ * <p>What the session knows outlives the logon ({@link SessionMemory}): the next logon resumes the gateway stream
+ * from the last sequence whose reports reached the FIX session, so fills and cancels that happened in between are
+ * reported when the firm is back.
  */
 final class VenueSession implements SessionHandler
 {
-    /** How many execution keys are remembered for deduplication; far more than can be in flight at once. */
-    private static final int SEEN_CAPACITY = 20_000;
-
     @FunctionalInterface
     private interface Outgoing
     {
@@ -108,31 +117,41 @@ final class VenueSession implements SessionHandler
         }
     }
 
-    /** One execution report, filled in field by field and encoded when it is sent. */
-    private static final class Report
+    /** A message waiting to be sent: a report is kept when it cannot be, and a marker only moves the resume point. */
+    private record Queued(Outgoing message, Report report, long resumeSequence)
     {
-        String orderId = "NONE";
+    }
+
+    /** An order status or mass status request waiting for the account's snapshot. */
+    private static final class StatusQuery
+    {
+        final String msgType;
+        final int refSeqNum;
+        final CompletableFuture<HttpResponse<String>> response;
+        // H
+        String orderId;
         String clOrdId;
-        String origClOrdId;
-        String execId;
-        char execType;
-        char ordStatus;
+        String ordStatusReqId;
         String symbol;
         char side;
-        long orderQty;
-        String price;
-        char timeInForce;
-        String execInst;
-        long lastQty;
-        String lastPx;
-        int liquidity;
-        long leavesQty;
-        long cumQty;
-        BigDecimal avgPx = BigDecimal.ZERO;
-        int ordRejReason = -1;
-        boolean restated;
-        String text;
+        // AF
+        String massStatusReqId;
+        int massStatusType;
+        String scope;
+        char sideFilter;
+
+        StatusQuery(final String msgType, final int refSeqNum, final CompletableFuture<HttpResponse<String>> response)
+        {
+            this.msgType = msgType;
+            this.refSeqNum = refSeqNum;
+            this.response = response;
+        }
     }
+
+    /** Executions of unknown orders kept while a snapshot is awaited; a bound, far above what arrives meanwhile. */
+    private static final int UNOWNED_CAPACITY = 20_000;
+    /** OrdRejReason (103) of the status of an order the venue does not have. */
+    private static final int UNKNOWN_ORDER_STATUS = 5;
 
     /** Markets per SecurityList message: a fragment stays well inside the encoder's buffer with long titles. */
     private static final int SECURITY_LIST_FRAGMENT = 40;
@@ -146,6 +165,9 @@ final class VenueSession implements SessionHandler
     private final String gateway;
     private final String accountId;
     private final long heartbeatNanos;
+    private final SessionMemory.Store memories;
+    /** What this session knows of its orders; it outlives the logon. */
+    private final SessionMemory memory;
 
     private final MutableAsciiBuffer ascii = new MutableAsciiBuffer();
     private final NewOrderSingleDecoder newOrder = new NewOrderSingleDecoder();
@@ -153,6 +175,8 @@ final class VenueSession implements SessionHandler
     private final OrderCancelRequestDecoder cancel = new OrderCancelRequestDecoder();
     private final OrderMassCancelRequestDecoder massCancel = new OrderMassCancelRequestDecoder();
     private final SecurityListRequestDecoder securityListRequest = new SecurityListRequestDecoder();
+    private final OrderStatusRequestDecoder statusRequest = new OrderStatusRequestDecoder();
+    private final OrderMassStatusRequestDecoder massStatusRequest = new OrderMassStatusRequestDecoder();
     private final UtcTimestampDecoder timestampDecoder = new UtcTimestampDecoder(true);
 
     private final ExecutionReportEncoder executionReport = new ExecutionReportEncoder();
@@ -164,22 +188,25 @@ final class VenueSession implements SessionHandler
     private final UtcTimestampEncoder transactTime = new UtcTimestampEncoder();
     private final DecimalFloat decimal = new DecimalFloat();
 
-    private final ArrayDeque<Outgoing> outbound = new ArrayDeque<>();
+    private final ArrayDeque<Queued> outbound = new ArrayDeque<>();
     private final Map<String, Request> inFlight = new HashMap<>();
     /** New orders sent and not yet answered, by ClOrdID. */
     private final Map<String, Request> pendingNew = new HashMap<>();
-    private final Map<String, OrderState> ordersById = new HashMap<>();
-    /** Every ClOrdID an order has answered to, so OrigClOrdID finds it after a replace too. */
-    private final Map<String, OrderState> ordersByClOrdId = new HashMap<>();
+    private final Map<String, OrderState> ordersById;
+    private final Map<String, OrderState> ordersByClOrdId;
     /** Streamed executions not yet safe to report, in arrival (and so sequence) order. */
     private final ArrayDeque<JsonNode> held = new ArrayDeque<>();
-    private final Set<String> seen = new LinkedHashSet<>();
     private final List<SecurityListFetch> securityListFetches = new ArrayList<>();
+    /** Status requests in the order they came, answered in that order. */
+    private final ArrayDeque<StatusQuery> statusQueries = new ArrayDeque<>();
+    /** Executions of orders this session does not know, seen while a snapshot is awaited, in sequence order. */
+    private final List<JsonNode> unowned = new ArrayList<>();
 
     private long lastReplySequence;
     private long nextRequestId;
     private long nextLocalExecId;
     private boolean ended;
+    private boolean remembered;
     private boolean logoutRequested;
 
     private record SecurityListFetch(
@@ -191,16 +218,44 @@ final class VenueSession implements SessionHandler
      * @param link the gateway session opened when the logon was authenticated, or null if it was lost before the
      *             FIX session reached the library; the session is then logged out at once.
      */
-    VenueSession(final Session session, final GatewayLink link, final HttpClient http, final String gateway)
+    VenueSession(
+        final Session session,
+        final GatewayLink link,
+        final HttpClient http,
+        final String gateway,
+        final SessionMemory.Store memories)
     {
         this.session = session;
         this.link = link;
         this.http = http;
         this.gateway = gateway;
+        this.memories = memories;
         final JsonNode welcome = link != null ? link.welcome() : null;
         this.accountId = welcome != null ? welcome.path("accountId").asText() : "";
         this.lastReplySequence = welcome != null ? welcome.path("sequence").asLong() : 0;
         this.heartbeatNanos = session.heartbeatIntervalInMs() * 1_000_000L;
+        this.memory = welcome != null ? memories.of(session.compositeKey().remoteCompId()) :
+            new SessionMemory(session.compositeKey().remoteCompId());
+        this.ordersById = memory.ordersById;
+        this.ordersByClOrdId = memory.ordersByClOrdId;
+        if (welcome == null)
+        {
+            return;
+        }
+        if (!accountId.equals(memory.accountId))
+        {
+            // The same SenderCompID on another account: nothing it knew is about this account.
+            memory.reset(accountId);
+        }
+        if (memory.resumeFrom == 0)
+        {
+            // A first logon: everything after the welcome reaches this session, nothing before concerns it.
+            memory.resumeFrom = welcome.path("sequence").asLong();
+        }
+        // If the gateway resumed, what was missed follows; if not, a resync follows and is dealt with then. Reports
+        // the last logon could not deliver go first, on the first pass, once the session is surely ready to send.
+        memory.undelivered.forEach(r -> outbound.add(queued(r)));
+        memory.undelivered.clear();
     }
 
     boolean isEnded()
@@ -290,6 +345,26 @@ final class VenueSession implements SessionHandler
                 securityListRequest.invalidTagId(), securityListRequest.rejectReason()))
             {
                 onSecurityListRequest();
+            }
+        }
+        else if (messageType == OrderStatusRequestDecoder.MESSAGE_TYPE)
+        {
+            statusRequest.reset();
+            statusRequest.decode(ascii, 0, length);
+            if (valid(statusRequest.validate(), statusRequest.header(), "H", statusRequest.invalidTagId(),
+                statusRequest.rejectReason()))
+            {
+                onStatusRequest();
+            }
+        }
+        else if (messageType == OrderMassStatusRequestDecoder.MESSAGE_TYPE)
+        {
+            massStatusRequest.reset();
+            massStatusRequest.decode(ascii, 0, length);
+            if (valid(massStatusRequest.validate(), massStatusRequest.header(), "AF",
+                massStatusRequest.invalidTagId(), massStatusRequest.rejectReason()))
+            {
+                onMassStatusRequest();
             }
         }
         else if (!isSessionMessage(buffer, offset, length))
@@ -507,7 +582,8 @@ final class VenueSession implements SessionHandler
         {
             final boolean pending = orderId == null && pendingNew.containsKey(request.origClOrdId);
             cancelReject(request, null, pending ? Translate.ALREADY_PENDING : Translate.UNKNOWN_ORDER,
-                pending ? "the order has not been acknowledged yet" : "no such order in this session");
+                pending ? "the order has not been acknowledged yet" :
+                    "no such order known to this session: an OrderStatusRequest (H) takes up the account's others");
             return null;
         }
         if (order.done)
@@ -572,6 +648,85 @@ final class VenueSession implements SessionHandler
             new SecurityListFetch(reqId, type, symbol, http.sendAsync(get, HttpResponse.BodyHandlers.ofString())));
     }
 
+    private void onStatusRequest()
+    {
+        final String orderId = statusRequest.hasOrderID() ? statusRequest.orderIDAsString() : null;
+        final String clOrdId = statusRequest.clOrdIDAsString();
+        final String reqId = statusRequest.hasOrdStatusReqID() ? statusRequest.ordStatusReqIDAsString() : null;
+        final int refSeqNum = statusRequest.header().msgSeqNum();
+        if (statusRequest.hasAccount() && !statusRequest.accountAsString().equals(accountId))
+        {
+            businessReject(refSeqNum, "H", reqId != null ? reqId : clOrdId, 0,
+                "Account (1), when given, must be the logged-on account " + accountId);
+            return;
+        }
+        final OrderState known = orderId != null ? ordersById.get(orderId) : ordersByClOrdId.get(clOrdId);
+        if (known != null && !known.stale && statusQueries.isEmpty())
+        {
+            // Everything the session has reported about the order is in its state: nothing to ask the venue.
+            sendStatus(known, reqId, null, -1, false);
+            return;
+        }
+        final StatusQuery query = new StatusQuery("H", refSeqNum, fetchAccount());
+        query.orderId = orderId;
+        query.clOrdId = clOrdId;
+        query.ordStatusReqId = reqId;
+        query.symbol = statusRequest.symbolAsString();
+        query.side = statusRequest.side();
+        statusQueries.add(query);
+    }
+
+    private void onMassStatusRequest()
+    {
+        final String reqId = massStatusRequest.massStatusReqIDAsString();
+        final int refSeqNum = massStatusRequest.header().msgSeqNum();
+        final int type = massStatusRequest.massStatusReqType();
+        final String scope;
+        if (type == 1)
+        {
+            scope = massStatusRequest.hasSymbol() ? massStatusRequest.symbolAsString() : null;
+        }
+        else if (type == 8)
+        {
+            // An event is the underlying of its markets, as for a mass cancel.
+            scope = massStatusRequest.hasUnderlyingSymbol() ? massStatusRequest.underlyingSymbolAsString() : null;
+        }
+        else
+        {
+            scope = "";
+        }
+        if (scope == null)
+        {
+            businessReject(refSeqNum, "AF", reqId, 5, type == 1 ?
+                "Symbol (55) must name the market for MassStatusReqType 1" :
+                "UnderlyingSymbol (311) must name the event for MassStatusReqType 8");
+            return;
+        }
+        if (massStatusRequest.hasAccount() && !massStatusRequest.accountAsString().equals(accountId))
+        {
+            businessReject(refSeqNum, "AF", reqId, 0, "Account (1), when given, must be the logged-on account " +
+                accountId);
+            return;
+        }
+        final StatusQuery query = new StatusQuery("AF", refSeqNum, fetchAccount());
+        query.massStatusReqId = reqId;
+        query.massStatusType = type;
+        query.scope = scope;
+        query.sideFilter = massStatusRequest.hasSide() ? massStatusRequest.side() : 0;
+        statusQueries.add(query);
+    }
+
+    /** The account's snapshot: its resting orders, whichever session or protocol placed them, at a sequence. */
+    private CompletableFuture<HttpResponse<String>> fetchAccount()
+    {
+        final HttpRequest get = HttpRequest.newBuilder(URI.create("http://" + gateway + "/v4/account"))
+            .timeout(Duration.ofSeconds(10))
+            .header("Authorization", "Bearer " + link.token())
+            .GET()
+            .build();
+        return http.sendAsync(get, HttpResponse.BodyHandlers.ofString());
+    }
+
     private void submit(final Request request, final ObjectNode message)
     {
         final String id = "r" + nextRequestId++;
@@ -624,6 +779,7 @@ final class VenueSession implements SessionHandler
         }
         work += releaseHeld();
         work += finishSecurityLists();
+        work += finishStatusQueries();
         work += flush();
         return work;
     }
@@ -655,9 +811,26 @@ final class VenueSession implements SessionHandler
                 }
             }
             case "execution" -> held.add(message.path("execution"));
-            // Account updates, payouts and releases have no place in an order session; resync means executions
-            // may have been missed, which only a drop copy or GET /v4/account can make up.
-            case "resync" -> System.err.println("fix adapter: gateway resync for " + session.compositeKey());
+            // Account updates, payouts and releases have no place in an order session, but they are in the account's
+            // sequence: once nothing before them waits, the session has dealt with everything up to them.
+            case "account", "payout", "release" ->
+            {
+                if (held.isEmpty())
+                {
+                    markResumePoint(message.path("sequence").asLong());
+                }
+            }
+            case "resync" ->
+            {
+                // The gateway no longer holds what happened since the session was last here: executions of the
+                // orders it knows may have been missed. Their next snapshot (a status request) is taken as the truth.
+                System.err.println("fix adapter: gateway resync for " + session.compositeKey());
+                for (final OrderState order : ordersById.values())
+                {
+                    order.stale = !order.done;
+                }
+                markResumePoint(message.path("sequence").asLong());
+            }
             default ->
             {
             }
@@ -670,7 +843,9 @@ final class VenueSession implements SessionHandler
         int released = 0;
         while (!held.isEmpty() && (inFlight.isEmpty() || sequence(held.peek()) <= lastReplySequence))
         {
-            onExecution(held.poll());
+            final JsonNode execution = held.poll();
+            onExecution(execution);
+            markResumePoint(sequence(execution));
             released++;
         }
         return released;
@@ -782,11 +957,31 @@ final class VenueSession implements SessionHandler
         final String clientOrderId = text(execution, "clientOrderId");
         final String key = execution.path("sequence").asText() + '|' + type + '|' + orderId + '|' +
             text(execution, "tradeId") + '|' + clientOrderId;
-        if (!remember(key))
+        if (!memory.remember(key))
         {
             return;
         }
+        apply(execution);
+    }
+
+    /** One execution not seen before: the change to the order's state, and its report. */
+    private void apply(final JsonNode execution)
+    {
+        final String type = execution.path("type").asText();
+        final String orderId = text(execution, "orderId");
+        final String clientOrderId = text(execution, "clientOrderId");
         final OrderState order = orderId != null ? ordersById.get(orderId) : null;
+        if (order != null && sequence(execution) <= order.baseSequence)
+        {
+            // Already counted in the snapshot the order was taken up from.
+            return;
+        }
+        if (order == null && orderId != null && !statusQueries.isEmpty() && unowned.size() < UNOWNED_CAPACITY &&
+            !"accepted".equals(type) && !"rejected".equals(type))
+        {
+            // A snapshot on its way may make this order known and be older than this change.
+            unowned.add(execution);
+        }
         final String sequence = execution.path("sequence").asText();
         switch (type)
         {
@@ -896,21 +1091,6 @@ final class VenueSession implements SessionHandler
         }
     }
 
-    private boolean remember(final String key)
-    {
-        if (!seen.add(key))
-        {
-            return false;
-        }
-        if (seen.size() > SEEN_CAPACITY)
-        {
-            final Iterator<String> oldest = seen.iterator();
-            oldest.next();
-            oldest.remove();
-        }
-        return true;
-    }
-
     private int finishSecurityLists()
     {
         int finished = 0;
@@ -998,6 +1178,240 @@ final class VenueSession implements SessionHandler
         }
     }
 
+    /** Answers the status requests whose snapshots have arrived, in the order they were asked. */
+    private int finishStatusQueries()
+    {
+        int finished = 0;
+        while (!statusQueries.isEmpty() && statusQueries.peek().response.isDone())
+        {
+            final StatusQuery query = statusQueries.poll();
+            finished++;
+            JsonNode account = null;
+            try
+            {
+                final HttpResponse<String> response = query.response.join();
+                if (response.statusCode() == 200)
+                {
+                    account = GatewayLink.JSON.readTree(response.body());
+                }
+                else
+                {
+                    System.err.println("fix adapter: GET /v4/account answered " + response.statusCode() + " for " +
+                        session.compositeKey() + ": " + response.body());
+                }
+            }
+            catch (final Exception e)
+            {
+                System.err.println("fix adapter: GET /v4/account failed: " + e);
+            }
+            if (account != null)
+            {
+                refreshStale(account);
+            }
+            if ("H".equals(query.msgType))
+            {
+                answerStatus(query, account);
+            }
+            else
+            {
+                answerMassStatus(query, account);
+            }
+        }
+        if (statusQueries.isEmpty())
+        {
+            unowned.clear();
+        }
+        return finished;
+    }
+
+    /** Orders whose executions may have been missed take the snapshot's word for where they stand. */
+    private void refreshStale(final JsonNode account)
+    {
+        final long sequence = account.path("sequence").asLong();
+        final Map<String, JsonNode> resting = new HashMap<>();
+        account.path("orders").forEach(o -> resting.put(o.path("orderId").asText(), o));
+        for (final OrderState order : ordersById.values())
+        {
+            if (!order.stale)
+            {
+                continue;
+            }
+            final JsonNode snapshot = resting.get(order.orderId);
+            if (snapshot != null)
+            {
+                takeUp(order, snapshot, sequence);
+            }
+            else
+            {
+                // Finished while the session could not hear it: filled or cancelled, the venue no longer says.
+                order.stale = false;
+                order.done = true;
+                order.leavesQty = 0;
+                order.baseSequence = sequence;
+            }
+        }
+    }
+
+    /** The order's state as the snapshot at {@code sequence} gives it; executions after it apply on top. */
+    private static void takeUp(final OrderState order, final JsonNode snapshot, final long sequence)
+    {
+        order.cumQty = snapshot.path("filled").asLong();
+        order.leavesQty = snapshot.path("remaining").asLong();
+        order.orderQty = snapshot.path("quantity").asLong(order.cumQty + order.leavesQty);
+        order.filledNotional = new BigDecimal(snapshot.path("filledYesCents").asText("0"));
+        order.price = snapshot.path("price").path("cents").asText(order.price);
+        order.baseSequence = sequence;
+        order.stale = false;
+    }
+
+    /**
+     * Makes a resting order of the account known to this session, whoever placed it, and applies the executions of it
+     * that arrived while the snapshot was on its way.
+     */
+    private OrderState adopt(final JsonNode snapshot, final long sequence)
+    {
+        final OrderState order = new OrderState(snapshot.path("orderId").asText(), text(snapshot, "clientOrderId"),
+            snapshot.path("instrumentId").asText(), "sell".equals(snapshot.path("side").asText()) ? '2' : '1',
+            snapshot.path("quantity").asLong(), snapshot.path("price").path("cents").asText(), (char)0, null);
+        takeUp(order, snapshot, sequence);
+        memory.know(order, order.clOrdId);
+        for (final Iterator<JsonNode> it = unowned.iterator(); it.hasNext(); )
+        {
+            final JsonNode execution = it.next();
+            if (order.orderId.equals(text(execution, "orderId")))
+            {
+                it.remove();
+                apply(execution);
+            }
+        }
+        return order;
+    }
+
+    private void answerStatus(final StatusQuery query, final JsonNode account)
+    {
+        OrderState order = query.orderId != null ? ordersById.get(query.orderId) : ordersByClOrdId.get(query.clOrdId);
+        if (order == null && account != null)
+        {
+            for (final JsonNode snapshot : account.path("orders"))
+            {
+                final boolean match = query.orderId != null ?
+                    query.orderId.equals(snapshot.path("orderId").asText()) :
+                    query.clOrdId.equals(text(snapshot, "clientOrderId"));
+                if (match)
+                {
+                    order = adopt(snapshot, account.path("sequence").asLong());
+                    break;
+                }
+            }
+        }
+        if (order != null)
+        {
+            sendStatus(order, query.ordStatusReqId, null, -1, false);
+            return;
+        }
+        if (account == null)
+        {
+            businessReject(query.refSeqNum, "H", query.ordStatusReqId != null ? query.ordStatusReqId : query.clOrdId,
+                4, "the venue could not be asked for the order's status: send the request again");
+            return;
+        }
+        // Not resting and never known here: filled, cancelled, rejected long ago, or never placed.
+        final Report report = new Report();
+        report.orderId = query.orderId != null ? query.orderId : "NONE";
+        report.clOrdId = query.clOrdId;
+        report.execId = "I-" + account.path("sequence").asText() + "-" + nextLocalExecId++;
+        report.execType = 'I';
+        report.ordStatus = '8';
+        report.ordRejReason = UNKNOWN_ORDER_STATUS;
+        report.symbol = query.symbol;
+        report.side = query.side;
+        report.ordStatusReqId = query.ordStatusReqId;
+        report.text = "unknown order: not resting, and not known to this session";
+        send(report);
+    }
+
+    private void answerMassStatus(final StatusQuery query, final JsonNode account)
+    {
+        if (account == null)
+        {
+            businessReject(query.refSeqNum, "AF", query.massStatusReqId, 4,
+                "the venue could not be asked for the account's orders: send the request again");
+            return;
+        }
+        final long sequence = account.path("sequence").asLong();
+        final List<JsonNode> matching = new ArrayList<>();
+        for (final JsonNode snapshot : account.path("orders"))
+        {
+            final String field = query.massStatusType == 1 ? "instrumentId" : query.massStatusType == 8 ? "eventId" : null;
+            final char side = "sell".equals(snapshot.path("side").asText()) ? '2' : '1';
+            if ((field == null || query.scope.equals(snapshot.path(field).asText())) &&
+                (query.sideFilter == 0 || query.sideFilter == side))
+            {
+                matching.add(snapshot);
+            }
+        }
+        matching.sort(Comparator.comparing((JsonNode o) -> o.path("orderId").asText().length())
+            .thenComparing(o -> o.path("orderId").asText()));
+        final List<OrderState> open = new ArrayList<>();
+        for (final JsonNode snapshot : matching)
+        {
+            final OrderState known = ordersById.get(snapshot.path("orderId").asText());
+            final OrderState order = known != null ? known : adopt(snapshot, sequence);
+            // A known order already reported finished is not open, though an older snapshot may still list it.
+            if (!order.done)
+            {
+                open.add(order);
+            }
+        }
+        for (int i = 0; i < open.size(); i++)
+        {
+            sendStatus(open.get(i), null, query.massStatusReqId, open.size(), i == open.size() - 1);
+        }
+        if (open.isEmpty())
+        {
+            // FIX has no report for "none": one status report with TotNumReports 0 says so, OrderID NONE.
+            final Report report = new Report();
+            report.execId = "I-" + sequence + "-" + nextLocalExecId++;
+            report.execType = 'I';
+            report.ordStatus = '8';
+            report.symbol = query.massStatusType == 1 ? query.scope : "NONE";
+            report.side = query.sideFilter != 0 ? query.sideFilter : '1';
+            report.massStatusReqId = query.massStatusReqId;
+            report.totNumReports = 0;
+            report.lastRptRequested = true;
+            report.text = "no open orders";
+            send(report);
+        }
+    }
+
+    /** An order's status (ExecType I), for one OrderStatusRequest or as one of a mass status's reports. */
+    private void sendStatus(
+        final OrderState order, final String ordStatusReqId, final String massStatusReqId, final int total,
+        final boolean last)
+    {
+        final Report report = reportOf(order, "I-" + order.orderId + "-" + nextLocalExecId++, 'I');
+        report.ordStatusReqId = ordStatusReqId;
+        report.massStatusReqId = massStatusReqId;
+        report.totNumReports = total;
+        report.lastRptRequested = last;
+        send(report);
+    }
+
+    private void businessReject(
+        final int refSeqNum, final String msgType, final String refId, final int reason, final String text)
+    {
+        send(s ->
+        {
+            businessReject.reset();
+            businessReject.refSeqNum(refSeqNum).refMsgType(msgType).businessRejectReason(reason).text(text);
+            if (refId != null)
+            {
+                businessReject.businessRejectRefID(refId);
+            }
+            return s.trySend(businessReject);
+        });
+    }
+
     // ---------------------------------------------------------------------------------------------------------------
     // FIX out
 
@@ -1046,7 +1460,12 @@ final class VenueSession implements SessionHandler
 
     private void send(final Report r)
     {
-        send(s ->
+        enqueue(queued(r));
+    }
+
+    private Queued queued(final Report r)
+    {
+        return new Queued(s ->
         {
             final ExecutionReportEncoder er = executionReport;
             er.reset();
@@ -1062,6 +1481,18 @@ final class VenueSession implements SessionHandler
             if (r.origClOrdId != null)
             {
                 er.origClOrdID(r.origClOrdId);
+            }
+            if (r.ordStatusReqId != null)
+            {
+                er.ordStatusReqID(r.ordStatusReqId);
+            }
+            if (r.massStatusReqId != null)
+            {
+                er.massStatusReqID(r.massStatusReqId);
+            }
+            if (r.totNumReports >= 0)
+            {
+                er.totNumReports(r.totNumReports).lastRptRequested(r.lastRptRequested);
             }
             if (r.price != null && !r.price.isEmpty())
             {
@@ -1092,7 +1523,7 @@ final class VenueSession implements SessionHandler
                 er.text(r.text);
             }
             return s.trySend(er);
-        });
+        }, r, 0);
     }
 
     private void cancelReject(final Request request, final OrderState order, final int reason, final String text)
@@ -1153,8 +1584,22 @@ final class VenueSession implements SessionHandler
      */
     private void send(final Outgoing message)
     {
+        enqueue(new Queued(message, null, 0));
+    }
+
+    private void enqueue(final Queued message)
+    {
         outbound.add(message);
         flush();
+    }
+
+    /**
+     * Records that every execution up to {@code sequence} has been dealt with, once the reports queued before this
+     * point have gone: a logon after that resumes the gateway stream from here.
+     */
+    private void markResumePoint(final long sequence)
+    {
+        enqueue(new Queued(null, null, sequence));
     }
 
     private int flush()
@@ -1162,21 +1607,56 @@ final class VenueSession implements SessionHandler
         int sent = 0;
         while (!outbound.isEmpty())
         {
-            final long position = outbound.peek().sendOn(session);
+            final Queued next = outbound.peek();
+            if (next.message() == null)
+            {
+                memory.resumeFrom = Math.max(memory.resumeFrom, next.resumeSequence());
+                outbound.poll();
+                continue;
+            }
+            final long position = next.message().sendOn(session);
             if (position < 0 && Pressure.isBackPressured(position))
             {
                 break;
             }
             if (position < 0)
             {
-                // Not connected any more: nothing queued can be delivered, and the client resends on its next logon.
-                outbound.clear();
+                // Not connected any more: nothing queued can be delivered now. Execution reports are kept for the
+                // next logon; answers to this connection's requests have no one to go to.
+                keepUndelivered();
                 break;
             }
             outbound.poll();
             sent++;
         }
         return sent;
+    }
+
+    private void keepUndelivered()
+    {
+        for (final Queued queued : outbound)
+        {
+            if (queued.report() != null)
+            {
+                memory.undelivered.add(queued.report());
+            }
+        }
+        outbound.clear();
+    }
+
+    /**
+     * Keeps what this session knows for its next logon, on disk too. Called once the session has ended, or by the
+     * adapter as it stops (after its polling thread has).
+     */
+    void remember()
+    {
+        if (remembered || link == null || link.welcome() == null)
+        {
+            return;
+        }
+        remembered = true;
+        keepUndelivered();
+        memories.save(memory);
     }
 
     private static DecimalFloat fix(final BigDecimal value)
@@ -1238,6 +1718,7 @@ final class VenueSession implements SessionHandler
         {
             link.close("fix session ended: " + reason);
         }
+        remember();
         return Action.CONTINUE;
     }
 

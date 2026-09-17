@@ -39,13 +39,16 @@ final class GatewayAuthenticator implements AuthenticationStrategy
     private final AdapterConfig config;
     private final HttpClient http;
     private final AuditLog audit;
+    private final SessionMemory.Store memories;
     private final Map<Long, GatewayLink> accepted = new ConcurrentHashMap<>();
 
-    GatewayAuthenticator(final AdapterConfig config, final HttpClient http, final AuditLog audit)
+    GatewayAuthenticator(
+        final AdapterConfig config, final HttpClient http, final AuditLog audit, final SessionMemory.Store memories)
     {
         this.config = config;
         this.http = http;
         this.audit = audit;
+        this.memories = memories;
     }
 
     @Override
@@ -78,6 +81,13 @@ final class GatewayAuthenticator implements AuthenticationStrategy
         if (heartBtInt > 0)
         {
             login.put("heartbeatSeconds", Math.min(300, heartBtInt * 3));
+        }
+        // The account's executions since the session last dealt with them are replayed before anything new, so what
+        // happened while it had no gateway session is reported now (SessionMemory).
+        final long resumeFrom = memories.resumeFrom(sender);
+        if (resumeFrom > 0)
+        {
+            login.put("resumeFrom", Long.toString(resumeFrom));
         }
         final URI uri = URI.create("ws://" + config.gateway() + "/v4/ws_private");
         GatewayLink.open(http, uri, login, LOGIN_TIMEOUT).whenComplete((link, failure) ->

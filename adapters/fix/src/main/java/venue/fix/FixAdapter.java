@@ -53,6 +53,7 @@ public final class FixAdapter implements AutoCloseable
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
     private final AuditLog audit;
     private final GatewayAuthenticator authenticator;
+    private final SessionMemory.Store memories;
     private final List<VenueSession> sessions = new ArrayList<>();
     private final CountDownLatch stopped = new CountDownLatch(1);
     private volatile boolean running = true;
@@ -68,7 +69,8 @@ public final class FixAdapter implements AutoCloseable
         this.config = config;
         // First, so that an adapter that cannot keep its audit log never takes a connection.
         this.audit = AuditLog.open(config.auditDir(), "fix-adapter", config.auditInstance(), config.auditFsync());
-        this.authenticator = new GatewayAuthenticator(config, http, audit);
+        this.memories = new SessionMemory.Store(config.dataDir().resolve("sessions"));
+        this.authenticator = new GatewayAuthenticator(config, http, audit, memories);
     }
 
     public static void main(final String[] args)
@@ -189,7 +191,7 @@ public final class FixAdapter implements AutoCloseable
     private SessionHandler onAcquired(final Session session)
     {
         final VenueSession venueSession =
-            new VenueSession(session, authenticator.take(session.connectionId()), http, config.gateway());
+            new VenueSession(session, authenticator.take(session.connectionId()), http, config.gateway(), memories);
         sessions.add(venueSession);
         System.err.println("fix adapter: " + session.compositeKey() + " logged on");
         return venueSession;
@@ -245,6 +247,12 @@ public final class FixAdapter implements AutoCloseable
             {
                 Thread.currentThread().interrupt();
             }
+        }
+        // The poller has stopped, so no session is touched anywhere else: what the ones still open remember is kept for
+        // their next logon, as if they had ended.
+        for (final VenueSession session : sessions)
+        {
+            session.remember();
         }
         CloseHelper.closeAll(library, engine);
         // After the engine, whose last messages (the Logouts it sends as it closes) are still on the streams, and

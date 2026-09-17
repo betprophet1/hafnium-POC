@@ -47,7 +47,7 @@ build/install/venue-fix-adapter/bin/venue-fix-adapter \
 | `--listen` | `127.0.0.1:17420` | where FIX clients connect |
 | `--comp-id` | `VENUE` | the venue's CompID; clients send it as TargetCompID |
 | `--gateway` | `127.0.0.1:8081` | the gateway's host and port (`/v4/ws_private`, `GET /v4/markets`) |
-| `--data` | `./fix-data` | Artio's session state and message archive, and the embedded Aeron directory |
+| `--data` | `./fix-data` | Artio's session state and message archive, the embedded Aeron directory, and what each SenderCompID's sessions know (`sessions/`) |
 | `--cancel-on-disconnect` | `true` | whether sessions' orders are cancelled when they end |
 | `--keep-orders-for` | none | SenderCompIDs, comma-separated, whose orders outlive their sessions |
 | `--audit-dir` | `<data>/audit` | the audit log of every FIX message (below) |
@@ -76,11 +76,15 @@ logs on two Artio initiators as a market maker and a retail customer. It checks:
 the security list; place, replace, cancel, a cancel too late and one of an unknown order; a price off the ladder, a
 duplicate ClOrdID, a malformed OrdType and a GTD without ExpireTime; a mass cancel by market and of everything; a
 fill between the two sessions reported to both, with maker and taker, partial and full fills and AvgPx, and no
-report twice; cancel-on-disconnect after Logout; an adapter restart after which the market maker logs on
-without resetting sequence numbers and has its first session's messages resent from the archive; and the audit log:
+report twice; cancel-on-disconnect after Logout; a session whose orders are kept (`--keep-orders-for`) that is sent, when it logs on
+again, the fill that happened while it was away; a second session that takes those orders up with an
+OrderMassStatusRequest (all, by market, by event, and one with no open orders), cancels one by ClOrdID, replaces one by
+OrderID and is then told of its fill; the status of an order placed over REST and of an unknown order; an adapter
+restart after which the market maker logs on without resetting sequence numbers, is sent the cancel that ended its
+last session, and has its first session's messages resent from the archive; and the audit log:
 one closed file per run of the adapter whose chain verifies and which holds no token in clear, with a Logon both ways
 (Password masked), an order and the report that answered it, a TestRequest and the Heartbeat Artio answered it with, a
-ResendRequest and its gap fill, Logouts, and the refused logons with their Logouts and the gateway's reasons.
+ResendRequest and its gap fill, Logouts, the status requests and their reports, and the refused logons with their Logouts and the gateway's reasons.
 `test.sh` then checks the same files with `interfaces/tools/audit_verify.py`.
 
 `./check` runs `test.sh` as its last step when the toolchain has been bootstrapped (`bootstrap.sh --check`), and
@@ -112,6 +116,18 @@ firm ── FIX 4.4 / TCP ──► Artio engine (session layer, archive) ──
   the account's `execution` stream become ExecutionReports, OrderCancelRejects and OrderMassCancelReports. The
   gateway reports an execution both in the reply and on the stream, in either order, so `VenueSession` reports each
   once and holds streamed ones back until no earlier reply can still arrive. The mapping is in the dialect document.
+- **Order status.** H and AF are answered from `GET /v4/account` (with the session's token), which lists every resting
+  order of the account with the client order ID it was placed with, its whole size, what filled and at what YES cost.
+  Each order a request answers about is taken up: the session knows it from then on, as if it had placed it. The
+  snapshot is taken at a sequence the session's stream may be behind or ahead of, so a taken-up order ignores
+  executions at or below that sequence, and executions of unknown orders that arrive while a snapshot is awaited are
+  applied on top of it once it has come.
+- **Memory across logons.** What a session knows (its orders, the executions it has reported, reports it could not
+  deliver) belongs to its SenderCompID, not to one logon (`SessionMemory`). Reports and markers leave in one queue;
+  a marker after each streamed execution moves the SenderCompID's resume point once the reports before it have been
+  handed to Artio. The next logon sends `login` with `resumeFrom` that point, and the gateway replays the account's
+  executions since, which are reported (deduplicated against what was already reported) before anything new. A
+  `resync` instead marks the known orders stale, and the next status request takes the snapshot's word for them.
 - **Threads.** Artio's framer and the embedded media driver and archive run on their own threads; every piece of
   translation state is touched only by the library's polling thread. The WebSocket client's callbacks only queue.
   Idle loops sleep a millisecond rather than spin: the machine is shared, and the gateway round trip dominates.
@@ -148,12 +164,24 @@ the Logon and Logout of a connection whose token was refused.
 - **Kept** in `--data`: each session's sequence numbers and every message sent and received (Artio's archive). A firm
   that logs on again without ResetSeqNumFlag carries on where it was and can ask for any of it to be resent, as the
   test does.
+- **Kept** in `--data/sessions`: each SenderCompID's memory (the live orders its sessions know, their ClOrdIDs and
+  totals, the gateway sequence it has been reported up to, the reports it could not deliver), written when a session
+  ends and when the adapter stops. On the next logon the gateway replays what happened since, so orders kept past a
+  disconnect (`--keep-orders-for`) are reported on, cancelled and replaced as before, and the fills and cancels in
+  between are reported.
 - **Lost**: the gateway sessions. When the adapter stops, their WebSockets close and the gateway cancels the orders
-  of every session that logged in with cancel-on-disconnect; no ExecutionReport is sent for those cancels.
-- **Lost**: the translation state (which OrderIDs a session placed, their ClOrdIDs, CumQty), which lives only as long
-  as one logon. Orders that outlive their session (sessions in `--keep-orders-for`) are therefore not reported on,
-  cancelled or replaced over FIX after a reconnect or a restart; a firm manages them over REST or mass cancels them. Executions that happened while no WebSocket was open are not replayed as FIX either.
-  The gateway's `resumeFrom` and persisting the order map would close both gaps; neither is done.
+  of every session that logged in with cancel-on-disconnect; the ExecutionReports for those cancels are sent when each
+  SenderCompID logs on again.
+- **Lost after a crash**: what changed in a memory since it was last written. The next logon resumes from the older
+  sequence and reports those executions again, under the same ExecIDs.
+- **Known gaps.** The gateway holds a window of each account's messages (`HISTORY` in `core/gateway/src/hub.rs`); a
+  SenderCompID away for longer, or one whose memory is lost, gets a `resync` and nothing replayed, and restores its
+  state with OrderMassStatusRequest (AF). A new order whose answer never reached the session before it ended is not
+  known on the next logon (the venue's replay carries its acceptance, but not the request that would tie it to the
+  session); a status request by its ClOrdID takes it up. ClOrdIDs of replaces are known only where they were sent: the
+  venue keeps the client order ID an order was placed with, so another session or a lost memory finds the order by
+  that or by OrderID. Status is only of resting orders or ones the session knows: the venue's account view has no
+  order history. TimeInForce and ExecInst of a taken-up order are not reported, for the same reason.
 
 ## The end state, and what would change
 
@@ -189,6 +217,8 @@ To get there:
 | `src/main/java/venue/fix/FixAuditor.java` | Every FIX message, both ways, off Artio's internal streams into the audit log |
 | `src/main/java/venue/fix/AuditLog.java` | The audit log's writer: queue, chain, rotation, sealing, masking, verification |
 | `src/main/java/venue/fix/OrderState.java` | What a session knows about one of its orders |
+| `src/main/java/venue/fix/SessionMemory.java` | What a SenderCompID's sessions know beyond one logon, and where it is kept |
+| `src/main/java/venue/fix/Report.java` | One execution report as data, so an undelivered one can be kept |
 | `src/main/java/venue/fix/Translate.java` | Fixed mappings: prices, quantities, reject reasons |
 | `src/test/java/venue/fix/` | The integration test and its Artio initiator |
 | `scripts/venue.sh` | A private node and gateway for tests and manual runs |
