@@ -209,7 +209,8 @@ def main():
     p = argparse.ArgumentParser(description="A FIX 4.4 console for the venue's FIX adapter.")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=17420)
-    p.add_argument("--token", required=True, help="the account's dev token, sent in Password (554)")
+    p.add_argument("--token", required=True,
+                   help="an API key's keyId.secret, or the account's dev token, sent in Password (554)")
     p.add_argument("--sender", default="CONSOLE", help="your SenderCompID")
     p.add_argument("--target", default="VENUE", help="the venue's CompID")
     p.add_argument("--heartbeat", type=int, default=30)

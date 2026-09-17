@@ -125,6 +125,14 @@ final class FixClient implements AutoCloseable
      */
     Session logon(final String senderCompId, final String token, final int adapterPort, final boolean persistent)
     {
+        return logon(senderCompId, senderCompId, token, adapterPort, persistent);
+    }
+
+    /** As {@link #logon(String, String, int, boolean)}, with Username (553) and Password (554) given apart. */
+    Session logon(
+        final String senderCompId, final String username, final String token, final int adapterPort,
+        final boolean persistent)
+    {
         final SessionConfiguration.Builder builder = SessionConfiguration.builder()
             .address("127.0.0.1", adapterPort)
             .senderCompId(senderCompId)
@@ -135,7 +143,7 @@ final class FixClient implements AutoCloseable
             .timeoutInMs(15_000);
         if (token != null)
         {
-            builder.credentials(senderCompId, token);
+            builder.credentials(username, token);
         }
         final Reply<Session> reply = library.initiate(builder.build());
         pollUntil("the logon is answered", () -> !reply.isExecuting());

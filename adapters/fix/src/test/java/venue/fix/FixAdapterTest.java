@@ -47,12 +47,13 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * The adapter end to end: a real node and gateway (scripts/venue.sh), the adapter in this JVM, and Artio initiators
  * as the firms. What a test sees is what the engine decided, translated twice.
  *
- * <p>The tests run in order and share the venue: each leaves the books as the next expects them.
+ * <p>The tests run in order and share the venue: each leaves the books as the next expects them. The venue includes an
+ * identity service, so firms can log on with API keys as well as dev tokens.
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 final class FixAdapterTest
 {
-    /** Ports: the venue takes 17430-17432 (node ingress, feed, gateway), the adapter 17440. */
+    /** Ports: the venue takes 17430-17433 (node ingress, feed, gateway, identity service), the adapter 17440. */
     private static final int VENUE_PORTS_BASE = 17430;
     private static final int ADAPTER_PORT = 17440;
     private static final String GATEWAY = "127.0.0.1:" + (VENUE_PORTS_BASE + 2);
@@ -582,6 +583,79 @@ final class FixAdapterTest
             "MAKER1".equals(r.path("sender").asText()) && !r.path("gatewaySession").asText().isEmpty()),
             "an accepted logon names the gateway session it opened");
         assertTrue(records.stream().anyMatch(r -> "disconnect".equals(r.path("kind").asText())));
+    }
+
+    @Test
+    @Order(14)
+    void aFirmLogsOnWithAnApiKeyWhichOnlyDoesWhatItsPermissionsAllowAndStopsWhenRevoked() throws Exception
+    {
+        adapter = FixAdapter.start(ADAPTER);
+        final JsonNode reader = makeKey("dev-retail-customer", "fix read", "[\"read\"]");
+        final JsonNode trader = makeKey("dev-retail-customer", "fix trade", "[\"read\", \"trade\"]");
+
+        // The key ID in Username (553) and the secret in Password (554): a read-only key logs on, and cannot trade.
+        final Session readOnly = client.logon(
+            "KEYREAD", reader.path("keyId").asText(), reader.path("secret").asText(), ADAPTER_PORT, false);
+        assertNotNull(readOnly, "a read-only key logs on");
+        client.send(readOnly, order("k1", RAIN, '1', 10, "5"));
+        final FixClient.Message refused = report(readOnly, "k1", '8');
+        assertTrue(refused.get(58).contains("FORBIDDEN") && refused.get(58).contains("trade"), refused.toString());
+        assertEquals("99", refused.get(103), refused.toString());
+
+        // The whole credential in Password, with Username the firm's own: this key trades.
+        final Session trading =
+            client.logon("KEYTRADE", "desk-7", trader.path("credential").asText(), ADAPTER_PORT, false);
+        assertNotNull(trading, "a trading key logs on");
+        client.send(trading, order("k2", RAIN, '1', 10, "5"));
+        report(trading, "k2", '0');
+
+        // Revoked: the session is logged out within the gateway's bound, and the key logs on no more.
+        final HttpResponse<String> revoked = HttpClient.newHttpClient().send(
+            HttpRequest.newBuilder(URI.create("http://" + GATEWAY + "/v4/keys/" + trader.path("keyId").asText()))
+                .header("Authorization", "Bearer dev-retail-customer").DELETE().build(),
+            HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, revoked.statusCode(), revoked.body());
+        client.pollUntil("the revoked key's session ends", () -> client.isDisconnected(trading));
+        assertNull(client.logon("KEYGONE", "desk-7", trader.path("credential").asText(), ADAPTER_PORT, false),
+            "a revoked key is refused");
+
+        readOnly.logoutAndDisconnect();
+        client.pollUntil("the read-only session is disconnected", () -> client.isDisconnected(readOnly));
+        adapter.close();
+        adapter = null;
+        final List<JsonNode> logins = new ArrayList<>();
+        try (var paths = Files.list(ADAPTER.auditDir()))
+        {
+            for (final Path file : paths.toList())
+            {
+                assertNull(AuditLog.verify(file), "the chain of " + file + " verifies");
+                for (final String line : Files.readAllLines(file))
+                {
+                    assertTrue(!line.contains(reader.path("secret").asText()) &&
+                        !line.contains(trader.path("secret").asText()), "a key's secret is written in " + file);
+                    final JsonNode record = GatewayLink.JSON.readTree(line);
+                    if ("gateway-login".equals(record.path("kind").asText()))
+                    {
+                        logins.add(record);
+                    }
+                }
+            }
+        }
+        assertTrue(logins.stream().anyMatch(r -> "KEYREAD".equals(r.path("sender").asText()) &&
+            reader.path("keyId").asText().equals(r.path("key").asText())), "an accepted logon names its key");
+    }
+
+    /** Makes an API key for the account of the dev token, through the gateway, and returns it with its secret. */
+    private static JsonNode makeKey(final String token, final String label, final String permissions)
+        throws IOException, InterruptedException
+    {
+        final String body = "{\"label\": \"" + label + "\", \"permissions\": " + permissions + "}";
+        final HttpResponse<String> response = HttpClient.newHttpClient().send(
+            HttpRequest.newBuilder(URI.create("http://" + GATEWAY + "/v4/keys"))
+                .header("Authorization", "Bearer " + token).POST(HttpRequest.BodyPublishers.ofString(body)).build(),
+            HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, response.statusCode(), response.body());
+        return GatewayLink.JSON.readTree(response.body());
     }
 
     /** The first FIX record going that way, from that SenderCompID, of that MsgType, whose message has all of those. */

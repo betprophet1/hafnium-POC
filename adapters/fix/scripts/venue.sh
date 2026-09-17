@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# A throwaway local venue for the FIX adapter: a node, seeded with the mini venue's catalogue, and a gateway serving
-# both halves, all on 127.0.0.1. Built binaries are taken from core/target/release (build them with
-# `cargo build --release -p venue-node -p venue-gateway -p venue-sim` in core/).
+# A throwaway local venue for the FIX adapter: a node, seeded with the mini venue's catalogue, an identity service for
+# API keys, and a gateway serving both halves, all on 127.0.0.1. Built binaries are taken from core/target/release
+# (build them with `cargo build --release -p venue-node -p venue-gateway -p venue-sim -p venue-identity` in core/).
 #
 #   scripts/venue.sh start DIR   starts in DIR (wiped first), writes DIR/pids and DIR/gateway.address, waits until seeded
 #   scripts/venue.sh stop DIR    stops exactly the processes recorded in DIR/pids
 #
-# Ports come from VENUE_FIX_PORTS_BASE (default 17410): base is the node's ingress, base+1 its feed, base+2 the gateway.
+# Ports come from VENUE_FIX_PORTS_BASE (default 17410): base is the node's ingress, base+1 its feed, base+2 the gateway,
+# base+3 the identity service.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 BIN="$ROOT/core/target/release"
@@ -25,7 +26,7 @@ wait_port() { # port what
 case "${1:-}" in
   start)
     dir="${2:?usage: venue.sh start DIR}"
-    for b in venue-node venue-gateway venue-sim; do
+    for b in venue-node venue-gateway venue-sim venue-identity; do
       [[ -x "$BIN/$b" ]] || { echo "missing $BIN/$b: build it first" >&2; exit 2; }
     done
     rm -rf "$dir" && mkdir -p "$dir"
@@ -34,8 +35,14 @@ case "${1:-}" in
     echo $! >>"$dir/pids"
     wait_port "$BASE" "the node"
     "$BIN/venue-sim" seed --ingress "$ingress" --catalogue "$CATALOGUE" >"$dir/seed.log" 2>&1
+    identity="127.0.0.1:$((BASE + 3))"
+    "$BIN/venue-identity" --catalogue "$CATALOGUE" --store "$dir/identity.jsonl" --fsync false --listen "$identity" \
+      >"$dir/identity.log" 2>&1 &
+    echo $! >>"$dir/pids"
+    wait_port "$((BASE + 3))" "the identity service"
     # Generous flood limits: a test sends in bursts no client would.
     "$BIN/venue-gateway" --feed "$feed" --ingress "$ingress" --catalogue "$CATALOGUE" --listen "$gateway" \
+      --identity "$identity" \
       --per-second 10000 --burst 10000 --logons-per-minute 10000 --audit-dir "$dir/gateway-audit" --audit-fsync false \
       >"$dir/gateway.log" 2>&1 &
     echo $! >>"$dir/pids"

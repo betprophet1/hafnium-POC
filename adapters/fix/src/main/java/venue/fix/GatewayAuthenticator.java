@@ -61,8 +61,10 @@ final class GatewayAuthenticator implements AuthenticationStrategy
     @Override
     public void authenticateAsync(final AbstractLogonDecoder logon, final AuthenticationProxy proxy)
     {
-        // The token travels in Password (554). Username (553) is free for the firm's own use and ignored.
-        final String token = logon.hasPassword() ? logon.passwordAsString() : "";
+        // A dev token or an API key's credential in Password (554), or a key ID in Username (553) and its secret in
+        // Password (Credentials).
+        final String token = Credentials.of(
+            logon.hasUsername() ? logon.usernameAsString() : null, logon.hasPassword() ? logon.passwordAsString() : "");
         final String sender = logon.header().senderCompIDAsString();
         if (token.isEmpty())
         {
@@ -95,9 +97,14 @@ final class GatewayAuthenticator implements AuthenticationStrategy
             if (failure == null)
             {
                 final JsonNode welcome = link.welcome();
-                recordLogin(proxy, sender, audit.fields()
+                final ObjectNode outcome = audit.fields()
                     .put("accountId", welcome.path("accountId").asText())
-                    .put("gatewaySession", welcome.path("sessionId").asText()));
+                    .put("gatewaySession", welcome.path("sessionId").asText());
+                if (welcome.hasNonNull("keyId"))
+                {
+                    outcome.put("key", welcome.path("keyId").asText());
+                }
+                recordLogin(proxy, sender, outcome);
                 accepted.put(proxy.connectionId(), link);
                 try
                 {

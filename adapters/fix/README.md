@@ -54,7 +54,9 @@ build/install/venue-fix-adapter/bin/venue-fix-adapter \
 | `--audit-instance` | `$HOSTNAME`, else `fix-adapter` | this adapter's name in the audit log's file names |
 | `--audit-fsync` | `true` | whether the audit log syncs what it writes; `false` only for tests |
 
-A firm then logs on with its SenderCompID, `TargetCompID=VENUE` and its dev token in `Password (554)`.
+A firm then logs on with its SenderCompID, `TargetCompID=VENUE` and an API key: the key ID in `Username (553)` and
+the secret in `Password (554)`, or the whole `keyId.secret` in Password. In test environments a dev token in Password
+works too. Keys are made on the gateway (`POST /v4/keys`, interfaces/gateway/README.md).
 
 To try it by hand, `scripts/fix-shell.py` is a FIX console that needs only Python 3: it logs on, keeps the session
 alive, prints reports as they arrive, and turns `list`, `buy`, `sell`, `replace`, `cancel` and `cancelall` into
@@ -70,8 +72,8 @@ The integration test:
 adapters/fix/test.sh                        # bootstrap, cargo build --release of the venue, gradle test
 ```
 
-It builds `venue-node`, `venue-gateway` and `venue-sim` in release, starts a node seeded with the mini venue's
-catalogue and a gateway (`scripts/venue.sh`, ports 17430-17432), runs the adapter in the test's JVM on 17440, and
+It builds `venue-node`, `venue-gateway`, `venue-sim` and `venue-identity` in release, starts a node seeded with the
+mini venue's catalogue, an identity service and a gateway (`scripts/venue.sh`, ports 17430-17433), runs the adapter in the test's JVM on 17440, and
 logs on two Artio initiators as a market maker and a retail customer. It checks: a refused token and a missing one;
 the security list; place, replace, cancel, a cancel too late and one of an unknown order; a price off the ladder, a
 duplicate ClOrdID, a malformed OrdType and a GTD without ExpireTime; a mass cancel by market and of everything; a
@@ -84,7 +86,10 @@ restart after which the market maker logs on without resetting sequence numbers,
 last session, and has its first session's messages resent from the archive; and the audit log:
 one closed file per run of the adapter whose chain verifies and which holds no token in clear, with a Logon both ways
 (Password masked), an order and the report that answered it, a TestRequest and the Heartbeat Artio answered it with, a
-ResendRequest and its gap fill, Logouts, the status requests and their reports, and the refused logons with their Logouts and the gateway's reasons.
+ResendRequest and its gap fill, Logouts, the status requests and their reports, and the refused logons with their Logouts and the gateway's reasons. Last,
+API keys: a read-only key logs on with Username and Password and its order is rejected `FORBIDDEN`, a trading key
+logs on with the whole credential in Password and trades, and once revoked its session is logged out and it is refused;
+the logon's audit record names the key and no secret is written.
 `test.sh` then checks the same files with `interfaces/tools/audit_verify.py`.
 
 `./check` runs `test.sh` as its last step when the toolchain has been bootstrapped (`bootstrap.sh --check`), and
@@ -103,7 +108,7 @@ firm ── FIX 4.4 / TCP ──► Artio engine (session layer, archive) ──
 ```
 
 - **Logon.** `GatewayAuthenticator` answers Artio asynchronously: it opens the gateway WebSocket and sends `login`
-  with the token from Password, `cancelOnDisconnect` (per the flags above) and `heartbeatSeconds` of three times the
+  with the credential from Username and Password (`Credentials`), `cancelOnDisconnect` (per the flags above) and `heartbeatSeconds` of three times the
   firm's HeartBtInt. A `welcome` accepts the logon; an `error` rejects it with a Logout saying why. The open WebSocket
   is handed to the session's `VenueSession` when Artio gives the library the session.
 - **Heartbeats.** Artio keeps the FIX heartbeat and ends a silent session. The adapter relays the firm's liveness to
@@ -211,7 +216,8 @@ To get there:
 | Path | What it is |
 |---|---|
 | `src/main/java/venue/fix/FixAdapter.java` | Startup: media driver and archive, Artio engine, library, polling thread |
-| `src/main/java/venue/fix/GatewayAuthenticator.java` | Logon: the token checked by logging in to the gateway |
+| `src/main/java/venue/fix/GatewayAuthenticator.java` | Logon: the credential checked by logging in to the gateway |
+| `src/main/java/venue/fix/Credentials.java` | Which credential a Logon's Username and Password make |
 | `src/main/java/venue/fix/GatewayLink.java` | One gateway WebSocket session |
 | `src/main/java/venue/fix/VenueSession.java` | The translation, both ways, for one FIX session |
 | `src/main/java/venue/fix/FixAuditor.java` | Every FIX message, both ways, off Artio's internal streams into the audit log |
@@ -221,5 +227,5 @@ To get there:
 | `src/main/java/venue/fix/Report.java` | One execution report as data, so an undelivered one can be kept |
 | `src/main/java/venue/fix/Translate.java` | Fixed mappings: prices, quantities, reject reasons |
 | `src/test/java/venue/fix/` | The integration test and its Artio initiator |
-| `scripts/venue.sh` | A private node and gateway for tests and manual runs |
+| `scripts/venue.sh` | A private node, identity service and gateway for tests and manual runs |
 | `bootstrap.sh`, `test.sh` | Toolchain, and the whole test from nothing |
