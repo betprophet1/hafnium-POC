@@ -18,7 +18,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const FORMAT: &str = "venue-audit/1";
+pub const FORMAT: &str = "venue-audit/2";
+/// The version of the rules the gateway renders derived frames by (interfaces/audit/README.md, frames derived from
+/// the journal). Raised whenever a renderer's output changes, so that a file written under older rules is still
+/// reconstructed by the rules it names.
+pub const RENDERER: u32 = 1;
 pub const COMPONENT: &str = "gateway";
 const ZEROS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 /// Records the queue holds: seconds of a busy gateway's private traffic.
@@ -50,16 +54,18 @@ fn exit_on_failure() -> Failure {
     })
 }
 
-/// What a field holds: JSON the loop already had, or text from the wire, which the writer masks and escapes. Masking
-/// is a scan of the whole message, so it belongs on the writer's thread and not on an event loop.
-enum Field {
-    Json(Value),
-    Wire(String),
+/// What a record carries: JSON the loop already had, text from the wire, or a frame the gateway derived from the
+/// journal, of which only the length and hash are written. Masking and hashing both read a whole message, so they
+/// belong on the writer's thread and not on an event loop.
+enum Item {
+    Json(&'static str, Value),
+    Wire(&'static str, String),
+    Digest(String),
 }
 
 /// A record's fields, in the order they were put there. Field names are static and the record is written straight
 /// into the writer's buffer, so a record about a message costs one allocation: the copy of the message itself.
-pub struct Fields(Vec<(&'static str, Field)>);
+pub struct Fields(Vec<Item>);
 
 impl Fields {
     /// Room for the fields a record has, taken once.
@@ -68,12 +74,21 @@ impl Fields {
     }
 
     pub fn put(&mut self, name: &'static str, value: impl Into<Value>) {
-        self.0.push((name, Field::Json(value.into())));
+        self.0.push(Item::Json(name, value.into()));
     }
 
     /// Text a client sent or was sent, kept as it arrived: the writer masks credentials out of it (`push_masked`).
     pub fn wire(&mut self, name: &'static str, text: &str) {
-        self.0.push((name, Field::Wire(text.to_string())));
+        self.0.push(Item::Wire(name, text.to_string()));
+    }
+
+    /// A frame the gateway rendered from a sequenced input: what it was, which input it came from, and the length and
+    /// hash of the bytes sent, rather than the bytes themselves. The journal holds what it was rendered from, and
+    /// `venue-gateway reconstruct` renders it again and checks it against the hash (interfaces/audit/README.md).
+    pub fn derived(&mut self, text: &str, kind: &'static str, sequence: u64) {
+        self.put("type", kind);
+        self.put("sequence", sequence.to_string());
+        self.0.push(Item::Digest(text.to_string()));
     }
 }
 
@@ -334,13 +349,28 @@ fn push_line(out: &mut Vec<u8>, head: &Head<'_>, fields: &Fields) {
     push_quoted(out, head.instance);
     out.extend_from_slice(b",\"kind\":");
     push_quoted(out, head.kind);
-    for (name, field) in &fields.0 {
+    for item in &fields.0 {
         out.push(b',');
-        push_quoted(out, name);
-        out.push(b':');
-        match field {
-            Field::Json(value) => serde_json::to_writer(&mut *out, value).expect("a buffer never fails a write"),
-            Field::Wire(text) => push_masked(out, text),
+        match item {
+            Item::Json(name, value) => {
+                push_quoted(out, name);
+                out.push(b':');
+                serde_json::to_writer(&mut *out, value).expect("a buffer never fails a write");
+            }
+            Item::Wire(name, text) => {
+                push_quoted(out, name);
+                out.push(b':');
+                push_masked(out, text);
+            }
+            // The frame itself is not written: the journal holds what it was rendered from, and the hash says which
+            // rendering of it was sent.
+            Item::Digest(text) => {
+                let _ = write!(out, "\"length\":{},\"sha256\":\"", text.len());
+                for b in Sha256::digest(text.as_bytes()) {
+                    let _ = write!(out, "{b:02x}");
+                }
+                out.push(b'"');
+            }
         }
     }
     out.extend_from_slice(b",\"prev\":\"");
@@ -493,6 +523,8 @@ impl Writer {
         open.put("format", FORMAT);
         open.put("file", self.name.clone());
         open.put("pid", std::process::id());
+        open.put("renderer", RENDERER);
+        open.put("build", env!("CARGO_PKG_VERSION"));
         if let Some(after) = after {
             open.put("after", after);
         }
@@ -703,9 +735,9 @@ mod tests {
             .fields
             .0
             .iter()
-            .find_map(|(_, field)| match field {
-                Field::Wire(text) => Some(text.clone()),
-                Field::Json(_) => None,
+            .find_map(|item| match item {
+                Item::Wire(_, text) => Some(text.clone()),
+                Item::Json(..) | Item::Digest(_) => None,
             })
             .unwrap_or_default()
     }
@@ -1000,6 +1032,19 @@ mod recorded {
         }
     }
 
+    /// The next frame of `kind` the client is sent, as text, so a test can check what the log says about it against
+    /// the bytes that were actually sent.
+    fn streamed(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>, kind: &str) -> String {
+        loop {
+            if let Message::Text(text) = socket.read().expect("a message") {
+                let m: Value = serde_json::from_str(text.as_str()).expect("JSON");
+                if m["type"] == kind {
+                    return text.to_string();
+                }
+            }
+        }
+    }
+
     fn order(id: &str) -> Value {
         json!({"clientOrderId": id, "instrumentId": MARKET.to_string(), "action": "buy", "outcome": "yes",
                "price": {"tick": 4}, "quantity": 2})
@@ -1184,9 +1229,18 @@ mod recorded {
         find(dir, "its reply", |r| {
             is(r, "ws-frame", "out") && r["msg"].as_str().is_some_and(|m| m.contains("\"o1\"") && m.contains("reply"))
         });
-        find(dir, "the execution streamed to the session", |r| {
-            is(r, "ws-frame", "out") && r["msg"].as_str().is_some_and(|m| m.contains("\"execution\""))
+        // What the engine did is recorded by reference to the journal: what the frame was, the input it was rendered
+        // from, and the hash of the bytes the client was sent (interfaces/audit/README.md).
+        let execution = streamed(&mut private, "execution");
+        let referenced = find(dir, "the execution streamed to the session", |r| {
+            is(r, "ws-frame", "out") && r["type"] == "execution"
         });
+        assert!(referenced.get("msg").is_none(), "a frame from the journal was written in full: {referenced}");
+        assert_eq!(referenced["length"], execution.len(), "{referenced}");
+        assert_eq!(referenced["sha256"], super::sha256_hex(execution.as_bytes()), "{referenced}");
+        let sent: Value = serde_json::from_str(&execution).expect("JSON");
+        // An execution carries its sequence inside the execution itself; the record says the same input.
+        assert_eq!(referenced["sequence"], sent["execution"]["sequence"], "{referenced}");
         drop(private);
         find(dir, "the session's end", |r| r["kind"] == "ws-close" && r["conn"] == conn);
 

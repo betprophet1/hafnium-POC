@@ -141,20 +141,45 @@ where
     }
 }
 
+/// What the gateway rendered a message from: the kind of frame it is, and the sequenced input whose results it was
+/// rendered from. The audit log records such a frame by reference to the journal rather than keeping a second copy of
+/// it (interfaces/audit/README.md, frames derived from the journal).
+#[derive(Clone, Copy)]
+pub struct Derived {
+    pub kind: &'static str,
+    pub sequence: u64,
+}
+
+/// A message on its way to a session, and where it came from. A message with no `derived` was not rendered from the
+/// journal — an answer, an error, a transfer, a quote — and the audit log keeps it in full.
+pub struct Queued {
+    pub text: String,
+    pub derived: Option<Derived>,
+}
+
 /// Where a session's messages go: its queue, and a way to tell whatever serves the session that something is waiting
 /// there, so nothing has to keep looking.
 #[derive(Clone)]
 pub struct Outbox {
-    queue: Sender<String>,
+    queue: Sender<Queued>,
     notify: Notify,
 }
 
 impl Outbox {
-    pub fn new(queue: Sender<String>, notify: Notify) -> Self {
+    pub fn new(queue: Sender<Queued>, notify: Notify) -> Self {
         Self { queue, notify }
     }
 
-    pub fn send(&self, message: String) -> Result<(), SendError<String>> {
+    pub fn send(&self, message: String) -> Result<(), SendError<Queued>> {
+        self.put(Queued { text: message, derived: None })
+    }
+
+    /// A frame rendered from the results of `sequence`, which the journal holds.
+    pub fn send_derived(&self, message: String, kind: &'static str, sequence: u64) -> Result<(), SendError<Queued>> {
+        self.put(Queued { text: message, derived: Some(Derived { kind, sequence }) })
+    }
+
+    fn put(&self, message: Queued) -> Result<(), SendError<Queued>> {
         self.queue.send(message)?;
         (self.notify)();
         Ok(())
@@ -367,7 +392,8 @@ impl Hub {
             self.accepted.remove(&oldest);
         }
         for (account, execution) in executions {
-            self.send_to_account(account, sequence, json!({"type": "execution", "execution": execution}).to_string());
+            let execution = json!({"type": "execution", "execution": execution}).to_string();
+            self.send_to_account(account, sequence, "execution", execution);
         }
         let mut accounts: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
         let event_of = |view: &View, instrument: u64| view.instruments.get(&instrument).map_or(0, |i| i.event);
@@ -393,7 +419,7 @@ impl Hub {
                         "type": "payout", "sequence": id(sequence), "eventId": id(event), "instrumentId": id(instrument),
                         "kind": lower(&r["kind"]), "positionClosed": r["positionClosed"], "cents": r["cents"]
                     });
-                    self.send_to_account(u(&r["accountId"]), sequence, payout.to_string());
+                    self.send_to_account(u(&r["accountId"]), sequence, "payout", payout.to_string());
                 }
                 // A set burn: complete sets the account held went back as cash (spec E-14.3), which would
                 // otherwise show only as positions falling and cash rising.
@@ -402,7 +428,7 @@ impl Hub {
                         "type": "release", "sequence": id(sequence), "eventId": id(u(&r["eventId"])),
                         "kind": lower(&r["kind"]), "cents": r["cents"]
                     });
-                    self.send_to_account(u(&r["accountId"]), sequence, release.to_string());
+                    self.send_to_account(u(&r["accountId"]), sequence, "release", release.to_string());
                 }
                 "Fill" => {
                     let trade = json!({
@@ -436,7 +462,7 @@ impl Hub {
                 "type": "account", "sequence": id(sequence), "availableCents": available, "reservedCents": reserved,
                 "positions": positions
             });
-            self.send_to_account(account, sequence, update.to_string());
+            self.send_to_account(account, sequence, "account", update.to_string());
         }
         // A released event and its markets are gone from `GET /v4/markets` and their books; followers forget them.
         for (event, _) in &released {
@@ -567,7 +593,9 @@ impl Hub {
         })
     }
 
-    fn send_to_account(&mut self, account: u64, sequence: u64, message: String) {
+    /// A frame rendered from `sequence`'s results, to every session of the account, and kept for one resuming.
+    /// `kind` is the frame's `type`, which the audit log records in place of the frame (`Derived`).
+    fn send_to_account(&mut self, account: u64, sequence: u64, kind: &'static str, message: String) {
         let history = self.history.entry(account).or_default();
         history.entries.push_back((sequence, message.clone()));
         while history.entries.len() > HISTORY {
@@ -577,7 +605,7 @@ impl Hub {
         }
         for key in self.by_account.get(&account).into_iter().flatten() {
             if let Some(s) = self.sessions.get(key) {
-                let _ = s.tx.send(message.clone());
+                let _ = s.tx.send_derived(message.clone(), kind, sequence);
             }
         }
     }
@@ -809,7 +837,7 @@ mod tests {
     use std::sync::{mpsc, Arc};
 
     /// A session's outbox, and what arrives in it.
-    fn outbox() -> (Outbox, mpsc::Receiver<String>) {
+    fn outbox() -> (Outbox, mpsc::Receiver<Queued>) {
         let (tx, rx) = mpsc::channel();
         (Outbox::new(tx, Arc::new(|| {})), rx)
     }
@@ -934,7 +962,7 @@ mod tests {
         hub.apply(&tick);
         assert_eq!(hub.markets(None)["events"].as_array().map(Vec::len), Some(0));
         assert!(hub.market(50).is_none());
-        let told: Vec<Value> = follower_rx.try_iter().filter_map(|m| serde_json::from_str(&m).ok()).collect();
+        let told: Vec<Value> = follower_rx.try_iter().filter_map(|m| serde_json::from_str(&m.text).ok()).collect();
         assert!(told.iter().any(|m| m["released"] == true && m["eventId"] == "5"), "{told:?}");
     }
 

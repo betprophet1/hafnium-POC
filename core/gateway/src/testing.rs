@@ -17,7 +17,7 @@ use venue_link::catalogue::{self, Catalogue};
 use venue_link::submit::Submit;
 use venue_node::node::{self, Config};
 
-const CATALOGUE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/charts/venue-mini/files/markets.json");
+pub const CATALOGUE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/charts/venue-mini/files/markets.json");
 /// A binary market the catalogue lists and opens.
 pub const MARKET: u64 = catalogue::instrument_id(catalogue::event_id(1, 1), 0);
 /// The mini venue's market maker, funded with 5 000 000 cents; its dev token.
@@ -52,6 +52,8 @@ pub struct Venue {
     pub ingress: String,
     /// The gateway's audit log: a directory of the test's own, written without syncing.
     pub audit_dir: PathBuf,
+    /// The node's data directory, which holds the journal a test can replay.
+    pub data_dir: PathBuf,
 }
 
 /// A seeded node, a treasury on it with a fake bank that decides `dummy_bank` transfers within half a second and never
@@ -70,7 +72,7 @@ fn free_address() -> String {
 /// ingress accepts a connection; one that stops first, however long it took to get there, is tried again on fresh
 /// ports. Under a loaded machine a node can take well over a moment to reach its bind, and one taken as started before
 /// it had would leave the test's seeder waiting for ever on a node that is gone.
-fn start_node(name: &str) -> (String, String) {
+fn start_node(name: &str) -> (String, String, PathBuf) {
     for attempt in 0..5 {
         let (ingress, feed) = (free_address(), free_address());
         let data_dir = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}-{attempt}", std::process::id()));
@@ -102,7 +104,7 @@ fn start_node(name: &str) -> (String, String) {
             match stop.recv_timeout(Duration::from_millis(20)) {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     settled = match settled {
-                        Some(0) => return (ingress, feed),
+                        Some(0) => return (ingress, feed, data_dir),
                         Some(n) => Some(n - 1),
                         None if journal.exists() && TcpStream::connect(&ingress).is_ok() => Some(10),
                         None => None,
@@ -140,7 +142,7 @@ pub fn venue_trusting(name: &str, proxies: &str) -> Venue {
 }
 
 fn venue_with(name: &str, public: bool, private: bool, treasury: bool, proxies: &str) -> Venue {
-    let (ingress, feed) = start_node(name);
+    let (ingress, feed, data_dir) = start_node(name);
     seed(name, &ingress);
     let limits = Limits { per_second: 1_000_000, burst: 1_000_000, logons_per_minute: 1_000_000 };
     let audit_dir = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}.audit", std::process::id()));
@@ -187,7 +189,7 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool, proxies: 
         gateway.open_rfqs_pending(RESPONDER, None).is_ok_and(|pending| gateway.wait_for(pending).is_ok())
     });
     let (ws_public, ws_private) = (format!("ws://{address}/v4/ws_public"), format!("ws://{address}/v4/ws_private"));
-    Venue { gateway, address, ws_public, ws_private, ingress, audit_dir }
+    Venue { gateway, address, ws_public, ws_private, ingress, audit_dir, data_dir }
 }
 
 /// Seeds a node with the mini venue's catalogue.
@@ -409,7 +411,7 @@ pub const GENEROUS: Limits = Limits { per_second: 1_000_000, burst: 1_000_000, l
 impl Fleet {
     /// The node and the shared services, and no gateway yet.
     pub fn start(name: &str) -> Self {
-        let (ingress, feed) = start_node(name);
+        let (ingress, feed, _data_dir) = start_node(name);
         seed(name, &ingress);
         let identity = start_identity(name);
         let treasury = start_treasury(name, &ingress, &feed);

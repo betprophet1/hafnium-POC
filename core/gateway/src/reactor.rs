@@ -24,7 +24,7 @@
 use crate::api::{Gateway, Half, Pending};
 use crate::audit::{self, Fields};
 use crate::forwarded::Forwarding;
-use crate::hub::Outbox;
+use crate::hub::{Derived, Outbox, Queued};
 use crate::identity::Credential;
 use crate::limits::monotonic;
 use crate::treasury::Call;
@@ -171,7 +171,7 @@ struct Conn {
     /// Opened once a WebSocket handshake completes; until then the outbox waits here for it.
     session: Option<Session>,
     outbox: Option<Outbox>,
-    queue: Receiver<String>,
+    queue: Receiver<Queued>,
     notify: Notify,
     /// Whether the socket may hold input not yet read. The loop is told when new input arrives, not that input is
     /// still there, so a session that stopped reading at its limit remembers it has more to read.
@@ -531,8 +531,8 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
         }
         // Messages the hub queued.
         while let Ok(message) = conn.queue.try_recv() {
-            record_to_client(gateway, origin, session, &message, false);
-            if !queue(socket, message, ending) {
+            record_queued(gateway, origin, session, &message);
+            if !queue(socket, message.text, ending) {
                 return false;
             }
         }
@@ -740,6 +740,22 @@ fn record_to_client(gateway: &Gateway, origin: &Origin, session: &Session, text:
     // Masked like anything else now that masking costs the loop nothing: no answer carries a credential today, and
     // one added later should not have to remember this.
     fields.wire("msg", text);
+    gateway.audit.record("ws-frame", fields);
+}
+
+/// A message the hub queued for the client. One the gateway rendered from a sequenced input is recorded as what it
+/// was, which input it came from and the hash of what was sent: the journal holds what it was rendered from, and
+/// `reconstruct` renders it again to check (interfaces/audit/README.md). Anything else is recorded in full.
+fn record_queued(gateway: &Gateway, origin: &Origin, session: &Session, message: &Queued) {
+    if gateway.half == Half::Public {
+        return;
+    }
+    let mut fields = about(gateway, origin, session.account(), session.api_key(), Some(session.id()));
+    fields.put("dir", "out");
+    match message.derived {
+        Some(Derived { kind, sequence }) => fields.derived(&message.text, kind, sequence),
+        None => fields.wire("msg", &message.text),
+    }
     gateway.audit.record("ws-frame", fields);
 }
 
