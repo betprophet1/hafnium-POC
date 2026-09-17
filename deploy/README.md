@@ -26,7 +26,7 @@ the gateway (`/v4/ws_private`), each logged in with its account's dev token, and
 cash, positions and transfers; the parlays tab builds a parlay from open markets and requests quotes for it as the
 retail customer, shows the quotes as they arrive and lapse, takes one, and lists every parlay with its legs and how it
 settled. Markets run on their own: the dummy oracle (`oracle.enabled`, on by default) lists a new round of each market
-every few minutes and starts, ends, closes and settles it through two dummy sources, an auto-approver and a 30 s
+every few minutes (the S&P 500 market once a day, trading for 22 hours, so something stays put while you test) and starts, ends, closes and settles it through two dummy sources, an auto-approver and a 30 s
 dispute window, voiding one now and then. The settlement tab shows its schedule, countdowns and resolution cases, and
 acts through it: start, suspend, end, close, postpone, propose an outcome or a void, dispute, and list a round now.
 The synthetic maker quotes over a WebSocket session with cancel-on-disconnect (delete its pod and its quotes leave the

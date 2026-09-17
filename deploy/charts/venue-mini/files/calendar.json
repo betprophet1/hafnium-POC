@@ -21,6 +21,11 @@
       "template": 3,
       "everySeconds": 360, "leadSeconds": 30, "runSeconds": 180, "closeAfterSeconds": 10,
       "suspendChance": 100, "suspendSeconds": 15, "voidChance": 50, "errorChance": 150
+    },
+    {
+      "template": 4,
+      "everySeconds": 86400, "leadSeconds": 60, "runSeconds": 79200, "closeAfterSeconds": 600,
+      "suspendChance": 0, "voidChance": 0, "errorChance": 0
     }
   ]
 }

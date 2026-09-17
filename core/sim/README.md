@@ -29,7 +29,9 @@ under the next round.
 ## The dummy oracle
 
 `deploy/charts/venue-mini/files/calendar.json` gives each template a cadence and timings, in seconds, and chances,
-in thousandths:
+in thousandths. The demo's rain, match and bitcoin markets list a round every few minutes; the S&P 500 market lists
+one a day that trades for 22 hours and is never suspended or voided, so a person trying the venue has a market that
+does not settle under them:
 
 | Field | Meaning |
 |---|---|

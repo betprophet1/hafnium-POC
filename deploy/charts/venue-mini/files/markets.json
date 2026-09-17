@@ -27,6 +27,12 @@
       "title": "Bitcoin above $150,000 on 31 December?",
       "states": ["No", "Yes"],
       "instruments": [{"label": "Above $150k", "class": "BINARY", "mask": 2}]
+    },
+    {
+      "template": 4,
+      "title": "Will the S&P 500 close higher today?",
+      "states": ["No", "Yes"],
+      "instruments": [{"label": "Higher", "class": "BINARY", "mask": 2}]
     }
   ]
 }
