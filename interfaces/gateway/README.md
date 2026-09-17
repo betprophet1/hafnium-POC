@@ -322,18 +322,43 @@ the same instrument and accumulates one book. The first request lists it under a
 and 1¢ between, because parlays live deep out of the money; its lot step is 10 contracts, which that ladder needs to
 keep every trade's cash in whole cents, and which is also the least a request may ask for.
 
-**Requesting.** `requestQuote` on `/v4/ws_private`, or `POST /v4/rfqs`, with `legs` and `quantity` (a multiple of the
-lot step). The answer names the request (`requestId`), the parlay's `instrumentId` and `eventId`, the canonical legs,
-and `expiresAt`: the end of the request's window, during which responders may quote. Anything wrong with the legs is
-refused at the edge with `BAD_REQUEST` and a reason, and nothing is listed.
+**Requesting.** `requestQuote` on `/v4/ws_private`, or `POST /v4/rfqs`, with `legs` and `quantity`: a multiple of the
+lot step, and at least the venue's minimum request, which the parlay service is configured with (one lot, 10
+contracts, unless the environment says otherwise). The answer names the request (`requestId`), the parlay's
+`instrumentId` and `eventId`, the canonical legs, `expiresAt`, the end of the request's window during which responders
+may quote, and `responders`, how many responder accounts it was sent to. Anything wrong with the legs is refused at
+the edge with `BAD_REQUEST` and a reason, and nothing is listed.
 
-**Responding.** Accounts registered as responders in the environment's catalogue receive each request as an `rfq`
-message on their private sessions while they are logged in. The requester is never named. A quote is a real resting
-order: the responder places a sell of YES on the parlay's book, usually GTD so that it lapses (its collateral is
-reserved like any order's), and then attaches it to the request with `attachQuote` or
-`POST /v4/rfqs/{requestId}/quotes`, naming the order. Only a responder's own resting sell on the request's parlay,
-within the request's window, can be attached. The order is on the public book from the moment it rests, so anyone
-may take it, not only the requester.
+**Responders.** Only approved responders see requests and quote. Approval is per account and belongs to the parlay
+service's operator, who approves and revokes accounts through the service's operator API; an environment starts from
+the accounts its catalogue marks `"responder": true`, and the list survives restarts. A credential also needs the
+`respond` permission, which every dev token holds and an API key will hold only if issued with it. Anything a
+responder-only op or path is refused for, an account that is not approved included, is 403 `FORBIDDEN`. Revoking an
+account ends its subscriptions at once (each session is sent `rfqSubscription` with `subscribed: false`) and refuses
+its later quotes; quotes it attached already are orders and stay on the book.
+
+**Subscribing.** A responder's private session asks for requests with `subscribeRfqs`, optionally with `filters`:
+`minLegs` and `maxLegs` (2 to 6), `eventIds` and `instrumentIds` (a request passes if any leg is on one of them), and
+`minQuantity`. Every filter given must pass. The session is sent an `rfq` message for each request still open that
+its filters select, oldest first, then the reply (`subscribed: true`, the filters in force, and `openRequests`, how
+many it was just sent), then an `rfq` for each new request its filters select as it opens, until the session ends or
+sends `unsubscribeRfqs`. Nothing is missed or sent twice between the catch-up and what follows it, though a request
+that opens while the subscription is being made may arrive just before the reply. Subscribing again
+replaces the filters and catches up again, so a client may simply resubscribe whenever in doubt; a refused
+`subscribeRfqs` leaves the session's subscription as it was. Subscriptions are per session: a responder with two
+sessions subscribed receives each request on both, and counts once in `responders`. A client without a session
+reads the same open requests with `GET /v4/rfqs`, unfiltered.
+
+**Fan-out.** A request goes to every subscribed session of an approved responder whose filters select it, except the
+requester's own sessions: an approved responder that requests is never sent its own request, and cannot quote it.
+There is no cap on how many responders receive a request. The requester is never named, in an `rfq` message or
+anywhere a responder can read.
+
+**Responding.** A quote is a real resting order: the responder places a sell of YES on the parlay's book, usually GTD
+so that it lapses (its collateral is reserved like any order's), and then attaches it to the request with
+`attachQuote` or `POST /v4/rfqs/{requestId}/quotes`, naming the order. Only an approved responder's own resting sell
+on the request's parlay, within the request's window, can be attached; being subscribed is not required. The order is
+on the public book from the moment it rests, so anyone may take it, not only the requester.
 
 **Receiving and accepting quotes.** The requester's private sessions receive a `quote` message when a quote is
 attached (`state: open`), again whenever a fill reduces it, and a last time when it leaves the book (`filled`,
@@ -351,13 +376,21 @@ resting orders, once any leg stops trading, whether or not it ever traded.
 **What holds what.** Parlays, their legs, quotes as orders, fills and settlements are all in the journal. Requests,
 and which order answers which request, are held by the parlay service, not by the gateway and not in the journal: a
 gateway that fails over loses nothing, and every gateway connected to the service delivers the same requests and
-quotes, so a requester and a responder need not share one. A restarted parlay service forgets open requests; the
-quotes stay on the book as orders.
+quotes, so a requester and a responder need not share one.
+
+**Restarts.** A restarted parlay service forgets open requests and subscriptions, rereads its approved responders,
+and relearns parlays, their legs and how they stand from the journal; until it has caught up with the feed it refuses
+new requests with `UNAVAILABLE`. Quotes stay on the book as orders, but their requesters are no longer sent `quote`
+updates for them. Re-establishing subscriptions is the gateway's job, not the client's: a gateway remembers what each
+of its live sessions subscribed with and subscribes them again as soon as it reaches the service again, so a
+responder's session stays subscribed across a service restart without doing anything. A client whose session ends
+(its gateway restarted, or it reconnected) subscribes on its new session. While the service is unreachable,
+`subscribeRfqs`, `requestQuote`, `attachQuote` and `GET /v4/rfqs` are refused with `UNAVAILABLE`.
 
 ## Not in this draft
 
 The binary market-maker gateway (interface 2); keys scoped to markets, IP allow-lists and signed requests; real
 payment rails and their holds, limits and clawbacks; minimum-sequence reads from the stores (interface 28); the
 environment manifest (interface 22); real identity (interface 6); a sequenced RFQ state machine (blueprint §6:
-requests, windows and acceptances in the journal) and responder caps and minimum sizes per class; order history beyond
-what a session resumes.
+requests, windows and acceptances in the journal); caps on how many responders receive a request, and minimum sizes
+per class of parlay; order history beyond what a session resumes.

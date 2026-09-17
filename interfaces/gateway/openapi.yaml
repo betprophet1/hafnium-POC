@@ -23,6 +23,11 @@ info:
     (README, deposits and withdrawals). Moving money is a permission of its own, `transfers`: an API key holds it only
     when it was created with it (README, API keys and permissions). Each operation's security requirement names the
     permission an API key needs for it; a dev token, in test environments, holds every permission.
+
+    Answering requests for quote needs two things: the account must be one the parlay service's operator has approved
+    as a responder (README, parlays), and the credential must hold the permission named `respond` in the security
+    requirement of the responder operations. A dev token holds `respond`; an API key will hold it only when issued
+    with it.
 servers:
   - url: http://127.0.0.1:8080
     description: The mini venue on a laptop, after `deploy/laptop.sh web`
@@ -301,6 +306,27 @@ paths:
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/TreasuryUnavailable' }
   /v4/rfqs:
+    get:
+      operationId: listOpenRfqs
+      tags: [rfq]
+      summary: The requests open now that this responder may quote (approved responders only)
+      description: |
+        Every request whose window is still open, oldest first, except the account's own, whatever filters its
+        sessions subscribed with. What a WebSocket `subscribeRfqs` catches up with, for a client without a session.
+        The requester is not named. A parlay service that restarted has forgotten the requests open before it did.
+      security:
+        - apiKey: [read]
+        - devToken: []
+      responses:
+        '200':
+          description: The open requests.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OpenRfqs' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/NotResponder' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/Unavailable' }
     post:
       operationId: requestQuote
       security:
@@ -310,8 +336,10 @@ paths:
       summary: Request quotes for a parlay, listing it if it does not exist yet
       description: |
         The legs are put in canonical order and must be on different events and on open markets. The parlay's ID is
-        a hash of them, so the same legs always name the same instrument. Registered responders receive the request
-        without the requester's identity, and quote by attaching resting sells of the parlay.
+        a hash of them, so the same legs always name the same instrument. The request is sent, without the
+        requester's identity, to every session of an approved responder that has subscribed and whose filters it
+        passes; `responders` says how many accounts that was. Responders quote by attaching resting sells of the
+        parlay.
       requestBody:
         required: true
         content:
@@ -357,10 +385,11 @@ paths:
         - apiKey: [trade]
         - devToken: []
       tags: [rfq]
-      summary: Attach a resting order to a request as a quote (responders only)
+      summary: Attach a resting order to a request as a quote (approved responders only)
       description: |
-        The order must be this account's resting sell of YES on the request's parlay, and the request's window must
-        still be open. The quote is the order: it lapses, fills or is cancelled as the order does.
+        The order must be this account's resting sell of YES on the request's parlay, the request must be another
+        account's, and its window must still be open. The quote is the order: it lapses, fills or is cancelled as the
+        order does. A responder need not be subscribed to quote, only approved.
       parameters:
         - $ref: '#/components/parameters/RequestId'
       requestBody:
@@ -376,7 +405,7 @@ paths:
               schema: { $ref: '#/components/schemas/Quote' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '403': { $ref: '#/components/responses/NotResponder' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/Unavailable' }
@@ -508,6 +537,13 @@ components:
       description: |
         The credential is valid but lacks the permission this call needs, which the message names; or a key tried to
         create a key with more than it holds. A dev token never gets this.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotResponder:
+      description: >-
+        `FORBIDDEN`: the account is not approved as a parlay responder by the parlay service's operator, or the
+        credential lacks the `respond` permission. Approval is per account and changes only through the operator.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -910,7 +946,9 @@ components:
           type: integer
           minimum: 1
           maximum: 4294967295
-          description: Contracts wanted, a multiple of the parlay's lot step (10), which is also the minimum.
+          description: >-
+            Contracts wanted, a multiple of the parlay's lot step (10) and at least the venue's minimum request, which
+            the parlay service is configured with (10, one lot, unless the environment says otherwise).
     Rfq:
       type: object
       required: [requestId, instrumentId, eventId, legs, quantity, lotStep, openedAt, expiresAt]
@@ -922,11 +960,48 @@ components:
         quantity: { type: integer, minimum: 1 }
         lotStep: { type: integer, minimum: 1 }
         listed: { type: boolean, description: 'True when this request listed the parlay; false when it already existed.' }
+        responders:
+          type: integer
+          minimum: 0
+          description: >-
+            In the answer to the requester only: how many responder accounts the request was sent to, none of them
+            named. Zero means nobody will quote unless a responder subscribes or lists open requests within the window.
         openedAt: { type: string, format: date-time, description: The sequencer's time when the request opened. }
         expiresAt:
           type: string
           format: date-time
           description: The end of the window in which quotes can be attached, in the sequencer's time.
+    OpenRfqs:
+      type: object
+      required: [requests]
+      properties:
+        requests: { type: array, items: { $ref: '#/components/schemas/Rfq' } }
+    RfqFilters:
+      type: object
+      additionalProperties: false
+      description: >-
+        Which requests a subscription is sent. Every field is optional, and every one given must hold: the number of
+        legs within `minLegs` and `maxLegs`, at least one leg on an event of `eventIds` if it is given, at least one
+        leg on a market of `instrumentIds` if it is given, and a quantity of at least `minQuantity`.
+      properties:
+        minLegs: { type: integer, minimum: 2, maximum: 6, default: 2 }
+        maxLegs: { type: integer, minimum: 2, maximum: 6, default: 6 }
+        eventIds: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/Id' } }
+        instrumentIds: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/Id' } }
+        minQuantity: { type: integer, minimum: 0, maximum: 4294967295, default: 0 }
+    RfqSubscription:
+      type: object
+      required: [subscribed]
+      description: The answer to `subscribeRfqs` and `unsubscribeRfqs`.
+      properties:
+        subscribed: { type: boolean }
+        filters:
+          allOf: [{ $ref: '#/components/schemas/RfqFilters' }]
+          description: On subscribing, the filters in force, every default filled in.
+        openRequests:
+          type: integer
+          minimum: 0
+          description: On subscribing, how many open requests were sent to the session, as `rfq` messages, ahead of this reply.
     RfqStatus:
       allOf:
         - $ref: '#/components/schemas/Rfq'

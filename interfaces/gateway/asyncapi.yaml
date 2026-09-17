@@ -10,8 +10,8 @@ info:
       conflated books, trades and market states.
     - `/v4/ws_private` carries one account. A session logs in with an API key's credential (or a dev token in a test
       environment), enters and cancels orders, requests quotes for parlays, and receives that account's executions,
-      account updates, payouts, releases and transfer updates, the quotes on its requests and, for a registered
-      responder, other accounts' requests. It carries no public topics.
+      account updates, payouts, releases and transfer updates, the quotes on its requests and, for an approved
+      responder that subscribes with `subscribeRfqs`, other accounts' requests. It carries no public topics.
 
     Logging in needs the `read` permission, which every key holds; `order`, `amend`, `cancel`, `cancelAll`,
     `requestQuote` and `attachQuote` need `trade`, and are answered with an `error` (`FORBIDDEN`) for a key without it
@@ -53,6 +53,8 @@ channels:
       cancelAll: { $ref: '#/components/messages/cancelAll' }
       requestQuote: { $ref: '#/components/messages/requestQuote' }
       attachQuote: { $ref: '#/components/messages/attachQuote' }
+      subscribeRfqs: { $ref: '#/components/messages/subscribeRfqs' }
+      unsubscribeRfqs: { $ref: '#/components/messages/unsubscribeRfqs' }
       heartbeat: { $ref: '#/components/messages/heartbeat' }
       welcome: { $ref: '#/components/messages/welcome' }
       reply: { $ref: '#/components/messages/reply' }
@@ -65,6 +67,7 @@ channels:
       resync: { $ref: '#/components/messages/resync' }
       rfq: { $ref: '#/components/messages/rfq' }
       quote: { $ref: '#/components/messages/quote' }
+      rfqSubscription: { $ref: '#/components/messages/rfqSubscription' }
 operations:
   receiveLogin:
     action: receive
@@ -130,8 +133,31 @@ operations:
     action: receive
     channel: { $ref: '#/channels/private' }
     summary: >-
-      A registered responder attaches one of its resting sells on the request's parlay to the request, as a quote.
+      An approved responder attaches one of its resting sells on the request's parlay to another account's request,
+      as a quote. Refused with `FORBIDDEN` for an account that is not approved.
     messages: [{ $ref: '#/channels/private/messages/attachQuote' }]
+    reply:
+      channel: { $ref: '#/channels/private' }
+      messages: [{ $ref: '#/channels/private/messages/reply' }, { $ref: '#/channels/private/messages/error' }]
+  receiveSubscribeRfqs:
+    action: receive
+    channel: { $ref: '#/channels/private' }
+    summary: >-
+      An approved responder starts receiving requests for quote on this session (README, parlays): first an `rfq`
+      message for each request open now that its filters select, then the reply, then each new one as it opens (one
+      that opens while the subscription is being made may come just before the reply; none is sent twice).
+      Subscribing again replaces the filters and catches up again. Refused with `FORBIDDEN` for an account that is
+      not approved, and with `UNAVAILABLE` while the parlay service cannot be reached; a refusal leaves any
+      subscription the session had as it was. The subscription lasts as long as the session.
+    messages: [{ $ref: '#/channels/private/messages/subscribeRfqs' }]
+    reply:
+      channel: { $ref: '#/channels/private' }
+      messages: [{ $ref: '#/channels/private/messages/reply' }, { $ref: '#/channels/private/messages/error' }]
+  receiveUnsubscribeRfqs:
+    action: receive
+    channel: { $ref: '#/channels/private' }
+    summary: Stop receiving requests for quote on this session. Quotes already attached stay attached.
+    messages: [{ $ref: '#/channels/private/messages/unsubscribeRfqs' }]
     reply:
       channel: { $ref: '#/channels/private' }
       messages: [{ $ref: '#/channels/private/messages/reply' }, { $ref: '#/channels/private/messages/error' }]
@@ -201,9 +227,17 @@ operations:
     action: send
     channel: { $ref: '#/channels/private' }
     summary: >-
-      To registered responders logged in, each request for quote from another account as it opens. The requester is
-      not named.
+      To every session of an approved responder subscribed with `subscribeRfqs` whose filters select it, each request
+      for quote from another account as it opens, and on subscribing each one still open. The requester is not named.
     messages: [{ $ref: '#/channels/private/messages/rfq' }]
+  sendRfqSubscription:
+    action: send
+    channel: { $ref: '#/channels/private' }
+    summary: >-
+      The session's subscription to requests has ended without the client asking: the account's approval was
+      revoked, or the parlay service refused to take the subscription back after it restarted. Subscribe again once
+      the reason has gone.
+    messages: [{ $ref: '#/channels/private/messages/rfqSubscription' }]
   sendQuote:
     action: send
     channel: { $ref: '#/channels/private' }
@@ -230,6 +264,7 @@ components:
     Transfer: { $ref: './openapi.yaml#/components/schemas/Transfer' }
     Rfq: { $ref: './openapi.yaml#/components/schemas/Rfq' }
     Quote: { $ref: './openapi.yaml#/components/schemas/Quote' }
+    RfqSubscription: { $ref: './openapi.yaml#/components/schemas/RfqSubscription' }
   messages:
     login:
       payload:
@@ -338,6 +373,23 @@ components:
               id: { $ref: '#/components/schemas/RequestId' }
               requestId: { $ref: './openapi.yaml#/components/schemas/RfqId' }
           - $ref: './openapi.yaml#/components/schemas/QuoteAttach'
+    subscribeRfqs:
+      payload:
+        type: object
+        required: [op]
+        additionalProperties: false
+        properties:
+          op: { const: subscribeRfqs }
+          id: { $ref: '#/components/schemas/RequestId' }
+          filters: { $ref: './openapi.yaml#/components/schemas/RfqFilters' }
+    unsubscribeRfqs:
+      payload:
+        type: object
+        required: [op]
+        additionalProperties: false
+        properties:
+          op: { const: unsubscribeRfqs }
+          id: { $ref: '#/components/schemas/RequestId' }
     heartbeat:
       payload:
         type: object
@@ -379,6 +431,7 @@ components:
               - $ref: '#/components/schemas/CancelAllResult'
               - $ref: '#/components/schemas/Rfq'
               - $ref: '#/components/schemas/Quote'
+              - $ref: '#/components/schemas/RfqSubscription'
     error:
       payload:
         type: object
@@ -536,6 +589,15 @@ components:
             properties:
               type: { const: quote }
           - $ref: '#/components/schemas/Quote'
+    rfqSubscription:
+      summary: The session's subscription to requests for quote ended without the client asking.
+      payload:
+        type: object
+        required: [type, subscribed, reason]
+        properties:
+          type: { const: rfqSubscription }
+          subscribed: { const: false }
+          reason: { type: string }
     resync:
       payload:
         type: object
