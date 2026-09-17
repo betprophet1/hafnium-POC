@@ -560,13 +560,18 @@ components:
         position: { type: integer, description: Signed YES contracts; negative holds NO. }
     RestingOrder:
       type: object
-      required: [orderId, instrumentId, side, price, remaining]
+      required: [orderId, clientOrderId, instrumentId, eventId, side, price, quantity, remaining, filled, filledYesCents]
       properties:
         orderId: { $ref: '#/components/schemas/Id' }
+        clientOrderId: { type: string, description: The ID the order was placed with; an amendment keeps it. }
         instrumentId: { $ref: '#/components/schemas/Id' }
+        eventId: { $ref: '#/components/schemas/Id' }
         side: { $ref: '#/components/schemas/Side' }
         price: { $ref: '#/components/schemas/PriceQuote' }
+        quantity: { type: integer, description: 'The order''s whole size: filled plus remaining, after any amendment or reduction.' }
         remaining: { type: integer }
+        filled: { type: integer, description: Contracts filled so far. }
+        filledYesCents: { type: integer, description: 'The YES cost of the filled contracts in cents (spec E-2.4); divided by filled, the average YES price in cents.' }
     Account:
       type: object
       required: [accountId, sequence, availableCents, reservedCents, positions, orders]

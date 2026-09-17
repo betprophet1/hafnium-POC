@@ -90,6 +90,12 @@ pub struct OrderView {
     pub side: String,
     pub tick: u64,
     pub remaining: u64,
+    /// The client order ID it was placed with. An amendment keeps it.
+    pub client_order_id: String,
+    /// Contracts filled so far, and their YES cost in cents (E-2.4), so a client restoring its state after a
+    /// disconnect can be told an order's filled quantity and average price, not only what still rests.
+    pub filled: u64,
+    pub filled_yes_cents: u64,
     /// When a GTD order lapses (E-8.1), from the `NewOrder` that placed it: `OrderAccepted` does not say.
     pub expires_at: Option<u64>,
 }
@@ -293,14 +299,34 @@ impl View {
                     side: s(&r["side"]),
                     tick: u(&r["tick"]),
                     remaining: u(&r["quantity"]),
+                    client_order_id: s(&r["clientOrderId"]),
+                    filled: 0,
+                    filled_yes_cents: 0,
                     expires_at: None,
                 };
                 self.orders.insert(u(&r["orderId"]), order);
             }
             "Fill" => {
+                let (quantity, tick) = (u(&r["quantity"]), u(&r["tick"]));
+                let instrument = u(&r["instrumentId"]);
+                // E-2.4: whole cents for a quantity on the lot step, which every fill is.
+                let yes_cents = self
+                    .instruments
+                    .get(&instrument)
+                    .and_then(|i| self.ladders.get(&i.table))
+                    .and_then(|ladder| ladder.get(usize::try_from(tick).ok()?))
+                    .map_or(0, |row| {
+                        u128::from(quantity) * 100 * u128::from(row.numerator) / u128::from(row.denominator.max(1))
+                    });
+                for order in [u(&r["makerOrderId"]), u(&r["takerOrderId"])] {
+                    if let Some(o) = self.orders.get_mut(&order) {
+                        o.filled = o.filled.saturating_add(quantity);
+                        o.filled_yes_cents =
+                            o.filled_yes_cents.saturating_add(u64::try_from(yes_cents).unwrap_or(u64::MAX));
+                    }
+                }
                 self.set_remaining(u(&r["makerOrderId"]), u(&r["makerRemaining"]));
                 self.set_remaining(u(&r["takerOrderId"]), u(&r["takerRemaining"]));
-                let instrument = u(&r["instrumentId"]);
                 if let Some(i) = self.instruments.get_mut(&instrument) {
                     i.last = Some(u(&r["tick"]));
                 }

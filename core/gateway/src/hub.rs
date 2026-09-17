@@ -696,9 +696,14 @@ impl Hub {
             .iter()
             .filter(|(_, o)| o.account == account)
             .map(|(order, o)| {
+                // Enough for a client that lost its session to take the order up again as its own: the ID it
+                // placed it under, its whole size and what has filled at what cost (the FIX adapter's order status).
+                let event = self.view.instruments.get(&o.instrument).map_or(0, |i| i.event);
                 json!({
-                    "orderId": id(*order), "instrumentId": id(o.instrument), "side": o.side.to_lowercase(),
-                    "price": self.quote(o.instrument, o.tick), "remaining": o.remaining
+                    "orderId": id(*order), "clientOrderId": o.client_order_id, "instrumentId": id(o.instrument),
+                    "eventId": id(event), "side": o.side.to_lowercase(), "price": self.quote(o.instrument, o.tick),
+                    "quantity": o.filled.saturating_add(o.remaining), "remaining": o.remaining, "filled": o.filled,
+                    "filledYesCents": o.filled_yes_cents
                 })
             })
             .collect();

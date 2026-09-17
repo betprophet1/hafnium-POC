@@ -253,6 +253,30 @@ mod tests {
     }
 
     #[test]
+    fn a_resting_order_in_the_account_says_how_it_was_placed_and_what_filled() {
+        let venue = testing::venue("rest-account-orders");
+        let a = &venue.address;
+        let (status, placed) = request(a, "POST", "/v4/orders", Some(MAKER_TOKEN), Some(&order("ra1")));
+        assert_eq!((status, placed["status"].as_str()), (200, Some("accepted")), "{placed}");
+        let id = placed["orderId"].as_str().expect("an order ID").to_string();
+        let sell = json!({"clientOrderId": "ra2", "instrumentId": MARKET.to_string(), "action": "sell",
+                          "outcome": "yes", "price": {"tick": 4}, "quantity": 1, "timeInForce": "IOC"});
+        let (status, sold) = request(a, "POST", "/v4/orders", Some(RETAIL_TOKEN), Some(&sell.to_string()));
+        assert_eq!((status, sold["status"].as_str()), (200, Some("accepted")), "{sold}");
+        let mut resting = Value::Null;
+        testing::eventually("the fill is in the account", || {
+            let (_, account) = request(a, "GET", "/v4/account", Some(MAKER_TOKEN), None);
+            let found = account["orders"].as_array().and_then(|o| o.iter().find(|o| o["orderId"] == id.as_str()));
+            resting = found.cloned().unwrap_or(Value::Null);
+            resting["filled"] == 1
+        });
+        assert_eq!(resting["clientOrderId"], "ra1", "{resting}");
+        assert_eq!((resting["quantity"].as_u64(), resting["remaining"].as_u64()), (Some(2), Some(1)), "{resting}");
+        assert!(resting["filledYesCents"].as_u64().is_some_and(|c| c > 0), "{resting}");
+        assert!(resting["eventId"].as_str().is_some_and(|e| e != "0"), "{resting}");
+    }
+
+    #[test]
     fn an_order_is_placed_resent_amended_and_cancelled() {
         let venue = testing::venue("rest-orders");
         let a = &venue.address;
