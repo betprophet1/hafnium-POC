@@ -13,7 +13,7 @@ through ArgoCD. There is no compose file; the laptop runs the same chart.
 | `charts/venue-mini/templates/gateway.yaml` | Also the gateway's audit log volume (`/var/lib/gateway-audit`, `gateway.audit` in values): every request and answer, in the format of `interfaces/audit/`. Nothing ships it to retained storage yet. With `gateway.split.enabled`, the public and private halves as StatefulSets of their own (several gateways, below) |
 | `charts/venue-mini/templates/ingress.yaml` | With `ingress.enabled`, the page and the gateway under one host name, routed by path to the halves (below) |
 | `charts/venue-mini/templates/fix.yaml` | With `fix.enabled`, the FIX adapter in front of the gateway's private half, its data and audit volumes, its Service and network policy (below) |
-| `laptop.sh` | `up`, `web`, `expose`, `scale`, `restart` and `down` for a local k3d cluster |
+| `laptop.sh` | `up`, `web`, `expose`, `scale`, `restart` and `down` for a local k3d cluster, its API on loopback |
 
 ## On a laptop
 
@@ -61,6 +61,12 @@ curl -s -H 'Authorization: Bearer dev-retail-customer' localhost:8080/v4/keys \
 `up` is safe to repeat. After rebuilding, it replaces every pod, the core included, which replays its journal before
 it is ready. `down` deletes the cluster and the journal with it.
 
+A cluster `up` creates has its Kubernetes API on loopback only, `127.0.0.1:6550` (`VENUE_API_PORT` to change it, for
+example `127.0.0.1:6551` when that port is taken); k3d's own default would listen on `0.0.0.0` on a random port, where
+anyone who can reach the machine can reach the cluster's admin endpoint. `up` makes `k3d-venue` kubectl's current
+context. A cluster created before this change keeps the binding it was created with: only recreating it moves it
+(below).
+
 ### On an address of this machine
 
 `up` installs an Ingress (Traefik's, which k3d ships) that serves the page and the gateway on one port, and the FIX
@@ -76,9 +82,19 @@ ss -tln | grep -E ':(8091|9879) '                   # listening on that address 
 ```
 
 k3d recreates its load balancer container with the ports; the cluster keeps running, and the mappings persist.
+A cluster can also be created with them, so that deleting and recreating it is one command (`VENUE_EXPOSE` is read
+only when `up` creates the cluster; on an existing one, use `expose`):
+
+```sh
+deploy/laptop.sh down                                # the journal goes with it
+VENUE_SPLIT=1 VENUE_EXPOSE=100.101.132.94 VENUE_EXPOSE_HTTP_PORT=8091 VENUE_EXPOSE_FIX_PORT=9879 deploy/laptop.sh up
+ss -tln | grep -E ':(6550|8091|9879) '               # 127.0.0.1:6550, and the two ports on 100.101.132.94 only
+```
+
+`VENUE_FIX_SERVICE_PORT` (default 9879) must match `fix.service.port` if that is changed.
 Never give an address the public can reach: the page and its operator APIs are unauthenticated and its tokens are
-fixed dev tokens (`ingress.operatorApis`, below). k3d's own API port mapping is set when the cluster is created
-(`k3d cluster create venue --api-port 127.0.0.1:6550` keeps it off other interfaces).
+fixed dev tokens (`ingress.operatorApis`, below). k3d's API port is set when the cluster is created, which `up` does on
+`127.0.0.1` (above).
 
 ## Several gateways
 

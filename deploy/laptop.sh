@@ -5,7 +5,10 @@
 #   deploy/laptop.sh up [--split] [--no-fix] [HELM FLAGS...]
 #                              build, install or upgrade, test; --split serves the gateway's public and private halves
 #                              from StatefulSets of their own (VENUE_SPLIT=1 does the same), --no-fix leaves the FIX
-#                              adapter out (VENUE_FIX=0), and helm flags such as --set pass through
+#                              adapter out (VENUE_FIX=0), and helm flags such as --set pass through. A cluster it
+#                              creates has its API on VENUE_API_PORT (default 127.0.0.1:6550, loopback only) and, with
+#                              VENUE_EXPOSE=ADDRESS, the ingress and FIX already published on ADDRESS as expose does
+#                              (VENUE_EXPOSE_HTTP_PORT, default 8088; VENUE_EXPOSE_FIX_PORT, default 9878)
 #   deploy/laptop.sh web [PORT]
 #                              port-forward the web page to http://127.0.0.1:8080 (or PORT)
 #   deploy/laptop.sh expose ADDRESS [HTTP_PORT] [FIX_PORT]
@@ -16,13 +19,22 @@
 #   deploy/laptop.sh restart   replace the core pod after an image rebuild (the StatefulSet is OnDelete)
 #   deploy/laptop.sh down      delete the cluster and everything in it, journal included
 #
-# Needs Docker, k3d, helm and kubectl. VENUE_CLUSTER, VENUE_RELEASE and VENUE_TAG override the defaults.
+# Needs Docker, k3d, helm and kubectl. VENUE_CLUSTER, VENUE_RELEASE and VENUE_TAG override the defaults. Nothing is
+# ever bound to 0.0.0.0 unless given as an address.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLUSTER="${VENUE_CLUSTER:-venue}"
 RELEASE="${VENUE_RELEASE:-venue}"
 TAG="${VENUE_TAG:-dev}"
 CHART="$ROOT/deploy/charts/venue-mini"
+# The Kubernetes API of a cluster this script creates: loopback, so the cluster's admin endpoint is not on every
+# interface of the machine, as k3d's default (0.0.0.0 and a random port) would put it.
+API_PORT="${VENUE_API_PORT:-127.0.0.1:6550}"
+# Where the ingress (Traefik's port 80) and the FIX Service (fix.service.port) are published through k3d's load
+# balancer, by expose, or by up on a cluster it creates when VENUE_EXPOSE names an address.
+HTTP_PORT="${VENUE_EXPOSE_HTTP_PORT:-8088}"
+FIX_HOST_PORT="${VENUE_EXPOSE_FIX_PORT:-9878}"
+FIX_SERVICE_PORT="${VENUE_FIX_SERVICE_PORT:-9879}"
 
 case "${1:-up}" in
   up)
@@ -46,7 +58,19 @@ case "${1:-up}" in
       docker build -f "$ROOT/deploy/images/venue-fix.Dockerfile" -t "venue-fix:$TAG" "$ROOT"
       images+=("venue-fix:$TAG")
     fi
-    k3d cluster get "$CLUSTER" >/dev/null 2>&1 || k3d cluster create "$CLUSTER" --wait
+    if ! k3d cluster get "$CLUSTER" >/dev/null 2>&1; then
+      create_flags=(--api-port "$API_PORT")
+      if [[ -n "${VENUE_EXPOSE:-}" ]]; then
+        # The same mappings expose adds, made with the cluster, so a recreated cluster is reachable in one command.
+        create_flags+=(--port "$VENUE_EXPOSE:$HTTP_PORT:80@loadbalancer")
+        if [[ "$fix" == 1 ]]; then
+          create_flags+=(--port "$VENUE_EXPOSE:$FIX_HOST_PORT:$FIX_SERVICE_PORT@loadbalancer")
+        fi
+      fi
+      k3d cluster create "$CLUSTER" "${create_flags[@]}" --wait
+    fi
+    # kubectl and helm act on this cluster from here on, whatever context was current.
+    kubectl config use-context "k3d-$CLUSTER" >/dev/null
     # Straight into the nodes' containerd: the default mode, through a tools container and a tarball, can fail to import
     # an image of this size ("short read") and still report success.
     k3d image import "${images[@]}" --cluster "$CLUSTER" --mode direct
@@ -67,7 +91,11 @@ case "${1:-up}" in
     helm test "$RELEASE" --logs
     echo
     echo "deploy/laptop.sh web                      then open http://127.0.0.1:8080"
-    echo "deploy/laptop.sh expose 127.0.0.1         or the ingress on http://127.0.0.1:8088 and FIX on 9878"
+    if [[ -n "${VENUE_EXPOSE:-}" ]]; then
+      echo "or the ingress on http://$VENUE_EXPOSE:$HTTP_PORT and FIX on $FIX_HOST_PORT, if the cluster was created with them"
+    else
+      echo "deploy/laptop.sh expose 127.0.0.1         or the ingress on http://127.0.0.1:8088 and FIX on 9878"
+    fi
     ;;
   web)
     exec kubectl port-forward "svc/$RELEASE-web" "${2:-8080}:8080"
@@ -78,9 +106,9 @@ case "${1:-up}" in
     # ADDRESS:FIX_PORT to the FIX Service's port there (fix.service.port, a LoadBalancer Service that k3s publishes on
     # each node). The load balancer container is recreated with the new ports; the cluster keeps running.
     fix_port="$(kubectl get service "$RELEASE-fix" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || true)"
-    flags=(--port-add "$address:${3:-8088}:80@loadbalancer")
+    flags=(--port-add "$address:${3:-$HTTP_PORT}:80@loadbalancer")
     if [[ -n "$fix_port" ]]; then
-      flags+=(--port-add "$address:${4:-9878}:$fix_port@loadbalancer")
+      flags+=(--port-add "$address:${4:-$FIX_HOST_PORT}:$fix_port@loadbalancer")
     fi
     k3d cluster edit "$CLUSTER" "${flags[@]}"
     ;;
