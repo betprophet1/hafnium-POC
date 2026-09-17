@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use venue_link::catalogue::Catalogue;
+use venue_link::named;
 use venue_link::submit::Submit;
 use venue_link::wire::{self, Error};
 
@@ -221,7 +222,7 @@ fn start_half(gateway: Gateway, feed: &str) -> Arc<Gateway> {
 /// Keeps the hub's view of the venue current from the node's feed, reconnecting for ever.
 fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
     let follower = Arc::clone(gateway);
-    thread::spawn(move || {
+    named("gw-feed", move || {
         wire::follow(&feed, || follower.hub().restart(), |unit| follower.hub().apply(&unit));
     });
 }
@@ -229,7 +230,7 @@ fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
 /// Sends book subscribers what changed, at a fixed rate.
 fn conflate(gateway: &Arc<Gateway>) {
     let conflater = Arc::clone(gateway);
-    thread::spawn(move || loop {
+    named("gw-conflate", move || loop {
         // Book topics carry at most ten snapshots a second (interface 1 README, market data).
         thread::sleep(Duration::from_millis(100));
         let mut hub = conflater.hub();

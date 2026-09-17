@@ -120,9 +120,10 @@ impl Reactors {
             polls.push(poll);
         }
         let reactors = Arc::new(Self { loops, next: AtomicUsize::new(0), other: OnceLock::new() });
-        for (poll, shared) in polls.into_iter().zip(&reactors.loops) {
+        for (index, (poll, shared)) in polls.into_iter().zip(&reactors.loops).enumerate() {
             let (gateway, own, reactors) = (Arc::clone(gateway), Arc::clone(shared), Arc::clone(&reactors));
-            thread::spawn(move || run(poll, &own, &reactors, &gateway, max_behind));
+            let name = format!("gw-{}-{index}", gateway.half.name());
+            thread::Builder::new().name(name).spawn(move || run(poll, &own, &reactors, &gateway, max_behind))?;
         }
         Ok(reactors)
     }
