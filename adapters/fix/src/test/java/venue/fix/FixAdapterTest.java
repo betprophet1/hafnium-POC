@@ -53,10 +53,15 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 final class FixAdapterTest
 {
-    /** Ports: the venue takes 17430-17433 (node ingress, feed, gateway, identity service), the adapter 17440. */
+    /**
+     * Ports: the venue takes 17430-17434 (node ingress, feed, gateway, identity service, a second gateway), the adapter
+     * 17440.
+     */
     private static final int VENUE_PORTS_BASE = 17430;
     private static final int ADAPTER_PORT = 17440;
     private static final String GATEWAY = "127.0.0.1:" + (VENUE_PORTS_BASE + 2);
+    /** Another gateway process on the same venue, serving the private half, which the adapter does not use. */
+    private static final String SECOND_GATEWAY = "127.0.0.1:" + (VENUE_PORTS_BASE + 4);
     /** Two binary markets the mini venue's catalogue lists and opens, and one categorical market. */
     private static final String RAIN = "100000100";
     private static final String BITCOIN = "300000100";
@@ -761,6 +766,53 @@ final class FixAdapterTest
                 Arrays.toString(contains) + " in the audit log"));
     }
 
+    @Test
+    @Order(15)
+    void anotherGatewaySeesAndChangesTheSameOrdersAsTheAdapters() throws Exception
+    {
+        // The adapter's gateway is one of two: a firm on FIX and a program on the other gateway trade one account.
+        adapter = FixAdapter.start(ADAPTER);
+        final Session desk = client.logon("SPLIT1", "dev-market-maker", ADAPTER_PORT, false);
+        assertNotNull(desk, "the desk logs on");
+
+        // Placed over FIX, seen and cancelled through the other gateway, straight away: the other gateway waits for
+        // its own feed to deliver the order rather than saying there is none. The desk hears the cancel.
+        client.send(desk, order("g1", RAIN, '1', 4, "12"));
+        final String g1 = report(desk, "g1", '0').get(37);
+        final JsonNode cancelled = rest(SECOND_GATEWAY, "dev-market-maker", "DELETE", "/v4/orders/" + g1, null);
+        assertEquals("cancelled", cancelled.path("status").asText(), cancelled.toString());
+        assertEquals(g1, report(desk, "g1", '4').get(37));
+        assertTrue(!restingOrdersOn(SECOND_GATEWAY, "dev-market-maker").contains(g1), "the other gateway shows g1");
+
+        // Placed through the other gateway: the adapter's order status, answered from its own gateway's snapshot, says
+        // the same once that gateway has had it from the feed.
+        final JsonNode placed = rest(SECOND_GATEWAY, "dev-market-maker", "POST", "/v4/orders",
+            "{\"clientOrderId\": \"g2\", \"instrumentId\": \"" + RAIN + "\", \"action\": \"buy\", " +
+            "\"outcome\": \"yes\", \"price\": {\"cents\": \"13\"}, \"quantity\": 6}");
+        assertEquals("accepted", placed.path("status").asText(), placed.toString());
+        final String g2 = placed.path("orderId").asText();
+        client.pollUntil("the adapter's gateway has g2", () -> restingOrdersOn(GATEWAY, "dev-market-maker").contains(g2));
+        client.send(desk, status("g2-s", g2, "g2", RAIN, '1'));
+        final FixClient.Message status = client.expect(desk, "the status of g2",
+            m -> "8".equals(m.type()) && "g2-s".equals(m.get(790)));
+        assertEquals(g2, status.get(37), status.toString());
+        assertEquals("0", status.get(39), status.toString());
+        assertEquals("6", status.get(38), status.toString());
+        assertEquals("6", status.get(151), status.toString());
+        assertEquals("13", status.get(44), status.toString());
+
+        // Cancelled over FIX: gone on the other gateway too.
+        client.send(desk, cancel("g2-c", "g2", RAIN, '1'));
+        assertEquals(g2, report(desk, "g2-c", '4').get(37));
+        client.pollUntil("the other gateway no longer shows g2",
+            () -> !restingOrdersOn(SECOND_GATEWAY, "dev-market-maker").contains(g2));
+
+        desk.logoutAndDisconnect();
+        client.pollUntil("the desk is disconnected", () -> client.isDisconnected(desk));
+        adapter.close();
+        adapter = null;
+    }
+
     // -------------------------------------------------------------------------------------------------------------
 
     private static void deleteRecursively(final Path dir) throws IOException
@@ -865,8 +917,16 @@ final class FixAdapterTest
     private static JsonNode rest(final String token, final String method, final String path, final String body)
         throws IOException, InterruptedException
     {
+        return rest(GATEWAY, token, method, path, body);
+    }
+
+    /** The same, to the gateway at {@code gateway}. */
+    private static JsonNode rest(
+        final String gateway, final String token, final String method, final String path, final String body)
+        throws IOException, InterruptedException
+    {
         final HttpResponse<String> response = HttpClient.newHttpClient().send(
-            HttpRequest.newBuilder(URI.create("http://" + GATEWAY + path))
+            HttpRequest.newBuilder(URI.create("http://" + gateway + path))
                 .header("Authorization", "Bearer " + token).header("Content-Type", "application/json")
                 .method(method, body == null ? HttpRequest.BodyPublishers.noBody() :
                     HttpRequest.BodyPublishers.ofString(body))
@@ -878,8 +938,27 @@ final class FixAdapterTest
     /** The account's resting order IDs, from the gateway's REST half. */
     private static List<String> restingOrders(final String token) throws IOException, InterruptedException
     {
+        return restingOrders(GATEWAY, token);
+    }
+
+    /** The same, as the gateway at {@code gateway} sees them. */
+    private static List<String> restingOrdersOn(final String gateway, final String token)
+    {
+        try
+        {
+            return restingOrders(gateway, token);
+        }
+        catch (final Exception e)
+        {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static List<String> restingOrders(final String gateway, final String token)
+        throws IOException, InterruptedException
+    {
         final HttpResponse<String> response = HttpClient.newHttpClient().send(
-            HttpRequest.newBuilder(URI.create("http://" + GATEWAY + "/v4/account"))
+            HttpRequest.newBuilder(URI.create("http://" + gateway + "/v4/account"))
                 .header("Authorization", "Bearer " + token).GET().build(),
             HttpResponse.BodyHandlers.ofString());
         final JsonNode account = GatewayLink.JSON.readTree(response.body());

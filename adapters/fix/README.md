@@ -73,7 +73,8 @@ adapters/fix/test.sh                        # bootstrap, cargo build --release o
 ```
 
 It builds `venue-node`, `venue-gateway`, `venue-sim` and `venue-identity` in release, starts a node seeded with the
-mini venue's catalogue, an identity service and a gateway (`scripts/venue.sh`, ports 17430-17433), runs the adapter in the test's JVM on 17440, and
+mini venue's catalogue, an identity service, a gateway and a second gateway serving the private half beside it
+(`scripts/venue.sh`, ports 17430-17434), runs the adapter in the test's JVM on 17440, and
 logs on two Artio initiators as a market maker and a retail customer. It checks: a refused token and a missing one;
 the security list; place, replace, cancel, a cancel too late and one of an unknown order; a price off the ladder, a
 duplicate ClOrdID, a malformed OrdType and a GTD without ExpireTime; a mass cancel by market and of everything; a
@@ -93,7 +94,10 @@ the read-only one seeing the trading key's order on the same account, and the ga
 adapter's `GET /v4/account` came with; once revoked, the trading key's session is logged out while it keeps asking for
 status (each answered, or refused with 380=6 once the gateway no longer takes the key), the key reads no status over
 REST, and it is refused at logon; the logon's audit record names the key and no secret is written in either audit log
-or in the sessions' memory.
+or in the sessions' memory. And a venue of several gateways: an order placed over FIX is cancelled at once through the
+second gateway, which the FIX session hears; an order placed through the second gateway is answered for by the
+adapter's order status, from its own gateway, once that gateway has it; and cancelled over FIX, it leaves the second
+gateway's account too.
 `test.sh` then checks the same files with `interfaces/tools/audit_verify.py`.
 
 `./check` runs `test.sh` as its last step when the toolchain has been bootstrapped (`bootstrap.sh --check`), and

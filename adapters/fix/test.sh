@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The FIX adapter's integration test, from nothing: fetches the pinned JDK and Gradle wrapper if they are not there,
 # builds the venue binaries it runs against, then builds the adapter and runs its tests. The test starts its own node,
-# gateway and identity service on 127.0.0.1:17430-17433 and the adapter on 17440, and stops them again.
+# gateways and identity service on 127.0.0.1:17430-17434 and the adapter on 17440, and stops them again.
 #
 #   adapters/fix/test.sh             everything
 #   adapters/fix/test.sh --no-cargo  skip the cargo build (the release binaries are already current)
