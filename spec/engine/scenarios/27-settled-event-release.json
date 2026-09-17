@@ -1,0 +1,102 @@
+{
+  "name": "A resolved event is released once its retention has passed, and its IDs can be listed again",
+  "rules": ["E-8.4", "E-8.5", "E-7.12", "E-15.3", "E-15.6", "E-5.2", "E-8.1", "E-9.3", "E-13.2"],
+  "notes": [
+    "Setup: retention 60 s (E-7.12); account 1 has maker protection on event 100 at 10 contracts an hour.",
+    "Prelude: A (1) bids 6 at 40c (tick 39) and B (2) sells into it: 6 minted, A pays 240, B posts 600 - 240 = 360. A's maker counter for event 100 reaches 6.",
+    "Step 3 resolves event 100 at time t3 in state 1, which YES (mask 2) pays: A's 6 YES pay 600 (balance 9760 + 600 = 10360); B's 6 NO pay 0. Payouts 600 = collateral 600.",
+    "Step 4, at t3 + 1 ms: A bids 5 at 10c on 1010, GTD expiring at t3 + 1 ms + 59 999 ms = t3 + 60 s; reservation 5 x 10 = 50, A 10310 available.",
+    "Step 5 ticks at t3 + 59.001 s: nothing expires, and the release of event 100 is due at t3 + 60 s, so the tick emits nothing (E-8.4).",
+    "Until then event 100 is carried: an order on 1000 is refused MARKET_NOT_OPEN (it is SETTLED), and voiding it is INVALID_COMMAND because a resolution is final (E-15.3).",
+    "Step 8 ticks at t3 + 59.003 s + 997 ms = t3 + 60 s exactly, and resolvedAt + 60 s <= now: first the GTD order expires (E-8.1), then event 100 is released (E-8.4). Within the events block the cancel comes before EventReleased, and A's sleeve (10360 available, 0 reserved) and the emptied level follow in blocks 4 and 5 (E-5.2).",
+    "After the release 1000 is unknown (UNKNOWN_INSTRUMENT, E-9.3 check 4), SetMarketState on it is INVALID_COMMAND, and a further tick releases nothing (event 101 is unresolved).",
+    "Event 100 and instrument 1000 are defined and listed again as new ones (E-8.5), and A's maker protection setting, which is not the listing's, still applies to event 100.",
+    "A bids 1 at 31c (tick 30, reserved 31) and 6 at 40c (reserved 240); B sells 6 at 40c, filling only the 40c bid: A 10360 - 240 = 10120 balance with 31 reserved; B 9640 - 360 = 9280.",
+    "The maker counter for event 100 was discarded at the release (E-8.4), so it restarts at 6, below 10, and A's 31c bid is not pulled. Had the counter survived, 6 + 6 = 12 within the hour would have pulled it (E-13.2)."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000},
+    {"op": "binary", "eventId": 101, "instrumentId": 1010},
+    {"op": "fund", "accountId": 1, "cents": 10000},
+    {"op": "fund", "accountId": 2, "cents": 10000},
+    {"msg": "SetMakerProtection", "accountId": 1, "eventId": 100, "maxContractsFilledPerWindow": 10, "windowMillis": 3600000},
+    {"msg": "SetListingParameters", "settledRetentionSeconds": 60, "maxEvents": 0, "maxInstruments": 0, "maxPriceLevels": 0}
+  ],
+  "steps": [
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a1", "instrumentId": 1000, "side": "BUY", "tick": 39, "quantity": 6}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 2, "clientOrderId": "b1", "instrumentId": 1000, "side": "SELL", "tick": 39, "quantity": 6}, "expect": null},
+    {"input": {"msg": "ResolveEvent", "commandId": "r1", "eventId": 100, "kind": "RESOLVED", "winningState": 1},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "r1", "outcome": "APPLIED"},
+       {"msg": "MarketStateChanged", "instrumentId": 1000, "state": "SETTLED"},
+       {"msg": "SettlementPayout", "accountId": 1, "instrumentId": 1000, "kind": "RESOLVED", "positionClosed": 6, "cents": 600},
+       {"msg": "SettlementPayout", "accountId": 2, "instrumentId": 1000, "kind": "RESOLVED", "positionClosed": -6, "cents": 0},
+       {"msg": "PositionChanged", "accountId": 1, "instrumentId": 1000, "position": 0},
+       {"msg": "PositionChanged", "accountId": 2, "instrumentId": 1000, "position": 0},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 10360, "reservedCents": 0}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a2", "instrumentId": 1010, "side": "BUY", "tick": 9, "quantity": 5, "timeInForce": "GTD", "expiresAfterNs": 59999000000},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O3", "accountId": 1, "clientOrderId": "a2", "instrumentId": 1010, "side": "BUY", "tick": 9, "quantity": 5, "reservedCents": 50},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 10310, "reservedCents": 50},
+       {"msg": "BookLevelChanged", "instrumentId": 1010, "side": "BUY", "tick": 9, "quantity": 5, "orderCount": 1}
+     ]},
+    {"input": {"msg": "TimeTick"}, "advanceNs": 59000000000, "expect": []},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a3", "instrumentId": 1000, "side": "BUY", "tick": 39, "quantity": 1},
+     "expect": [
+       {"msg": "OrderRejected", "accountId": 1, "clientOrderId": "a3", "instrumentId": 1000, "reason": "MARKET_NOT_OPEN"}
+     ]},
+    {"input": {"msg": "ResolveEvent", "commandId": "r2", "eventId": 100, "kind": "VOID"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "r2", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}
+     ]},
+    {"input": {"msg": "TimeTick"}, "advanceNs": 997000000,
+     "expect": [
+       {"msg": "OrderCancelled", "orderId": "O3", "accountId": 1, "instrumentId": 1010, "cancelledQuantity": 5, "reason": "EXPIRED"},
+       {"msg": "EventReleased", "eventId": 100},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 10360, "reservedCents": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1010, "side": "BUY", "tick": 9, "quantity": 0, "orderCount": 0}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a4", "instrumentId": 1000, "side": "BUY", "tick": 39, "quantity": 1},
+     "expect": [
+       {"msg": "OrderRejected", "accountId": 1, "clientOrderId": "a4", "instrumentId": 1000, "reason": "UNKNOWN_INSTRUMENT"}
+     ]},
+    {"input": {"msg": "SetMarketState", "commandId": "m1", "instrumentId": 1000, "state": "OPEN"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "m1", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}
+     ]},
+    {"input": {"msg": "TimeTick"}, "expect": []},
+    {"input": {"msg": "DefineEvent", "commandId": "d1", "eventId": 100, "stateCount": 2, "scheduledStart": 0},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "d1", "outcome": "APPLIED"}
+     ]},
+    {"input": {"msg": "ListInstrument", "commandId": "l1", "instrumentId": 1000, "eventId": 100, "instrumentClass": "BINARY", "tickTableId": 1, "lotStep": 1, "allocationPolicy": "PRICE_TIME", "stateMask": 2, "positionLimit": 0, "legs": []},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "l1", "outcome": "APPLIED"},
+       {"msg": "MarketStateChanged", "instrumentId": 1000, "state": "LISTED"}
+     ]},
+    {"input": {"msg": "SetMarketState", "commandId": "m2", "instrumentId": 1000, "state": "OPEN"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "m2", "outcome": "APPLIED"},
+       {"msg": "MarketStateChanged", "instrumentId": 1000, "state": "OPEN"}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a5", "instrumentId": 1000, "side": "BUY", "tick": 30, "quantity": 1},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O4", "accountId": 1, "clientOrderId": "a5", "instrumentId": 1000, "side": "BUY", "tick": 30, "quantity": 1, "reservedCents": 31},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 10329, "reservedCents": 31},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 30, "quantity": 1, "orderCount": 1}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a6", "instrumentId": 1000, "side": "BUY", "tick": 39, "quantity": 6}, "expect": null},
+    {"input": {"msg": "NewOrder", "accountId": 2, "clientOrderId": "b2", "instrumentId": 1000, "side": "SELL", "tick": 39, "quantity": 6},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O6", "accountId": 2, "clientOrderId": "b2", "instrumentId": 1000, "side": "SELL", "tick": 39, "quantity": 6, "reservedCents": 360},
+       {"msg": "Fill", "tradeId": "T2", "instrumentId": 1000, "tick": 39, "quantity": 6, "makerOrderId": "O5", "makerAccountId": 1, "makerRemaining": 0, "takerOrderId": "O6", "takerAccountId": 2, "takerRemaining": 0, "takerSide": "SELL", "mintedPairs": 6, "burnedPairs": 0, "buyerCashCents": -240, "sellerCashCents": -360},
+       {"msg": "PositionChanged", "accountId": 1, "instrumentId": 1000, "position": 6},
+       {"msg": "PositionChanged", "accountId": 2, "instrumentId": 1000, "position": -6},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 10089, "reservedCents": 31},
+       {"msg": "SleeveChanged", "accountId": 2, "availableCents": 9280, "reservedCents": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "BUY", "tick": 39, "quantity": 0, "orderCount": 0}
+     ]}
+  ]
+}

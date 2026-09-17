@@ -1,0 +1,63 @@
+{
+  "name": "Listings past the group's limits are refused, and a released event's room is reused",
+  "rules": ["E-6.2", "E-6.3", "E-6.5", "E-7.12", "E-8.4", "E-18.3"],
+  "notes": [
+    "The cent table has 99 rows, so each book on it counts 2 x 99 = 198 price levels (E-6.5).",
+    "A retention of 0 is refused (E-7.12). Limits: 2 events, 2 instruments, 396 price levels, retention 1 s.",
+    "Two events fit; a third is LISTING_CAPACITY. Redefining event 100 is INVALID_COMMAND: validity is checked before capacity.",
+    "Instrument 1000 on event 100 takes 198 levels. With maxPriceLevels lowered to 300, 198 + 198 = 396 > 300 refuses 1010; nothing already listed changes. An invalid listing (lot step 0) is still INVALID_COMMAND.",
+    "With maxInstruments 1 and no level limit, the group carries 1 instrument, so 1010 is refused again.",
+    "Event 100 is resolved at t (no positions, so only the outcome and market state). A resolved event is carried until released, so event 102 is still refused at t + 1 ms.",
+    "The tick at t + 1 ms + 1 s is past resolvedAt + 1 s, and releases event 100 with instrument 1000 (E-8.4).",
+    "Now the group carries 1 event and no instrument: event 102 and instrument 1020 are listed, and then 1010 is refused, the group carrying 1 instrument again."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1}
+  ],
+  "steps": [
+    {"input": {"msg": "SetListingParameters", "commandId": "p0", "settledRetentionSeconds": 0, "maxEvents": 2, "maxInstruments": 2, "maxPriceLevels": 396},
+     "expect": [{"msg": "CommandApplied", "commandId": "p0", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}]},
+    {"input": {"msg": "SetListingParameters", "commandId": "p1", "settledRetentionSeconds": 1, "maxEvents": 2, "maxInstruments": 2, "maxPriceLevels": 396},
+     "expect": [{"msg": "CommandApplied", "commandId": "p1", "outcome": "APPLIED"}]},
+    {"input": {"msg": "DefineEvent", "commandId": "e100", "eventId": 100, "stateCount": 2, "scheduledStart": 0},
+     "expect": [{"msg": "CommandApplied", "commandId": "e100", "outcome": "APPLIED"}]},
+    {"input": {"msg": "DefineEvent", "commandId": "e101", "eventId": 101, "stateCount": 2, "scheduledStart": 0},
+     "expect": [{"msg": "CommandApplied", "commandId": "e101", "outcome": "APPLIED"}]},
+    {"input": {"msg": "DefineEvent", "commandId": "e102", "eventId": 102, "stateCount": 2, "scheduledStart": 0},
+     "expect": [{"msg": "CommandApplied", "commandId": "e102", "outcome": "REJECTED", "rejectReason": "LISTING_CAPACITY"}]},
+    {"input": {"msg": "DefineEvent", "commandId": "e100b", "eventId": 100, "stateCount": 2, "scheduledStart": 0},
+     "expect": [{"msg": "CommandApplied", "commandId": "e100b", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}]},
+    {"input": {"msg": "ListInstrument", "commandId": "i1000", "instrumentId": 1000, "eventId": 100, "instrumentClass": "BINARY", "tickTableId": 1, "lotStep": 1, "allocationPolicy": "PRICE_TIME", "stateMask": 2, "positionLimit": 0, "legs": []},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "i1000", "outcome": "APPLIED"},
+       {"msg": "MarketStateChanged", "instrumentId": 1000, "state": "LISTED"}
+     ]},
+    {"input": {"msg": "SetListingParameters", "commandId": "p2", "settledRetentionSeconds": 1, "maxEvents": 2, "maxInstruments": 3, "maxPriceLevels": 300},
+     "expect": [{"msg": "CommandApplied", "commandId": "p2", "outcome": "APPLIED"}]},
+    {"input": {"msg": "ListInstrument", "commandId": "i1010", "instrumentId": 1010, "eventId": 101, "instrumentClass": "BINARY", "tickTableId": 1, "lotStep": 1, "allocationPolicy": "PRICE_TIME", "stateMask": 2, "positionLimit": 0, "legs": []},
+     "expect": [{"msg": "CommandApplied", "commandId": "i1010", "outcome": "REJECTED", "rejectReason": "LISTING_CAPACITY"}]},
+    {"input": {"msg": "ListInstrument", "commandId": "i1011", "instrumentId": 1011, "eventId": 101, "instrumentClass": "BINARY", "tickTableId": 1, "lotStep": 0, "allocationPolicy": "PRICE_TIME", "stateMask": 2, "positionLimit": 0, "legs": []},
+     "expect": [{"msg": "CommandApplied", "commandId": "i1011", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}]},
+    {"input": {"msg": "SetListingParameters", "commandId": "p3", "settledRetentionSeconds": 1, "maxEvents": 2, "maxInstruments": 1, "maxPriceLevels": 0},
+     "expect": [{"msg": "CommandApplied", "commandId": "p3", "outcome": "APPLIED"}]},
+    {"input": {"msg": "ListInstrument", "commandId": "i1010b", "instrumentId": 1010, "eventId": 101, "instrumentClass": "BINARY", "tickTableId": 1, "lotStep": 1, "allocationPolicy": "PRICE_TIME", "stateMask": 2, "positionLimit": 0, "legs": []},
+     "expect": [{"msg": "CommandApplied", "commandId": "i1010b", "outcome": "REJECTED", "rejectReason": "LISTING_CAPACITY"}]},
+    {"input": {"msg": "ResolveEvent", "commandId": "r100", "eventId": 100, "kind": "RESOLVED", "winningState": 0},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "r100", "outcome": "APPLIED"},
+       {"msg": "MarketStateChanged", "instrumentId": 1000, "state": "SETTLED"}
+     ]},
+    {"input": {"msg": "DefineEvent", "commandId": "e102b", "eventId": 102, "stateCount": 2, "scheduledStart": 0},
+     "expect": [{"msg": "CommandApplied", "commandId": "e102b", "outcome": "REJECTED", "rejectReason": "LISTING_CAPACITY"}]},
+    {"input": {"msg": "TimeTick"}, "advanceNs": 1000000000, "expect": [{"msg": "EventReleased", "eventId": 100}]},
+    {"input": {"msg": "DefineEvent", "commandId": "e102c", "eventId": 102, "stateCount": 2, "scheduledStart": 0},
+     "expect": [{"msg": "CommandApplied", "commandId": "e102c", "outcome": "APPLIED"}]},
+    {"input": {"msg": "ListInstrument", "commandId": "i1020", "instrumentId": 1020, "eventId": 102, "instrumentClass": "BINARY", "tickTableId": 1, "lotStep": 1, "allocationPolicy": "PRICE_TIME", "stateMask": 2, "positionLimit": 0, "legs": []},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "i1020", "outcome": "APPLIED"},
+       {"msg": "MarketStateChanged", "instrumentId": 1020, "state": "LISTED"}
+     ]},
+    {"input": {"msg": "ListInstrument", "commandId": "i1010c", "instrumentId": 1010, "eventId": 101, "instrumentClass": "BINARY", "tickTableId": 1, "lotStep": 1, "allocationPolicy": "PRICE_TIME", "stateMask": 2, "positionLimit": 0, "legs": []},
+     "expect": [{"msg": "CommandApplied", "commandId": "i1010c", "outcome": "REJECTED", "rejectReason": "LISTING_CAPACITY"}]}
+  ]
+}

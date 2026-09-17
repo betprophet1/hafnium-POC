@@ -13,6 +13,9 @@ books, non-negative available cash, lock and reservation consistency, lot steps)
 Fees are on from the start (a 7% taker fee and a maker rebate), and schedules and overrides change at random, so
 fills charge, rebate and take accounts below zero (E-10.11, E-3.3).
 
+Events are resolved throughout, retentions and listing limits change at random, and a released event is listed again
+under the same IDs, so releases (E-8.4), refused listings (E-6.2, E-6.3) and reused IDs (E-8.5) all occur.
+
 It ends with a coverage line naming every result kind, reject reason and cancel reason never produced, so a
 passing run that exercised little is visible as such.
 """
@@ -36,7 +39,7 @@ STATES = {100: 2, 101: 2, 200: 3, 300: 2, 400: 4}
 
 ALL_RESULTS = {"OrderAccepted", "OrderRejected", "Fill", "OrderCancelled", "OrderAmended", "OrderReduced",
                "PositionChanged", "SleeveChanged", "CollateralReleased", "BookLevelChanged", "MarketStateChanged",
-               "SettlementPayout", "OrderGroupUpdated", "CommandApplied"}
+               "SettlementPayout", "EventReleased", "OrderGroupUpdated", "CommandApplied"}
 ALL_REJECTS = {"MALFORMED", "UNKNOWN_INSTRUMENT", "UNKNOWN_ORDER", "MARKET_NOT_OPEN", "VENUE_MODE",
                "TICK_NOT_ON_LADDER", "QUANTITY_NOT_ON_LOT_STEP", "EXPIRY_IN_PAST", "INSUFFICIENT_SLEEVE",
                "POST_ONLY_WOULD_TAKE", "FOK_NOT_FILLABLE", "REDUCE_ONLY_NO_POSITION", "CLOSED_ONLY_MODE",
@@ -49,14 +52,14 @@ FILL_KINDS = {"mint", "burn", "transfer", "mixed"}
 FEE_KINDS = {"charged", "rebated", "free", "below zero by fees"}
 
 
-def setup_inputs():
-    items = [
-        {"op": "centTable", "tickTableId": 1},
-        {"op": "binary", "eventId": 100, "instrumentId": BINARY_PT, "positionLimit": 15},
-        {"op": "binary", "eventId": 101, "instrumentId": BINARY_PR, "allocationPolicy": "PRO_RATA", "lotStep": 2},
-        {"op": "parlay", "eventId": 300, "instrumentId": PARLAY,
-         "legs": [{"legEventId": 100, "legInstrumentId": BINARY_PT, "legOutcome": "YES"}]},
-        {"op": "categorical", "eventId": 200, "instrumentIds": CATEGORICAL},
+# The listing of each event, as setup items; a released event is listed again from these (E-8.5).
+EVENT_LISTINGS = {
+    100: [{"op": "binary", "eventId": 100, "instrumentId": BINARY_PT, "positionLimit": 15}],
+    101: [{"op": "binary", "eventId": 101, "instrumentId": BINARY_PR, "allocationPolicy": "PRO_RATA", "lotStep": 2}],
+    300: [{"op": "parlay", "eventId": 300, "instrumentId": PARLAY,
+           "legs": [{"legEventId": 100, "legInstrumentId": BINARY_PT, "legOutcome": "YES"}]}],
+    200: [{"op": "categorical", "eventId": 200, "instrumentIds": CATEGORICAL}],
+    400: [
         {"msg": "DefineEvent", "eventId": 400, "stateCount": 4, "scheduledStart": 0},
         {"msg": "ListInstrument", "instrumentId": 4001, "eventId": 400, "instrumentClass": "SCALAR_BAND",
          "tickTableId": 1, "lotStep": 5, "allocationPolicy": "PRICE_TIME", "stateMask": 0b0011,
@@ -66,6 +69,15 @@ def setup_inputs():
          "positionLimit": 0, "legs": []},
         {"msg": "SetMarketState", "instrumentId": 4001, "state": "OPEN"},
         {"msg": "SetMarketState", "instrumentId": 4002, "state": "OPEN"},
+    ],
+}
+
+
+def setup_inputs():
+    items = [{"op": "centTable", "tickTableId": 1}]
+    for event in (100, 101, 300, 200, 400):
+        items.extend(EVENT_LISTINGS[event])
+    items += [
         {"msg": "SetRuleLimits", "accountId": 0, "maxRestingOrders": 12, "maxNewOrdersPerSecond": 0,
          "maxOrderToTradeRatioMilli": 0, "ratioFreeOrdersPerSecond": 0},
         {"msg": "SetFeeSchedule", "makerRateMicros": -17_500, "takerRateMicros": 70_000},
@@ -92,6 +104,7 @@ class Fuzzer:
         self.transcript = []
         self.compiled = []
         self.below_zero_by_fees = 0
+        self.pending = []                                            # inputs to send before any random one
 
     # ---- input generators
 
@@ -113,7 +126,9 @@ class Fuzzer:
 
     def pick_tick(self, i, side):
         r = self.rng
-        inst = self.engine.instruments[i]
+        inst = self.engine.instruments.get(i)
+        if inst is None:                                             # released and not listed again (E-8.5)
+            return r.randint(0, 98)
         opposite = self.engine.best(inst, "SELL" if side == "BUY" else "BUY")
         if opposite is not None and r.random() < 0.7:
             return max(0, min(98, opposite + r.randint(-3, 3)))
@@ -152,14 +167,16 @@ class Fuzzer:
 
     def random_input(self):
         r = self.rng
+        if self.pending:
+            return self.pending.pop(0), None
         a = r.choice(ACCOUNTS)
         if self.engine.venue_mode != "NORMAL" and r.random() < 0.3:
             return dict(msg="SetVenueMode", commandId=self.next_cmd(), mode="NORMAL"), None
         kind = r.choices(
             ["new", "cancel", "amend", "mass", "batch", "sweep", "tick", "grant", "reclaim", "controls",
              "protect", "group", "reset", "market", "phase", "venue", "limits", "params", "seed", "fees",
-             "override", "unoverride"],
-            [40, 10, 8, 2, 4, 3, 8, 2, 2, 1, 3, 3, 1, 2, 1, 1, 1, 1, 1, 1, 2, 1])[0]
+             "override", "unoverride", "listing", "resolve", "relist"],
+            [40, 10, 8, 2, 4, 3, 8, 2, 2, 1, 3, 3, 1, 2, 1, 1, 1, 1, 1, 1, 2, 1, 1, 0.5, 4])[0]
         if kind == "new":
             e = self.order_fields(a)
             e.pop("entryType")
@@ -275,6 +292,23 @@ class Fuzzer:
                         expiresAt=None if expiry is None else e.now + 1_000_000 + expiry), None
         if kind == "unoverride":                                     # E-7.11
             return dict(msg="RemoveFeeOverride", commandId=self.next_cmd(), overrideId=r.randint(1, 6)), None
+        if kind == "listing":                                        # E-7.12: a retention of 0 is refused
+            return dict(msg="SetListingParameters", commandId=self.next_cmd(),
+                        settledRetentionSeconds=r.choice([0, 1, 1, 2, 5, 604_800]),
+                        maxEvents=r.choice([0, 0, 4, 5, 6]), maxInstruments=r.choice([0, 0, 5, 7, 8]),
+                        maxPriceLevels=r.choice([0, 0, 1_188, 1_584])), None
+        if kind == "resolve":
+            return self.resolution(), None
+        if kind == "relist":                                         # E-8.5: a released event's IDs again
+            gone = [ev for ev in sorted(EVENT_LISTINGS) if ev not in self.engine.events]
+            if not gone:
+                return dict(msg="TimeTick"), r.choice([100, 1500]) * 1_000_000
+            counter = [0]
+            for item in EVENT_LISTINGS[r.choice(gone)]:
+                for inp in expand_setup(item, counter):
+                    inp["commandId"] = self.next_cmd()
+                    self.pending.append(inp)
+            return self.pending.pop(0), None
         if kind == "params":
             return dict(msg="SetGroupParameters", commandId=self.next_cmd(),
                         activeOrderLimit=r.choice([0, 0, 8, 30]),

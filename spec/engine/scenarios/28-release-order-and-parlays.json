@@ -1,0 +1,74 @@
+{
+  "name": "Releases go one a tick in resolution order, a void is released like a resolution, and a parlay outlives its leg's release",
+  "rules": ["E-8.4", "E-8.5", "E-7.12", "E-7.1", "E-15.7", "E-12.2", "E-12.6"],
+  "notes": [
+    "Event 101 is voided at t1 and event 100 resolved at t1 + 1 ms; neither has trades, so each emits only its outcome and market state (E-15.5).",
+    "An hour later the default retention of 604 800 s (D-29) keeps both.",
+    "SetListingParameters shortens the retention to 60 s. It applies to both events at the next tick (E-7.12), and both are now due, but a tick releases at most one event: first 101, resolved earliest, then 100, then nothing.",
+    "The parlay 3000 names 1000 as its leg. Legs are the listing's data only, so releasing the leg's event leaves the parlay listed and open: A bids 10 at 5c (reservation 50).",
+    "ExpireParlay settles event 300 at t9: A's bid is removed (MARKET_RESOLVED) and its 50 returned; no one holds a position, so there are no payouts.",
+    "At t9 + 59.999 s the release is not due. At t9 + 60 s a resend of the expiry under its command ID is a DUPLICATE (E-7.1): commands never release, only ticks do.",
+    "The tick at t9 + 60.001 s releases event 300. The command ID is still remembered (seven days, D-25), so the resend stays a DUPLICATE; a new ExpireParlay names an instrument that no longer exists and is INVALID_COMMAND (E-8.5).",
+    "A cancel of A's old order on 3000 is UNKNOWN_ORDER, and a mass cancel of instrument 3000 has nothing in scope and emits nothing (E-12.6)."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000},
+    {"op": "binary", "eventId": 101, "instrumentId": 1010},
+    {"op": "parlay", "eventId": 300, "instrumentId": 3000, "legs": [{"legEventId": 100, "legInstrumentId": 1000, "legOutcome": "YES"}]},
+    {"op": "fund", "accountId": 1, "cents": 10000}
+  ],
+  "steps": [
+    {"input": {"msg": "ResolveEvent", "commandId": "q1", "eventId": 101, "kind": "VOID"},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "q1", "outcome": "APPLIED"},
+       {"msg": "MarketStateChanged", "instrumentId": 1010, "state": "VOIDED"}
+     ]},
+    {"input": {"msg": "ResolveEvent", "commandId": "q2", "eventId": 100, "kind": "RESOLVED", "winningState": 1},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "q2", "outcome": "APPLIED"},
+       {"msg": "MarketStateChanged", "instrumentId": 1000, "state": "SETTLED"}
+     ]},
+    {"input": {"msg": "TimeTick"}, "advanceNs": 3600000000000, "expect": []},
+    {"input": {"msg": "SetListingParameters", "commandId": "p1", "settledRetentionSeconds": 60, "maxEvents": 0, "maxInstruments": 0, "maxPriceLevels": 0},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "p1", "outcome": "APPLIED"}
+     ]},
+    {"input": {"msg": "TimeTick"}, "expect": [{"msg": "EventReleased", "eventId": 101}]},
+    {"input": {"msg": "TimeTick"}, "expect": [{"msg": "EventReleased", "eventId": 100}]},
+    {"input": {"msg": "TimeTick"}, "expect": []},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "a1", "instrumentId": 3000, "side": "BUY", "tick": 4, "quantity": 10},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O1", "accountId": 1, "clientOrderId": "a1", "instrumentId": 3000, "side": "BUY", "tick": 4, "quantity": 10, "reservedCents": 50},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 9950, "reservedCents": 50},
+       {"msg": "BookLevelChanged", "instrumentId": 3000, "side": "BUY", "tick": 4, "quantity": 10, "orderCount": 1}
+     ]},
+    {"input": {"msg": "ExpireParlay", "commandId": "x1", "instrumentId": 3000, "causingEventId": 100},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "x1", "outcome": "APPLIED"},
+       {"msg": "OrderCancelled", "orderId": "O1", "accountId": 1, "instrumentId": 3000, "cancelledQuantity": 10, "reason": "MARKET_RESOLVED"},
+       {"msg": "MarketStateChanged", "instrumentId": 3000, "state": "SETTLED"},
+       {"msg": "SleeveChanged", "accountId": 1, "availableCents": 10000, "reservedCents": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 3000, "side": "BUY", "tick": 4, "quantity": 0, "orderCount": 0}
+     ]},
+    {"input": {"msg": "TimeTick"}, "advanceNs": 59999000000, "expect": []},
+    {"input": {"msg": "ExpireParlay", "commandId": "x1", "instrumentId": 3000, "causingEventId": 100},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "x1", "outcome": "DUPLICATE"}
+     ]},
+    {"input": {"msg": "TimeTick"}, "expect": [{"msg": "EventReleased", "eventId": 300}]},
+    {"input": {"msg": "ExpireParlay", "commandId": "x1", "instrumentId": 3000, "causingEventId": 100},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "x1", "outcome": "DUPLICATE"}
+     ]},
+    {"input": {"msg": "ExpireParlay", "commandId": "x2", "instrumentId": 3000, "causingEventId": 100},
+     "expect": [
+       {"msg": "CommandApplied", "commandId": "x2", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}
+     ]},
+    {"input": {"msg": "CancelOrder", "accountId": 1, "instrumentId": 3000, "orderId": "O1"},
+     "expect": [
+       {"msg": "OrderRejected", "accountId": 1, "clientOrderId": "", "instrumentId": 3000, "reason": "UNKNOWN_ORDER"}
+     ]},
+    {"input": {"msg": "MassCancel", "accountId": 1, "scope": "INSTRUMENT", "scopeRef": 3000, "cause": "CLIENT_REQUEST"}, "expect": []}
+  ]
+}
