@@ -434,12 +434,32 @@ function onMessage(s, msg) {
 
 function report(result) {
   const [, m] = result.executions && result.executions[0] ? find(result.executions[0].instrumentId) : [null, null];
-  let filled = 0, fees = 0;
+  let filled = 0, fees = 0, value = 0, left = null, cancelled = 0;
+  const prices = new Map();
   for (const e of result.executions || []) {
-    if (e.type === 'fill') { filled += e.quantity; fees += e.feeCents || 0; announced.add(e.tradeId + ':' + e.orderId); }
+    if (e.type === 'fill') {
+      filled += e.quantity; fees += e.feeCents || 0; announced.add(e.tradeId + ':' + e.orderId);
+      // Exact from the probability; the cents string may be rounded for display.
+      const [n, d] = e.price.probability.split('/').map(Number);
+      value += e.quantity * 100 * n / d;
+      prices.set(e.price.tick, e.price.cents);
+    }
+    if (e.type === 'cancelled') cancelled += e.quantity || 0;
+    if (e.remaining != null) left = e.remaining;
   }
   const first = (result.executions || [])[0];
-  if (result.status === 'accepted') toast(`Order accepted: ${first.quantity} at ${first.price.cents}¢ (YES ${first.side})${filled ? `, ${filled} filled${feeText(fees)}` : ''}`, 'ok');
+  if (result.status === 'accepted') {
+    // What happened: the fills at their own prices, then whatever rests at the order's limit.
+    const resting = cancelled ? 0 : left ?? first.quantity - filled;
+    const at = prices.size === 1 ? `${[...prices.values()][0]}¢`
+      : `an average of ${+(value / filled).toFixed(2)}¢ (${[...prices.entries()].sort((a, b) => a[0] - b[0]).map(([, c]) => c + '¢').join(', ')})`;
+    const parts = [
+      filled ? `${filled} filled at ${at}${feeText(fees)}` : null,
+      resting ? `${resting} resting at ${first.price.cents}¢` : null,
+      cancelled ? `${cancelled} cancelled` : null,
+    ].filter(Boolean);
+    toast(`Order accepted (YES ${first.side}): ${parts.join('; ') || `${first.quantity} at ${first.price.cents}¢`}`, 'ok');
+  }
   else if (result.status === 'rejected') toast('Rejected: ' + words(result.rejectReason), 'bad');
   else if (result.status === 'duplicate') toast('Duplicate client order ID', 'bad');
   else if (result.status === 'cancelled') toast(`Cancelled ${first ? first.quantity : ''}`);
