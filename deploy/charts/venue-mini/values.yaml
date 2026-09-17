@@ -211,4 +211,35 @@ bots:
     intervalMs: 1000
     seed: 2
 
+# Metrics and logs (deploy/observability/). Each process serves Prometheus metrics on a port of its own, never a client
+# port: core 9101, gateway 9102, observer 9103, FIX adapter 9104; and logs one line per event to stdout, as JSON with
+# logFormat json or readable text with text. Scraping and dashboards are the observability stack's
+# (deploy/observability/install.sh), in its own namespace.
+metrics:
+  enabled: true
+  # Labels on every series this release exports, added by the PodMonitor: the environment's name, and its profile.
+  # A laptop or per-PR environment is functional, which the latency dashboard refuses to plot (blueprint §16).
+  env: local
+  profile: functional
+  # The namespace Prometheus scrapes from, let in to the metrics ports of the pods that have network policies.
+  monitoringNamespace: monitoring
+  # A PodMonitor for the Prometheus Operator, rendered only where its API exists.
+  podMonitor:
+    enabled: true
+    interval: 15s
+  logFormat: json
+
+# The observer (core/observer): journal-derived metrics and read-only operator endpoints from the core's feed. With
+# metrics.enabled only.
+observer:
+  enabled: true
+  # Markets with series of their own at once; more are counted only in the venue's totals.
+  maxMarketSeries: 500
+  resources:
+    requests:
+      cpu: 20m
+      memory: 32Mi
+    limits:
+      memory: 256Mi
+
 fullnameOverride: ""

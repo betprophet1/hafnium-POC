@@ -1,0 +1,63 @@
+{{- if .Values.metrics.enabled }}
+{{- $name := include "venue-mini.fullname" . }}
+# Metrics are served on ports of their own (deploy/observability/metrics.md): core 9101, gateway 9102, observer 9103,
+# FIX adapter 9104. The core, the FIX adapter and the observer have network policies, so the monitoring namespace is
+# let in to those ports here, and to nothing else; the gateway has no policy and its port is reachable in the cluster,
+# as its client port is.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-metrics
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: venue-mini
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [core, fix, observer]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.metrics.monitoringNamespace }}
+      ports:
+        - port: 9101
+        - port: 9103
+        - port: 9104
+{{- if and .Values.metrics.podMonitor.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PodMonitor") }}
+---
+# What Prometheus (through the Prometheus Operator) scrapes: every venue pod's port named metrics. Every series gets
+# the environment's labels here, so dashboards and alerts tell environments apart and the latency dashboard can refuse
+# a functional profile's numbers (blueprint §16).
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: venue-mini
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [core, gateway, fix, observer]
+  podMetricsEndpoints:
+    - port: metrics
+      interval: {{ .Values.metrics.podMonitor.interval }}
+      relabelings:
+        - targetLabel: env
+          replacement: {{ .Values.metrics.env | quote }}
+        - targetLabel: profile
+          replacement: {{ .Values.metrics.profile | quote }}
+        - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+          targetLabel: component
+{{- end }}
+{{- end }}

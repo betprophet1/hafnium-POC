@@ -84,9 +84,19 @@ spec:
               value: {{ .Values.fix.auditFsync | quote }}
             - name: JAVA_OPTS
               value: "-XX:+ExitOnOutOfMemoryError -XX:-UsePerfData -Djava.io.tmpdir=/tmp"
+            {{- if .Values.metrics.enabled }}
+            - name: VENUE_FIX_METRICS_LISTEN
+              value: "0.0.0.0:9104"
+            - name: VENUE_LOG_FORMAT
+              value: {{ .Values.metrics.logFormat | quote }}
+            {{- end }}
           ports:
             - name: fix
               containerPort: 9878
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: 9104
+            {{- end }}
           readinessProbe:
             tcpSocket:
               port: fix
