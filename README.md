@@ -21,12 +21,15 @@ The published blueprint is at https://claude.ai/code/artifact/5e4d2278-46dd-4f2c
 ```
 
 That runs, in order: the blueprint's structure, consistency and figure checks; a gate that no change touches the
-engine together with the specification; the interface catalogue and a check that the committed codec matches the
+engine together with the specification; a throwaway PostgreSQL in a container for the database tests, when Docker is
+usable; the interface catalogue and a check that the committed codec matches the
 schema; the reference model against every scenario and on random sequences; the Rust formatting, lints and tests;
 the Rust engine against the scenarios and the reference model's differential vectors; a golden replay through
 the node; and, when its toolchain is there, the FIX adapter against a local venue.
 
-**Needed:** Python 3.11+, Rust with `rustfmt` and `clippy`. **Optional:** Node, for the Chromium checks
+**Needed:** Python 3.11+, Rust with `rustfmt` and `clippy`, and OpenSSL's headers (`libssl-dev`), which the services'
+PostgreSQL client builds against. **Optional:** Docker, for the database tests (`core/store/README.md`; they say they
+were skipped without it, or `VENUE_TEST_DATABASE_URL` names a server of your own); Node, for the Chromium checks
 (`cd blueprint/tools && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci`); a JDK 17+ and sbe-all 1.40.1, only when the
 journal schema changes (see `interfaces/README.md`); the FIX adapter's toolchain, fetched into the repository by
 `adapters/fix/bootstrap.sh`, for its integration test (see `adapters/fix/README.md`).
