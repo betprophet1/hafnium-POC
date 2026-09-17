@@ -82,6 +82,12 @@ impl Fields {
         self.0.push(Item::Wire(name, text.to_string()));
     }
 
+    /// What was sent, by its length and hash rather than its bytes: for an answer whose content is elsewhere. The
+    /// hash is taken by the writer, so no loop ever hashes a body it has just sent.
+    pub fn digest(&mut self, text: &str) {
+        self.0.push(Item::Digest(text.to_string()));
+    }
+
     /// A frame the gateway rendered from a sequenced input: what it was, which input it came from, and the length and
     /// hash of the bytes sent, rather than the bytes themselves. The journal holds what it was rendered from, and
     /// `venue-gateway reconstruct` renders it again and checks it against the hash (interfaces/audit/README.md).

@@ -697,8 +697,7 @@ fn record_response(gateway: &Gateway, origin: &Origin, http: &Http) {
         // What the public half answers is market data: the same for every client, reconstructable from the journal,
         // and polled all day, so its bytes would fill the log. The length and hash of what was sent still say what the
         // answer was; a refusal or an error keeps its body.
-        fields.put("length", body.len());
-        fields.put("sha256", audit::sha256_hex(body));
+        fields.digest(&String::from_utf8_lossy(body));
     } else {
         // Masked too: the answer that creates an API key carries its secret.
         fields.wire("body", &String::from_utf8_lossy(body));
