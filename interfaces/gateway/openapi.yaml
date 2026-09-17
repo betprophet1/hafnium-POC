@@ -26,8 +26,8 @@ info:
 
     Answering requests for quote needs two things: the account must be one the parlay service's operator has approved
     as a responder (README, parlays), and the credential must hold the permission named `respond` in the security
-    requirement of the responder operations. A dev token holds `respond`; an API key will hold it only when issued
-    with it.
+    requirement of the responder operations. A dev token holds `respond`; an API key holds it only when it was created
+    with it. Either one missing is 403 `FORBIDDEN`.
 servers:
   - url: http://127.0.0.1:8080
     description: The mini venue on a laptop, after `deploy/laptop.sh web`
@@ -315,7 +315,7 @@ paths:
         sessions subscribed with. What a WebSocket `subscribeRfqs` catches up with, for a client without a session.
         The requester is not named. A parlay service that restarted has forgotten the requests open before it did.
       security:
-        - apiKey: [read]
+        - apiKey: [respond]
         - devToken: []
       responses:
         '200':
@@ -382,7 +382,7 @@ paths:
     post:
       operationId: attachQuote
       security:
-        - apiKey: [trade]
+        - apiKey: [trade, respond]
         - devToken: []
       tags: [rfq]
       summary: Attach a resting order to a request as a quote (approved responders only)
@@ -487,7 +487,8 @@ components:
       bearerFormat: '<keyId>.<secret>'
       description: |
         An API key's credential: `Authorization: Bearer ak_0123456789abcdef.<64 hex digits>` (README, API keys and
-        permissions). A requirement names the permission the key must hold: `read`, `trade`, `transfers` or `keys`.
+        permissions). A requirement names the permissions the key must hold, each of `read`, `trade`, `transfers`,
+        `keys` and `respond`.
         A valid key without it is refused with 403 `FORBIDDEN`; a missing, unknown, revoked or expired one with 401.
     devToken:
       type: http
@@ -870,11 +871,12 @@ components:
       description: An API key's public ID.
     Permission:
       type: string
-      enum: [read, trade, transfers, keys]
+      enum: [read, trade, transfers, keys, respond]
       description: |
         `read`: the account, its transfers and requests, and private sessions. `trade`: orders, amendments, cancels,
         requests for quote and quotes. `transfers`: deposits, withdrawals and their cancellation. `keys`: this
-        account's API keys.
+        account's API keys. `respond`: answering requests for quote as an approved responder (subscribing, reading
+        those open, and, with `trade`, attaching quotes).
     KeyRequest:
       type: object
       required: [label, permissions]

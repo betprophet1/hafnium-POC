@@ -28,12 +28,20 @@ impl Permissions {
     pub const TRANSFERS: Self = Self(4);
     /// The account's keys.
     pub const KEYS: Self = Self(8);
+    /// Answering requests for quote: subscribing to them, reading those open, and attaching quotes (decision G-12).
+    /// The account must also be an approved responder, which is the parlay service's to say.
+    pub const RESPOND: Self = Self(16);
     /// What a dev token holds.
-    pub const ALL: Self = Self(15);
+    pub const ALL: Self = Self(31);
 
     /// Each permission with its name, in the order lists give them.
-    const NAMED: [(Self, &'static str); 4] =
-        [(Self::READ, "read"), (Self::TRADE, "trade"), (Self::TRANSFERS, "transfers"), (Self::KEYS, "keys")];
+    const NAMED: [(Self, &'static str); 5] = [
+        (Self::READ, "read"),
+        (Self::TRADE, "trade"),
+        (Self::TRANSFERS, "transfers"),
+        (Self::KEYS, "keys"),
+        (Self::RESPOND, "respond"),
+    ];
 
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -56,10 +64,9 @@ impl Permissions {
     pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<Self, String> {
         let mut set = Self::NONE;
         for name in names {
-            let (permission, _) = Self::NAMED
-                .iter()
-                .find(|(_, n)| *n == name)
-                .ok_or_else(|| format!("unknown permission {name}: permissions are read, trade, transfers and keys"))?;
+            let (permission, _) = Self::NAMED.iter().find(|(_, n)| *n == name).ok_or_else(|| {
+                format!("unknown permission {name}: permissions are read, trade, transfers, keys and respond")
+            })?;
             if set.contains(*permission) {
                 return Err(format!("permission {name} is given twice"));
             }
@@ -188,6 +195,8 @@ mod tests {
         assert!(Permissions::from_names(["read", "read"]).is_err());
         assert!(Permissions::from_names(["admin"]).is_err());
         assert_eq!(Permissions::KEYS.name(), "keys");
-        assert_eq!(Permissions::ALL.names(), ["read", "trade", "transfers", "keys"]);
+        assert_eq!(Permissions::RESPOND.name(), "respond");
+        assert_eq!(Permissions::ALL.names(), ["read", "trade", "transfers", "keys", "respond"]);
+        assert!(!Permissions::from_names(["read", "trade"]).expect("valid").contains(Permissions::RESPOND));
     }
 }

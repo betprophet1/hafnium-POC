@@ -152,7 +152,7 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Res
             Ok(Routed::Later(gateway.request_quote_pending(account, &body(request)?, later())?))
         }
         ("GET", ["v4", "rfqs"]) => {
-            let account = account(gateway, request, Permissions::READ)?;
+            let account = account(gateway, request, Permissions::RESPOND)?;
             Ok(Routed::Later(gateway.open_rfqs_pending(account, later())?))
         }
         ("GET", ["v4", "rfqs", rfq]) => {
@@ -160,7 +160,11 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Res
             Ok(Routed::Later(gateway.rfq_pending(account, rfq, later())?))
         }
         ("POST", ["v4", "rfqs", rfq, "quotes"]) => {
-            let account = account(gateway, request, Permissions::TRADE)?;
+            // A quote is a resting order (trade) given to a request (respond); the account's approval is the parlay
+            // service's to check.
+            let credential = credential(gateway, request, Permissions::TRADE)?;
+            credential.require(Permissions::RESPOND)?;
+            let account = credential.account;
             let mut body = body(request)?;
             if let Some(fields) = body.as_object_mut() {
                 if fields.contains_key("requestId") {

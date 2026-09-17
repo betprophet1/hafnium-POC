@@ -133,6 +133,7 @@ presents both joined by a dot, `ak_0123456789abcdef.<secret>`, called the key's 
 | `trade` | orders, amendments, cancels and mass cancels (`/v4/orders`, and `order`, `amend`, `cancel`, `cancelAll`); requests for quote and quotes (`POST /v4/rfqs`, `POST /v4/rfqs/{requestId}/quotes`, `requestQuote`, `attachQuote`) |
 | `transfers` | moving money: `POST /v4/transfers` and `DELETE /v4/transfers/{transferId}` |
 | `keys` | managing the account's keys: `/v4/keys` |
+| `respond` | answering requests for quote as a responder: `GET /v4/rfqs`, `subscribeRfqs` and `unsubscribeRfqs`, and, with `trade` as well, attaching a quote (`POST /v4/rfqs/{requestId}/quotes`, `attachQuote`). The account must also be an approved responder (parlays, responders): the permission and the approval are both needed. |
 
 A request with a valid credential that lacks the permission is refused with HTTP 403 `FORBIDDEN`, or an `error` with
 `FORBIDDEN` on the WebSocket, naming the permission; nothing is sent on, and the refusal is in the audit log with the
@@ -332,7 +333,9 @@ the edge with `BAD_REQUEST` and a reason, and nothing is listed.
 **Responders.** Only approved responders see requests and quote. Approval is per account and belongs to the parlay
 service's operator, who approves and revokes accounts through the service's operator API; an environment starts from
 the accounts its catalogue marks `"responder": true`, and the list survives restarts. A credential also needs the
-`respond` permission, which every dev token holds and an API key will hold only if issued with it. Anything a
+`respond` permission (API keys and permissions), which every dev token holds and an API key holds only if it was
+created with it; a key without it is refused even for an approved account, and an approved account's key with it
+still needs the approval. Anything a
 responder-only op or path is refused for, an account that is not approved included, is 403 `FORBIDDEN`. Revoking an
 account ends its subscriptions at once (each session is sent `rfqSubscription` with `subscribed: false`) and refuses
 its later quotes; quotes it attached already are orders and stay on the book.

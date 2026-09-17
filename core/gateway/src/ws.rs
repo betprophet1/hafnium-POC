@@ -313,7 +313,7 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
             Ok(Vec::new())
         }
         "subscribeRfqs" | "unsubscribeRfqs" => {
-            let account = session.allowed(Permissions::READ)?;
+            let account = session.allowed(Permissions::RESPOND)?;
             let notify = Some(Arc::clone(&session.notify));
             let body = body_of(message);
             let subscribe = op == "subscribeRfqs";
@@ -327,6 +327,9 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
         }
         "requestQuote" | "attachQuote" => {
             let account = session.allowed(Permissions::TRADE)?;
+            if op == "attachQuote" {
+                session.allowed(Permissions::RESPOND)?;
+            }
             let notify = Some(Arc::clone(&session.notify));
             let body = body_of(message);
             // Answered in turn with the session's orders, so a responder that rests an order and then attaches it

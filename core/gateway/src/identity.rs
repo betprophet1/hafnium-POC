@@ -333,7 +333,9 @@ pub fn manage(
                 .and_then(Value::as_array)
                 .map(|names| names.iter().map(Value::as_str).collect::<Option<Vec<&str>>>())
                 .and_then(|names| Permissions::from_names(names?).ok())
-                .ok_or_else(|| ApiError::bad("permissions must be a list of read, trade, transfers and keys"))?;
+                .ok_or_else(|| {
+                    ApiError::bad("permissions must be a list of read, trade, transfers, keys and respond")
+                })?;
             if credential.key.is_some() {
                 beyond_the_creator(credential, asked, fields.get("expiresAt"))?;
                 body["createdBy"] = json!(credential.key);
@@ -380,7 +382,7 @@ mod tests {
     use crate::api::{Gateway, Limits};
     use crate::hub::Hub;
     use crate::limits::monotonic;
-    use crate::testing::{self, eventually, MAKER, MAKER_TOKEN, MARKET, RETAIL_TOKEN};
+    use crate::testing::{self, eventually, MAKER, MAKER_TOKEN, MARKET, RESPONDER_TOKEN, RETAIL_TOKEN};
     use serde_json::{json, Value};
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -582,7 +584,7 @@ mod tests {
         let welcome = ask(&mut dev, &json!({"op": "login", "id": "l", "token": MAKER_TOKEN}));
         assert_eq!(
             (welcome.get("keyId"), &welcome["permissions"]),
-            (None, &json!(["read", "trade", "transfers", "keys"]))
+            (None, &json!(["read", "trade", "transfers", "keys", "respond"]))
         );
     }
 
@@ -643,6 +645,102 @@ mod tests {
         let mut again = connect(&venue.ws_private);
         let refused = ask(&mut again, &json!({"op": "login", "id": "l", "token": key}));
         assert_eq!(refused["error"]["code"], "UNAUTHORIZED", "{refused}");
+    }
+
+    /// `ask`, again while the parlay service is unavailable, which on a loaded machine it can be for a moment.
+    fn ask_parlays(socket: &mut Socket, message: &Value) -> Value {
+        for _ in 0..300 {
+            let answer = ask(socket, message);
+            if answer["error"]["code"] != "UNAVAILABLE" {
+                return answer;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the parlay service stayed unavailable for {message}");
+    }
+
+    /// `request`, again while the parlay service is unavailable.
+    fn request_parlays(address: &str, method: &str, path: &str, token: &str, body: Option<&Value>) -> (u16, Value) {
+        for _ in 0..300 {
+            let answer = request(address, method, path, Some(token), body);
+            if answer.0 != 503 {
+                return answer;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the parlay service stayed unavailable for {method} {path}");
+    }
+
+    fn names_respond(answer: &Value) -> bool {
+        answer["error"]["message"].as_str().is_some_and(|m| m.contains("respond"))
+    }
+
+    #[test]
+    fn answering_requests_for_quote_needs_the_respond_permission_and_an_approved_account() {
+        let venue = testing::venue("keys-respond");
+        let a = &venue.address;
+        // The synthetic maker's account is an approved responder; the retail customer's is not.
+        let trader = make_key(a, RESPONDER_TOKEN, &["read", "trade"]);
+        let responder = make_key(a, RESPONDER_TOKEN, &["read", "trade", "respond"]);
+        let unapproved = credential(&make_key(a, RETAIL_TOKEN, &["read", "trade", "respond"]));
+        let (trader_id, trader) = (trader["keyId"].as_str().expect("an ID").to_string(), credential(&trader));
+        let responder = credential(&responder);
+        let quote = json!({"orderId": "1"});
+
+        // An approved account's key without respond: refused over REST and on a session, naming the permission.
+        for (method, path, body) in [("GET", "/v4/rfqs", None), ("POST", "/v4/rfqs/abc/quotes", Some(&quote))] {
+            let answer = request(a, method, path, Some(&trader), body);
+            assert!(forbidden(&answer) && names_respond(&answer.1), "{method} {path}: {} {}", answer.0, answer.1);
+        }
+        let mut session = connect(&venue.ws_private);
+        assert_eq!(ask(&mut session, &json!({"op": "login", "id": "l", "token": trader}))["type"], "welcome");
+        for op in [
+            json!({"op": "subscribeRfqs", "id": "s"}),
+            json!({"op": "unsubscribeRfqs", "id": "u"}),
+            json!({"op": "attachQuote", "id": "q", "requestId": "abc", "orderId": "1"}),
+        ] {
+            let refused = ask(&mut session, &op);
+            assert_eq!(
+                (&refused["id"], refused["error"]["code"].as_str()),
+                (&op["id"], Some("FORBIDDEN")),
+                "{refused}"
+            );
+            assert!(names_respond(&refused), "{refused}");
+        }
+
+        // With respond, the same account subscribes and reads what is open; a quote for no request is refused for
+        // that, not for the key.
+        let mut session = connect(&venue.ws_private);
+        assert_eq!(ask(&mut session, &json!({"op": "login", "id": "l", "token": responder}))["type"], "welcome");
+        let subscribed = ask_parlays(&mut session, &json!({"op": "subscribeRfqs", "id": "s"}));
+        assert_eq!(subscribed["result"]["subscribed"], true, "{subscribed}");
+        let attached = ask_parlays(
+            &mut session,
+            &json!({"op": "attachQuote", "id": "q", "requestId": "nosuchrequest", "orderId": "1"}),
+        );
+        assert!(attached["type"] == "error" && attached["error"]["code"] != "FORBIDDEN", "{attached}");
+        let (status, open) = request_parlays(a, "GET", "/v4/rfqs", &responder, None);
+        assert_eq!(status, 200, "{open}");
+
+        // With respond, an account the parlay service has not approved is still refused.
+        let (status, refused) = request_parlays(a, "GET", "/v4/rfqs", &unapproved, None);
+        assert_eq!((status, refused["error"]["code"].as_str()), (403, Some("FORBIDDEN")), "{refused}");
+        assert!(refused["error"]["message"].as_str().is_some_and(|m| m.contains("approved")), "{refused}");
+        let mut session = connect(&venue.ws_private);
+        assert_eq!(ask(&mut session, &json!({"op": "login", "id": "l", "token": unapproved}))["type"], "welcome");
+        let refused = ask_parlays(&mut session, &json!({"op": "subscribeRfqs", "id": "s"}));
+        assert_eq!(refused["error"]["code"], "FORBIDDEN", "{refused}");
+        assert!(refused["error"]["message"].as_str().is_some_and(|m| m.contains("approved")), "{refused}");
+
+        // The audit log names the key a refused subscription came from.
+        eventually("the refused subscription is recorded with its key", || {
+            audit_text(&venue.audit_dir).lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).any(|r| {
+                r["kind"] == "ws-frame"
+                    && r["dir"] == "in"
+                    && r["key"] == trader_id.as_str()
+                    && r["msg"].as_str().is_some_and(|m| m.contains("subscribeRfqs"))
+            })
+        });
     }
 
     /// Every record in the directory's files.

@@ -14,8 +14,9 @@ info:
       responder that subscribes with `subscribeRfqs`, other accounts' requests. It carries no public topics.
 
     Logging in needs the `read` permission, which every key holds; `order`, `amend`, `cancel`, `cancelAll`,
-    `requestQuote` and `attachQuote` need `trade`, and are answered with an `error` (`FORBIDDEN`) for a key without it
-    (README, API keys and permissions). A session whose key is revoked or expires is sent an `error`
+    `requestQuote` and `attachQuote` need `trade`; `subscribeRfqs`, `unsubscribeRfqs` and `attachQuote` need
+    `respond`, on top of the account being an approved responder. Each is answered with an `error` (`FORBIDDEN`)
+    naming the permission for a key without it (README, API keys and permissions). A session whose key is revoked or expires is sent an `error`
     (`UNAUTHORIZED`) and closed within 10 seconds.
 
     A client that trades and watches the market opens one of each. The two may be served by one gateway or by
@@ -134,7 +135,8 @@ operations:
     channel: { $ref: '#/channels/private' }
     summary: >-
       An approved responder attaches one of its resting sells on the request's parlay to another account's request,
-      as a quote. Refused with `FORBIDDEN` for an account that is not approved.
+      as a quote. Needs `trade` and `respond`. Refused with `FORBIDDEN` for a key without either, and for an
+      account that is not approved.
     messages: [{ $ref: '#/channels/private/messages/attachQuote' }]
     reply:
       channel: { $ref: '#/channels/private' }
@@ -146,8 +148,8 @@ operations:
       An approved responder starts receiving requests for quote on this session (README, parlays): first an `rfq`
       message for each request open now that its filters select, then the reply, then each new one as it opens (one
       that opens while the subscription is being made may come just before the reply; none is sent twice).
-      Subscribing again replaces the filters and catches up again. Refused with `FORBIDDEN` for an account that is
-      not approved, and with `UNAVAILABLE` while the parlay service cannot be reached; a refusal leaves any
+      Subscribing again replaces the filters and catches up again. Needs `respond`. Refused with `FORBIDDEN` for a
+      key without it and for an account that is not approved, and with `UNAVAILABLE` while the parlay service cannot be reached; a refusal leaves any
       subscription the session had as it was. The subscription lasts as long as the session.
     messages: [{ $ref: '#/channels/private/messages/subscribeRfqs' }]
     reply:

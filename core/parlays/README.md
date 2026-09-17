@@ -34,7 +34,7 @@ change. When the file does not exist, the list starts from the catalogue's `"res
 at once; after that the file, not the catalogue, is the truth, so a revoked catalogue responder stays revoked across
 restarts. An operator changes it through the operator API, or edits the file and restarts the service; a damaged file
 stops the service from starting rather than being replaced. Approval is per account; whether a credential may act
-for a responder (an API key's `respond` permission, when keys arrive) is the gateway's to check.
+for a responder (an API key's `respond` permission) is the gateway's to check, and both are needed.
 
 The operator API listens on `--operator` (`none` turns it off), apart from the gateways' port:
 

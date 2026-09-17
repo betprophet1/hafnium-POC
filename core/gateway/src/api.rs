@@ -545,25 +545,18 @@ impl Gateway {
         self.ask_parlays(account, json!({"op": "status", "requestId": request}), notify)
     }
 
-    /// POST /v4/rfqs/{requestId}/quotes and the WebSocket `attachQuote` op.
+    /// POST /v4/rfqs/{requestId}/quotes and the WebSocket `attachQuote` op. The caller has checked that the credential
+    /// holds `trade` and `respond`; whether the account is an approved responder is the parlay service's to say.
     pub fn attach_quote_pending(
         &self,
         account: u64,
         body: &Value,
         notify: Option<Notify>,
     ) -> Result<Pending, ApiError> {
-        self.may_respond(account)?;
         let fields = only(body, &["requestId", "orderId"])?;
         let request = request_id(fields.get("requestId").and_then(Value::as_str).unwrap_or(""))?;
         let order = id_field(fields, "orderId")?;
         self.ask_parlays(account, json!({"op": "quote", "requestId": request, "orderId": order}), notify)
-    }
-
-    /// The credential may answer requests for quote. Every dev token may; an API key will only if it was issued with
-    /// the permission to respond, and this is where that permission is read. Whether the account is an approved
-    /// responder is the parlay service's to say.
-    const fn may_respond(&self, _account: u64) -> Result<(), ApiError> {
-        Ok(())
     }
 
     /// The WebSocket `subscribeRfqs` op for the session with hub key `session`: requests from now on, and those open
@@ -575,7 +568,6 @@ impl Gateway {
         body: &Value,
         notify: Option<Notify>,
     ) -> Result<Pending, ApiError> {
-        self.may_respond(account)?;
         let fields = only(body, &["filters"])?;
         let filters = match fields.get("filters") {
             None => Value::Null,
@@ -605,9 +597,8 @@ impl Gateway {
         }
     }
 
-    /// GET /v4/rfqs: the requests open now that an approved responder may quote.
+    /// GET /v4/rfqs: the requests open now that an approved responder may quote. The caller has checked `respond`.
     pub fn open_rfqs_pending(&self, account: u64, notify: Option<Notify>) -> Result<Pending, ApiError> {
-        self.may_respond(account)?;
         self.ask_parlays(account, json!({"op": "open"}), notify)
     }
 

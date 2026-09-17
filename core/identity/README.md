@@ -2,7 +2,7 @@
 
 The identity service of test environments: it keeps every account's API keys and tells the gateways which account and
 permissions a key's credential stands for (interfaces/gateway/README.md, API keys and permissions; the reasons for each
-choice are in interfaces/gateway/decisions.md, G-1 to G-11). Clients never reach it: they create, list and revoke keys
+choice are in interfaces/gateway/decisions.md, G-1 to G-12). Clients never reach it: they create, list and revoke keys
 through the private half of the gateway (`/v4/keys`), which authenticates them and passes the call on.
 
 It is test-environment identity. Production needs interface 6 and the environment manifest's issuer (interface 22):

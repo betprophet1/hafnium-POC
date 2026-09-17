@@ -224,6 +224,7 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
           <label class="check"><input type="checkbox" id="keyTrade" checked> trade</label>
           <label class="check"><input type="checkbox" id="keyTransfers"> transfers</label>
           <label class="check"><input type="checkbox" id="keyKeys"> keys</label>
+          <label class="check"><input type="checkbox" id="keyRespond"> respond</label>
           <label>Expires<select id="keyExpiry"><option value="">never</option><option value="1">in an hour</option><option value="24">in a day</option><option value="720">in 30 days</option></select></label>
           <button class="primary">Create</button>
         </form>
@@ -881,7 +882,7 @@ async function keyCall(s, method, path, body) {
 async function createKey() {
   const s = sessions[acctName];
   if (!s) return;
-  const permissions = ['read'].concat([['#keyTrade', 'trade'], ['#keyTransfers', 'transfers'], ['#keyKeys', 'keys']].filter(([id]) => $(id).checked).map(([, p]) => p));
+  const permissions = ['read'].concat([['#keyTrade', 'trade'], ['#keyTransfers', 'transfers'], ['#keyKeys', 'keys'], ['#keyRespond', 'respond']].filter(([id]) => $(id).checked).map(([, p]) => p));
   const body = {label: $('#keyLabel').value.trim(), permissions};
   const hours = +$('#keyExpiry').value;
   if (hours) body.expiresAt = new Date(Date.now() + hours * 3600e3).toISOString();
