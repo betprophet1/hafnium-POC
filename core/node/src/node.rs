@@ -9,6 +9,7 @@
 //! start of the journal, then live.
 
 use crate::frames::{read_frame, write_frame};
+use crate::metrics::{NodeMetrics, Subscriber};
 use crate::sequencer::{self, Sequencer};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -16,6 +17,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -25,6 +27,7 @@ use venue_engine::state::Capacities;
 use venue_engine::{Engine, EngineConfig, ResultSink};
 use venue_harness::memory::OwnedMemory;
 use venue_journal::time_tick_codec::SBE_TEMPLATE_ID as TIME_TICK;
+use venue_telemetry::log;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -47,6 +50,8 @@ pub struct Config {
     pub fsync: bool,
     /// The capacity profile to size the engine's tables by: `small`, `launch` or `scale`.
     pub capacity: String,
+    /// Where to serve metrics (deploy/observability/metrics.md), if anywhere.
+    pub metrics: Option<String>,
 }
 
 /// The file beside a journal naming the capacity profile it was recorded under.
@@ -149,7 +154,11 @@ fn run_journal(
             }
             Ok(None) => break,
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                eprintln!("journal {}: torn final frame after byte {good} of {length}", path.display());
+                let journal = path.display();
+                log::warn(
+                    "torn final frame in the journal",
+                    &[("journal", &journal), ("after", &good), ("of", &length)],
+                );
                 break;
             }
             Err(e) => return Err(e.into()),
@@ -158,7 +167,7 @@ fn run_journal(
     drop(reader);
     if repair && good < length {
         file.set_len(good)?;
-        eprintln!("journal {}: cut to {good} bytes", path.display());
+        log::warn("journal cut to its last whole frame", &[("journal", &path.display()), ("bytes", &good)]);
     }
     Ok(inputs)
 }
@@ -193,16 +202,23 @@ struct Pipeline {
     fsync: bool,
     /// The framed results of the input committed last.
     out: Vec<u8>,
+    metrics: Arc<NodeMetrics>,
 }
 
 impl Pipeline {
     fn commit(&mut self, engine: &mut Engine<'_>, input: &mut [u8]) -> Result<(), Error> {
-        self.sequencer.stamp(input, clock_ns());
+        let (sequence, at) = self.sequencer.stamp(input, clock_ns());
+        let started = monotonic();
         write_frame(&mut self.journal, input)?;
         self.journal.flush()?;
-        if self.fsync {
+        let appended = monotonic();
+        let synced = if self.fsync {
             self.journal.get_ref().sync_data()?;
-        }
+            Some(monotonic().duration_since(appended))
+        } else {
+            None
+        };
+        self.metrics.journaled(input, sequence, at, appended.duration_since(started), synced);
         self.out.clear();
         apply(engine, input, &mut self.results, Some(&mut self.out))
     }
@@ -279,12 +295,26 @@ fn unit(input: &[u8], results: &[u8]) -> io::Result<Vec<u8>> {
     Ok(u)
 }
 
-fn publish(subscribers: &mut Vec<Sender<Unit>>, input: &[u8], results: &[u8]) -> io::Result<()> {
-    if subscribers.is_empty() || quiet(input, results) {
+/// A live subscriber: where its units go, and how far its thread has got with them.
+type Live = (Sender<Unit>, Arc<Subscriber>);
+
+fn publish(subscribers: &mut Vec<Live>, metrics: &NodeMetrics, input: &[u8], results: &[u8]) -> io::Result<()> {
+    if quiet(input, results) {
+        return Ok(());
+    }
+    metrics.feed_published_sequence.set(i64::try_from(u64_at(input, 8)).unwrap_or(i64::MAX));
+    if subscribers.is_empty() {
         return Ok(());
     }
     let u = Arc::new(unit(input, results)?);
-    subscribers.retain(|s| s.send(Arc::clone(&u)).is_ok());
+    subscribers.retain(|(s, progress)| {
+        let sent = s.send(Arc::clone(&u)).is_ok();
+        if sent {
+            progress.sent.fetch_add(1, Ordering::Relaxed);
+        }
+        sent
+    });
+    metrics.feed_units_published.inc();
     Ok(())
 }
 
@@ -296,6 +326,7 @@ fn serve_subscriber(
     journal: (&Path, u64),
     results: (&Path, u64),
     live: Receiver<Unit>,
+    progress: &Subscriber,
 ) -> Result<(), Error> {
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut out = BufWriter::new(stream);
@@ -321,6 +352,7 @@ fn serve_subscriber(
     for u in live {
         out.write_all(&u)?;
         out.flush()?;
+        progress.written.fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -354,13 +386,28 @@ pub fn serve(config: &Config) -> Result<(), Error> {
         }
     }
     fs::write(&recorded, format!("{}\n", config.capacity))?;
+    let mut registry = venue_telemetry::prometheus_client::registry::Registry::default();
+    venue_telemetry::build_info(
+        &mut registry,
+        "venue_node",
+        env!("CARGO_PKG_VERSION"),
+        &[("capacity", &config.capacity)],
+    );
+    let metrics = NodeMetrics::register(&mut registry);
+    if let Some(address) = &config.metrics {
+        let bound = venue_telemetry::serve::spawn(address, registry, None)?;
+        log::info("metrics served", &[("address", &bound)]);
+    }
     let mut owned = OwnedMemory::new(&capacities);
     let mut engine =
         Engine::new(engine_config(config.group)?, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
     let mut results = BufWriter::new(File::create(&results_path)?);
     let recovered = run_journal(&mut engine, &journal_path, &mut results, true)?;
     let (last_sequence, last_at) = engine.position();
-    eprintln!("recovered {recovered} inputs from {}; last sequence {last_sequence}", journal_path.display());
+    log::info(
+        "recovered from the journal",
+        &[("inputs", &recovered), ("journal", &journal_path.display()), ("last_sequence", &last_sequence)],
+    );
     let journal = BufWriter::new(OpenOptions::new().append(true).create(true).open(&journal_path)?);
     let mut pipeline = Pipeline {
         sequencer: Sequencer::resume(config.group, last_sequence, last_at),
@@ -368,57 +415,66 @@ pub fn serve(config: &Config) -> Result<(), Error> {
         results,
         fsync: config.fsync,
         out: Vec::new(),
+        metrics: Arc::clone(&metrics),
     };
     pipeline.commit(&mut engine, &mut sequencer::engine_started(config.node_id, &hash))?;
 
     let listener = TcpListener::bind(config.listen)?;
     let feed = TcpListener::bind(config.feed)?;
-    eprintln!(
-        "group {} node {}: ingress on {}, feed on {}",
-        config.group,
-        config.node_id,
-        listener.local_addr()?,
-        feed.local_addr()?
+    log::info(
+        "serving",
+        &[
+            ("group", &config.group),
+            ("node", &config.node_id),
+            ("ingress", &listener.local_addr()?),
+            ("feed", &feed.local_addr()?),
+        ],
     );
     let (tx, rx) = mpsc::channel();
     let feed_tx = tx.clone();
     thread::spawn(move || accept(listener, tx));
     thread::spawn(move || accept_feed(feed, feed_tx));
     let mut clients: BTreeMap<u64, TcpStream> = BTreeMap::new();
-    let mut subscribers: Vec<Sender<Unit>> = Vec::new();
+    let mut subscribers: Vec<Live> = Vec::new();
     let mut reply = Vec::new();
     let mut next_tick = monotonic() + config.tick;
     loop {
         match rx.recv_timeout(next_tick.saturating_duration_since(monotonic())) {
             Ok(Ingress::Connected(id, stream)) => {
                 clients.insert(id, stream);
+                metrics.ingress_connections.set(i64::try_from(clients.len()).unwrap_or(i64::MAX));
             }
             Ok(Ingress::Closed(id)) => {
                 clients.remove(&id);
+                metrics.ingress_connections.set(i64::try_from(clients.len()).unwrap_or(i64::MAX));
             }
             Ok(Ingress::Subscribe(stream)) => {
                 pipeline.journal.flush()?;
                 pipeline.results.flush()?;
                 let lengths = (fs::metadata(&journal_path)?.len(), fs::metadata(&results_path)?.len());
                 let (unit_tx, unit_rx) = mpsc::channel();
-                subscribers.push(unit_tx);
-                let (j, r) = (journal_path.clone(), results_path.clone());
+                let progress = Arc::new(Subscriber::default());
+                subscribers.push((unit_tx, Arc::clone(&progress)));
+                let (j, r, metrics) = (journal_path.clone(), results_path.clone(), Arc::clone(&metrics));
                 thread::spawn(move || {
-                    if let Err(e) = serve_subscriber(stream, (&j, lengths.0), (&r, lengths.1), unit_rx) {
-                        eprintln!("feed subscriber: {e}");
+                    let peer = stream.peer_addr().map_or_else(|_| "unknown".to_string(), |a| a.to_string());
+                    if let Err(e) = serve_subscriber(stream, (&j, lengths.0), (&r, lengths.1), unit_rx, &progress) {
+                        log::info("feed subscriber gone", &[("peer", &peer), ("reason", &e)]);
                     }
+                    metrics.subscribers_disconnected.inc();
                 });
             }
             Ok(Ingress::Input(id, mut input)) => {
                 if let Err(why) = admissible(&input) {
-                    eprintln!("connection {id}: refused: {why}");
+                    log::warn("ingress input refused, connection closed", &[("connection", &id), ("reason", &why)]);
+                    metrics.ingress_refused.inc();
                     if let Some(stream) = clients.remove(&id) {
                         let _ = stream.shutdown(Shutdown::Both);
                     }
                     continue;
                 }
                 pipeline.commit(&mut engine, &mut input)?;
-                publish(&mut subscribers, &input, &pipeline.out)?;
+                publish(&mut subscribers, &metrics, &input, &pipeline.out)?;
                 // E-17.4: the reply leaves only after the input is journaled and its results exist.
                 if let Some(stream) = clients.get_mut(&id) {
                     reply.clear();
@@ -436,8 +492,9 @@ pub fn serve(config: &Config) -> Result<(), Error> {
         if now >= next_tick {
             let mut tick = sequencer::time_tick();
             pipeline.commit(&mut engine, &mut tick)?;
-            publish(&mut subscribers, &tick, &pipeline.out)?;
+            publish(&mut subscribers, &metrics, &tick, &pipeline.out)?;
             pipeline.results.flush()?;
+            metrics.subscribers(subscribers.iter().map(|(_, progress)| progress.as_ref()));
             next_tick = (next_tick + config.tick).max(now);
         }
     }

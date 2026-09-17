@@ -10,5 +10,6 @@
 pub mod bench;
 pub mod frames;
 pub mod load;
+pub mod metrics;
 pub mod node;
 pub mod sequencer;

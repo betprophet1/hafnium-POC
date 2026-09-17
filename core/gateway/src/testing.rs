@@ -84,6 +84,7 @@ fn start_node(name: &str) -> (String, String) {
             tick: Duration::from_millis(100),
             fsync: false,
             capacity: "small".into(),
+            metrics: None,
         };
         let (stopped, stop) = std::sync::mpsc::channel();
         thread::spawn(move || {

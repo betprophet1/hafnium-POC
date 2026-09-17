@@ -1,0 +1,21 @@
+[package]
+name = "venue-telemetry"
+version = "0.1.0"
+description = "Metrics and logs for the venue's processes: Prometheus registries, histograms, a metrics endpoint and structured logs"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The Prometheus project's own Rust client: registries, counters, gauges and families, and the text exposition. Its
+# histogram takes a lock per observation, so histograms here are this crate's own (histogram.rs).
+prometheus-client = "0.25"
+# Full-resolution latency distributions for the hops the blueprint publishes (§14). Without its serialisation and
+# sync features: nothing here writes interval logs, and recorders are merged by the owner.
+hdrhistogram = { version = "7.6", default-features = false }
+# Log lines as JSON objects, escaped by the library every other crate here already uses.
+serde_json = "1"
