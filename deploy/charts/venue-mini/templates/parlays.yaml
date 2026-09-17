@@ -15,11 +15,35 @@ spec:
     - name: gateways
       port: 7103
       targetPort: gateways
+    # The operator API: approving and revoking responders. Like the oracle's control API, unauthenticated; never
+    # expose it outside the cluster.
+    - name: operator
+      port: 7104
+      targetPort: operator
 ---
-# The parlay service (core/parlays): lists a parlay on its first request for quote, relays requests to the
-# catalogue's responders and their quotes to the requester through the gateway, and settles parlays from their legs.
-# It sequences as an operator, like the seed job, and holds open requests in memory: replacing its pod forgets them,
-# while parlays and quotes, which are listings and orders, stay in the journal.
+# The approved responders outlive the pod: an operator's approvals and revocations should not quietly revert to the
+# catalogue's list when the pod is replaced.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-parlays
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: parlays
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.parlays.storage.className }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.parlays.storage.size }}
+---
+# The parlay service (core/parlays): lists a parlay on its first request for quote, relays requests to the subscribed
+# sessions of approved responders and their quotes to the requester through the gateway, and settles parlays from
+# their legs. It sequences as an operator, like the seed job, and holds open requests and subscriptions in memory:
+# replacing its pod forgets them (the gateway subscribes its sessions again), while parlays and quotes, which are
+# listings and orders, stay in the journal, and the approved responders stay in their file.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,6 +53,8 @@ metadata:
     app.kubernetes.io/component: parlays
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "venue-mini.selector" (dict "ctx" . "component" "parlays") | nindent 6 }}
@@ -61,9 +87,17 @@ spec:
             # No parlay is listed that would take the core past 95% of its profile, which the oracle's rounds share.
             - name: VENUE_CAPACITY
               value: {{ .Values.core.capacity | quote }}
+            - name: VENUE_RESPONDERS
+              value: /var/lib/parlays/responders.json
+            - name: VENUE_OPERATOR
+              value: "0.0.0.0:7104"
+            - name: VENUE_MIN_QUANTITY
+              value: {{ .Values.parlays.minQuantity | quote }}
           ports:
             - name: gateways
               containerPort: 7103
+            - name: operator
+              containerPort: 7104
           readinessProbe:
             tcpSocket:
               port: gateways
@@ -77,8 +111,13 @@ spec:
           volumeMounts:
             - name: catalogue
               mountPath: /catalogue
+            - name: responders
+              mountPath: /var/lib/parlays
       volumes:
         - name: catalogue
           configMap:
             name: {{ $name }}-catalogue
+        - name: responders
+          persistentVolumeClaim:
+            claimName: {{ $name }}-parlays
 {{- end }}

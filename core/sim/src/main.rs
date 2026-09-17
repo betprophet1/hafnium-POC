@@ -35,8 +35,8 @@ const USAGE: &str = "usage:
                   (the last two default from the node's capacity profile: 3/4 of its orders, and its
                   client order ID table's entries / 120 000 seconds)
 
-The bots are clients of the gateway. The maker answers requests for quote when its account is a registered
-responder, adding --margin thousandths to its price for a parlay. seed, workload and the dummy oracle are operator
+The bots are clients of the gateway. The maker subscribes to requests for quote and answers them when its account is an
+approved responder, adding --margin thousandths to its price for a parlay. seed, workload and the dummy oracle are operator
 tools and use the core's ingress and feed; the web page's settlement tab drives the dummy oracle's control API.
 workload puts a venue-shaped load on a core on its own, with no gateway in the way.
 Every flag can also be given as VENUE_<FLAG> in the environment, for example VENUE_GATEWAY.";

@@ -31,10 +31,11 @@ every few minutes (the S&P 500 market once a day, trading for 22 hours, so somet
 dispute window, voiding one now and then. The settlement tab shows its schedule, countdowns and resolution cases, and
 acts through it: start, suspend, end, close, postpone, propose an outcome or a void, dispute, and list a round now.
 The synthetic maker quotes over a WebSocket session with cancel-on-disconnect (delete its pod and its quotes leave the
-book until the new pod logs in) and answers requests for quote as the catalogue's registered responder, and the
+book until the new pod logs in) and, as an approved responder, subscribes to requests for quote and answers them, and the
 synthetic taker trades over REST, leaving parlays alone. The parlay service (`venue-parlays`) lists a parlay on its
-first request, routes requests and quotes for the gateway, and expires, resolves or voids each parlay as its legs
-resolve (interfaces/gateway/README.md, parlays).
+first request, routes requests to approved responders that subscribe and quotes back for the gateway, and expires,
+resolves or voids each parlay as its legs resolve (interfaces/gateway/README.md, parlays). Responders are approved
+and revoked through its operator API, port 7104 of the `parlays` service (`core/parlays/README.md`).
 The same port also serves the gateway itself under `/v4`:
 
 ```sh
@@ -73,8 +74,9 @@ it is ready. `down` deletes the cluster and the journal with it.
 - **One oracle, bounded by the core's capacity.** The oracle is `replicas: 1` with `Recreate`, so two never act on a
   round. The engine releases a settled round half an hour after it resolves (the seed's retention), so the calendar
   runs indefinitely on the `small` profile.
-- **Requests for quote are not journaled.** Open requests live in the parlay service's memory; replacing its pod
-  forgets them, while parlays and quotes (listings and orders) stay in the journal. It lists at most
+- **Requests for quote are not journaled.** Open requests and responders' subscriptions live in the parlay service's
+  memory; replacing its pod forgets them (the gateway subscribes its sessions again), while parlays and quotes
+  (listings and orders) stay in the journal, and the approved responders on the service's own volume. It lists at most
   `parlays.maxParlays` parlays at once, because every book reserves its levels until its settled event is released,
   and none that would take the core past 95% of its capacity profile, which the oracle's rounds share.
 - **Not yet in the chart:** the resolution console behind the dummy oracle (its cases live in the oracle process), the

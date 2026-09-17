@@ -95,15 +95,22 @@ gateway:
       # Empty uses the cluster's default class (k3d: local-path).
       className: ""
 
-# The parlay service: parlays listed on request, requests for quote routed to the catalogue's responders, and
-# settlement from the legs. A request accepts quotes for windowSeconds of sequencer time. Every book reserves its
-# levels until the engine releases it, half an hour after it settles, so the venue carries at most maxParlays at once:
-# a parlay's ladder has 279 rows, 558 levels, of the small profile's 131 072. It also holds, like the oracle, while
-# one more parlay would take the core past 95% of core.capacity, which the oracle's rounds share.
+# The parlay service: parlays listed on request, requests for quote routed to approved responders that subscribe, and
+# settlement from the legs. Responders start from the catalogue's "responder": true accounts and are approved and
+# revoked through its operator API on port 7104, kept on a volume of their own. A request accepts quotes for
+# windowSeconds of sequencer time, and is for at least minQuantity contracts (a multiple of the lot step, 10). Every
+# book reserves its levels until the engine releases it, half an hour after it settles, so the venue carries at most
+# maxParlays at once: a parlay's ladder has 279 rows, 558 levels, of the small profile's 131 072. It also holds, like
+# the oracle, while one more parlay would take the core past 95% of core.capacity, which the oracle's rounds share.
 parlays:
   enabled: true
   windowSeconds: 30
   maxParlays: 100
+  minQuantity: 10
+  storage:
+    size: 16Mi
+    # Empty uses the cluster's default class (k3d: local-path).
+    className: ""
 
 # Synthetic traders, clients of the gateway. Each acts as the catalogue account its dev token names. The maker holds a
 # WebSocket session with cancel-on-disconnect, so replacing its pod pulls its quotes; the taker uses REST.
@@ -119,7 +126,7 @@ bots:
     spread: 1
     intervalMs: 700
     seed: 1
-    # As a registered responder, what it adds to a parlay's price from its legs' books, in thousandths.
+    # As an approved responder, what it adds to a parlay's price from its legs' books, in thousandths.
     margin: 100
   taker:
     enabled: true

@@ -234,7 +234,7 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
     </div>
 
     <div id="tab-parlays" hidden>
-      <p class="note">A parlay pays $1 if every leg happens as picked, and nothing otherwise. Pick legs from open markets, one per event, and request quotes as the retail customer: registered responders (the synthetic maker) answer with firm quotes, which are real sell orders resting on the parlay's own book until they lapse. Once a parlay exists it trades on the retail and maker tabs like any market, and it settles by itself as its legs resolve: the first leg lost expires it, a voided leg voids it.</p>
+      <p class="note">A parlay pays $1 if every leg happens as picked, and nothing otherwise. Pick legs from open markets, one per event, and request quotes as the retail customer: approved responders listening for requests (the synthetic maker) answer with firm quotes, which are real sell orders resting on the parlay's own book until they lapse. Once a parlay exists it trades on the retail and maker tabs like any market, and it settles by itself as its legs resolve: the first leg lost expires it, a voided leg voids it.</p>
       <h3>Build a parlay</h3>
       <div id="pbLegs" class="picker"></div>
       <p id="pbSummary" class="note"></p>
@@ -516,7 +516,11 @@ const secondsUntil = at => Math.max(0, Math.round((Date.parse(at) - Date.now()) 
 function opened(rfq) {
   rfqs.unshift({rfq, quotes: new Map(), outcome: null});
   rfqs.length = Math.min(rfqs.length, 8);
-  toast(`Request sent to responders: ${rfq.legs.length} legs, ${rfq.quantity} contracts${rfq.listed ? ', parlay listed' : ''}`, 'ok');
+  const reached = rfq.responders === 1 ? '1 responder' : `${rfq.responders} responders`;
+  toast(rfq.responders === 0
+    ? `Request open, but no responder is listening: ${rfq.legs.length} legs, ${rfq.quantity} contracts${rfq.listed ? ', parlay listed' : ''}`
+    : `Request sent to ${reached}: ${rfq.legs.length} legs, ${rfq.quantity} contracts${rfq.listed ? ', parlay listed' : ''}`,
+    rfq.responders === 0 ? 'bad' : 'ok');
   loadMarkets();
   loadAllMarkets();
   renderParlays();

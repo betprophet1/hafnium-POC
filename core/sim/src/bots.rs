@@ -8,7 +8,7 @@ use crate::session::{self, Session};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use venue_link::wire::{Error, Ids};
 
 /// The maker's session heartbeat: silence this long and the gateway pulls its quotes.
@@ -338,6 +338,8 @@ struct Stream {
     resync: bool,
     /// Requests for quote received and not answered yet.
     rfqs: Vec<Value>,
+    /// The parlay service ended the session's subscription to requests.
+    rfqs_ended: bool,
 }
 
 impl Stream {
@@ -392,6 +394,7 @@ impl Stream {
             "market" => self.markets_changed = true,
             "resync" => self.resync = true,
             "rfq" => self.rfqs.push(message.clone()),
+            "rfqSubscription" if message["subscribed"] == false => self.rfqs_ended = true,
             _ => {}
         }
     }
@@ -448,6 +451,9 @@ fn session_pass(
     let mut stream = Stream { sequence: id(&welcome["sequence"]), ..Stream::default() };
     stream.restart(account(api)?);
     market.send(&json!({"op": "subscribe", "topics": ["markets"]}))?;
+    // Requests for quote reach only a session that subscribes to them; the gateway subscribes it again should it lose
+    // the parlay service, so this is needed once a session unless it is refused or ended.
+    let mut subscribe_at = Some(session::monotonic());
     let mut followed: BTreeSet<u64> = BTreeSet::new();
     let (mut sent, mut waited) = (0u64, 0u32);
     let mut next_plan = session::monotonic();
@@ -464,6 +470,14 @@ fn session_pass(
             session.poll(Duration::from_millis(50))?.into_iter().chain(market.poll(Duration::from_millis(50))?)
         {
             stream.apply(&message);
+        }
+        if subscribe_at.is_some_and(|at| session::monotonic() >= at) {
+            subscribe_at = subscribe_rfqs(&mut session, who)?;
+        }
+        if stream.rfqs_ended {
+            stream.rfqs_ended = false;
+            eprintln!("{who}: the subscription to requests for quote was ended; subscribing again in a minute");
+            subscribe_at = Some(session::monotonic() + Duration::from_secs(60));
         }
         if stream.markets_changed {
             stream.markets_changed = false;
@@ -526,6 +540,19 @@ fn session_pass(
             }
         }
     }
+}
+
+/// Subscribes the session to requests for quote. Those still open arrive ahead of the answer and wait in the session
+/// for the next poll. Returns when to try again: soon if the parlay service could not be reached, later if it refused.
+fn subscribe_rfqs(session: &mut Session, who: &str) -> Result<Option<Instant>, Error> {
+    let answer = session.request(json!({"op": "subscribeRfqs"}))?;
+    if answer["type"] == "reply" {
+        eprintln!("{who}: subscribed to requests for quote, {} open", answer["result"]["openRequests"]);
+        return Ok(None);
+    }
+    let wait = if answer["error"]["code"] == "UNAVAILABLE" { 10 } else { 60 };
+    eprintln!("{who}: not subscribed to requests for quote: {}; trying again in {wait} s", answer["error"]);
+    Ok(Some(session::monotonic() + Duration::from_secs(wait)))
 }
 
 /// Rests the quote's sell and attaches it to the request. `Err` means the session is gone; a refusal is only logged,
