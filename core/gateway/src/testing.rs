@@ -1,6 +1,8 @@
-//! A whole gateway for tests, started the way `main` starts one: a real node of its own on free local ports,
-//! seeded with the mini venue's catalogue, a parlay service following it, and a gateway that sends to both, follows
-//! the node's feed, conflates its books and serves connections on a port of its own. What a test sees is what the engine and the gateway actually do.
+//! A whole gateway for tests, started the way `main` starts one: a real node of its own on free local ports, seeded with
+//! the mini venue's catalogue, a parlay service following it, an identity service for API keys, and a gateway that
+//! sends to the node and the parlay service, verifies keys with the identity service, follows the node's feed,
+//! conflates its books and serves connections on a port of its own. What a test sees is what the engine and the
+//! gateway actually do.
 
 use crate::api::{Gateway, Limits};
 use crate::audit::Audit;
@@ -134,7 +136,9 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
     let _ = std::fs::remove_dir_all(&audit_dir);
     let audit = Audit::start(&audit_dir, "test", false).expect("an audit log");
     let hub = || Hub::new(Catalogue::load(CATALOGUE).expect("the mini venue's catalogue"));
-    let mut private_half = Gateway::private(hub(), Submit::spawn(&ingress), limits).with_audit(audit.clone());
+    let mut private_half = Gateway::private(hub(), Submit::spawn(&ingress), limits)
+        .with_audit(audit.clone())
+        .with_identity(Some(start_identity(name)), true);
     let treasury = treasury.then(|| start_treasury(name, &ingress, &feed));
     if let Some(address) = &treasury {
         private_half = private_half.with_treasury(address);
@@ -180,6 +184,17 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
     }
     let (ws_public, ws_private) = (format!("ws://{address}/v4/ws_public"), format!("ws://{address}/v4/ws_private"));
     Venue { gateway, address, ws_public, ws_private, ingress, audit_dir }
+}
+
+/// Starts an identity service of the test's own, with a fresh store, and returns where it listens.
+fn start_identity(name: &str) -> String {
+    let store = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}.identity", std::process::id()));
+    let _ = std::fs::remove_file(&store);
+    let settings = venue_identity::Settings { catalogue: CATALOGUE.to_string(), store, fsync: false };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the identity service");
+    let address = listener.local_addr().expect("its address").to_string();
+    venue_identity::start(&settings, listener).expect("an identity service");
+    address
 }
 
 /// Starts a treasury of the test's own on the node, with a fresh book, and returns where it listens.

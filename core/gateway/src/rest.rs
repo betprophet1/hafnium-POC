@@ -4,9 +4,11 @@
 
 use crate::api::{parse_id, ApiError, Gateway, Half, Pending};
 use crate::http::{self, Request};
+use crate::identity::{self, Credential};
 use crate::treasury::Call;
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
+use venue_identity::key::Permissions;
 use venue_link::submit::Notify;
 
 /// What a request comes to: its answer now, or a request given to the node whose answer `Gateway::finish` has once
@@ -14,8 +16,9 @@ use venue_link::submit::Notify;
 pub enum Routed {
     Now(Result<Value, ApiError>),
     Later(Pending),
-    /// A request passed to the treasury, whose whole response `Call::take` has once the notify is called.
-    Treasury(Call),
+    /// A request passed to the treasury or the identity service, whose whole response `Call::take` has once the notify
+    /// is called.
+    Service(Call),
 }
 
 /// The response for an answer.
@@ -40,30 +43,37 @@ const fn rest_session(account: u64) -> u64 {
     account * 10
 }
 
-fn account(gateway: &Gateway, request: &Request) -> Result<u64, ApiError> {
+/// The request's credential, authenticated, within its flood limit, and holding `permission`.
+fn credential(gateway: &Gateway, request: &Request, permission: Permissions) -> Result<Credential, ApiError> {
     let token = request
         .headers
         .get("authorization")
         .and_then(|h| h.strip_prefix("Bearer "))
         .ok_or_else(ApiError::unauthorized)?;
-    let account = gateway.authenticate(token.trim())?;
-    gateway.rest_rate(account)?;
-    Ok(account)
+    let credential = gateway.authenticate(token.trim())?;
+    gateway.rest_rate(credential.account)?;
+    credential.require(permission)?;
+    Ok(credential)
 }
 
-/// Deposits and withdrawals: the account authenticated and allowed to move money, then the request passed to the
-/// treasury as it came, which validates it and answers in interface 1's terms.
+/// The account of a request whose credential holds `permission`.
+fn account(gateway: &Gateway, request: &Request, permission: Permissions) -> Result<u64, ApiError> {
+    credential(gateway, request, permission).map(|c| c.account)
+}
+
+/// Deposits and withdrawals: the account authenticated and, to move money, allowed to (reading takes only `read`),
+/// then the request passed to the treasury as it came, which validates it and answers in interface 1's terms.
 fn transfer(gateway: &Gateway, request: &Request, notify: &Notify) -> Result<Routed, ApiError> {
-    let account = account(gateway, request)?;
-    let token = request.headers.get("authorization").and_then(|h| h.strip_prefix("Bearer ")).unwrap_or("");
-    let treasury = gateway.treasury(token.trim())?;
+    let needs = if request.method == "GET" { Permissions::READ } else { Permissions::TRANSFERS };
+    let account = account(gateway, request, needs)?;
+    let treasury = gateway.treasury()?;
     if let Some(id) = request.path.trim_matches('/').split('/').nth(2) {
         parse_id(id, "transferId")?;
     }
     let query: Vec<String> = request.query.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let call =
         treasury.call(account, &request.method, &request.path, &query.join("&"), &request.body, Arc::clone(notify))?;
-    Ok(Routed::Treasury(call))
+    Ok(Routed::Service(call))
 }
 
 fn body(request: &Request) -> Result<Value, ApiError> {
@@ -110,27 +120,27 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Res
             Ok(Routed::Now(gateway.hub().book(instrument, depth).ok_or_else(|| ApiError::not_found("no such market"))))
         }
         ("GET", ["v4", "account"]) => {
-            let account = account(gateway, request)?;
+            let account = account(gateway, request, Permissions::READ)?;
             Ok(Routed::Now(Ok(gateway.hub().account(account))))
         }
         ("POST", ["v4", "orders"]) => {
-            let account = account(gateway, request)?;
+            let account = account(gateway, request, Permissions::TRADE)?;
             Ok(Routed::Later(gateway.place_pending(account, rest_session(account), &body(request)?, later())?))
         }
         ("DELETE", ["v4", "orders"]) => {
-            let account = account(gateway, request)?;
+            let account = account(gateway, request, Permissions::TRADE)?;
             let scope: Map<String, Value> =
                 request.query.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
             let body = Value::Object(scope);
             Ok(Routed::Later(gateway.cancel_all_pending(account, rest_session(account), &body, later())?))
         }
         ("PATCH", ["v4", "orders", order]) => {
-            let account = account(gateway, request)?;
+            let account = account(gateway, request, Permissions::TRADE)?;
             let order = parse_id(order, "orderId")?;
             Ok(Routed::Later(gateway.amend_pending(account, rest_session(account), order, &body(request)?, later())?))
         }
         ("DELETE", ["v4", "orders", order]) => {
-            let account = account(gateway, request)?;
+            let account = account(gateway, request, Permissions::TRADE)?;
             let order = parse_id(order, "orderId")?;
             Ok(Routed::Later(gateway.cancel_pending(account, rest_session(account), order, later())?))
         }
@@ -138,15 +148,15 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Res
             transfer(gateway, request, notify)
         }
         ("POST", ["v4", "rfqs"]) => {
-            let account = account(gateway, request)?;
+            let account = account(gateway, request, Permissions::TRADE)?;
             Ok(Routed::Later(gateway.request_quote_pending(account, &body(request)?, later())?))
         }
         ("GET", ["v4", "rfqs", rfq]) => {
-            let account = account(gateway, request)?;
+            let account = account(gateway, request, Permissions::READ)?;
             Ok(Routed::Later(gateway.rfq_pending(account, rfq, later())?))
         }
         ("POST", ["v4", "rfqs", rfq, "quotes"]) => {
-            let account = account(gateway, request)?;
+            let account = account(gateway, request, Permissions::TRADE)?;
             let mut body = body(request)?;
             if let Some(fields) = body.as_object_mut() {
                 if fields.contains_key("requestId") {
@@ -155,6 +165,10 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Res
                 fields.insert("requestId".into(), Value::String((*rfq).to_string()));
             }
             Ok(Routed::Later(gateway.attach_quote_pending(account, &body, later())?))
+        }
+        ("GET" | "POST", ["v4", "keys"]) | ("DELETE", ["v4", "keys", _]) => {
+            let credential = credential(gateway, request, Permissions::KEYS)?;
+            Ok(Routed::Service(identity::manage(gateway, &credential, request, notify)?))
         }
         _ => Err(ApiError::not_found("no such route")),
     }

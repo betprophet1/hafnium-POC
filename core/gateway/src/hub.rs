@@ -520,7 +520,7 @@ impl Hub {
 
     /// A transfer update from the treasury, to the account's sessions now. Not kept for resuming: it did not come from
     /// the journal and has no sequence, so a client that reconnects reads the transfers again instead. Every session
-    /// here is logged in with a dev token, which may see transfers; a session whose API key may not will be skipped.
+    /// may see them: seeing transfers takes `read`, which every credential holds.
     pub fn send_transfer(&self, account: u64, message: &str) {
         for key in self.by_account.get(&account).into_iter().flatten() {
             if let Some(s) = self.sessions.get(key) {

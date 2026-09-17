@@ -5,6 +5,7 @@ mod api;
 mod audit;
 mod http;
 mod hub;
+mod identity;
 mod limits;
 mod parlays;
 mod price;
@@ -33,7 +34,7 @@ use venue_link::wire::{self, Error};
 const USAGE: &str = "usage:
   venue-gateway verify-audit FILE...
   venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--treasury ADDR] [--parlays ADDR]
-                [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
+                [--identity ADDR] [--dev-tokens true] [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
                 [--audit-dir ./gateway-audit] [--audit-instance HOSTNAME] [--audit-fsync true]
 
 --serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
@@ -41,7 +42,9 @@ const USAGE: &str = "usage:
 and needs --ingress. With --treasury, the private half also passes deposits and withdrawals (/v4/transfers) to the
 treasury there and sends its updates to private sessions; without it, /v4/transfers answers 503. --parlays is the
 parlay service (venue-parlays) the private half sends requests for quote (/v4/rfqs) to; without it they are refused
-as unavailable. Every request and what it was answered is written to the audit log in --audit-dir
+as unavailable. --identity is the identity service (venue-identity) the private half verifies API keys with and passes
+/v4/keys to; without it keys are refused as unavailable. --dev-tokens false refuses the catalogue's dev tokens, which
+otherwise act as their accounts with every permission. Every request and what it was answered is written to the audit log in --audit-dir
 (interfaces/audit/README.md); a gateway that cannot write it does not start, and one that stops being able to exits.
 Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
@@ -152,7 +155,14 @@ fn run(args: &Args) -> Result<(), Error> {
         },
         private: if private {
             let ingress = Submit::spawn(&args.get("ingress", None)?);
-            let mut gateway = Gateway::private(Hub::new(catalogue), ingress, limits).with_audit(audit.clone());
+            let dev_tokens = match args.get("dev-tokens", Some("true"))?.as_str() {
+                "true" => true,
+                "false" => false,
+                other => return Err(format!("--dev-tokens must be true or false, not {other}").into()),
+            };
+            let mut gateway = Gateway::private(Hub::new(catalogue), ingress, limits)
+                .with_audit(audit.clone())
+                .with_identity(args.optional("identity").filter(|a| !a.is_empty()), dev_tokens);
             let treasury = args.get("treasury", Some(""))?;
             if !treasury.is_empty() {
                 gateway = gateway.with_treasury(&treasury);
@@ -186,11 +196,15 @@ struct Halves {
     private: Option<Arc<Gateway>>,
 }
 
-/// A half that follows the node's feed and sends its book subscribers what changed.
+/// A half that follows the node's feed and sends its book subscribers what changed, and keeps checking the API keys
+/// its sessions use when it verifies keys.
 fn start_half(gateway: Gateway, feed: &str) -> Arc<Gateway> {
     let gateway = Arc::new(gateway);
     follow_feed(&gateway, feed.to_string());
     conflate(&gateway);
+    if gateway.identity.serves_keys() {
+        identity::keep_checking(&gateway);
+    }
     gateway
 }
 

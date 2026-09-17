@@ -334,6 +334,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tungstenite",
+ "venue-identity",
  "venue-link",
  "venue-node",
  "venue-parlays",

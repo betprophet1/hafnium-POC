@@ -3,6 +3,7 @@
 
 use crate::audit::Audit;
 use crate::hub::{self, id, Hub};
+use crate::identity::{Credential, Identity};
 use crate::limits::{monotonic, Bucket};
 use crate::parlays::{self, Parlays};
 use crate::price::{self, PriceError};
@@ -11,6 +12,7 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
+use venue_identity::key;
 use venue_link::submit::{self, Notify, Submit};
 use venue_link::wire;
 
@@ -79,6 +81,16 @@ impl ApiError {
 
     pub fn unauthorized() -> Self {
         Self::new(401, "UNAUTHORIZED", "a valid token is required")
+    }
+
+    /// A credential that was refused for a reason its holder may know, such as a revoked key.
+    pub fn unauthorized_because(message: &str) -> Self {
+        Self::new(401, "UNAUTHORIZED", message)
+    }
+
+    /// A valid credential without the permission a request needs.
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(403, "FORBIDDEN", message)
     }
 
     pub fn not_found(message: &str) -> Self {
@@ -231,9 +243,14 @@ impl Half {
         let path = path.split('?').next().unwrap_or("");
         match path {
             "/v4/ws_public" | "/v4/markets" => Some(Self::Public),
-            "/v4/ws_private" | "/v4/account" | "/v4/orders" | "/v4/transfers" | "/v4/rfqs" => Some(Self::Private),
+            "/v4/ws_private" | "/v4/account" | "/v4/orders" | "/v4/transfers" | "/v4/rfqs" | "/v4/keys" => {
+                Some(Self::Private)
+            }
             p if p.starts_with("/v4/markets/") => Some(Self::Public),
-            p if p.starts_with("/v4/orders/") || p.starts_with("/v4/transfers/") || p.starts_with("/v4/rfqs/") => {
+            p if ["/v4/orders/", "/v4/transfers/", "/v4/rfqs/", "/v4/keys/"]
+                .iter()
+                .any(|under| p.starts_with(under)) =>
+            {
                 Some(Self::Private)
             }
             _ => None,
@@ -256,6 +273,8 @@ pub struct Gateway {
     treasury: Option<Treasury>,
     /// Where what clients sent and were answered is recorded (`audit.rs`).
     pub audit: Audit,
+    /// Who a credential is (`identity.rs`): dev tokens, and API keys through the identity service.
+    pub identity: Identity,
 }
 
 impl Gateway {
@@ -280,6 +299,7 @@ impl Gateway {
             logon_buckets: Mutex::new(BTreeMap::new()),
             treasury: None,
             audit: Audit::disabled(),
+            identity: Identity::new(None, true),
         }
     }
 
@@ -295,10 +315,15 @@ impl Gateway {
         self
     }
 
-    /// The treasury, for a credential allowed to move money (interfaces/gateway/README.md, permissions). Every dev
-    /// token is; an API key will be only if it was issued with the transfers flag, and this is where that flag is
-    /// read.
-    pub fn treasury(&self, _token: &str) -> Result<&Treasury, ApiError> {
+    /// The same half, verifying API keys with the identity service at `address`, if any, and taking the catalogue's
+    /// dev tokens only if `dev_tokens`.
+    pub fn with_identity(mut self, address: Option<String>, dev_tokens: bool) -> Self {
+        self.identity = Identity::new(address, dev_tokens);
+        self
+    }
+
+    /// The treasury. The caller has checked the credential's permission for what it asks (`rest.rs`).
+    pub fn treasury(&self) -> Result<&Treasury, ApiError> {
         self.treasury
             .as_ref()
             .ok_or_else(|| ApiError::unavailable("this gateway has no treasury; transfers are not offered"))
@@ -313,8 +338,16 @@ impl Gateway {
         locked(&self.hub)
     }
 
-    pub fn authenticate(&self, token: &str) -> Result<u64, ApiError> {
-        self.hub().account_for(token).ok_or_else(ApiError::unauthorized)
+    /// Who a credential is: an API key's, by the identity service (interfaces/gateway/README.md, API keys and
+    /// permissions), or a dev token's, by the catalogue, holding every permission.
+    pub fn authenticate(&self, token: &str) -> Result<Credential, ApiError> {
+        if key::looks_like_key(token) {
+            return self.identity.verify_key(token);
+        }
+        if !self.identity.dev_tokens {
+            return Err(ApiError::unauthorized());
+        }
+        self.hub().account_for(token).map(Credential::dev_token).ok_or_else(ApiError::unauthorized)
     }
 
     /// REST requests have no session, so their flood limit is per account.

@@ -24,6 +24,7 @@
 use crate::api::{Gateway, Half, Pending};
 use crate::audit;
 use crate::hub::Outbox;
+use crate::identity::Credential;
 use crate::limits::monotonic;
 use crate::treasury::Call;
 use crate::ws::{self, Session};
@@ -149,8 +150,8 @@ struct Http {
     call: Option<Call>,
     response: Vec<u8>,
     written: usize,
-    /// The account the request's token names, for the audit log.
-    account: Option<u64>,
+    /// The credential the request's token is, for the audit log: its account and, for an API key, the key.
+    who: Option<Credential>,
     /// Whether the response has been recorded in the audit log.
     recorded: bool,
 }
@@ -368,7 +369,7 @@ fn decide(gateway: &Gateway, conn: &mut Conn, max_behind: usize, registry: &Regi
             call: None,
             response: Vec::new(),
             written: 0,
-            account: None,
+            who: None,
             recorded: false,
         })
     });
@@ -393,7 +394,7 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, id: u64, peer
         match http::parse(&http.request) {
             Ok(None) => return true,
             Ok(Some(request)) => {
-                http.account = request
+                http.who = request
                     .headers
                     .get("authorization")
                     .and_then(|h| h.strip_prefix("Bearer "))
@@ -402,11 +403,11 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, id: u64, peer
                 match rest::route(gateway, &request, notify) {
                     rest::Routed::Now(answer) => http.response = rest::response(answer),
                     rest::Routed::Later(pending) => http.pending = Some(pending),
-                    rest::Routed::Treasury(call) => http.call = Some(call),
+                    rest::Routed::Service(call) => http.call = Some(call),
                 }
             }
             Err(reason) => {
-                let mut fields = about(gateway, id, peer, None, None);
+                let mut fields = about(gateway, id, peer, None, None, None);
                 fields.insert("dir".into(), json!("in"));
                 fields.insert("line".into(), json!(request_line(&http.request)));
                 fields.insert("unreadable".into(), json!(reason));
@@ -463,7 +464,7 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
         let Some(outbox) = conn.outbox.take() else { return false };
         conn.session = Session::open(gateway, outbox, Arc::clone(&conn.notify));
         if let Some(session) = &conn.session {
-            let mut fields = about(gateway, conn.id, &conn.peer, None, Some(session.id()));
+            let mut fields = about(gateway, conn.id, &conn.peer, None, None, Some(session.id()));
             fields.insert("path".into(), json!(conn.path));
             gateway.audit.record("ws-open", fields);
         }
@@ -486,7 +487,7 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
                     }
                 }
                 Ok(Message::Binary(data)) => {
-                    let mut fields = about(gateway, id, peer, session.account(), Some(session.id()));
+                    let mut fields = about(gateway, id, peer, session.account(), session.api_key(), Some(session.id()));
                     fields.insert("dir".into(), json!("in"));
                     fields.insert("binary".into(), json!(data.len()));
                     gateway.audit.record("ws-frame", fields);
@@ -525,8 +526,8 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
     flushed(socket)
 }
 
-/// Closes the connections of logged-in clients silent past their heartbeat, and of clients that have not managed to
-/// say what they want within `ARRIVAL`.
+/// Closes the connections of logged-in clients silent past their heartbeat or whose API key has been revoked or has
+/// expired, and of clients that have not managed to say what they want within `ARRIVAL`.
 fn sweep(gateway: &Arc<Gateway>, conns: &mut [Option<Conn>], free: &mut Vec<usize>, now: Instant) {
     for token in 0..conns.len() {
         let Some(conn) = conns[token].as_mut() else { continue };
@@ -542,6 +543,17 @@ fn sweep(gateway: &Arc<Gateway>, conns: &mut [Option<Conn>], free: &mut Vec<usiz
             continue;
         }
         let Some(session) = conn.session.as_mut() else { continue };
+        if ws::key_withdrawn(gateway, session) {
+            let told = ws::key_withdrawn_error();
+            record_to_client(gateway, conn.id, &conn.peer, session, &told, true);
+            if let Some(Socket::Open(socket)) = conn.socket.as_mut() {
+                let _ = socket.write(Message::text(told));
+                let _ = socket.close(None);
+                let _ = socket.flush();
+            }
+            close_slot(gateway, conns, free, token, Some("key no longer valid"));
+            continue;
+        }
         if !session.heartbeat_missed(now) {
             continue;
         }
@@ -565,7 +577,8 @@ fn close_slot(
 ) {
     if let Some(conn) = conns[token].take() {
         if let Some(session) = &conn.session {
-            let mut fields = about(gateway, conn.id, &conn.peer, session.account(), Some(session.id()));
+            let mut fields =
+                about(gateway, conn.id, &conn.peer, session.account(), session.api_key(), Some(session.id()));
             fields.insert("reason".into(), json!(reason.unwrap_or(conn.ending)));
             gateway.audit.record("ws-close", fields);
             ws::end(gateway, session);
@@ -578,13 +591,24 @@ fn close_slot(
 // The audit log (interfaces/audit/README.md, gateway)
 
 /// The fields that say which connection a record is about.
-fn about(gateway: &Gateway, id: u64, peer: &str, account: Option<u64>, session: Option<u64>) -> Map<String, Value> {
+fn about(
+    gateway: &Gateway,
+    id: u64,
+    peer: &str,
+    account: Option<u64>,
+    key: Option<&str>,
+    session: Option<u64>,
+) -> Map<String, Value> {
     let mut fields = Map::new();
     fields.insert("conn".into(), json!(id));
     fields.insert("peer".into(), json!(peer));
     fields.insert("half".into(), json!(gateway.half.name()));
     if let Some(account) = account {
         fields.insert("account".into(), json!(account.to_string()));
+    }
+    // The key's ID, never its secret, so an auditor can tell which of an account's keys did something.
+    if let Some(key) = key {
+        fields.insert("key".into(), json!(key));
     }
     if let Some(session) = session {
         fields.insert("session".into(), json!(session.to_string()));
@@ -600,7 +624,8 @@ fn request_line(request: &[u8]) -> String {
 }
 
 fn record_request(gateway: &Gateway, id: u64, peer: &str, http: &Http, request: &http::Request) {
-    let mut fields = about(gateway, id, peer, http.account, None);
+    let who = http.who.as_ref();
+    let mut fields = about(gateway, id, peer, who.map(|c| c.account), who.and_then(|c| c.key.as_deref()), None);
     fields.insert("dir".into(), json!("in"));
     fields.insert("line".into(), json!(request_line(&http.request)));
     let headers: Map<String, Value> =
@@ -614,15 +639,17 @@ fn record_response(gateway: &Gateway, id: u64, peer: &str, http: &Http) {
     let response = &http.response;
     let status = response.get(9..12).and_then(|s| std::str::from_utf8(s).ok()).and_then(|s| s.parse::<u16>().ok());
     let body = response.windows(4).position(|w| w == b"\r\n\r\n").map_or(&response[..0], |i| &response[i + 4..]);
-    let mut fields = about(gateway, id, peer, http.account, None);
+    let who = http.who.as_ref();
+    let mut fields = about(gateway, id, peer, who.map(|c| c.account), who.and_then(|c| c.key.as_deref()), None);
     fields.insert("dir".into(), json!("out"));
     fields.insert("status".into(), json!(status));
-    fields.insert("body".into(), json!(String::from_utf8_lossy(body)));
+    // Masked too: the answer that creates an API key carries its secret.
+    fields.insert("body".into(), json!(audit::mask_tokens(&String::from_utf8_lossy(body))));
     gateway.audit.record("http-response", fields);
 }
 
 fn record_refused_upgrade(gateway: &Gateway, conn: &Conn) {
-    let mut fields = about(gateway, conn.id, &conn.peer, None, None);
+    let mut fields = about(gateway, conn.id, &conn.peer, None, None, None);
     fields.insert("path".into(), json!(conn.path));
     gateway.audit.record("ws-refused", fields);
 }
@@ -635,7 +662,7 @@ fn record_from_client(gateway: &Gateway, id: u64, peer: &str, session: &Session,
     {
         return;
     }
-    let mut fields = about(gateway, id, peer, session.account(), Some(session.id()));
+    let mut fields = about(gateway, id, peer, session.account(), session.api_key(), Some(session.id()));
     fields.insert("dir".into(), json!("in"));
     fields.insert("msg".into(), json!(audit::mask_tokens(text)));
     gateway.audit.record("ws-frame", fields);
@@ -649,7 +676,7 @@ fn record_to_client(gateway: &Gateway, id: u64, peer: &str, session: &Session, t
     {
         return;
     }
-    let mut fields = about(gateway, id, peer, session.account(), Some(session.id()));
+    let mut fields = about(gateway, id, peer, session.account(), session.api_key(), Some(session.id()));
     fields.insert("dir".into(), json!("out"));
     fields.insert("msg".into(), json!(text));
     gateway.audit.record("ws-frame", fields);

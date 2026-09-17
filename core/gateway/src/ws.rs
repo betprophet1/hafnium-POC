@@ -6,6 +6,7 @@
 
 use crate::api::{only, parse_id, ApiError, Gateway, Half, Pending};
 use crate::hub::{id, Outbox};
+use crate::identity::Credential;
 use crate::limits::{monotonic, Bucket};
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
@@ -14,6 +15,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use venue_identity::key::Permissions;
 use venue_link::submit::Notify;
 
 /// Requests one session may have outstanding at once. At this many, whatever serves the connection stops reading
@@ -25,6 +27,8 @@ pub struct Session {
     key: u64,
     engine_session: u64,
     account: Option<u64>,
+    /// What the session logged in with, and so what it may do.
+    credential: Option<Credential>,
     cancel_on_disconnect: bool,
     heartbeat: Option<Duration>,
     last_heard: Instant,
@@ -47,6 +51,7 @@ impl Session {
             key,
             engine_session,
             account: None,
+            credential: None,
             cancel_on_disconnect: false,
             heartbeat: None,
             last_heard: monotonic(),
@@ -59,6 +64,20 @@ impl Session {
     /// The account logged in on this session, once one has.
     pub const fn account(&self) -> Option<u64> {
         self.account
+    }
+
+    /// The API key the session logged in with, if it did with one.
+    pub fn api_key(&self) -> Option<&str> {
+        self.credential.as_ref().and_then(|c| c.key.as_deref())
+    }
+
+    /// Refuses unless the session is logged in with a credential holding `permission`, and says whose account it is.
+    fn allowed(&self, permission: Permissions) -> Result<u64, ApiError> {
+        let (Some(account), Some(credential)) = (self.account, &self.credential) else {
+            return Err(ApiError::unauthorized());
+        };
+        credential.require(permission)?;
+        Ok(account)
     }
 
     /// The engine session ID this session's orders carry.
@@ -119,6 +138,18 @@ pub fn end(gateway: &Arc<Gateway>, session: &Session) {
     if session.cancel_on_disconnect {
         cancel_session_orders(gateway, session, "SESSION_DISCONNECT");
     }
+}
+
+/// Whether the session is logged in with an API key that has since been revoked or has expired, by what the gateway
+/// last heard from the identity service. Such a session is told and closed (interfaces/gateway/README.md, API keys
+/// and permissions), which cancels its orders if it asked at logon.
+pub fn key_withdrawn(gateway: &Gateway, session: &Session) -> bool {
+    session.credential.as_ref().is_some_and(|c| !gateway.identity.still_valid(c))
+}
+
+/// What a session whose key was withdrawn is told before it is closed.
+pub fn key_withdrawn_error() -> String {
+    error(&Value::Null, &ApiError::unauthorized_because("the session's API key has been revoked or has expired"))
 }
 
 /// The replies whose results have arrived, oldest first, stopping at the first that has not.
@@ -241,7 +272,7 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
             Ok(Vec::new())
         }
         "order" | "amend" | "cancel" | "cancelAll" => {
-            let account = session.account.ok_or_else(ApiError::unauthorized)?;
+            let account = session.allowed(Permissions::TRADE)?;
             let s = session.engine_session;
             let notify = Some(Arc::clone(&session.notify));
             let mut body = body_of(message);
@@ -268,7 +299,7 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
             Ok(Vec::new())
         }
         "requestQuote" | "attachQuote" => {
-            let account = session.account.ok_or_else(ApiError::unauthorized)?;
+            let account = session.allowed(Permissions::TRADE)?;
             let notify = Some(Arc::clone(&session.notify));
             let body = body_of(message);
             // Answered in turn with the session's orders, so a responder that rests an order and then attaches it
@@ -291,8 +322,11 @@ fn login(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<Ve
     if session.account.is_some() {
         return Err(ApiError::bad("this session is already logged in"));
     }
-    let account = gateway.authenticate(fields.get("token").and_then(Value::as_str).unwrap_or(""))?;
+    let credential = gateway.authenticate(fields.get("token").and_then(Value::as_str).unwrap_or(""))?;
+    let account = credential.account;
     gateway.logon_rate(account)?;
+    // A private session streams the account, which is reading it.
+    credential.require(Permissions::READ)?;
     let cancel_on_disconnect = match fields.get("cancelOnDisconnect") {
         None => false,
         Some(Value::Bool(b)) => *b,
@@ -313,6 +347,8 @@ fn login(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<Ve
     }
     session.account = Some(account);
     session.cancel_on_disconnect = cancel_on_disconnect;
+    let (key, permissions) = (credential.key.clone(), credential.permissions.names());
+    session.credential = Some(credential);
     session.heartbeat = (heartbeat > 0).then(|| Duration::from_secs(heartbeat));
     let (sequence, resumed) = {
         let mut hub = gateway.hub();
@@ -328,6 +364,10 @@ fn login(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<Ve
     welcome.insert("sessionId".into(), id(session.engine_session));
     welcome.insert("sequence".into(), id(sequence));
     welcome.insert("resumed".into(), json!(matches!(resumed, Some(Some(_)))));
+    if let Some(key) = key {
+        welcome.insert("keyId".into(), json!(key));
+    }
+    welcome.insert("permissions".into(), json!(permissions));
     let mut out = vec![Value::Object(welcome).to_string()];
     match resumed {
         Some(Some(messages)) => out.extend(messages),

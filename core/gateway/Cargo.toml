@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 venue-link = { path = "../link" }
+# What a key's credential and permissions look like, read the same way the identity service reads them.
+venue-identity = { path = "../identity" }
 serde_json = "1"
 # The audit log's hash chain (interfaces/audit/README.md).
 sha2 = "0.11"

@@ -475,16 +475,22 @@ pub fn header_value(name: &str, value: &str) -> String {
     }
 }
 
-/// JSON text as it is recorded: the string value of every member named `token` becomes `***`. Found textually, so a
-/// frame that is not valid JSON is masked too.
+/// JSON text as it is recorded: the string value of every member named `token`, `secret` or `credential` becomes `***`.
+/// Found textually, so a frame that is not valid JSON is masked too.
 pub fn mask_tokens(text: &str) -> String {
-    const KEY: &str = "\"token\"";
+    ["\"token\"", "\"secret\"", "\"credential\""]
+        .into_iter()
+        .fold(text.to_string(), |text, key| mask_member(&text, key))
+}
+
+/// `text` with the string value of every member named `key` (quotes included) masked.
+fn mask_member(text: &str, key: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     let mut from = 0;
-    while let Some(found) = text[from..].find(KEY) {
-        let key_end = from + found + KEY.len();
+    while let Some(found) = text[from..].find(key) {
+        let key_end = from + found + key.len();
         from = key_end;
         let mut i = key_end;
         while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
@@ -629,6 +635,10 @@ mod tests {
         assert_eq!(
             mask_tokens(r#"{"token" : "a\"b", "x": {"token":"c"}}"#),
             r#"{"token" : "***", "x": {"token":"***"}}"#
+        );
+        assert_eq!(
+            mask_tokens(r#"{"keyId":"ak_0123456789abcdef","secret":"00ff","credential":"ak_0123456789abcdef.00ff"}"#),
+            r#"{"keyId":"ak_0123456789abcdef","secret":"***","credential":"***"}"#
         );
         // Not JSON, and still masked; and a value that happens to be the word token is not a member.
         assert_eq!(mask_tokens(r#"{"op":"login","token":"secret"#), r#"{"op":"login","token":"***"#);

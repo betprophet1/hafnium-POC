@@ -40,12 +40,18 @@ pub struct Treasury {
     calls: Arc<AtomicUsize>,
 }
 
-/// A request passed to the treasury, whose response `take` has once the notify it was given is called.
+/// A request passed to the treasury or the identity service, whose response `take` has once the notify it was given is
+/// called.
 pub struct Call {
     response: Receiver<Vec<u8>>,
 }
 
 impl Call {
+    /// A call whose whole response will arrive on `response`.
+    pub const fn new(response: Receiver<Vec<u8>>) -> Self {
+        Self { response }
+    }
+
     /// The whole response, if it has arrived.
     pub fn take(&self) -> Option<Vec<u8>> {
         match self.response.try_recv() {
@@ -99,7 +105,7 @@ impl Treasury {
             let _ = tx.send(answer);
             notify();
         });
-        Ok(Call { response })
+        Ok(Call::new(response))
     }
 }
 
@@ -114,7 +120,7 @@ fn connect(address: &str) -> Result<TcpStream, String> {
 
 /// One request and its response, which is interface 1's already and is passed on as it is: the status, and the body
 /// as the gateway writes any other.
-fn exchange(address: &str, request: &[u8]) -> Result<Vec<u8>, String> {
+pub fn exchange(address: &str, request: &[u8]) -> Result<Vec<u8>, String> {
     let mut stream = connect(address)?;
     stream.set_read_timeout(Some(ANSWER)).map_err(|e| e.to_string())?;
     stream.set_write_timeout(Some(ANSWER)).map_err(|e| e.to_string())?;
