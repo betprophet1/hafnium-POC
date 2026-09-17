@@ -54,9 +54,10 @@ pub struct Capacity {
     pub levels: usize,
 }
 
-/// Why listing one more parlay could take the node past its capacity, if it could. The engine never frees an event,
-/// a market or a book's levels, and listing past its capacity profile is a fail-stop, not a rejection (E-6.3), so
-/// on a venue whose calendar keeps listing rounds a fixed most-parlays is not enough on its own.
+/// Why listing one more parlay could take the node past its capacity, if it could. The engine releases settled events
+/// after a retention (E-8.4) and refuses a listing past the seed's limits (E-6.3), but a parlay is listed as an event
+/// and then its market, and a refusal of the market would leave an event nobody resolves, which is never released.
+/// So the service stops short of the limits, as the oracle does, and lists again once releases make room.
 pub fn no_room(view: &View, capacity: &Capacity) -> Option<String> {
     let levels_used: usize = view.instruments.values().map(|i| 2 * view.tables.get(&i.table).map_or(0, Vec::len)).sum();
     let checks = [
@@ -66,7 +67,7 @@ pub fn no_room(view: &View, capacity: &Capacity) -> Option<String> {
     ];
     checks.iter().find(|(_, used, adding, limit)| (used + adding) * 100 > limit * CAPACITY_PERCENT).map(
         |(what, used, _, limit)| {
-            format!("no room for another parlay: the venue holds {used} of its {limit} {what}, and never frees them")
+            format!("no room for another parlay: the venue holds {used} of its {limit} {what} until settled ones are released")
         },
     )
 }
@@ -201,11 +202,12 @@ pub enum LegOutcome {
 }
 
 pub fn leg_outcome(view: &View, leg: &Leg) -> LegOutcome {
-    let Some(r) = view.events.get(&leg.event).and_then(|e| e.resolution.as_ref()) else { return LegOutcome::Open };
+    // A leg's event may have been released since it resolved (E-8.4); the view keeps its resolution for the parlay.
+    let Some(r) = view.resolution_of(leg.event) else { return LegOutcome::Open };
     if r.kind == "VOID" {
         return LegOutcome::Void(r.at);
     }
-    let mask = view.instruments.get(&leg.instrument).map_or(0, |i| i.mask);
+    let mask = view.mask_of(leg.event, leg.instrument).unwrap_or(0);
     let yes_paid = r.winning_state < 64 && mask >> r.winning_state & 1 == 1;
     if yes_paid == leg.yes {
         LegOutcome::Won(r.at)

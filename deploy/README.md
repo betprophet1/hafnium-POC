@@ -66,11 +66,11 @@ it is ready. `down` deletes the cluster and the journal with it.
 - **Not production.** Production runs the core on dedicated hosts behind Aeron Cluster (blueprint §5, §9). Tokens are
   fixed dev tokens, and the page and operator actions are unauthenticated; never expose them outside the cluster.
 - **One oracle, bounded by the core's capacity.** The oracle is `replicas: 1` with `Recreate`, so two never act on a
-  round. The engine never frees a market, so with the `small` profile the calendar lists for about ten hours before
-  the oracle stops listing short of the ceiling; `down` and `up` start a fresh journal.
+  round. The engine releases a settled round half an hour after it resolves (the seed's retention), so the calendar
+  runs indefinitely on the `small` profile.
 - **Requests for quote are not journaled.** Open requests live in the parlay service's memory; replacing its pod
   forgets them, while parlays and quotes (listings and orders) stay in the journal. It lists at most
-  `parlays.maxParlays` parlays, because every book reserves its levels for as long as the core runs, and none
-  that would take the core past 95% of its capacity profile, which the oracle's rounds share.
+  `parlays.maxParlays` parlays at once, because every book reserves its levels until its settled event is released,
+  and none that would take the core past 95% of its capacity profile, which the oracle's rounds share.
 - **Not yet in the chart:** the resolution console behind the dummy oracle (its cases live in the oracle process), the
   scenario player and the environment manifest of §16.

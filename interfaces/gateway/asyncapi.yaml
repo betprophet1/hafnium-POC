@@ -428,6 +428,12 @@ components:
             description: >
               Set once an event is resolved or voided, after each of its markets' own state change: the markets
               show only that trading ended, and this says which, and which outcome occurred.
+          released:
+            type: boolean
+            const: true
+            description: >
+              Set when the venue releases a settled event, a retention after its resolution (spec E-8.4): the event
+              and its markets are gone from GET /v4/markets and their books, and their IDs name nothing.
     execution:
       payload:
         allOf:

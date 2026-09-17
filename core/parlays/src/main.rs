@@ -15,7 +15,8 @@ const USAGE: &str = "usage:
 Lists parlays when they are first requested, relays requests for quote to the catalogue's responders and their
 quotes to the requester through the gateways that connect to --listen, and settles every parlay from its legs. It
 uses the core's ingress as an operator. --capacity must name the node's capacity profile: no parlay is listed that
-would take the venue past 95% of its events, markets or price levels. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
+would take the venue past 95% of its events, markets or price levels. Settled parlays are released by the engine a
+retention after settlement, which makes room again. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
 struct Args(BTreeMap<String, String>);
 

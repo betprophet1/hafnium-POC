@@ -1,5 +1,10 @@
 //! A reader's picture of the venue, built only from the node's feed: books, orders, positions, sleeves, trades and
 //! payouts. The web page shows it and the bots decide from it.
+//!
+//! Like the engine, it forgets a settled event and its markets when the engine releases them (`EventReleased`, spec
+//! E-8.4), so it holds what the venue carries rather than everything it ever listed. It keeps two small things past a
+//! release, each bounded: the latest round of each template (`released_rounds`), so a calendar never lists a round
+//! again, and how a released event resolved while an unsettled parlay still names it as a leg (`released_legs`).
 
 use crate::catalogue::Catalogue;
 use crate::wire::{self, Unit};
@@ -122,6 +127,22 @@ pub struct View {
     pub payouts: VecDeque<Value>,
     /// The event whose markets were last settled or voided: a void pays with instrument 0, so its payouts name it.
     settled_event: u64,
+    /// For each template, the highest round the engine has released and when that round was defined: a template's
+    /// rounds can all be released between two listings, and a calendar counts on from the latest one. Parlays' events
+    /// are no template's rounds and are not counted.
+    pub released_rounds: BTreeMap<u64, (u64, u64)>,
+    /// Released events that a parlay the view still carries names as a leg: how each resolved, and the masks of its
+    /// markets, so the parlay can still be settled from them (`resolution_of`, `mask_of`). Dropped once no carried
+    /// parlay names the event.
+    pub released_legs: BTreeMap<u64, ReleasedLeg>,
+}
+
+/// What a parlay needs of a leg's event once the engine has released it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleasedLeg {
+    pub resolution: Option<Resolution>,
+    /// Market to its state mask.
+    pub masks: BTreeMap<u64, u64>,
 }
 
 fn u(v: &Value) -> u64 {
@@ -259,6 +280,55 @@ impl View {
         }
     }
 
+    /// How an event resolved, whether the view still carries it or it was released under a carried parlay's leg.
+    pub fn resolution_of(&self, event: u64) -> Option<&Resolution> {
+        match self.events.get(&event) {
+            Some(e) => e.resolution.as_ref(),
+            None => self.released_legs.get(&event).and_then(|r| r.resolution.as_ref()),
+        }
+    }
+
+    /// A market's state mask, whether the view still carries it or it was released under a carried parlay's leg.
+    pub fn mask_of(&self, event: u64, instrument: u64) -> Option<u64> {
+        match self.instruments.get(&instrument) {
+            Some(i) => Some(i.mask),
+            None => self.released_legs.get(&event).and_then(|r| r.masks.get(&instrument).copied()),
+        }
+    }
+
+    /// E-8.4: the event and its markets no longer exist. Its positions are already 0 and its orders gone (E-15.5);
+    /// anything left of them here goes too.
+    fn release(&mut self, event: u64) {
+        let Some(e) = self.events.remove(&event) else { return };
+        let mut markets: Vec<u64> = e.instruments.clone();
+        markets.extend(self.instruments.iter().filter(|(_, i)| i.event == event).map(|(&id, _)| id));
+        markets.sort_unstable();
+        markets.dedup();
+        let released: Vec<(u64, InstrumentView)> =
+            markets.iter().filter_map(|id| self.instruments.remove(id).map(|i| (*id, i))).collect();
+        self.positions.retain(|(_, instrument), _| !markets.contains(instrument));
+        self.orders.retain(|_, o| !markets.contains(&o.instrument));
+        let parlay = released.iter().any(|(_, i)| i.class == "PARLAY");
+        if !parlay {
+            let (template, round) = crate::catalogue::split_event(event);
+            let latest = self.released_rounds.entry(template).or_insert((round, e.defined_at));
+            if round >= latest.0 {
+                *latest = (round, e.defined_at);
+            }
+        }
+        let named = |view: &Self, event: u64| {
+            view.instruments.values().any(|i| i.class == "PARLAY" && i.legs.iter().any(|l| l.event == event))
+        };
+        if named(self, event) {
+            let masks = released.iter().map(|(id, i)| (*id, i.mask)).collect();
+            self.released_legs.insert(event, ReleasedLeg { resolution: e.resolution, masks });
+        }
+        if parlay {
+            let kept: Vec<u64> = self.released_legs.keys().copied().filter(|&leg| named(self, leg)).collect();
+            self.released_legs.retain(|leg, _| kept.contains(leg));
+        }
+    }
+
     fn set_remaining(&mut self, order: u64, remaining: u64) {
         if remaining == 0 {
             self.orders.remove(&order);
@@ -358,6 +428,7 @@ impl View {
                 let sleeve = (r["availableCents"].as_i64().unwrap_or(0), r["reservedCents"].as_i64().unwrap_or(0));
                 self.sleeves.insert(u(&r["accountId"]), sleeve);
             }
+            "EventReleased" => self.release(u(&r["eventId"])),
             "SettlementPayout" => {
                 let instrument = u(&r["instrumentId"]);
                 let event = match instrument {
@@ -532,6 +603,48 @@ mod tests {
         view.apply(&unit(json!({"msg": "DefineEvent", "eventId": 5, "stateCount": 2, "scheduledStart": 0}), 1, true));
         view.apply(&unit(json!({"msg": "ResolveEvent", "eventId": 5, "kind": "VOID", "caseId": 0}), 2, false));
         assert_eq!(view.events[&5].resolution, None);
+    }
+
+    #[test]
+    fn a_released_event_is_forgotten_but_its_round_and_a_parlays_leg_are_not() {
+        let mut view = View::default();
+        let round = crate::catalogue::event_id(3, 7);
+        let leg = crate::catalogue::instrument_id(round, 0);
+        view.apply(&unit(
+            json!({"msg": "DefineEvent", "eventId": round, "stateCount": 2, "scheduledStart": 0}),
+            1,
+            true,
+        ));
+        let list = |id: u64, event: u64, class: &str, legs: Value| {
+            json!({"msg": "ListInstrument", "instrumentId": id, "eventId": event, "instrumentClass": class,
+                   "stateMask": 2, "tickTableId": 1, "lotStep": 1, "legs": legs})
+        };
+        view.apply(&unit(list(leg, round, "BINARY", json!([])), 2, true));
+        let parlay = 1u64 << 52;
+        view.apply(&unit(
+            json!({"msg": "DefineEvent", "eventId": parlay, "stateCount": 2, "scheduledStart": 0}),
+            3,
+            true,
+        ));
+        let legs = json!([{"legEventId": round, "legInstrumentId": leg, "legOutcome": "YES"}]);
+        view.apply(&unit(list(parlay, parlay, "PARLAY", legs), 4, true));
+        let resolve =
+            json!({"msg": "ResolveEvent", "eventId": round, "kind": "RESOLVED", "caseId": 1, "winningState": 1});
+        view.apply(&unit(resolve, 5, true));
+        let tick = |at: u64, event: u64| {
+            let mut input = json!({"msg": "TimeTick"});
+            input["record"] = json!({"sequence": at, "sequencedAt": at, "sequencerGroup": 1});
+            Unit { input, results: vec![json!({"msg": "EventReleased", "eventId": event})] }
+        };
+        view.apply(&tick(6, round));
+        assert!(!view.events.contains_key(&round) && !view.instruments.contains_key(&leg));
+        assert_eq!(view.released_rounds.get(&3), Some(&(7, 1)));
+        assert_eq!(view.resolution_of(round).map(|r| r.winning_state), Some(1));
+        assert_eq!(view.mask_of(round, leg), Some(2));
+        // Once the parlay goes too, nothing is kept for its leg, and a parlay's event is no template's round.
+        view.apply(&tick(7, parlay));
+        assert!(view.released_legs.is_empty() && view.instruments.is_empty());
+        assert_eq!(view.released_rounds.len(), 1);
     }
 
     #[test]

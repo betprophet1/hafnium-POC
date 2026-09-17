@@ -47,8 +47,9 @@ paths:
         - name: resolved
           in: query
           description: |
-            Only events that are (`true`) or are not (`false`) resolved. A venue that lists rounds on a calendar keeps
-            every settled event, so a client that trades asks for `false`. Omitted, every event.
+            Only events that are (`true`) or are not (`false`) resolved. A settled event stays listed until the venue
+            releases it, a retention after its resolution (spec E-8.4), so a client that trades asks for `false`.
+            Omitted, every event the venue still carries.
           schema: { type: boolean }
       responses:
         '200':

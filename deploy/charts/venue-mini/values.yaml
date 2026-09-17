@@ -64,8 +64,8 @@ treasury:
 # The dummy oracle: lists a new round of each demo market on the calendar in files/calendar.json, runs it (start,
 # sometimes a suspension, end, close) and settles it through proposal, auto-approval and a dispute window, voiding one
 # now and then. The settlement tab drives it. Off, the markets the seed lists stay open until someone settles them.
-# The engine never frees a listed market: with the small capacity profile the calendar lists for about ten hours
-# before the oracle stops listing short of the ceiling (a fresh journal starts again).
+# The seed has the engine release a settled round half an hour after it resolves, so the calendar runs indefinitely
+# on the small capacity profile.
 oracle:
   enabled: true
 
@@ -87,9 +87,9 @@ gateway:
 
 # The parlay service: parlays listed on request, requests for quote routed to the catalogue's responders, and
 # settlement from the legs. A request accepts quotes for windowSeconds of sequencer time. Every book reserves its
-# levels for as long as the core runs, and running out is a fail-stop, so the service lists at most maxParlays: a
-# parlay's ladder has 279 rows, 558 levels, of the small profile's 131 072. It also stops, like the oracle, while one
-# more parlay would take the core past 95% of core.capacity, which the oracle's rounds use up over the hours.
+# levels until the engine releases it, half an hour after it settles, so the venue carries at most maxParlays at once:
+# a parlay's ladder has 279 rows, 558 levels, of the small profile's 131 072. It also holds, like the oracle, while
+# one more parlay would take the core past 95% of core.capacity, which the oracle's rounds share.
 parlays:
   enabled: true
   windowSeconds: 30

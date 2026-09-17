@@ -289,7 +289,22 @@ impl Hub {
         let input = &unit.input;
         let sequence = u(&input["record"]["sequence"]);
         let executions = executions(&self.view, &unit.results, sequence);
+        // Markets the engine releases with their events (E-8.4), found before the view forgets them.
+        let released: Vec<(u64, Vec<u64>)> = unit
+            .results
+            .iter()
+            .filter(|r| r["msg"] == "EventReleased")
+            .map(|r| {
+                let event = u(&r["eventId"]);
+                (event, self.view.events.get(&event).map(|e| e.instruments.clone()).unwrap_or_default())
+            })
+            .collect();
         self.view.apply(unit);
+        for (_, markets) in &released {
+            for market in markets {
+                self.dirty.remove(market);
+            }
+        }
         self.last_unit = Some((monotonic(), u(&input["record"]["sequencedAt"])));
         // The view has now applied this unit, so every order accepted at or before it can be forgotten here.
         self.last_sequence = self.last_sequence.max(sequence);
@@ -371,6 +386,11 @@ impl Hub {
                 "positions": positions
             });
             self.send_to_account(account, sequence, update.to_string());
+        }
+        // A released event and its markets are gone from `GET /v4/markets` and their books; followers forget them.
+        for (event, _) in &released {
+            let gone = json!({"type": "market", "sequence": id(sequence), "eventId": id(*event), "released": true});
+            self.send_to_topic("markets", &gone.to_string());
         }
         if input["msg"] == "SetEventPhase" && unit.results.iter().any(|r| r["outcome"] == "APPLIED") {
             let phase = json!({
@@ -796,6 +816,33 @@ mod tests {
         // There is nothing to remember: the view has applied input 6, so it has already seen whatever input 3 did.
         hub.accept(8, 3, 1, 1000);
         assert_eq!(hub.order(8), None);
+    }
+
+    #[test]
+    fn a_released_event_leaves_the_markets_and_its_followers_are_told() {
+        let mut hub = hub();
+        let (follower, follower_rx) = outbox();
+        let follower = hub.add_session(follower);
+        hub.subscribe(follower, &["markets".to_string()], 10);
+        let applied = vec![json!({"msg": "CommandApplied", "outcome": "APPLIED"})];
+        let command = |sequence: u64, input: Value| {
+            let mut input = input;
+            input["record"] = json!({"sequence": sequence, "sequencedAt": sequence, "sequencerGroup": 1});
+            Unit { input, results: applied.clone() }
+        };
+        hub.apply(&command(1, json!({"msg": "DefineEvent", "eventId": 5, "stateCount": 2, "scheduledStart": 0})));
+        let list = json!({"msg": "ListInstrument", "instrumentId": 50, "eventId": 5, "instrumentClass": "BINARY",
+                          "tickTableId": 1, "lotStep": 1, "stateMask": 2, "legs": []});
+        hub.apply(&command(2, list));
+        assert_eq!(hub.markets(None)["events"].as_array().map(Vec::len), Some(1));
+        follower_rx.try_iter().count();
+        let mut tick = unit(3, vec![json!({"msg": "EventReleased", "eventId": 5})]);
+        tick.input["msg"] = json!("TimeTick");
+        hub.apply(&tick);
+        assert_eq!(hub.markets(None)["events"].as_array().map(Vec::len), Some(0));
+        assert!(hub.market(50).is_none());
+        let told: Vec<Value> = follower_rx.try_iter().filter_map(|m| serde_json::from_str(&m).ok()).collect();
+        assert!(told.iter().any(|m| m["released"] == true && m["eventId"] == "5"), "{told:?}");
     }
 
     #[test]

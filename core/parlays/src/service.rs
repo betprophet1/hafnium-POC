@@ -44,8 +44,8 @@ pub struct Config {
     pub listen: String,
     /// How long a request accepts quotes, in seconds of sequencer time.
     pub window_seconds: u64,
-    /// The most parlays the service lists. Every book reserves its levels at listing for as long as the node runs
-    /// (E-6.3), and running out of them is a fail-stop, so the service refuses a request past this instead.
+    /// The most parlays the venue carries at once. Every book reserves its levels until its event is released a
+    /// retention after settlement (E-8.4), so the service refuses a request past this instead of using them up.
     pub max_parlays: usize,
     /// The node's capacity profile: no parlay is listed that would take the venue past 95% of it (`rules::no_room`).
     pub capacity: rules::Capacity,

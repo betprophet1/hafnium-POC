@@ -33,6 +33,12 @@ pub fn capacity_profile(profile: &str) -> Result<Capacities, Error> {
         .ok_or_else(|| format!("unknown capacity profile {profile:?}: small, launch or scale").into())
 }
 
+/// How long a demo venue keeps a settled event before the engine releases it (E-8.4, D-29): half an hour of
+/// sequencer time, long enough for the page's followers to see a round settle and for the parlay service to settle
+/// parlays on its legs, and short enough that a calendar listing rounds every few minutes runs indefinitely on the
+/// `small` profile. Production keeps the engine's default of seven days.
+pub const DEMO_SETTLED_RETENTION_SECONDS: u64 = 1_800;
+
 /// D-12's window, restated here because E-7.4 replaces both group parameters together: see `group_parameters`.
 pub const CLIENT_ORDER_ID_WINDOW_SECONDS: u64 = 7_200;
 
@@ -179,6 +185,24 @@ impl Catalogue {
         )
     }
 
+    /// The retention and the listing limits (E-7.12, D-30). The limits are the profile's own tables, so a listing past
+    /// them is refused with `LISTING_CAPACITY` rather than fail-stopping the core; they must therefore be the profile
+    /// the node runs with. Listers still stop short of them (the oracle's and the parlay service's `no_room`), so a
+    /// round or a parlay is refused whole rather than listed in part.
+    fn listing_parameters(profile: &Capacities) -> Value {
+        let limit = |n: usize| u64::try_from(n).unwrap_or(u64::MAX).min(u64::from(u32::MAX));
+        command(
+            "SetListingParameters",
+            "seed-listing".into(),
+            json!({
+                "settledRetentionSeconds": DEMO_SETTLED_RETENTION_SECONDS,
+                "maxEvents": limit(profile.events),
+                "maxInstruments": limit(profile.instruments),
+                "maxPriceLevels": limit(profile.levels)
+            }),
+        )
+    }
+
     /// The demo fee schedule (spec E-10.11, D-2), in the form prediction-market exchanges publish: a taker pays
     /// 7% and a maker 1.75% of `contracts × P × (1 − P)` dollars. The synthetic maker, standing in for a market
     /// maker on a programme, instead earns a 0.5% maker rebate and pays no taker fee, for as long as the venue runs
@@ -202,11 +226,11 @@ impl Catalogue {
         inputs
     }
 
-    /// Everything a fresh venue needs: the group settings, the fee schedule, the tick table, funded accounts and
-    /// round 1 of every market. The settings come first, so no order can exist before the limit that bounds them,
-    /// and no fill before the fees that apply to it.
-    pub fn seed(&self, order_ceiling: usize) -> Result<Vec<Value>, Error> {
-        let mut inputs = vec![Self::group_parameters(order_ceiling)];
+    /// Everything a fresh venue needs: the group settings, the listing parameters, the fee schedule, the tick table,
+    /// funded accounts and round 1 of every market, for a node running `profile`. The settings come first, so no
+    /// order or listing can exist before the limit that bounds it, and no fill before the fees that apply to it.
+    pub fn seed(&self, profile: &Capacities) -> Result<Vec<Value>, Error> {
+        let mut inputs = vec![Self::group_parameters(profile.orders), Self::listing_parameters(profile)];
         inputs.extend(self.fees());
         inputs.push(Self::cent_table());
         for a in &self.accounts {

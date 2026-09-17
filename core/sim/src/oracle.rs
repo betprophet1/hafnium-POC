@@ -18,9 +18,11 @@
 //! change nothing off its feed, so while the venue is quiet the last time the feed carried stands still; the oracle
 //! then counts on from it by its own monotonic clock. Everything it records comes from the journal regardless.
 //!
-//! Capacity: the engine never forgets an event or a market, and a listing past its capacity profile is a fail-stop,
-//! not a rejection. The oracle is told the node's profile and stops listing new rounds while one would take the
-//! venue past 95% of its events, markets or price levels; it says so on the schedule.
+//! Capacity: the engine releases a settled event and its markets a retention after resolution (E-8.4; the seed sets
+//! half an hour), and refuses a listing past the seed's limits with `LISTING_CAPACITY` (E-6.2, E-6.3), so the venue
+//! runs indefinitely. The oracle is still told the node's profile and holds a new round while it would take the venue
+//! past 95% of its events, markets or price levels: a round is several commands, and a refusal part-way through would
+//! leave an event with only some of its markets. It says so on the schedule, and carries on once releases make room.
 //!
 //! The control API, all JSON, times in milliseconds since the epoch on the sequencer's clock:
 //!
@@ -196,7 +198,7 @@ impl Oracle {
             ("price levels", levels_used, markets * 2 * rows, self.capacity.levels),
         ];
         checks.iter().find(|(_, used, adding, limit)| !within(*used, *adding, *limit)).map(|(what, used, _, limit)| {
-            format!("listing paused: the venue holds {used} of its {limit} {what}, and the engine never frees them")
+            format!("listing paused: the venue holds {used} of its {limit} {what} until settled rounds are released")
         })
     }
 
@@ -208,9 +210,10 @@ impl Oracle {
             .is_some_and(|e| e.instruments.iter().any(|i| view.instruments.get(i).is_some_and(|i| i.class == "PARLAY")))
     }
 
-    /// The latest round of each template and when it was listed.
+    /// The latest round of each template and when it was listed, released rounds included (E-8.4), so a template
+    /// whose rounds have all been released counts on from the last rather than listing round 1 again.
     fn latest_rounds(view: &View) -> BTreeMap<u64, (u64, u64)> {
-        let mut latest = BTreeMap::new();
+        let mut latest = view.released_rounds.clone();
         for (&id, e) in view.events.iter().filter(|(&id, _)| !Self::is_parlay(view, id)) {
             let (template, round) = split_event(id);
             let entry = latest.entry(template).or_insert((round, e.defined_at));

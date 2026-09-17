@@ -79,10 +79,12 @@ curl -s -XPOST localhost:8080/oracle/events/2000007/propose -d '{"winningState":
 state, outcome), and the gateway's public `markets` topic sends it when the event resolves, after the markets' own
 state changes. A trading client asks `GET /v4/markets?resolved=false` to leave the settled rounds out.
 
-**Capacity.** The engine never frees a listed event or market, and listing past its capacity profile fail-stops the
-core. The oracle takes the node's `--capacity` and stops listing while another round would pass 95% of the profile's
-events, markets or price levels, and the schedule says so. With `small` and the chart's calendar that is about ten
-hours; a fresh journal starts again. The parlay service (`venue-parlays --capacity`) applies the same limit to
+**Capacity.** The engine releases a settled event and its markets a retention after resolution (spec E-8.4), and the
+seed sets that retention to half an hour and the listing limits to the `--capacity` profile, past which a listing is
+refused rather than fail-stopping the core (E-6.3). The oracle takes the node's `--capacity` too, and holds a round
+while it would pass 95% of the profile's events, markets or price levels, so a round is never refused part-way; the
+schedule says so, and listing resumes as settled rounds are released. With `small` the venue runs indefinitely.
+Released events leave `GET /v4/markets`, and the `markets` topic says `released`. The parlay service (`venue-parlays --capacity`) applies the same limit to
 parlays, counting the oracle's rounds, so neither takes the core over its ceiling. The oracle leaves parlays' events
 alone: they are not on its schedule, and its control API refuses to act on them.
 

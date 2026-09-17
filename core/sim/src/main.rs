@@ -125,9 +125,9 @@ fn workload(args: &Args) -> Result<(), Error> {
 fn seed(args: &Args) -> Result<(), Error> {
     let catalogue = Catalogue::load(&args.get("catalogue", None)?)?;
     let mut ingress = Ingress::new(&args.get("ingress", None)?);
-    // The order limit is set beneath the node's order ceiling, so this must name the profile the node runs with.
+    // The order and listing limits are the node's own tables, so this must name the profile the node runs with.
     let profile = venue_link::catalogue::capacity_profile(&args.get("capacity", Some("small"))?)?;
-    let mut inputs = catalogue.seed(profile.orders)?.into_iter().peekable();
+    let mut inputs = catalogue.seed(&profile)?.into_iter().peekable();
     let mut attempts = 0;
     while let Some(input) = inputs.peek() {
         match ingress.send(input.clone()) {

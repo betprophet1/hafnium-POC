@@ -239,7 +239,7 @@ actually meet is a rule limit, which is sequenced and explainable (spec E-9.4).
 
 | Topic | Contents | Delivery |
 |---|---|---|
-| `markets` | market state changes and event phases | every change |
+| `markets` | market state changes, event phases, resolutions and releases of settled events | every change |
 | `book.{instrumentId}` | a full snapshot to the requested depth, both sides | a snapshot on subscribe, then at most ten a second, only when the book changed |
 | `trades.{instrumentId}` | each trade: price, quantity, taker side | every trade |
 

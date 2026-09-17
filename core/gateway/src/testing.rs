@@ -125,8 +125,8 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
     // Sends wait for the forwarder's first connection, so seeding can start before the node is listening.
     let seeder = Submit::spawn(&ingress);
     let catalogue = Catalogue::load(CATALOGUE).expect("the mini venue's catalogue");
-    let ceiling = catalogue::capacity_profile("small").expect("a known profile").orders;
-    for input in catalogue.seed(ceiling).expect("the seed") {
+    let profile = catalogue::capacity_profile("small").expect("a known profile");
+    for input in catalogue.seed(&profile).expect("the seed") {
         seeder.send(input).expect("seeded");
     }
     let limits = Limits { per_second: 1_000_000, burst: 1_000_000, logons_per_minute: 1_000_000 };
