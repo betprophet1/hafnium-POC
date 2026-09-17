@@ -116,6 +116,10 @@ pub enum Out {
         position_closed: i64,
         cents: i64,
     },
+    /// E-8.4: the event and its instruments no longer exist.
+    EventReleased {
+        event_id: u64,
+    },
     OrderGroupUpdated {
         account_id: u64,
         client_order_group: u32,
@@ -299,6 +303,11 @@ impl Emitter {
                 let mut e = begin!(settlement_payout_codec, SettlementPayoutEncoder);
                 e.account_id(account_id).instrument_id(instrument_id).kind(kind);
                 e.position_closed(position_closed).cents(cents);
+                e.get_limit()
+            }
+            Out::EventReleased { event_id } => {
+                let mut e = begin!(event_released_codec, EventReleasedEncoder);
+                e.event_id(event_id);
                 e.get_limit()
             }
             Out::OrderGroupUpdated {

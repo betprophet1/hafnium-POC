@@ -1,4 +1,4 @@
-//! Resolution and settlement (spec §15). There are no baskets (D-24).
+//! Resolution and settlement (spec §15), and the release of a settled event (E-8.4). There are no baskets (D-24).
 
 use crate::commands::header;
 use crate::emit::{CancelReason, MarketState, Out, ResolutionKind};
@@ -92,13 +92,68 @@ impl<'a> Engine<'a> {
         };
         // The event's cash is settled with it.
         self.event_cash.retain(|key, _| key.1 != event_id);
+        // Everything else keyed by the event's instruments or by the event, which E-8.4 discards at release, goes
+        // now: no fill can happen in a resolved event, so nothing reads or changes it before then. Holdings in the
+        // event are all 0 (paid or reversed above) and no order can lock them again; maker protection counters only
+        // count fills. Doing it here keeps the release itself to the event's own instruments.
+        {
+            let Self { holdings, instrument_index, instruments, .. } = self;
+            holdings.retain(|&(_, instrument_id), _| {
+                instrument_index.get(&instrument_id).is_none_or(|&s| instruments[s as usize].event_id != event_id)
+            });
+        }
+        self.maker_counters.retain(|key, _| key.1 != event_id);
         if paid != event.collateral {
             return Err(FailStop::Conservation);
         }
+        // E-15.6: resolved now, and at the end of the releases (E-8.4, D-29).
+        let now = self.now;
         let e = self.events.get_mut(&event_id).ok_or(FailStop::Inconsistent)?;
         e.collateral = 0;
         e.resolved = true;
+        e.resolved_at = now;
+        e.next_release = None;
+        match self.release_tail {
+            Some(tail) => self.events.get_mut(&tail).ok_or(FailStop::Inconsistent)?.next_release = Some(event_id),
+            None => self.release_head = Some(event_id),
+        }
+        self.release_tail = Some(event_id);
         Ok(())
+    }
+
+    /// E-8.4: releases the earliest-resolved event the group carries if its retention, as it stands now, has passed.
+    /// At most one a tick (D-29). Its positions, cash, holdings and counters went at settlement, so what is left is
+    /// the event and its instruments: each instrument's slot joins the free list, its levels become a hole that a
+    /// later listing reclaims (`commands.rs`), and its ID is forgotten.
+    pub(crate) fn release_due<S: ResultSink>(&mut self, sink: &mut S) -> Result<(), FailStop> {
+        let Some(event_id) = self.release_head else { return Ok(()) };
+        let event = *self.events.get(&event_id).ok_or(FailStop::Inconsistent)?;
+        let retention =
+            u64::from(self.settled_retention_seconds).checked_mul(1_000_000_000).ok_or(FailStop::Overflow)?;
+        if event.resolved_at.checked_add(retention).ok_or(FailStop::Overflow)? > self.now {
+            return Ok(());
+        }
+        let mut cur = event.first_instrument;
+        while cur != NONE {
+            let inst = self.instruments[cur as usize];
+            self.instrument_index.remove(&inst.id).ok_or(FailStop::Inconsistent)?;
+            let freed = &mut self.instruments[cur as usize];
+            freed.in_use = false;
+            freed.next_in_event = self.free_instrument;
+            self.free_instrument = cur;
+            let levels = 2 * usize::from(inst.table.len);
+            self.levels_carried = self.levels_carried.checked_sub(levels).ok_or(FailStop::Inconsistent)?;
+            let words = 2 * inst.words_per_side();
+            self.level_bits_carried = self.level_bits_carried.checked_sub(words).ok_or(FailStop::Inconsistent)?;
+            self.instruments_carried = self.instruments_carried.checked_sub(1).ok_or(FailStop::Inconsistent)?;
+            cur = inst.next_in_event;
+        }
+        self.events.remove(&event_id).ok_or(FailStop::Inconsistent)?;
+        self.release_head = event.next_release;
+        if self.release_head.is_none() {
+            self.release_tail = None;
+        }
+        self.out(sink, &Out::EventReleased { event_id })
     }
 
     /// E-15.5 for `RESOLVED`: each open position is paid in the winning state, ascending by account then instrument.

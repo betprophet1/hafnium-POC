@@ -83,6 +83,11 @@ impl<'a> Engine<'a> {
             list_instrument_codec::SBE_TEMPLATE_ID => self.check_listing(input)?,
             sleeve_adjust_codec::SBE_TEMPLATE_ID => self.check_sleeve_adjust(input)?,
             set_group_parameters_codec::SBE_TEMPLATE_ID => self.check_group_parameters(input)?,
+            set_listing_parameters_codec::SBE_TEMPLATE_ID => {
+                // E-7.12
+                let dec = set_listing_parameters_codec::SetListingParametersDecoder::default().header(header(input), 0);
+                valid(dec.settled_retention_seconds() != 0)
+            }
             activate_protocol_codec::SBE_TEMPLATE_ID => self.check_activation(input)?,
             set_market_state_codec::SBE_TEMPLATE_ID => self.check_market_state(input)?,
             set_event_phase_codec::SBE_TEMPLATE_ID => self.check_event_phase(input)?,
@@ -149,6 +154,16 @@ impl<'a> Engine<'a> {
                     self.expiry_window_shortened();
                 }
                 self.client_order_id_window_seconds = window;
+                Ok(())
+            }
+            set_listing_parameters_codec::SBE_TEMPLATE_ID => {
+                // E-7.12: the retention applies at the next tick to every event awaiting release (E-8.4); a limit
+                // applies to later listings only.
+                let dec = set_listing_parameters_codec::SetListingParametersDecoder::default().header(header(input), 0);
+                self.settled_retention_seconds = dec.settled_retention_seconds();
+                self.max_events = dec.max_events();
+                self.max_instruments = dec.max_instruments();
+                self.max_price_levels = dec.max_price_levels();
                 Ok(())
             }
             activate_protocol_codec::SBE_TEMPLATE_ID => {
@@ -259,6 +274,10 @@ impl<'a> Engine<'a> {
         if self.events.contains(&dec.event_id()) || !(2..=64).contains(&dec.state_count()) {
             return Ok(Rejected(RejectReason::INVALID_COMMAND));
         }
+        // E-6.2, after validity: the events the group carries, resolved ones not yet released included (E-6.5).
+        if self.max_events != 0 && self.events.len() >= self.max_events as usize {
+            return Ok(Rejected(RejectReason::LISTING_CAPACITY));
+        }
         Ok(Applied)
     }
 
@@ -314,22 +333,44 @@ impl<'a> Engine<'a> {
         if !ok {
             return reject;
         }
+        // E-6.3, after validity: the instruments and price levels the group carries (E-6.5).
+        let levels = 2 * usize::from(table.len);
+        let instruments_full = self.max_instruments != 0 && self.instruments_carried >= self.max_instruments as usize;
+        let levels_full = self.max_price_levels != 0 && self.levels_carried + levels > self.max_price_levels as usize;
+        if instruments_full || levels_full {
+            return Ok(Rejected(RejectReason::LISTING_CAPACITY));
+        }
         Ok(Applied)
     }
 
     fn apply_listing<S: ResultSink>(&mut self, input: &[u8], sink: &mut S) -> Result<(), FailStop> {
         let dec = list_instrument_codec::ListInstrumentDecoder::default().header(header(input), 0);
         let table = *self.tick_tables.get(&dec.tick_table_id()).ok_or(FailStop::MalformedCommand)?;
-        let slot = self.instruments_used;
         let per_side = usize::from(table.len);
         let words = per_side.div_ceil(64);
-        if slot >= self.instruments.len()
-            || self.levels_used + 2 * per_side > self.levels.len()
+        // A slot a release freed first, else a new one (E-18.3).
+        let slot = if self.free_instrument != NONE {
+            self.free_instrument as usize
+        } else if self.instruments_used < self.instruments.len() {
+            self.instruments_used
+        } else {
+            return Err(FailStop::Capacity);
+        };
+        // The book's levels and occupancy words go at the end of their pools; if releases have left the room in
+        // holes, the pools are compacted first, so a listing never fails for room the group does not carry.
+        if self.levels_used + 2 * per_side > self.levels.len()
             || self.level_bits_used + 2 * words > self.level_bits.len()
         {
-            return Err(FailStop::Capacity);
+            if self.levels_carried + 2 * per_side > self.levels.len()
+                || self.level_bits_carried + 2 * words > self.level_bits.len()
+            {
+                return Err(FailStop::Capacity);
+            }
+            self.compact_levels()?;
         }
+        let free_next = self.instruments[slot].next_in_event;
         let mut inst = Instrument {
+            in_use: true,
             id: dec.instrument_id(),
             event_id: dec.event_id(),
             class: dec.instrument_class(),
@@ -366,10 +407,53 @@ impl<'a> Engine<'a> {
         event.instrument_count += 1;
         self.instruments[slot] = inst;
         self.instrument_index.insert(inst.id, slot as u32).map_err(|_| FailStop::Capacity)?;
-        self.instruments_used += 1;
+        if slot == self.instruments_used {
+            self.instruments_used += 1;
+        } else {
+            self.free_instrument = free_next;
+        }
+        self.instruments_carried += 1;
         self.levels_used += 2 * per_side;
+        self.levels_carried += 2 * per_side;
         self.level_bits_used += 2 * words;
+        self.level_bits_carried += 2 * words;
         self.emitter.emit(sink, &Out::MarketStateChanged { instrument_id: inst.id, state: MarketState::LISTED })
+    }
+
+    /// Moves every carried book's levels and occupancy words to the front of their pools, in pool order, closing the
+    /// holes releases left (E-8.4, E-18.3). Only a listing that does not fit at the end of a pool calls this, so its
+    /// cost, the used part of the pools, is paid by a command and never by a tick. No order, touch or undo record
+    /// holds a level index across inputs: queues link order slots, and orders find their level from their book.
+    fn compact_levels(&mut self) -> Result<(), FailStop> {
+        let mut n = 0usize;
+        for (slot, inst) in self.instruments[..self.instruments_used].iter().enumerate() {
+            if inst.in_use {
+                *self.scratch.get_mut(n).ok_or(FailStop::Capacity)? = (u64::from(inst.levels_start), slot as u64);
+                n += 1;
+            }
+        }
+        // Books take both pools in the same order, and compaction keeps it, so one order serves both.
+        self.scratch[..n].sort_unstable();
+        let (mut levels_at, mut bits_at) = (0usize, 0usize);
+        for j in 0..n {
+            let slot = self.scratch[j].1 as usize;
+            let inst = self.instruments[slot];
+            let (levels, words) = (2 * usize::from(inst.table.len), 2 * inst.words_per_side());
+            let (from_levels, from_bits) = (inst.levels_start as usize, inst.bits_start as usize);
+            self.levels.copy_within(from_levels..from_levels + levels, levels_at);
+            self.level_bits.copy_within(from_bits..from_bits + words, bits_at);
+            let moved = &mut self.instruments[slot];
+            moved.levels_start = levels_at as u32;
+            moved.bits_start = bits_at as u32;
+            levels_at += levels;
+            bits_at += words;
+        }
+        if levels_at != self.levels_carried || bits_at != self.level_bits_carried {
+            return Err(FailStop::Inconsistent);
+        }
+        self.levels_used = levels_at;
+        self.level_bits_used = bits_at;
+        Ok(())
     }
 
     // ------------------------------------------------------------------ E-7.2 .. E-7.7

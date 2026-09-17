@@ -65,7 +65,7 @@ impl OwnedMemory {
             position_touches: vec![((0, 0), 0, 0); c.touches],
             sleeve_touches: vec![(0, 0, (0, 0)); c.touches],
             level_touches: vec![((0, 0, 0), 0, (0, 0)); c.touches],
-            scratch: vec![(0, 0); c.orders.max(s(c.holdings) / 2).max(s(c.event_cash) / 2)],
+            scratch: vec![(0, 0); c.orders.max(c.instruments).max(s(c.holdings) / 2).max(s(c.event_cash) / 2)],
             marks: vec![(0, 0, 0); c.touches],
             undo: vec![Undo::default(); c.undo],
             check_orders: vec![CheckOrder::default(); c.orders],

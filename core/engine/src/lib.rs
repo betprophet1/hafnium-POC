@@ -95,6 +95,14 @@ pub struct Engine<'a> {
     venue_mode: VenueMode,
     active_order_limit: u32,
     client_order_id_window_seconds: u32,
+    /// E-7.12: how long a resolved event is kept (D-29), and the listing limits, 0 for none (D-30).
+    settled_retention_seconds: u32,
+    max_events: u32,
+    max_instruments: u32,
+    max_price_levels: u32,
+    /// The releases (E-8.4): the earliest and latest resolved events not yet released, linked by `next_release`.
+    release_head: Option<u64>,
+    release_tail: Option<u64>,
     default_limits: Option<RuleLimits>,
     next_order: u64,
     next_trade: u64,
@@ -104,12 +112,21 @@ pub struct Engine<'a> {
     tick_rows_used: usize,
     events: FixedMap<'a, u64, Event>,
     instruments: &'a mut [Instrument],
+    /// Instrument slots ever used; those below it that a release freed are linked from `free_instrument`.
     instruments_used: usize,
+    free_instrument: u32,
+    /// Instruments the group carries (E-6.5).
+    instruments_carried: usize,
     instrument_index: FixedMap<'a, u64, u32>,
     levels: &'a mut [Level],
+    /// The end of the level pool's used part. Books take ranges from it; a release leaves a hole, and a listing that
+    /// does not fit at the end compacts the pool (`commands.rs`), so what the group carries always fits (E-18.3).
     levels_used: usize,
+    /// Levels of the books the group carries, holes not counted: its price levels (E-6.5).
+    levels_carried: usize,
     level_bits: &'a mut [u64],
     level_bits_used: usize,
+    level_bits_carried: usize,
     accounts: &'a mut [Account],
     accounts_used: usize,
     account_index: FixedMap<'a, u64, u32>,
@@ -183,7 +200,8 @@ impl<'a> Engine<'a> {
         let seed = config.table_seed;
         let orders = memory.orders;
         let order_count = orders.len();
-        let scratch_needed = order_count.max(memory.holdings.len() / 2).max(memory.event_cash.len() / 2);
+        let scratch_needed =
+            order_count.max(memory.instruments.len()).max(memory.holdings.len() / 2).max(memory.event_cash.len() / 2);
         let check_short =
             memory.check_orders.len() < order_count || memory.check_holdings.len() < memory.accounts.len();
         // Tables whose size follows another's, as `Memory` documents them. Short ones used to surface only as a
@@ -215,6 +233,12 @@ impl<'a> Engine<'a> {
             venue_mode: VenueMode::NORMAL,
             active_order_limit: 0,
             client_order_id_window_seconds: 7_200,
+            settled_retention_seconds: 604_800,
+            max_events: 0,
+            max_instruments: 0,
+            max_price_levels: 0,
+            release_head: None,
+            release_tail: None,
             default_limits: None,
             next_order: 1,
             next_trade: 1,
@@ -224,11 +248,15 @@ impl<'a> Engine<'a> {
             events: cap(FixedMap::new(memory.events, seed))?,
             instruments: memory.instruments,
             instruments_used: 0,
+            free_instrument: NONE,
+            instruments_carried: 0,
             instrument_index: cap(FixedMap::new(memory.instrument_index, seed))?,
             levels: memory.levels,
             levels_used: 0,
+            levels_carried: 0,
             level_bits: memory.level_bits,
             level_bits_used: 0,
+            level_bits_carried: 0,
             accounts: memory.accounts,
             accounts_used: 0,
             account_index: cap(FixedMap::new(memory.account_index, seed))?,
@@ -354,6 +382,8 @@ impl<'a> Engine<'a> {
                 self.remove(slot, emit::CancelReason::EXPIRED, sink)?;
             }
         }
+        // E-8.4: then at most one resolved event whose retention has passed.
+        self.release_due(sink)?;
         // E-8.2: expired records are always at the front, of the queue or of the heap, so the work is what actually
         // expired, never the size of the table. The ID may have been recorded again under a later expiry; that
         // recording is its own record, so only an entry that has itself expired goes.

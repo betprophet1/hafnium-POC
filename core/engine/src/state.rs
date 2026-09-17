@@ -34,6 +34,10 @@ pub struct Event {
     pub suspended: bool,
     pub ended: bool,
     pub resolved: bool,
+    /// When the event was resolved (E-15.6), from which its release is counted (E-8.4).
+    pub resolved_at: u64,
+    /// The next event in the releases, in resolution order (E-8.4).
+    pub next_release: Option<u64>,
     pub collateral: i64,
     /// Instrument slots of this event, ascending by instrument ID.
     pub first_instrument: u32,
@@ -42,6 +46,8 @@ pub struct Event {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Instrument {
+    /// False for a slot never used or freed by a release (E-8.4); a free slot's `next_in_event` links the free list.
+    pub in_use: bool,
     pub id: u64,
     pub event_id: u64,
     pub class: InstrumentClass,
@@ -404,8 +410,8 @@ pub struct Memory<'a> {
     pub position_touches: &'a mut [(HoldingKey, u32, i64)],
     pub sleeve_touches: &'a mut [(u64, u32, (i64, i64))],
     pub level_touches: &'a mut [(LevelKey, u32, (u64, u32))],
-    /// Working space for collecting keys to act on in order; as long as `orders`, half the `holdings` slots and
-    /// half the `event_cash` slots.
+    /// Working space for collecting keys to act on in order; as long as `orders`, `instruments`, half the `holdings`
+    /// slots and half the `event_cash` slots.
     pub scratch: &'a mut [(u64, u64)],
     /// `touches` entries.
     pub marks: &'a mut [Mark],
