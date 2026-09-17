@@ -468,6 +468,15 @@ fn session_pass(
         if stream.markets_changed {
             stream.markets_changed = false;
             markets = crate::bots::markets(api)?;
+            // A resolved event's markets leave the list, and the engine later releases them (E-8.4): forget their
+            // books and stop following them, so a maker on a calendar does not hold every round it ever quoted.
+            let gone: Vec<u64> = followed.iter().copied().filter(|f| !markets.iter().any(|m| m.id == *f)).collect();
+            if !gone.is_empty() {
+                let topics: Vec<String> = gone.iter().map(|g| format!("book.{g}")).collect();
+                market.send(&json!({"op": "unsubscribe", "topics": topics}))?;
+                followed.retain(|f| !gone.contains(f));
+            }
+            stream.books.retain(|b, _| markets.iter().any(|m| m.id == *b));
         }
         if stream.resync {
             stream.resync = false;
