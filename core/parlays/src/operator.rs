@@ -4,7 +4,9 @@
 //! - `GET /v1/responders`: the approved responder accounts, each with its name and how many sessions it has subscribed
 //! - `PUT /v1/responders/{accountId}`: approves a catalogue account as a responder
 //! - `DELETE /v1/responders/{accountId}`: revokes one, ending its subscriptions
-//! - `GET /healthz`: `{"ready": true}` once the service has caught up with the feed, 503 until then
+//! - `GET /healthz`: `{"ready": true, "database": "ok"}` once the service has caught up with the feed, 503 until then;
+//!   `database` says whether the approved responders' database answers (`unavailable: ...` while it does not, when
+//!   approvals and revocations are refused and requests are still routed from memory; `none` without one)
 //!
 //! One thread per connection and one request per connection, like the treasury's: an operator's traffic is a few
 //! calls a day.
@@ -83,7 +85,12 @@ fn route(service: &Service, method: &str, path: &str) -> Result<Value, Failure> 
     match (method, segments.as_slice()) {
         ("GET", ["healthz"]) => {
             if service.ready() {
-                Ok(json!({"ready": true}))
+                let database = match service.database_health() {
+                    None => "none".to_string(),
+                    Some(Ok(())) => "ok".to_string(),
+                    Some(Err(e)) => format!("unavailable: {e}"),
+                };
+                Ok(json!({"ready": true, "database": database}))
             } else {
                 Err(failure(503, "UNAVAILABLE", "catching up with the feed"))
             }

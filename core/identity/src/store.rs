@@ -1,23 +1,20 @@
-//! The key store: every key of every account, kept in an append-only file of JSON lines and replayed at start.
+//! The key store: every key of every account, kept in the identity service's records (`records.rs`: PostgreSQL, or
+//! memory for tests) and held in memory for verification.
 //!
-//! The first line names the format. Each later line is one thing that happened to a key, written before anyone is
-//! told it happened: `create` (everything about the key but its secret, which is only ever hashed), `revoke`, or
-//! `used` (a key's last use, at most once a minute per key, decision G-8). Nothing is ever rewritten, so the file is
-//! also the history of every key. A stop mid-write leaves at most a last line cut short, which the next start drops.
+//! Each change is written to the records before anyone is told it happened: a key made (everything about it but its
+//! secret, which is only ever hashed), a key revoked, or a key's last use (at most once a minute per key, decision G-8).
+//! A key's terms never change once made, so its row is also its history.
 //!
 //! One lock serves every call. Verifications are a few a second per key in use, since gateways remember the answer
 //! (decision G-7), and a create or revoke is a person's action; neither is a market's traffic.
 
 use crate::clock;
 use crate::key::{self, Permissions};
+use crate::records::{KeyRecords, KeyRow};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-const FORMAT: &str = "venue-identity/1";
 /// Keys an account may hold that are neither revoked nor expired (decision G-6).
 pub const MAX_ACTIVE: usize = 20;
 /// How often at most a key's last use is written down.
@@ -45,7 +42,7 @@ impl Refusal {
         Self { status: 404, code: "NOT_FOUND", message: message.into() }
     }
 
-    fn unavailable(message: impl Into<String>) -> Self {
+    pub fn unavailable(message: impl Into<String>) -> Self {
         Self { status: 503, code: "UNAVAILABLE", message: message.into() }
     }
 
@@ -65,7 +62,7 @@ struct Key {
     revoked_at: Option<u64>,
     created_by: Option<String>,
     last_used: Option<u64>,
-    /// The last use written to the file.
+    /// The last use written to the records.
     written_use: Option<u64>,
 }
 
@@ -82,6 +79,37 @@ impl Key {
 
     fn active(&self, now: u64) -> bool {
         self.revoked_at.is_none() && self.expires_at.is_none_or(|t| t > now)
+    }
+
+    fn row(&self) -> KeyRow {
+        KeyRow {
+            id: self.id.clone(),
+            account: self.account,
+            label: self.label.clone(),
+            permissions: self.permissions.names().iter().map(|n| (*n).to_string()).collect(),
+            hash: self.hash,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            revoked_at: self.revoked_at,
+            created_by: self.created_by.clone(),
+            last_used: self.last_used,
+        }
+    }
+
+    fn from_row(row: KeyRow) -> Result<Self, String> {
+        Ok(Self {
+            permissions: Permissions::from_names(row.permissions.iter().map(String::as_str))?,
+            id: row.id,
+            account: row.account,
+            label: row.label,
+            hash: row.hash,
+            created_at: row.created_at,
+            expires_at: row.expires_at,
+            revoked_at: row.revoked_at,
+            created_by: row.created_by,
+            last_used: row.last_used,
+            written_use: row.last_used,
+        })
     }
 }
 
@@ -104,16 +132,19 @@ impl Verified {
     }
 }
 
+#[derive(Default)]
 struct State {
     keys: BTreeMap<String, Key>,
     /// Each account's key IDs, oldest first.
     by_account: BTreeMap<u64, Vec<String>>,
-    file: File,
+    /// A write failed, so the records may hold something memory does not (a revocation whose acknowledgement was
+    /// lost): memory is read again from them first.
+    stale: bool,
 }
 
 pub struct Store {
     state: Mutex<State>,
-    fsync: bool,
+    records: Arc<dyn KeyRecords>,
     /// The accounts keys may be made for: the environment's catalogue.
     accounts: BTreeSet<u64>,
 }
@@ -122,59 +153,50 @@ fn locked(m: &Mutex<State>) -> MutexGuard<'_, State> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn insert(state: &mut State, made: Key) {
+    state.by_account.entry(made.account).or_default().push(made.id.clone());
+    state.keys.insert(made.id.clone(), made);
+}
+
+fn read(records: &dyn KeyRecords) -> Result<State, String> {
+    let mut state = State::default();
+    for row in records.load_keys()? {
+        let key = Key::from_row(row)?;
+        insert(&mut state, key);
+    }
+    Ok(state)
+}
+
 impl Store {
-    /// Opens the store at `path`, creating it if there is none, and replays it. A line that is not a whole record,
-    /// other than a last one cut short, is a store this service did not write, and it refuses to start on it.
-    pub fn open(path: &Path, fsync: bool, accounts: BTreeSet<u64>) -> Result<Self, String> {
-        let shown = path.display();
-        let mut text = Vec::new();
-        if path.exists() {
-            File::open(path).and_then(|mut f| f.read_to_end(&mut text)).map_err(|e| format!("{shown}: {e}"))?;
-        }
-        // Everything after the last newline is a record a stop cut short: it was never acted on, so it goes.
-        let whole = text.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-        if whole < text.len() {
-            eprintln!("identity: dropping a last line cut short in {shown}");
-            OpenOptions::new()
-                .write(true)
-                .open(path)
-                .and_then(|f| f.set_len(whole as u64))
-                .map_err(|e| format!("{shown}: {e}"))?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(path).map_err(|e| format!("{shown}: {e}"))?;
-        let mut state = State { keys: BTreeMap::new(), by_account: BTreeMap::new(), file };
-        let lines = std::str::from_utf8(&text[..whole]).map_err(|_| format!("{shown}: not text"))?;
-        for (n, line) in lines.lines().enumerate() {
-            let record: Value =
-                serde_json::from_str(line).map_err(|e| format!("{shown}: line {}: not JSON: {e}", n + 1))?;
-            if n == 0 {
-                if record["format"] != FORMAT {
-                    return Err(format!("{shown}: not a {FORMAT} store"));
-                }
-                continue;
-            }
-            replay(&mut state, &record).map_err(|e| format!("{shown}: line {}: {e}", n + 1))?;
-        }
-        let store = Self { state: Mutex::new(state), fsync, accounts };
-        if whole == 0 {
-            store.write(&mut locked(&store.state), &json!({"format": FORMAT})).map_err(|e| e.message)?;
-        }
-        Ok(store)
+    /// The store whose keys are in `records`, read into memory.
+    pub fn open(records: Arc<dyn KeyRecords>, accounts: BTreeSet<u64>) -> Result<Self, String> {
+        let state = read(records.as_ref())?;
+        Ok(Self { state: Mutex::new(state), records, accounts })
     }
 
-    /// Appends one record, durably when the store syncs, before the change it records is made.
-    fn write(&self, state: &mut State, record: &Value) -> Result<(), Refusal> {
-        let mut line = record.to_string();
-        line.push('\n');
-        let written =
-            state
-                .file
-                .write_all(line.as_bytes())
-                .and_then(|()| if self.fsync { state.file.sync_data() } else { Ok(()) });
-        written.map_err(|e| {
-            eprintln!("identity: writing the store: {e}");
-            Refusal::unavailable("the key store could not be written; nothing was changed")
-        })
+    /// Reads the keys again if a write failed since they were last read. Verification carries on from memory if the
+    /// records cannot be read; changes are refused.
+    fn fresh(&self, state: &mut State) -> Result<(), Refusal> {
+        if !state.stale {
+            return Ok(());
+        }
+        match read(self.records.as_ref()) {
+            Ok(mut again) => {
+                again.stale = false;
+                *state = again;
+                eprintln!("identity: keys read again from the records");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("identity: reading the records: {e}");
+                Err(Refusal::unavailable("the key store could not be read; nothing was changed"))
+            }
+        }
+    }
+
+    /// Whether the records answer, for health checks.
+    pub fn health(&self) -> Result<(), String> {
+        self.records.ping().map_err(String::from)
     }
 
     /// Makes a key for `account` from a request body (interface 1's `KeyRequest`, and `createdBy` when a key asked),
@@ -232,6 +254,7 @@ impl Store {
         };
         let secret = key::new_secret().map_err(random)?;
         let mut state = locked(&self.state);
+        self.fresh(&mut state)?;
         let active =
             state.by_account.get(&account).into_iter().flatten().filter(|id| state.keys[*id].active(now)).count();
         if active >= MAX_ACTIVE {
@@ -256,12 +279,11 @@ impl Store {
             last_used: None,
             written_use: None,
         };
-        let record = json!({
-            "op": "create", "keyId": made.id, "accountId": account, "label": made.label,
-            "permissions": permissions.names(), "hash": key::hex(&made.hash), "createdAt": now,
-            "expiresAt": expires_at, "createdBy": made.created_by
-        });
-        self.write(&mut state, &record)?;
+        if let Err(e) = self.records.create(&made.row()) {
+            state.stale = true;
+            eprintln!("identity: writing key {}: {e}", made.id);
+            return Err(Refusal::unavailable("the key store could not be written; nothing was changed"));
+        }
         let mut answer = made.json();
         answer["secret"] = json!(secret);
         answer["credential"] = json!(format!("{}.{secret}", made.id));
@@ -271,7 +293,8 @@ impl Store {
 
     /// Every key of `account`, newest first.
     pub fn list(&self, account: u64) -> Value {
-        let state = locked(&self.state);
+        let mut state = locked(&self.state);
+        let _ = self.fresh(&mut state);
         let keys: Vec<Value> =
             state.by_account.get(&account).into_iter().flatten().rev().map(|id| state.keys[id].json()).collect();
         json!({"keys": keys})
@@ -280,14 +303,22 @@ impl Store {
     /// Revokes one of `account`'s keys. Revoking a key already revoked answers it as it is.
     pub fn revoke(&self, account: u64, key_id: &str, now: u64) -> Result<Value, Refusal> {
         let mut state = locked(&self.state);
+        self.fresh(&mut state)?;
         let found = state.keys.get(key_id).filter(|k| k.account == account);
         let found = found.ok_or_else(|| Refusal::not_found("no such key of this account"))?;
         if found.revoked_at.is_some() {
             return Ok(found.json());
         }
-        self.write(&mut state, &json!({"op": "revoke", "keyId": key_id, "at": now}))?;
+        let revoked_at = match self.records.revoke(key_id, now) {
+            Ok(at) => at,
+            Err(e) => {
+                state.stale = true;
+                eprintln!("identity: revoking key {key_id}: {e}");
+                return Err(Refusal::unavailable("the key store could not be written; nothing was changed"));
+            }
+        };
         let revoked = state.keys.get_mut(key_id).ok_or_else(|| Refusal::not_found("no such key of this account"))?;
-        revoked.revoked_at = Some(now);
+        revoked.revoked_at = Some(revoked_at);
         Ok(revoked.json())
     }
 
@@ -298,6 +329,9 @@ impl Store {
         let (id, secret) = key::split(credential).ok_or_else(invalid)?;
         let presented = key::hash(id, secret);
         let mut state = locked(&self.state);
+        // A revocation the records hold and memory might not: read them again if a write failed. If they cannot be
+        // read, memory answers, as it would have before the failed write.
+        let _ = self.fresh(&mut state);
         let found = state.keys.get(id).ok_or_else(invalid)?;
         if !key::same(&found.hash, &presented) {
             return Err(invalid());
@@ -316,7 +350,7 @@ impl Store {
         };
         let due = found.written_use.is_none_or(|t| now >= t.saturating_add(USED_EVERY_MS));
         // A use that cannot be written down is not a reason to refuse the key: it is only ever a minute out.
-        if due && self.write(&mut state, &json!({"op": "used", "keyId": id, "at": now})).is_ok() {
+        if due && self.records.used(id, now).is_ok() {
             if let Some(k) = state.keys.get_mut(id) {
                 k.written_use = Some(now);
             }
@@ -328,59 +362,11 @@ impl Store {
     }
 }
 
-fn insert(state: &mut State, made: Key) {
-    state.by_account.entry(made.account).or_default().push(made.id.clone());
-    state.keys.insert(made.id.clone(), made);
-}
-
-/// Applies one record of the file to what has been replayed so far.
-fn replay(state: &mut State, record: &Value) -> Result<(), String> {
-    let text = |name: &str| record[name].as_str().map(str::to_string).ok_or_else(|| format!("no {name}"));
-    let time = |name: &str| record[name].as_u64().ok_or_else(|| format!("no {name}"));
-    let id = text("keyId")?;
-    match record["op"].as_str() {
-        Some("create") => {
-            let names: Vec<&str> =
-                record["permissions"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-            let made = Key {
-                hash: key::unhex(&text("hash")?).ok_or("a malformed hash")?,
-                account: record["accountId"].as_u64().ok_or("no accountId")?,
-                label: text("label")?,
-                permissions: Permissions::from_names(names)?,
-                created_at: time("createdAt")?,
-                expires_at: record["expiresAt"].as_u64(),
-                revoked_at: None,
-                created_by: record["createdBy"].as_str().map(str::to_string),
-                last_used: None,
-                written_use: None,
-                id,
-            };
-            if state.keys.contains_key(&made.id) {
-                return Err(format!("key {} is created twice", made.id));
-            }
-            insert(state, made);
-        }
-        Some(op @ ("revoke" | "used")) => {
-            let at = time("at")?;
-            let found = state.keys.get_mut(&id).ok_or_else(|| format!("{op} of unknown key {id}"))?;
-            if op == "revoke" {
-                found.revoked_at = Some(at);
-            } else {
-                found.last_used = Some(at);
-                found.written_use = Some(at);
-            }
-        }
-        _ => return Err("an unknown record".into()),
-    }
-    Ok(())
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::records::Memory;
     use serde_json::Map;
-    use std::path::PathBuf;
-    use std::sync::Arc;
 
     /// A request body as the gateway passes it on, for tests.
     fn request(label: &str, permissions: &[&str], expires_at: Option<u64>) -> Value {
@@ -396,14 +382,12 @@ mod tests {
     /// 2026-09-17T00:00:00Z.
     const NOW: u64 = 1_789_603_200_000;
 
-    fn path(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("venue-identity-{name}-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        path
+    fn open(records: &Arc<dyn KeyRecords>) -> Store {
+        Store::open(Arc::clone(records), BTreeSet::from([1, 2])).expect("a store")
     }
 
-    fn open(path: &Path) -> Store {
-        Store::open(path, false, BTreeSet::from([1, 2])).expect("a store")
+    fn memory() -> Arc<dyn KeyRecords> {
+        Arc::new(Memory::default())
     }
 
     fn credential(created: &Value) -> String {
@@ -412,7 +396,7 @@ mod tests {
 
     #[test]
     fn a_created_key_verifies_only_with_its_own_secret() {
-        let store = open(&path("verify"));
+        let store = open(&memory());
         let created = store.create(1, &request("bot", &["read", "trade"], None), NOW).expect("created");
         let id = created["keyId"].as_str().expect("an ID");
         assert_eq!(created["permissions"], json!(["read", "trade"]));
@@ -444,7 +428,7 @@ mod tests {
 
     #[test]
     fn a_malformed_request_is_refused_and_makes_nothing() {
-        let store = open(&path("malformed"));
+        let store = open(&memory());
         for (why, account, body) in [
             ("no read", 1, request("x", &["trade"], None)),
             ("an unknown permission", 1, request("x", &["read", "admin"], None)),
@@ -462,7 +446,7 @@ mod tests {
 
     #[test]
     fn an_expired_key_is_refused_and_says_so_to_its_holder() {
-        let store = open(&path("expiry"));
+        let store = open(&memory());
         let created = store.create(1, &request("short", &["read"], Some(NOW + 1000)), NOW).expect("created");
         assert!(store.verify(&credential(&created), NOW + 999).is_ok());
         let refused = store.verify(&credential(&created), NOW + 1000).expect_err("expired");
@@ -471,7 +455,7 @@ mod tests {
 
     #[test]
     fn a_revoked_key_is_refused_for_good_and_only_its_account_can_revoke_it() {
-        let store = open(&path("revoke"));
+        let store = open(&memory());
         let created = store.create(1, &request("gone", &["read", "transfers"], None), NOW).expect("created");
         let id = created["keyId"].as_str().expect("an ID");
         assert_eq!(store.revoke(2, id, NOW).expect_err("another account's").status, 404);
@@ -486,7 +470,7 @@ mod tests {
 
     #[test]
     fn an_account_holds_a_bounded_number_of_active_keys() {
-        let store = open(&path("bounded"));
+        let store = open(&memory());
         let made: Vec<Value> = (0..MAX_ACTIVE)
             .map(|i| store.create(2, &request(&format!("k{i}"), &["read"], None), NOW).expect("created"))
             .collect();
@@ -498,11 +482,10 @@ mod tests {
         assert_eq!(listed["keys"].as_array().map(Vec::len), Some(MAX_ACTIVE + 1));
     }
 
-    #[test]
-    fn the_store_replays_keys_revocations_and_uses_and_survives_a_cut_off_line() {
-        let file = path("replay");
+    /// Keys, revocations and uses outlive the store; a secret is never written anywhere.
+    pub(crate) fn keys_revocations_and_uses_survive_a_restart(records: &Arc<dyn KeyRecords>) {
         let (kept, revoked, used) = {
-            let store = open(&file);
+            let store = open(records);
             let kept =
                 store.create(1, &request("kept", &["read", "trade"], Some(NOW + 3_600_000)), NOW).expect("created");
             let mut child = request("child", &["read"], None);
@@ -514,34 +497,42 @@ mod tests {
             store.verify(&credential(&kept), NOW + 30).expect("used again");
             (kept, revoked, store.list(1))
         };
-        let text = std::fs::read_to_string(&file).expect("read");
-        assert_eq!(text.lines().filter(|l| l.contains("\"used\"")).count(), 1, "{text}");
-        assert!(!text.contains(kept["secret"].as_str().expect("a secret")), "a secret was written");
-        // A stop in the middle of a write.
-        let mut cut = std::fs::OpenOptions::new().append(true).open(&file).expect("opened");
-        cut.write_all(br#"{"op":"revoke","keyId":"#).expect("written");
-        drop(cut);
-
-        let store = open(&file);
+        let store = open(records);
         let replayed = store.list(1);
         assert_eq!(replayed["keys"][0]["createdBy"], kept["keyId"]);
         assert_eq!(replayed["keys"][1]["lastUsedAt"], clock::rfc3339(NOW + 20), "the last use written survives");
         assert_eq!(used["keys"][0], replayed["keys"][0]);
-        assert!(store.verify(&credential(&kept), NOW + 40).is_ok(), "a kept key verifies after replay");
+        assert!(store.verify(&credential(&kept), NOW + 40).is_ok(), "a kept key verifies after a restart");
         assert_eq!(store.verify(&credential(&revoked), NOW + 40).expect_err("still revoked").status, 401);
-        // The cut line went, and new records follow whole lines.
-        store.create(1, &request("after", &["read"], None), NOW + 50).expect("created");
-        drop(store);
-        assert_eq!(open(&file).list(1)["keys"].as_array().map(Vec::len), Some(3));
-
-        std::fs::write(&file, "{\"format\":\"something-else\"}\n").expect("written");
-        assert!(Store::open(&file, false, BTreeSet::new()).is_err(), "a foreign file is refused");
+        let rows = records.load_keys().expect("readable");
+        let secret = kept["secret"].as_str().expect("a secret");
+        assert!(rows.iter().all(|r| !format!("{r:?}").contains(secret)), "a secret was written");
     }
 
     #[test]
-    fn many_threads_create_verify_and_revoke_at_once() {
-        let file = path("concurrent");
-        let store = Arc::new(open(&file));
+    fn keys_revocations_and_uses_survive_a_restart_in_memory() {
+        keys_revocations_and_uses_survive_a_restart(&memory());
+    }
+
+    #[test]
+    fn records_that_cannot_be_written_refuse_changes_and_verification_carries_on() {
+        let memory = Memory::default();
+        let records: Arc<dyn KeyRecords> = Arc::new(memory.clone());
+        let store = open(&records);
+        let created = store.create(1, &request("bot", &["read"], None), NOW).expect("created");
+        memory.set_down(true);
+        assert_eq!(store.create(1, &request("more", &["read"], None), NOW).expect_err("down").status, 503);
+        let id = created["keyId"].as_str().expect("an ID");
+        assert_eq!(store.revoke(1, id, NOW).expect_err("down").status, 503);
+        assert!(store.verify(&credential(&created), NOW + 1).is_ok(), "verified from memory");
+        assert!(store.health().is_err());
+        memory.set_down(false);
+        store.revoke(1, id, NOW + 2).expect("revoked once the records are back");
+        assert!(store.verify(&credential(&created), NOW + 3).is_err());
+    }
+
+    pub(crate) fn many_threads_create_verify_and_revoke_at_once(records: &Arc<dyn KeyRecords>) {
+        let store = Arc::new(open(records));
         let threads: Vec<_> = (0..8)
             .map(|t| {
                 let store = Arc::clone(&store);
@@ -567,8 +558,13 @@ mod tests {
             .collect();
         let made: Vec<Value> = threads.into_iter().flat_map(|t| t.join().expect("a thread")).collect();
         drop(store);
-        let store = open(&file);
+        let store = open(records);
         let valid = made.iter().filter(|c| store.verify(&credential(c), NOW).is_ok()).count();
         assert_eq!((made.len(), valid), (40, 24));
+    }
+
+    #[test]
+    fn many_threads_create_verify_and_revoke_at_once_in_memory() {
+        many_threads_create_verify_and_revoke_at_once(&memory());
     }
 }

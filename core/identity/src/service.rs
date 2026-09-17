@@ -7,7 +7,8 @@
 //! - `GET /v1/accounts/{accountId}/keys`
 //! - `DELETE /v1/accounts/{accountId}/keys/{keyId}`
 //! - `POST /v1/verify`: `{"credential"}`, answered `{"keyId", "accountId", "permissions", "expiresAt"}` or 401
-//! - `GET /healthz`
+//! - `GET /healthz`: `{"ready": true, "database": "ok"}`, or 503 when the key store cannot be reached (the pod is then
+//!   not ready, and gateways answer keys they have not verified recently with 503)
 //!
 //! One thread per connection and one request per connection, like the treasury's: gateways ask about a key once every
 //! few seconds, and people manage keys by hand.
@@ -114,7 +115,10 @@ fn route(store: &Store, request: &Request) -> Result<Value, Refusal> {
     let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
     let now = clock::wall_ms();
     match (request.method.as_str(), segments.as_slice()) {
-        ("GET", ["healthz"]) => Ok(json!({"ready": true})),
+        ("GET", ["healthz"]) => match store.health() {
+            Ok(()) => Ok(json!({"ready": true, "database": "ok"})),
+            Err(e) => Err(Refusal::unavailable(format!("the key store is unavailable: {e}"))),
+        },
         ("POST", ["v1", "verify"]) => {
             let body = json_body(request)?;
             let credential = body["credential"].as_str().ok_or_else(|| Refusal::bad("credential is required"))?;
@@ -148,16 +152,13 @@ mod tests {
 
     #[test]
     fn keys_are_made_verified_listed_and_revoked_over_http() {
-        let store = std::env::temp_dir().join(format!("venue-identity-http-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&store);
         let settings = Settings {
             catalogue: concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/charts/venue-mini/files/markets.json").into(),
-            store,
-            fsync: false,
         };
+        let records = crate::records(&crate::Storage::Memory(crate::records::Memory::default())).expect("records");
         let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
         let a = listener.local_addr().expect("an address").to_string();
-        crate::start(&settings, listener).expect("started");
+        crate::start(&settings, records, listener).expect("started");
 
         assert_eq!(call(&a, "GET", "/healthz", None).0, 200);
         let (status, created) =

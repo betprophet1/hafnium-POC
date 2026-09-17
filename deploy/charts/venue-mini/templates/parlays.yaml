@@ -21,29 +21,11 @@ spec:
       port: 7104
       targetPort: operator
 ---
-# The approved responders outlive the pod: an operator's approvals and revocations should not quietly revert to the
-# catalogue's list when the pod is replaced.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: {{ $name }}-parlays
-  labels:
-    {{- include "venue-mini.labels" . | nindent 4 }}
-    app.kubernetes.io/component: parlays
-spec:
-  accessModes: ["ReadWriteOnce"]
-  {{- with .Values.parlays.storage.className }}
-  storageClassName: {{ . }}
-  {{- end }}
-  resources:
-    requests:
-      storage: {{ .Values.parlays.storage.size }}
----
 # The parlay service (core/parlays): lists a parlay on its first request for quote, relays requests to the subscribed
 # sessions of approved responders and their quotes to the requester through the gateway, and settles parlays from
 # their legs. It sequences as an operator, like the seed job, and holds open requests and subscriptions in memory:
 # replacing its pod forgets them (the gateway subscribes its sessions again), while parlays and quotes, which are
-# listings and orders, stay in the journal, and the approved responders stay in their file.
+# listings and orders, stay in the journal, and the approved responders stay in its PostgreSQL database.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -87,8 +69,7 @@ spec:
             # No parlay is listed that would take the core past 95% of its profile, which the oracle's rounds share.
             - name: VENUE_CAPACITY
               value: {{ .Values.core.capacity | quote }}
-            - name: VENUE_RESPONDERS
-              value: /var/lib/parlays/responders.json
+            {{- include "venue-mini.databaseEnv" (dict "ctx" . "service" "parlays") | trim | nindent 12 }}
             - name: VENUE_OPERATOR
               value: "0.0.0.0:7104"
             - name: VENUE_MIN_QUANTITY
@@ -111,15 +92,12 @@ spec:
           volumeMounts:
             - name: catalogue
               mountPath: /catalogue
-            - name: responders
-              mountPath: /var/lib/parlays
+            {{- include "venue-mini.databaseCaMount" . | trim | nindent 12 }}
       volumes:
         - name: catalogue
           configMap:
             name: {{ $name }}-catalogue
-        - name: responders
-          persistentVolumeClaim:
-            claimName: {{ $name }}-parlays
+        {{- include "venue-mini.databaseCaVolume" . | trim | nindent 8 }}
 ---
 # Only the gateway talks to the parlay service (requests, quotes, subscriptions), and nothing in the cluster reaches its
 # operator API: approving a responder is a person's act, through `kubectl port-forward svc/<release>-parlays 7104`,

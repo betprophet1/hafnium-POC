@@ -138,3 +138,80 @@ containers:
       - name: audit
         mountPath: /var/lib/gateway-audit
 {{- end -}}
+
+{{/*
+The services that keep their records in PostgreSQL and are enabled, in the order migrations run.
+*/}}
+{{- define "venue-mini.databaseServices" -}}
+{{- $services := list -}}
+{{- range $service := list "treasury" "identity" "parlays" "oracle" -}}
+{{- if (index $.Values $service).enabled -}}
+{{- $services = append $services $service -}}
+{{- end -}}
+{{- end -}}
+{{- join " " $services -}}
+{{- end -}}
+
+{{- define "venue-mini.postgresSecret" -}}
+{{- .Values.postgres.existingSecret | default (printf "%s-postgres" (include "venue-mini.fullname" .)) -}}
+{{- end -}}
+
+{{/*
+The environment that tells a service where its database is: `service` one of treasury, identity, parlays, oracle, and
+`ctx` the chart's root. In-cluster, the URL is put together from the service's generated password (URL-safe); outside,
+it comes whole from a Secret.
+*/}}
+{{- define "venue-mini.databaseEnv" -}}
+{{- $ := .ctx -}}
+{{- $db := index $.Values.database .service -}}
+{{- if $.Values.postgres.enabled }}
+- name: DATABASE_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "venue-mini.postgresSecret" $ }}
+      key: {{ .service }}-password
+- name: VENUE_DATABASE_URL
+  value: "postgres://{{ .service }}:$(DATABASE_PASSWORD)@{{ include "venue-mini.fullname" $ }}-postgres:5432/{{ .service }}"
+# The pod network, confined by network policy to the owning services.
+- name: VENUE_DATABASE_TLS
+  value: disable
+{{- else }}
+- name: VENUE_DATABASE_URL
+  valueFrom:
+    secretKeyRef:
+      {{- if $db.existingSecret }}
+      name: {{ $db.existingSecret }}
+      key: {{ $db.existingSecretKey }}
+      {{- else }}
+      name: {{ include "venue-mini.fullname" $ }}-database
+      key: {{ .service }}-url
+      {{- end }}
+- name: VENUE_DATABASE_TLS
+  value: {{ $.Values.database.tls | quote }}
+{{- if $.Values.database.caSecret }}
+- name: VENUE_DATABASE_CA_FILE
+  value: /etc/venue/database-ca/ca.pem
+{{- end }}
+{{- end }}
+- name: VENUE_DATABASE_SCHEMA
+  value: {{ .service }}
+- name: VENUE_DATABASE_POOL_SIZE
+  value: {{ $.Values.database.poolSize | quote }}
+{{- end -}}
+
+{{/* The CA bundle's volume mount and volume, for external databases that give one. */}}
+{{- define "venue-mini.databaseCaMount" -}}
+{{- if and (not .Values.postgres.enabled) .Values.database.caSecret }}
+- name: database-ca
+  mountPath: /etc/venue/database-ca
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{- define "venue-mini.databaseCaVolume" -}}
+{{- if and (not .Values.postgres.enabled) .Values.database.caSecret }}
+- name: database-ca
+  secret:
+    secretName: {{ .Values.database.caSecret }}
+{{- end }}
+{{- end -}}

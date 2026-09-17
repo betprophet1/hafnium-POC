@@ -1,0 +1,20 @@
+[package]
+name = "venue-store"
+version = "0.1.0"
+description = "The services' PostgreSQL: connecting by URL, a small pool, versioned migrations and transactions"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The synchronous client: the services are threads, not tasks; it runs its own small runtime per connection.
+postgres = "0.19"
+# TLS to the database, for managed databases that require it (and verify-full wherever the network is not trusted).
+postgres-openssl = "0.5"
+openssl = "0.10"
+# A migration's checksum; the workspace already builds with it.
+sha2 = "0.11"

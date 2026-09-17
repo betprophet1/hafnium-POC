@@ -10,9 +10,11 @@
 //! API is sequenced with source `OPERATOR`, so the journal says who decided each phase.
 //!
 //! State: the calendar's decisions are derived from the journal, so a restarted oracle carries on where the venue
-//! is. Resolution cases, postponements and suspensions by hand live only in this process; after a restart a case is
-//! opened afresh for any event still waiting, and its sources report the same outcomes, because they are drawn from
-//! the seed and the event.
+//! is. Resolution cases (reports, proposals, sign-offs, disputes, history), postponements and suspensions by hand are
+//! written to PostgreSQL (`cases.rs`) whenever they change, before anything is done about the change, and read back at
+//! start, so a restarted oracle carries each case on where it was. While the database cannot be reached, cases do not
+//! move and manual actions on them are refused; the calendar carries on. Without a database (`--store memory`) they
+//! live only in this process, and a case is opened afresh after a restart.
 //!
 //! Time: every timer runs on the sequencer's clock, which the oracle reads from the feed. The node leaves ticks that
 //! change nothing off its feed, so while the venue is quiet the last time the feed carried stands still; the oracle
@@ -37,6 +39,7 @@
 //! | `POST /oracle/events/{event}/postpone` `{"seconds": n}` | holds a round that has not started |
 
 use crate::calendar::{Calendar, Facts, Step, Timing, NANOS};
+use crate::cases::CaseStore;
 use crate::resolution::{Action, Case, Outcome, Source, Stage};
 use crate::session::monotonic;
 use serde_json::{json, Value};
@@ -75,6 +78,8 @@ pub struct Oracle {
     desk: Mutex<Desk>,
     /// The last sequencer time the feed carried, and when this process saw it: see the module comment, on time.
     clock: Mutex<(u64, Instant)>,
+    /// Where cases and manual actions are kept; `None`: memory only.
+    store: Option<CaseStore>,
 }
 
 /// What the oracle holds that the journal does not.
@@ -88,6 +93,8 @@ struct Desk {
     sent: BTreeMap<u64, u64>,
     /// Why listing is paused, if it is.
     paused: Option<String>,
+    /// Why cases are paused, if they are: the records could not be written.
+    cases_paused: Option<String>,
 }
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -123,6 +130,7 @@ impl Oracle {
         capacity: Capacity,
         live: Arc<Live>,
         ingress: Ingress,
+        store: Option<CaseStore>,
     ) -> Result<Self, Error> {
         for template in calendar.templates.keys() {
             if !catalogue.templates().contains(template) {
@@ -131,14 +139,35 @@ impl Oracle {
         }
         let ids = Ids::new('o')?;
         let clock = Mutex::new((0, monotonic()));
+        let mut desk = Desk::default();
+        if let Some(store) = &store {
+            let held = store.load(RECENT * 4).map_err(|e| format!("reading the oracle's cases: {e}"))?;
+            for case in held.cases {
+                // A case that was sequencing when the oracle stopped sends its ResolveEvent again at once, under the
+                // same command ID, which the sequencer group deduplicates.
+                if matches!(case.stage, Stage::Sequencing(_)) {
+                    desk.sent.insert(case.event, 0);
+                }
+                desk.cases.insert(case.event, case);
+            }
+            desk.holds = held.holds;
+            desk.suspended_by_hand = held.suspended_by_hand;
+            eprintln!(
+                "oracle: {} cases, {} postponements and {} suspensions by hand read from the database",
+                desk.cases.len(),
+                desk.holds.len(),
+                desk.suspended_by_hand.len()
+            );
+        }
         Ok(Self {
             calendar,
             catalogue,
             capacity,
             live,
             ingress: Mutex::new((ingress, ids)),
-            desk: Mutex::default(),
+            desk: Mutex::new(desk),
             clock,
+            store,
         })
     }
 
@@ -260,6 +289,7 @@ impl Oracle {
             return Vec::new();
         }
         let mut desk = locked(&self.desk);
+        let before = (desk.cases.clone(), desk.sent.clone());
         let mut ids_guard = locked(&self.ingress);
         let ids = &mut ids_guard.1;
         let mut batch = Batch::new();
@@ -318,7 +348,74 @@ impl Oracle {
             }
         }
         self.tick_cases(&view, now, &mut desk, &mut batch);
+        self.persist(&mut desk, before, &mut batch);
         batch
+    }
+
+    /// Writes every case this pass changed, before its commands are sent. A case that cannot be written is put back as
+    /// it was and its `ResolveEvent` is not sent: cases are paused until the records answer again.
+    fn persist(&self, desk: &mut Desk, before: (BTreeMap<u64, Case>, BTreeMap<u64, u64>), batch: &mut Batch) {
+        let Some(store) = &self.store else { return };
+        let (cases, sent) = before;
+        let changed: Vec<u64> = desk
+            .cases
+            .iter()
+            .filter(|(event, case)| cases.get(event) != Some(*case))
+            .map(|(event, _)| *event)
+            .collect();
+        let mut failure = None;
+        let quiet = changed.is_empty();
+        for event in changed {
+            let Some(case) = desk.cases.get(&event) else { continue };
+            if let Err(e) = store.save(case) {
+                match cases.get(&event) {
+                    Some(old) => desk.cases.insert(event, old.clone()),
+                    None => desk.cases.remove(&event),
+                };
+                match sent.get(&event) {
+                    Some(at) => desk.sent.insert(event, *at),
+                    None => desk.sent.remove(&event),
+                };
+                let resolve = format!("resolve {event}");
+                batch.retain(|(what, _)| *what != resolve);
+                failure = Some(e.to_string());
+            }
+        }
+        match (failure, desk.cases_paused.is_some()) {
+            (Some(e), false) => {
+                eprintln!("oracle: cases paused, their records could not be written: {e}");
+                desk.cases_paused = Some(format!("cases paused: the oracle's database is unavailable ({e})"));
+            }
+            // Nothing was written this pass: only an answering database lifts the pause.
+            (None, true) if quiet && store.ping().is_err() => {}
+            (None, true) => {
+                eprintln!("oracle: cases carry on, their records can be written again");
+                desk.cases_paused = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Writes one case after a manual action, or refuses the action.
+    fn save_case(&self, desk: &Desk, event: u64) -> Result<(), Refusal> {
+        match (&self.store, desk.cases.get(&event)) {
+            (Some(store), Some(case)) => store.save(case).map_err(|e| {
+                eprintln!("oracle: case {event} could not be written: {e}");
+                Refusal(503, format!("the oracle's database is unavailable, nothing was done: {e}"))
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Writes a manual postponement or suspension, or refuses the action.
+    fn save_manual(&self, write: impl FnOnce(&CaseStore) -> Result<(), venue_store::Error>) -> Result<(), Refusal> {
+        match &self.store {
+            Some(store) => write(store).map_err(|e| {
+                eprintln!("oracle: a manual action could not be written: {e}");
+                Refusal(503, format!("the oracle's database is unavailable, nothing was done: {e}"))
+            }),
+            None => Ok(()),
+        }
     }
 
     fn tick_cases(&self, view: &View, now: u64, desk: &mut Desk, batch: &mut Batch) {
@@ -460,7 +557,7 @@ impl Oracle {
             .filter_map(|&(_, id)| self.event_json(&view, now, &desk, id))
             .collect();
         json!({
-            "now": ms(now), "templates": templates, "events": events, "listing": desk.paused,
+            "now": ms(now), "templates": templates, "events": events, "listing": desk.paused, "cases": desk.cases_paused,
             "disputeSeconds": self.calendar.timers.dispute / NANOS,
             "tiebreakSeconds": self.calendar.timers.tiebreak / NANOS,
             "escalationSeconds": self.calendar.timers.escalation / NANOS
@@ -563,12 +660,17 @@ impl Oracle {
                     };
                     match action {
                         "suspend" => {
+                            self.save_manual(|s| s.suspended_by_hand(event, true))?;
                             desk.suspended_by_hand.insert(event);
                         }
                         "resume" => {
+                            self.save_manual(|s| s.suspended_by_hand(event, false))?;
                             desk.suspended_by_hand.remove(&event);
                         }
                         _ => {}
+                    }
+                    if desk.holds.contains_key(&event) {
+                        self.save_manual(|s| s.hold(event, None))?;
                     }
                     desk.holds.remove(&event);
                     batch.push((what, vec![Self::phase(ids, event, phase, "OPERATOR")]));
@@ -587,15 +689,28 @@ impl Oracle {
                     };
                     let evidence =
                         body["evidence"].as_str().unwrap_or("proposed through the dummy oracle's control API");
+                    let before = desk.cases.get(&event).cloned();
                     let case = desk.cases.entry(event).or_insert_with(|| Case::open(event, states, now));
                     case.operator_propose(outcome, format!("operator: {evidence}"), now, timers, &names)
                         .map_err(|e| Refusal(400, e))?;
+                    if let Err(refusal) = self.save_case(&desk, event) {
+                        match before {
+                            Some(old) => desk.cases.insert(event, old),
+                            None => desk.cases.remove(&event),
+                        };
+                        return Err(refusal);
+                    }
                 }
                 "dispute" => {
                     let reason = body["reason"].as_str().unwrap_or("disputed through the control API");
                     let case =
                         desk.cases.get_mut(&event).ok_or_else(|| Refusal(400, "the event has no case".into()))?;
+                    let before = case.clone();
                     case.dispute(reason, now).map_err(|e| Refusal(400, e))?;
+                    if let Err(refusal) = self.save_case(&desk, event) {
+                        desk.cases.insert(event, before);
+                        return Err(refusal);
+                    }
                 }
                 "postpone" => {
                     if e.started {
@@ -605,6 +720,7 @@ impl Oracle {
                     let seconds = seconds.ok_or_else(|| Refusal(400, "seconds must be from 1 to 86400".into()))?;
                     let from = self.timing(event).map_or(now, |t| Calendar::start_at(t, &facts)).max(now);
                     let until = desk.holds.get(&event).copied().unwrap_or(from).max(from) + seconds * NANOS;
+                    self.save_manual(|s| s.hold(event, Some(until)))?;
                     desk.holds.insert(event, until);
                     eprintln!("oracle: postpone {event} by hand for {seconds} s");
                 }
@@ -625,7 +741,13 @@ impl Oracle {
         let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
         let number = |s: &str| s.parse::<u64>().map_err(|_| Refusal(404, format!("{s} is not an ID")));
         match (method, segments.as_slice()) {
-            ("GET", ["oracle", "healthz"]) => Ok(json!({"ready": locked(&self.live.view).now > 0})),
+            ("GET", ["oracle", "healthz"]) => {
+                let database = match &self.store {
+                    None => "none".to_string(),
+                    Some(store) => store.ping().map_or_else(|e| format!("unavailable: {e}"), |()| "ok".to_string()),
+                };
+                Ok(json!({"ready": locked(&self.live.view).now > 0, "database": database}))
+            }
             ("GET", ["oracle", "schedule"]) => Ok(self.schedule()),
             ("POST", ["oracle", "templates", template, "list"]) => {
                 let template = number(template)?;

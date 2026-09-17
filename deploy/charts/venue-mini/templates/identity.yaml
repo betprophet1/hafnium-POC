@@ -15,26 +15,9 @@ spec:
       port: 8084
       targetPort: http
 ---
-# The key store outlives the pod: a service that forgot its keys would lock every firm out, and one that forgot a
-# revocation would let a leaked key back in.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: {{ $name }}-identity
-  labels:
-    {{- include "venue-mini.labels" . | nindent 4 }}
-    app.kubernetes.io/component: identity
-spec:
-  accessModes: ["ReadWriteOnce"]
-  {{- with .Values.identity.storage.className }}
-  storageClassName: {{ . }}
-  {{- end }}
-  resources:
-    requests:
-      storage: {{ .Values.identity.storage.size }}
----
 # The identity service of test environments (core/identity): API keys, their permissions, and their verification for
-# the gateway. One writer to its store, so an old pod stops before a new one starts.
+# the gateway, the environment's accounts and keys in PostgreSQL. One writer, so an old pod stops before a new one
+# starts.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -67,10 +50,7 @@ spec:
               value: "0.0.0.0:8084"
             - name: VENUE_CATALOGUE
               value: /catalogue/markets.json
-            - name: VENUE_STORE
-              value: /var/lib/identity/keys.jsonl
-            - name: VENUE_FSYNC
-              value: {{ .Values.identity.fsync | quote }}
+            {{- include "venue-mini.databaseEnv" (dict "ctx" . "service" "identity") | trim | nindent 12 }}
           ports:
             - name: http
               containerPort: 8084
@@ -88,15 +68,12 @@ spec:
           volumeMounts:
             - name: catalogue
               mountPath: /catalogue
-            - name: store
-              mountPath: /var/lib/identity
+            {{- include "venue-mini.databaseCaMount" . | trim | nindent 12 }}
       volumes:
         - name: catalogue
           configMap:
             name: {{ $name }}-catalogue
-        - name: store
-          persistentVolumeClaim:
-            claimName: {{ $name }}-identity
+        {{- include "venue-mini.databaseCaVolume" . | trim | nindent 8 }}
 ---
 # The identity service trusts the account a request names and answers whether a secret is right, so only the
 # gateway, which authenticated the account and checked what it may do, may reach it.

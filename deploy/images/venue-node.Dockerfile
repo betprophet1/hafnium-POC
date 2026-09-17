@@ -4,6 +4,8 @@
 # The toolchain comes from core/rust-toolchain.toml; release profile, as every environment runs (blueprint §16).
 
 FROM rust:1.96.0-slim-bookworm AS build
+# OpenSSL's headers, for TLS to PostgreSQL (core/store).
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY core/ core/
 RUN cd core && cargo build --release --locked -p venue-node -p venue-gateway -p venue-parlays -p venue-sim -p venue-treasury -p venue-identity
@@ -12,7 +14,10 @@ FROM debian:bookworm-slim
 # tini runs as PID 1 so SIGTERM stops the binaries at once. The kernel gives PID 1 no default signal actions, and a
 # process ignoring SIGTERM holds its sessions open until the kill after the grace period; a deleted maker pod would
 # keep quoting beside its replacement.
-RUN apt-get update && apt-get install -y --no-install-recommends tini && rm -rf /var/lib/apt/lists/*
+# libssl3 and the CA certificates: the services reach PostgreSQL over TLS where it is configured (verify-full checks
+# the server against these CAs unless a CA file is given).
+RUN apt-get update && apt-get install -y --no-install-recommends tini libssl3 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --home-dir /var/lib/venue venue \
  && mkdir -p /var/lib/venue && chown 10001:10001 /var/lib/venue
 COPY --from=build /src/core/target/release/venue-node /src/core/target/release/venue-gateway \

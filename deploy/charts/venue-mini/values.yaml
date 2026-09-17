@@ -36,7 +36,7 @@ web:
   enabled: true
 
 # The dummy treasury (core/treasury): deposits and withdrawals on the gateway's private half (/v4/transfers), a
-# double-entry ledger kept on a volume of its own, and a fake bank. Without it the page's account tab cannot move money
+# double-entry ledger kept in its PostgreSQL database (database.treasury), and a fake bank. Without it the page's account tab cannot move money
 # and /v4/transfers answers 503.
 treasury:
   enabled: true
@@ -57,27 +57,81 @@ treasury:
   reconciliation:
     everyMs: 60000
     graceMs: 10000
-  storage:
-    size: 256Mi
-    # Empty uses the cluster's default class (k3d: local-path).
-    className: ""
-# The identity service of test environments (core/identity): API keys with permissions, made, listed and revoked on
-# the gateway's private half (/v4/keys) and kept in a store on a volume of its own. Without it the gateway refuses keys
-# and only the catalogue's dev tokens work. Test environments only: production identity is interface 6.
+# The identity service of test environments (core/identity): the environment's accounts and their API keys with
+# permissions, made, listed and revoked on the gateway's private half (/v4/keys) and kept in its PostgreSQL database
+# (database.identity). Without it the gateway refuses keys and only the catalogue's dev tokens work. Test environments
+# only: production identity is interface 6.
 identity:
   enabled: true
-  fsync: true
-  storage:
-    size: 64Mi
-    # Empty uses the cluster's default class (k3d: local-path).
-    className: ""
 # The dummy oracle: lists a new round of each demo market on the calendar in files/calendar.json, runs it (start,
 # sometimes a suspension, end, close) and settles it through proposal, auto-approval and a dispute window, voiding one
 # now and then. The settlement tab drives it. Off, the markets the seed lists stay open until someone settles them.
 # The seed has the engine release a settled round half an hour after it resolves, so the calendar runs indefinitely
-# on the small capacity profile.
+# on the small capacity profile. Its resolution cases, and what operators did by hand, are kept in its PostgreSQL
+# database (database.oracle), so a replaced pod carries on where it was.
 oracle:
   enabled: true
+
+# PostgreSQL for the services' records (core/store): the treasury, identity, parlay and oracle services each own a
+# database and a role of their own, and only they, and the migrate job, may reach it (network policy). Either this
+# chart runs one server for all of them (postgres.enabled), or each service is given the URL of a database elsewhere,
+# self-hosted or managed (RDS, Aurora), under database.<service>: the code is the same either way.
+postgres:
+  # true: a PostgreSQL StatefulSet of one, on a volume of its own, with a database, role and password per service
+  # generated into the Secret <release>-postgres (kept across upgrades) unless existingSecret names one.
+  enabled: true
+  image:
+    repository: postgres
+    # Pinned by tag and digest, as ./check's test database is.
+    tag: 18.6-alpine3.24@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
+  # A Secret of your own instead of the generated one, with keys postgres-password and <service>-password for each
+  # service (treasury, identity, parlays, oracle).
+  existingSecret: ""
+  storage:
+    size: 1Gi
+    # Empty uses the cluster's default class (k3d: local-path).
+    className: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+# Where each service's database is when postgres.enabled is false: a URL (postgres://USER:PASSWORD@HOST:5432/DB),
+# given inline (the chart keeps it in a Secret) or as a key of an existing Secret. Nothing else changes between an
+# in-cluster, self-hosted or managed database.
+database:
+  # TLS for external databases (core/store/README.md): disable, prefer, require, verify-ca or verify-full. Managed
+  # databases: verify-full, with the provider's CA bundle in caSecret. This setting overrides a URL's own sslmode.
+  tls: verify-full
+  # A Secret with the CA bundle under the key ca.pem, mounted into every service that reaches a database; empty uses the
+  # image's system CAs.
+  caSecret: ""
+  # Connections each service opens at most.
+  poolSize: 4
+  treasury:
+    url: ""
+    existingSecret: ""
+    existingSecretKey: url
+  identity:
+    url: ""
+    existingSecret: ""
+    existingSecretKey: url
+  parlays:
+    url: ""
+    existingSecret: ""
+    existingSecretKey: url
+  oracle:
+    url: ""
+    existingSecret: ""
+    existingSecretKey: url
+
+# Schema migrations (core/store/README.md): each service's `migrate`, run by one Job before the services need them
+# (a Helm pre-install and pre-upgrade hook; in the release that creates an in-cluster PostgreSQL, a Job beside it,
+# which the services wait for). Each migration run takes an advisory lock, so two runs never collide.
+migrations:
+  backoffLimit: 20
 
 # Interface 1. Flood limits per WebSocket session, and per account for REST: messages a second and burst, logons a
 # minute per account (blueprint §12). Set well above what the page and bots need: a maker requoting every market can
@@ -170,7 +224,7 @@ fix:
 
 # The parlay service: parlays listed on request, requests for quote routed to approved responders that subscribe, and
 # settlement from the legs. Responders start from the catalogue's "responder": true accounts and are approved and
-# revoked through its operator API on port 7104, kept on a volume of their own. A request accepts quotes for
+# revoked through its operator API on port 7104, kept in its PostgreSQL database (database.parlays). A request accepts quotes for
 # windowSeconds of sequencer time, and is for at least minQuantity contracts (a multiple of the lot step, 10). Every
 # book reserves its levels until the engine releases it, half an hour after it settles, so the venue carries at most
 # maxParlays at once: a parlay's ladder has 279 rows, 558 levels, of the small profile's 131 072. It also holds, like
@@ -180,10 +234,6 @@ parlays:
   windowSeconds: 30
   maxParlays: 100
   minQuantity: 10
-  storage:
-    size: 16Mi
-    # Empty uses the cluster's default class (k3d: local-path).
-    className: ""
 
 # Synthetic traders, clients of the gateway. Each acts as the catalogue account its dev token names. The maker holds a
 # WebSocket session with cancel-on-disconnect, so replacing its pod pulls its quotes; the taker uses REST.

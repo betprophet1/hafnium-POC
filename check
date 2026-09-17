@@ -2,12 +2,15 @@
 # Every gate in the repository, in order:
 #   1. blueprint: structure, consistency, figure geometry, Chromium widths (when installed)
 #   2. separation: no change touches core/engine/ together with the specification or schema (AGENTS.md)
-#   3. core/ci.sh: interfaces, reference model, test vectors, engine guardrails, Rust, engine results
-#   4. the FIX adapter's integration test (when its Java toolchain has been bootstrapped)
+#   3. PostgreSQL for the database tests: a throwaway server in a container (when Docker is usable), removed on exit
+#   4. core/ci.sh: interfaces, reference model, test vectors, engine guardrails, Rust, engine results
+#   5. the FIX adapter's integration test (when its Java toolchain has been bootstrapped)
 #
 # Environment: JAVA and SBE_JAR revalidate the schema and regenerate core/journal; ENGINE_REQUIRED=1 makes engine
 # results fatal; CHECK_RANGE=base..head checks those commits for separation (default: main..HEAD off main);
 # ALLOW_SPEC_AND_ENGINE=1 skips the separation gate for a reviewed change that must touch both.
+# VENUE_TEST_DATABASE_URL names a PostgreSQL server for the database tests instead of the container (each test makes a
+# schema of its own on it); VENUE_CHECK_POSTGRES=0 runs without one, and the database tests say they were skipped.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 step() { printf '\n== %s\n' "$*"; }
@@ -52,6 +55,52 @@ elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
   fi
 else
   echo "not a git checkout: skipped"
+fi
+
+step "PostgreSQL for the database tests"
+# The image the chart runs (deploy/charts/venue-mini/values.yaml, postgres.image), pinned by tag and digest.
+POSTGRES_IMAGE="postgres:18.6-alpine3.24@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2"
+docker_cmd=()
+if docker info >/dev/null 2>&1; then
+  docker_cmd=(docker)
+elif command -v sg >/dev/null 2>&1 && sg docker -c "docker info" >/dev/null 2>&1; then
+  docker_cmd=(sg_docker)
+fi
+sg_docker() { sg docker -c "$(printf '%q ' docker "$@")"; }
+postgres_container=""
+remove_postgres() {
+  if [[ -n "$postgres_container" ]]; then
+    "${docker_cmd[@]}" rm -f "$postgres_container" >/dev/null 2>&1 || true
+  fi
+}
+trap remove_postgres EXIT
+if [[ -n "${VENUE_TEST_DATABASE_URL:-}" ]]; then
+  echo "using VENUE_TEST_DATABASE_URL as it is set"
+elif [[ "${VENUE_CHECK_POSTGRES:-1}" == "0" ]]; then
+  echo "VENUE_CHECK_POSTGRES=0: the database tests will be skipped"
+elif [[ ${#docker_cmd[@]} -eq 0 ]]; then
+  echo "skipping PostgreSQL: Docker is not usable here (docker info failed), so the database tests will be skipped"
+else
+  # A free loopback port, never another interface.
+  port=""
+  for candidate in $(seq "${VENUE_CHECK_POSTGRES_PORT:-18410}" 18449); do
+    if ! (exec 3<>"/dev/tcp/127.0.0.1/$candidate") 2>/dev/null; then port="$candidate"; break; fi
+  done
+  [[ -n "$port" ]] || fail "no free port in 18410-18449 for the test database"
+  postgres_container="venue-check-postgres-$$"
+  password="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+  "${docker_cmd[@]}" run -d --rm --name "$postgres_container" -e POSTGRES_PASSWORD="$password" \
+    -p "127.0.0.1:$port:5432" "$POSTGRES_IMAGE" -c max_connections=500 -c fsync=off >/dev/null \
+    || fail "could not start $POSTGRES_IMAGE"
+  ready=0
+  for _ in $(seq 1 120); do
+    if "${docker_cmd[@]}" exec "$postgres_container" pg_isready -q -h 127.0.0.1 -U postgres >/dev/null 2>&1 \
+        && (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then ready=1; break; fi
+    sleep 0.5
+  done
+  [[ "$ready" == 1 ]] || fail "the test database never became ready"
+  export VENUE_TEST_DATABASE_URL="postgres://postgres:$password@127.0.0.1:$port/postgres?sslmode=disable"
+  echo "PostgreSQL ($POSTGRES_IMAGE) in container $postgres_container on 127.0.0.1:$port, removed when the check ends"
 fi
 
 "$ROOT/core/ci.sh"

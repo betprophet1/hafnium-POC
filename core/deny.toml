@@ -3,6 +3,8 @@
 
 [graph]
 all-features = true
+# Every binary runs on Linux (deploy/images); a duplicate that only a wasm or Windows build would link is not ours.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
 [licenses]
 # Unicode-3.0 is OSI-approved and permissive; it reaches the gateway only through unicode-ident in a proc macro.
@@ -14,6 +16,11 @@ private = { ignore = true }
 multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
+skip = [
+  # openssl-macros, a proc macro of the openssl crate that PostgreSQL's TLS uses (core/store), is still on syn 2
+  # while the rest of the tree has moved to syn 3. Build time only: neither reaches a binary.
+  { crate = "syn@2", reason = "openssl-macros (build-time proc macro) has not moved to syn 3" },
+]
 
 [sources]
 unknown-registry = "deny"

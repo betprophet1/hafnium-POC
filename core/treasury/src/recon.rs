@@ -38,7 +38,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 /// Runs kept for the operator surface. Breaks are all kept: they are the audit trail.
-const RUNS: usize = 200;
+pub(crate) const RUNS: usize = 200;
+/// How long a run the records could not take waits before it is tried again.
+const POSTPONE_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
@@ -117,33 +119,6 @@ pub struct Break {
 }
 
 impl Break {
-    fn record(&self) -> Value {
-        json!({
-            "id": self.id, "kind": self.kind, "transfer": self.transfer, "account": self.account,
-            "detail": self.detail, "foundAt": self.found_at, "foundBy": self.found_by,
-            "resolution": self.resolution.as_ref().map(|r| json!({"at": r.at, "by": r.by, "note": r.note}))
-        })
-    }
-
-    fn from_record(v: &Value) -> Result<Self, String> {
-        let number = |name: &str| v[name].as_u64().ok_or_else(|| format!("a break record needs {name}: {v}"));
-        let r = &v["resolution"];
-        Ok(Self {
-            id: number("id")?,
-            kind: v["kind"].as_str().ok_or("a break record needs kind")?.to_string(),
-            transfer: v["transfer"].as_u64(),
-            account: v["account"].as_u64(),
-            detail: v["detail"].as_str().unwrap_or("").to_string(),
-            found_at: number("foundAt")?,
-            found_by: number("foundBy")?,
-            resolution: (!r.is_null()).then(|| Resolution {
-                at: r["at"].as_u64().unwrap_or(0),
-                by: r["by"].as_str().unwrap_or("").to_string(),
-                note: r["note"].as_str().unwrap_or("").to_string(),
-            }),
-        })
-    }
-
     pub fn to_json(&self) -> Value {
         json!({
             "breakId": self.id.to_string(), "kind": self.kind, "transferId": self.transfer.map(|t| t.to_string()),
@@ -175,6 +150,8 @@ pub struct State {
     pub requested: bool,
     /// Notices that arrived for transfers already past the bank: which, and when.
     pub ignored: Vec<(u64, u64)>,
+    /// No run starts before this: the last one could not reach the records.
+    pub postponed_until: u64,
 }
 
 impl State {
@@ -187,6 +164,7 @@ impl State {
             every_ms: options.every_ms,
             requested: false,
             ignored: Vec::new(),
+            postponed_until: 0,
         };
         state.schedule(now);
         state
@@ -196,24 +174,20 @@ impl State {
         self.due_at = if self.every_ms == 0 { u64::MAX } else { now.saturating_add(self.every_ms) };
     }
 
-    /// Takes up a line of the book: a break as it now stands, or a run worth keeping.
-    pub fn replay(&mut self, record: &Value) -> Result<(), String> {
-        if !record["break"].is_null() {
-            let b = Break::from_record(&record["break"])?;
-            self.breaks.insert(b.id, b);
+    /// Takes up the breaks and newest runs the records hold, and numbers the next run after every one of them.
+    pub fn restore(&mut self, breaks: Vec<Break>, runs: Vec<Value>, next_run: u64) {
+        self.breaks = breaks.into_iter().map(|b| (b.id, b)).collect();
+        self.runs = runs.into_iter().collect();
+        while self.runs.len() > RUNS {
+            self.runs.pop_front();
         }
-        if let Some(id) = record["run"]["runId"].as_str().and_then(|r| r.parse::<u64>().ok()) {
-            self.next_run = self.next_run.max(id + 1);
-            self.runs.push_back(record["run"].clone());
-            while self.runs.len() > RUNS {
-                self.runs.pop_front();
-            }
-        }
-        Ok(())
+        self.next_run = self.next_run.max(next_run);
     }
 
     pub fn due(&self, now: u64) -> Option<Trigger> {
-        if self.requested {
+        if now < self.postponed_until {
+            None
+        } else if self.requested {
             Some(Trigger::Operator)
         } else if now >= self.due_at {
             Some(Trigger::Schedule)
@@ -474,13 +448,34 @@ fn signed(reason: &str, cents: u64) -> i128 {
     }
 }
 
-/// The invariants, over the treasury's state, the bank's record and the journal.
-pub(crate) fn invariants(inner: &Inner, journal: &Journal, in_flight_at_bank: i64, now: u64) -> Vec<Check> {
-    let total = inner.ledger.total();
+/// The invariants, over the treasury's state, the ledger of record (its balances and number of postings, as the
+/// records sum them), the bank's record and the journal.
+pub(crate) fn invariants(
+    inner: &Inner,
+    of_record: &(BTreeMap<String, i64>, u64),
+    journal: &Journal,
+    in_flight_at_bank: i64,
+    now: u64,
+) -> Vec<Check> {
+    let (balances, postings) = of_record;
+    let total: i128 = balances.values().map(|b| i128::from(*b)).sum();
+    let nonzero = |m: &BTreeMap<String, i64>| {
+        m.iter().filter(|(_, b)| **b != 0).map(|(a, b)| (a.clone(), *b)).collect::<Vec<_>>()
+    };
+    let agrees = nonzero(balances) == nonzero(inner.ledger.balances()) && *postings == inner.ledger.postings();
     let mut checks = vec![Check {
         name: "ledger_sums_to_zero",
-        ok: total == 0,
-        detail: format!("the ledger sums to {total} cents"),
+        ok: total == 0 && agrees,
+        detail: if agrees {
+            format!("the ledger of record sums to {total} cents over {postings} postings")
+        } else {
+            format!(
+                "the ledger of record sums to {total} cents over {postings} postings, and the treasury's working copy \
+                 ({} postings, summing to {} cents) differs from it",
+                inner.ledger.postings(),
+                inner.ledger.total()
+            )
+        },
     }];
 
     let balances = inner.ledger.balances();
@@ -554,9 +549,18 @@ fn check_json(c: &Check) -> Value {
 }
 
 impl Treasury {
-    /// One reconciliation run, start to finish, under the lock: everything it reads is in memory, and every fix it
-    /// makes is a line in the book.
-    pub(crate) fn reconcile(&self, inner: &mut Inner, journal: &Journal, trigger: Trigger, now: u64) {
+    /// One reconciliation run, start to finish, under the lock: everything it reads is in memory but the ledger of
+    /// record's sums, and every fix it makes is written to the records. A run that cannot reach the records is not
+    /// started, and is tried again a few seconds later; says whether it ran.
+    pub(crate) fn reconcile(&self, inner: &mut Inner, journal: &Journal, trigger: Trigger, now: u64) -> bool {
+        match self.fresh(inner).and_then(|()| self.records.ping().map_err(String::from)) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("treasury: reconciliation postponed, the records are unavailable: {e}");
+                inner.recon.postponed_until = now.saturating_add(POSTPONE_MS);
+                return false;
+            }
+        }
         let options = self.config.recon;
         let run = inner.recon.next_run;
         inner.recon.next_run += 1;
@@ -603,7 +607,13 @@ impl Treasury {
         }
 
         let (_, in_flight) = match_bank(&inner.transfers, &inner.bank, &inner.fbo, now, options.grace_ms);
-        let checks = invariants(inner, journal, in_flight, now);
+        // The ledger of record is summed after the run's fixes are written, so it includes them. Should the records
+        // stop answering in between, the working copy is checked on its own, and the check says so.
+        let of_record = self.records.trial_balance().map_err(|e| {
+            eprintln!("treasury: reconciliation run {run} could not sum the ledger of record: {e}");
+        });
+        let of_record = of_record.unwrap_or_else(|()| (inner.ledger.balances().clone(), inner.ledger.postings()));
+        let checks = invariants(inner, &of_record, journal, in_flight, now);
         for c in checks.iter().filter(|c| !c.ok) {
             let f = Finding {
                 kind: format!("invariant_{}", c.name),
@@ -656,10 +666,11 @@ impl Treasury {
             "found": ids(&found), "resolved": ids(&resolved), "open": ids(&open),
             "invariants": checks.iter().map(check_json).collect::<Vec<_>>()
         });
-        // Every run goes into the book, so run numbers never repeat after a restart and each note that names a run names
-        // one that can be read back.
-        if let Err(e) = Self::write(inner, &json!({"run": report})) {
-            eprintln!("treasury: {e}");
+        // Every run goes into the records, so run numbers never repeat after a restart and each note that names a run
+        // names one that can be read back.
+        if let Err(e) = self.records.record_run(run, status, &report, now) {
+            inner.stale = true;
+            eprintln!("treasury: recording run {run}: {e}");
         }
         if status != "clean" {
             eprintln!(
@@ -680,6 +691,7 @@ impl Treasury {
         }
         inner.generation += 1;
         self.changed.notify_all();
+        true
     }
 
     /// Takes up a finding: the open break it already is, or a new one; and fixes it if it can. Returns the break and
@@ -709,7 +721,8 @@ impl Treasury {
             found_by: run,
             resolution: None,
         };
-        if let Err(e) = Self::write(inner, &json!({"break": b.record()})) {
+        if let Err(e) = self.records.record_break(&b) {
+            inner.stale = true;
             eprintln!("treasury: recording break {id}: {e}");
         }
         inner.recon.breaks.insert(id, b);
@@ -799,7 +812,8 @@ impl Treasury {
         }
         let mut b = b.clone();
         b.resolution = Some(Resolution { at: now, by: by.to_string(), note: note.to_string() });
-        Self::write(inner, &json!({"break": b.record()})).map_err(|e| {
+        self.records.record_break(&b).map_err(|e| {
+            inner.stale = true;
             eprintln!("treasury: {e}");
             Refusal::unavailable("the treasury could not record the resolution; nothing was done")
         })?;
@@ -878,6 +892,10 @@ impl Treasury {
             return Err(Refusal::bad("note is required: 1 to 1000 characters saying how the break was resolved"));
         }
         let mut inner = locked(&self.inner);
+        self.fresh(&mut inner).map_err(|e| {
+            eprintln!("treasury: {e}");
+            Refusal::unavailable("the treasury's records are unavailable; nothing was done")
+        })?;
         self.close(&mut inner, id, "operator", note, now)
     }
 
@@ -892,7 +910,8 @@ mod tests {
     use super::*;
     use crate::faults::{Faults, Lossy};
     use crate::ledger::{customer, FBO};
-    use crate::treasury::tests::{balanced, body, open_with, path, state, Group, ACCOUNT};
+    use crate::records::Memory;
+    use crate::treasury::tests::{balanced, body, open_with, state, Group, ACCOUNT};
     use crate::treasury::Sequencer;
 
     fn options(faults: Faults) -> Options {
@@ -937,7 +956,7 @@ mod tests {
 
     #[test]
     fn a_lost_notice_is_booked_from_the_statement_once() {
-        let p = path("recon-lost-notice");
+        let p = Memory::default();
         let faults = Faults { lost_notice_per_mille: 1000, ..Faults::NONE };
         let treasury = open_with(&p, options(faults));
         let mut group = Group::default();
@@ -962,12 +981,11 @@ mod tests {
         assert_eq!(again["status"], "clean", "{again}");
         assert_eq!(postings(&treasury), before);
         assert_eq!(group.sleeves[&ACCOUNT], 700);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn a_decision_inside_the_grace_period_is_in_flight_not_a_break() {
-        let p = path("recon-grace");
+        let p = Memory::default();
         let faults = Faults { lost_notice_per_mille: 1000, ..Faults::NONE };
         let treasury = open_with(&p, options(faults));
         let mut group = Group::default();
@@ -977,12 +995,11 @@ mod tests {
         assert_eq!(run["status"], "clean", "{run}");
         assert_eq!(run["bank"]["inFlightCents"], 700);
         invariants_hold(&run);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn a_late_notice_after_booking_and_a_duplicate_notice_are_ignored_and_reported() {
-        let p = path("recon-late");
+        let p = Memory::default();
         let faults = Faults { late_notice_per_mille: 1000, late_notice_ms: 5_000, ..Faults::NONE };
         let treasury = open_with(&p, options(faults));
         let mut group = Group::default();
@@ -999,9 +1016,8 @@ mod tests {
         assert_eq!(kinds(&treasury, "resolved"), vec!["bank_decision_unbooked", "bank_late_notice"], "{run}");
         invariants_hold(&run);
         balanced(&treasury);
-        let _ = std::fs::remove_file(&p);
 
-        let p = path("recon-duplicate");
+        let p = Memory::default();
         let faults = Faults { duplicate_notice_per_mille: 1000, ..Faults::NONE };
         let treasury = open_with(&p, options(faults));
         let d = treasury.request(ACCOUNT, &body("d", "deposit", 300, "dummy_bank"), 1_000).expect("requested");
@@ -1012,12 +1028,11 @@ mod tests {
         assert_eq!(run["status"], "resolved", "{run} {}", treasury.breaks(None, 10).expect("breaks"));
         assert_eq!(kinds(&treasury, "resolved"), vec!["bank_duplicate_notice"]);
         invariants_hold(&run);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn a_posting_the_bank_never_made_is_a_break_and_a_breach_for_an_operator() {
-        let p = path("recon-double");
+        let p = Memory::default();
         let treasury = open_with(&p, options(Faults::NONE));
         let mut group = Group::default();
         let d = treasury.request(ACCOUNT, &body("d", "deposit", 300, "dummy_instant"), 1_000).expect("requested");
@@ -1050,12 +1065,11 @@ mod tests {
         let twice = treasury.resolve_break(id, &json!({"note": "again"}), 3_200).map_err(|r| (r.status, r.code));
         assert_eq!(twice, Err((409, "BREAK_ALREADY_RESOLVED")));
         assert_eq!(treasury.resolve_break(999, &json!({"note": "x"}), 3_200).map_err(|r| r.status), Err(404));
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn a_lost_answer_is_looked_up_and_a_lost_command_is_sent_again_once() {
-        let p = path("recon-lost-answer");
+        let p = Memory::default();
         let faults = Faults { lost_answer_per_mille: 1000, ..Faults::NONE };
         let treasury = open_with(&p, options(faults));
         let mut lossy = Lossy::new(Group::default(), faults, 5);
@@ -1071,9 +1085,8 @@ mod tests {
         assert_eq!(lossy.inner().sent, 1, "looked up, not sent again");
         assert_eq!(reconcile(&treasury, &mut lossy, 4_000)["status"], "clean");
         balanced(&treasury);
-        let _ = std::fs::remove_file(&p);
 
-        let p = path("recon-lost-command");
+        let p = Memory::default();
         let faults = Faults { lost_command_per_mille: 1000, ..Faults::NONE };
         let treasury = open_with(&p, options(faults));
         let mut group = Group::default();
@@ -1090,12 +1103,11 @@ mod tests {
         assert_eq!((lossy.inner().sleeves[&ACCOUNT], lossy.inner().sent), (400, 1), "reclaimed once");
         invariants_hold(&reconcile(&treasury, &mut lossy, 4_000));
         balanced(&treasury);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn a_command_the_treasury_never_sent_is_reported_with_a_breach() {
-        let p = path("recon-unexpected");
+        let p = Memory::default();
         let treasury = open_with(&p, options(Faults::NONE));
         let mut group = Group::default();
         let d = treasury.request(ACCOUNT, &body("d", "deposit", 250, "dummy_failing"), 1_000).expect("requested");
@@ -1107,12 +1119,11 @@ mod tests {
         let run = reconcile(&treasury, &mut group, 2_000);
         assert_eq!(run["status"], "breach", "{run}");
         assert_eq!(kinds(&treasury, "open"), vec!["engine_unexpected_command", "invariant_journal_matches_treasury"]);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn with_every_loss_injected_every_transfer_finishes_and_every_run_keeps_the_invariants() {
-        let p = path("recon-soak");
+        let p = Memory::default();
         let faults = Faults {
             lost_notice_per_mille: 150,
             late_notice_per_mille: 150,
@@ -1192,6 +1203,5 @@ mod tests {
         let run = reconcile(&treasury, &mut lossy, 41_000);
         assert_eq!(run["found"], json!([]), "{run}");
         invariants_hold(&run);
-        let _ = std::fs::remove_file(&p);
     }
 }

@@ -1,0 +1,196 @@
+{{- $name := include "venue-mini.fullname" . }}
+{{- $services := splitList " " (include "venue-mini.databaseServices" .) | compact }}
+{{- if .Values.postgres.enabled }}
+{{- if not .Values.postgres.existingSecret }}
+{{- $secretName := printf "%s-postgres" $name }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $secretName }}
+# The superuser's password and one per service, generated once and kept across upgrades (and an uninstall, since the
+# data volume outlives it and was initialised with them). Passwords are URL-safe: the services put them in a URL.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+data:
+  {{- range $key := list "postgres-password" "treasury-password" "identity-password" "parlays-password" "oracle-password" }}
+  {{- if and $existing (hasKey $existing.data $key) }}
+  {{ $key }}: {{ index $existing.data $key }}
+  {{- else }}
+  {{ $key }}: {{ randAlphaNum 32 | b64enc }}
+  {{- end }}
+  {{- end }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-postgres
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  selector:
+    {{- include "venue-mini.selector" (dict "ctx" . "component" "postgres") | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+# One PostgreSQL server for the mini venue's services, each with a database and role of its own (created by the
+# migrate job's bootstrap). Production gives each service a URL of its own instead (postgres.enabled false).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}-postgres
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  serviceName: {{ $name }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "postgres") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres
+    spec:
+      # The image's postgres user (alpine: 70).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        runAsGroup: 70
+        fsGroup: 70
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: postgres
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "venue-mini.postgresSecret" . }}
+                  key: postgres-password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-q", "-h", "127.0.0.1", "-U", "postgres"]
+            periodSeconds: 3
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+          securityContext:
+            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.postgres.storage.className }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage.size }}
+---
+# Only the services that own a database here, and the migrate job, reach PostgreSQL. `kubectl exec` into the pod (psql)
+# is not network traffic and is not affected.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-postgres
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "postgres") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        {{- range $component := concat $services (list "migrate") }}
+        - podSelector:
+            matchLabels:
+              {{- include "venue-mini.selector" (dict "ctx" $ "component" $component) | nindent 14 }}
+        {{- end }}
+      ports:
+        - port: 5432
+---
+# How the migrate job's bootstrap makes each service's role, database and schema, idempotently, and keeps each role's
+# password what the Secret says.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-postgres-bootstrap
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+data:
+  bootstrap.sh: |
+    set -eu
+    until pg_isready -q; do echo "waiting for $PGHOST"; sleep 2; done
+    for service in {{ join " " $services }}; do
+      password="$(cat "/etc/venue/postgres/$service-password")"
+      psql -v ON_ERROR_STOP=1 -q -v service="$service" -v password="$password" <<'SQL'
+    SELECT format('CREATE ROLE %I LOGIN', :'service') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'service') \gexec
+    SELECT format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD %L', :'service', :'password') \gexec
+    SELECT format('CREATE DATABASE %I OWNER %I', :'service', :'service') WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'service') \gexec
+    SELECT format('REVOKE ALL ON DATABASE %I FROM PUBLIC', :'service') \gexec
+    SQL
+      psql -v ON_ERROR_STOP=1 -q -d "$service" -v service="$service" <<'SQL'
+    SELECT format('CREATE SCHEMA IF NOT EXISTS %I AUTHORIZATION %I', :'service', :'service') \gexec
+    SQL
+      echo "database $service ready"
+    done
+{{- else }}
+{{- $inline := list }}
+{{- range $service := $services }}
+{{- $db := index $.Values.database $service }}
+{{- if and (not $db.existingSecret) (not $db.url) }}
+{{- fail (printf "postgres.enabled is false: set database.%s.url or database.%s.existingSecret" $service $service) }}
+{{- end }}
+{{- if not $db.existingSecret }}
+{{- $inline = append $inline $service }}
+{{- end }}
+{{- end }}
+{{- if $inline }}
+# The database URLs given inline in values. A hook, so that it exists before the pre-install migrate job needs it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}-database
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+type: Opaque
+stringData:
+  {{- range $service := $inline }}
+  {{ $service }}-url: {{ (index $.Values.database $service).url | quote }}
+  {{- end }}
+{{- end }}
+{{- end }}

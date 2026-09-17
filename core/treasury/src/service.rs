@@ -13,7 +13,8 @@
 //! - `GET /v1/reconciliation/runs?limit=`, and `POST` the same to run now (waits up to ten seconds for it)
 //! - `GET /v1/reconciliation/breaks?state=open|resolved|all&limit=`
 //! - `POST /v1/reconciliation/breaks/{breakId}/resolve` with `{"note"}`: an operator marks a break resolved
-//! - `GET /healthz`
+//! - `GET /healthz`: `{"ready": true, "database": "ok"}`, or 503 when the records cannot be reached (the pod is then
+//!   not ready, and the gateway answers transfers with 503 until they can)
 //!
 //! One thread per connection and one request per connection, like the web page's server: a treasury's traffic is a
 //! person's deposits, not a market's orders.
@@ -143,7 +144,10 @@ fn handle(treasury: &Arc<Treasury>, stream: TcpStream) -> Result<(), String> {
 fn route(treasury: &Treasury, request: &Request, segments: &[&str]) -> Result<Value, Refusal> {
     let now = clock::wall_ms;
     match (request.method.as_str(), segments) {
-        ("GET", ["healthz"]) => Ok(json!({"ready": true})),
+        ("GET", ["healthz"]) => match treasury.health() {
+            Ok(()) => Ok(json!({"ready": true, "database": "ok"})),
+            Err(e) => Err(Refusal::unavailable(format!("the treasury's records are unavailable: {e}"))),
+        },
         ("GET", ["v1", "ledger"]) => Ok(treasury.trial_balance()),
         ("GET", ["v1", "bank", "statement"]) => {
             let to = match param(request, "to") {

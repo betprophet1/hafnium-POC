@@ -29,6 +29,22 @@ impl Posting {
         Ok(Self(vec![(debit.to_string(), cents), (credit.to_string(), -cents)]))
     }
 
+    /// A posting of these entries, as the records hold it. `Ledger::post` checks that it balances.
+    pub const fn from_entries(entries: Vec<(String, i64)>) -> Self {
+        Self(entries)
+    }
+
+    /// Its entries, in the order they are written down.
+    pub fn entries(&self) -> &[(String, i64)] {
+        &self.0
+    }
+
+    /// The accounts it moves money between, in order: `debit>credit` for a posting made by `moving`. With the
+    /// transfer it belongs to, this names the step of the transfer it records, which happens at most once.
+    pub fn accounts(&self) -> String {
+        self.0.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>().join(">")
+    }
+
     /// What this posting moves into `account` (negative: out of it).
     pub fn cents(&self, account: &str) -> i64 {
         self.0.iter().filter(|(a, _)| a == account).map(|(_, c)| *c).sum()
@@ -58,6 +74,15 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    /// A ledger whose postings the records have already summed.
+    pub const fn restore(balances: BTreeMap<String, i64>, postings: u64) -> Self {
+        Self { balances, postings }
+    }
+
+    pub const fn postings(&self) -> u64 {
+        self.postings
+    }
+
     /// Applies a posting whole, or not at all if it does not balance or a balance would overflow.
     pub fn post(&mut self, posting: &Posting) -> Result<(), String> {
         if posting.0.len() < 2 {

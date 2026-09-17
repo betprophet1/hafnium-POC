@@ -15,3 +15,5 @@ venue-link = { path = "../link" }
 serde_json = "1"
 # The parlay's ID is a hash of its canonical legs (blueprint §6); the node already builds with this crate.
 sha2 = "0.11"
+# The approved responders, in PostgreSQL.
+venue-store = { path = "../store" }

@@ -7,7 +7,8 @@ through ArgoCD. There is no compose file; the laptop runs the same chart.
 |---|---|
 | `images/venue-node.Dockerfile` | The image `venue`: `venue-node`, `venue-gateway`, `venue-parlays`, `venue-sim`, `venue-treasury` and `venue-identity`, built from the repository root |
 | `images/venue-fix.Dockerfile` | The image `venue-fix`: the FIX 4.4 adapter (`adapters/fix`), built with Gradle from the repository root |
-| `charts/venue-mini/` | The chart: the core, the gateway, the identity service, the dummy treasury, the parlay service, a seed job for the demo markets, the dummy oracle, synthetic maker and taker, the web page, network policies and a `helm test` smoke test |
+| `charts/venue-mini/` | The chart: the core, the gateway, the identity service, the dummy treasury, the parlay service, PostgreSQL for their records and a job that migrates them, a seed job for the demo markets, the dummy oracle, synthetic maker and taker, the web page, network policies and a `helm test` smoke test |
+| `charts/venue-mini/templates/postgres.yaml`, `migrate.yaml` | PostgreSQL (in the cluster, or a URL per service outside it) and each service's schema migrations (Databases, below) |
 | `charts/venue-mini/files/markets.json` | The demo catalogue: accounts with their dev tokens, tabs and whether they respond to requests for quote, markets and their outcome names |
 | `charts/venue-mini/files/calendar.json` | The dummy oracle's calendar: how often each market lists a new round, its timings, and the resolution timers (`core/sim/README.md`) |
 | `charts/venue-mini/templates/gateway.yaml` | Also the gateway's audit log volume (`/var/lib/gateway-audit`, `gateway.audit` in values): every request and answer, in the format of `interfaces/audit/`. Nothing ships it to retained storage yet. With `gateway.split.enabled`, the public and private halves as StatefulSets of their own (several gateways, below) |
@@ -75,9 +76,9 @@ load balancer maps a host address to them; `expose` adds both mappings, bound to
 
 ```sh
 deploy/laptop.sh expose 127.0.0.1                    # page and /v4 on 127.0.0.1:8088, FIX on 127.0.0.1:9878
-deploy/laptop.sh expose 100.101.132.94 8091 9879     # a private (tailnet) address of the machine
+deploy/laptop.sh expose 192.0.2.10 8091 9879     # a private (for example tailnet) address of the machine; 192.0.2.10 stands for it
 # which is:
-k3d cluster edit venue --port-add 100.101.132.94:8091:80@loadbalancer --port-add 100.101.132.94:9879:9879@loadbalancer
+k3d cluster edit venue --port-add 192.0.2.10:8091:80@loadbalancer --port-add 192.0.2.10:9879:9879@loadbalancer
 ss -tln | grep -E ':(8091|9879) '                   # listening on that address only, not 0.0.0.0
 ```
 
@@ -87,8 +88,8 @@ only when `up` creates the cluster; on an existing one, use `expose`):
 
 ```sh
 deploy/laptop.sh down                                # the journal goes with it
-VENUE_SPLIT=1 VENUE_EXPOSE=100.101.132.94 VENUE_EXPOSE_HTTP_PORT=8091 VENUE_EXPOSE_FIX_PORT=9879 deploy/laptop.sh up
-ss -tln | grep -E ':(6550|8091|9879) '               # 127.0.0.1:6550, and the two ports on 100.101.132.94 only
+VENUE_SPLIT=1 VENUE_EXPOSE=192.0.2.10 VENUE_EXPOSE_HTTP_PORT=8091 VENUE_EXPOSE_FIX_PORT=9879 deploy/laptop.sh up
+ss -tln | grep -E ':(6550|8091|9879) '               # 127.0.0.1:6550, and the two ports on 192.0.2.10 only
 ```
 
 `VENUE_FIX_SERVICE_PORT` (default 9879) must match `fix.service.port` if that is changed.
@@ -111,11 +112,12 @@ logon limits (decision G-13), and its audit instance, which no two live gateways
 mkdir -p run
 $BIN/venue-node serve --listen 127.0.0.1:18200 --feed 127.0.0.1:18201 --data run/node &
 $BIN/venue-sim seed --ingress 127.0.0.1:18200 --catalogue $CAT
-$BIN/venue-identity --catalogue $CAT --store run/identity.jsonl --listen 127.0.0.1:18202 &
-$BIN/venue-treasury --ingress 127.0.0.1:18200 --feed 127.0.0.1:18201 --catalogue $CAT --ledger run/ledger.jsonl \
-  --listen 127.0.0.1:18203 &
+# Records in a local PostgreSQL, one schema per service (core/store/README.md); migrated at start for the laptop.
+export VENUE_DATABASE_URL='postgres://postgres:dev@127.0.0.1:5432/postgres?sslmode=disable' VENUE_MIGRATE_ON_START=true
+$BIN/venue-identity --catalogue $CAT --listen 127.0.0.1:18202 &
+$BIN/venue-treasury --ingress 127.0.0.1:18200 --feed 127.0.0.1:18201 --catalogue $CAT --listen 127.0.0.1:18203 &
 $BIN/venue-parlays --ingress 127.0.0.1:18200 --feed 127.0.0.1:18201 --catalogue $CAT --listen 127.0.0.1:18204 \
-  --operator 127.0.0.1:18205 --responders run/responders.json &
+  --operator 127.0.0.1:18205 &
 # Two private and two public gateways, each with its own port and audit instance.
 for g in private-a:private:18210 private-b:private:18211 public-c:public:18212 public-d:public:18213; do
   IFS=: read -r instance serve port <<<"$g"
@@ -193,6 +195,56 @@ restricted. Its network policy lets anything reach its FIX port (a Logon's crede
 adapter reach only the gateway pods and cluster DNS. `fix.service.type` is `LoadBalancer` for k3d (published on the
 node, then mapped by `expose`), `ClusterIP` to keep FIX inside the cluster; `fix.service.port` is its port.
 
+## Databases
+
+The treasury, identity, parlay and oracle services keep their records in PostgreSQL (`core/store/README.md`; the
+reasons are `core/store/decisions.md`). Each owns a database, a role and a schema named after it, and no service reads
+another's. Where those databases are is configuration only:
+
+- **In the cluster** (`postgres.enabled: true`, the default): one PostgreSQL StatefulSet (`postgres.image`, pinned by
+  tag and digest) on a volume of its own (`postgres.storage`), with the superuser's and each service's password
+  generated into the Secret `<release>-postgres`, kept across upgrades and uninstalls (or `postgres.existingSecret`,
+  URL-safe passwords). A network policy lets only the four services and the migrate job reach port 5432. The migrate
+  job first makes each service's role, database and schema if they are missing (and keeps each role's password what
+  the Secret says), then runs each service's `migrate`.
+- **Outside it** (`postgres.enabled: false`), self-hosted or managed (RDS, Aurora): give each service a URL, inline
+  (`database.treasury.url`, kept in a Secret the chart makes) or from a Secret of your own
+  (`database.treasury.existingSecret`, `existingSecretKey`), and likewise for `identity`, `parlays` and `oracle`; the
+  URLs may name one server or four. `database.tls` (default `verify-full`) and `database.caSecret` (a Secret with
+  `ca.pem`, for example a provider's CA bundle) apply to all of them. The roles must own their databases (or at least
+  their schema); the chart creates nothing there.
+
+```sh
+helm upgrade --install venue deploy/charts/venue-mini --set postgres.enabled=false \
+  --set database.caSecret=rds-ca \
+  --set database.treasury.existingSecret=venue-treasury-db --set database.identity.existingSecret=venue-identity-db \
+  --set database.parlays.existingSecret=venue-parlays-db --set database.oracle.existingSecret=venue-oracle-db
+```
+
+**Migrations** run in one Job, `<release>-migrate`, a pre-install and pre-upgrade hook, so a schema is current before
+pods of a new build start; while an in-cluster PostgreSQL does not exist yet (the install or upgrade that creates it),
+a Job `<release>-migrate-first` runs beside it instead, since a hook could only wait for a server not yet created. Services never migrate in the chart: at start each waits, saying so in its log,
+until its schema is at the migration it was built with, and refuses to start against a newer or edited one. Every run
+holds an advisory lock, so overlapping runs are safe. DevOps may run the same SQL files (`core/*/migrations/`) with
+another tool instead.
+
+**Looking inside**, in the cluster:
+
+```sh
+kubectl exec -it statefulset/venue-postgres -- psql -U postgres -d treasury -c 'SELECT * FROM treasury.ledger_check'
+kubectl exec -it statefulset/venue-postgres -- psql -U postgres -d identity -c 'SELECT key_id, account_id, revoked_at FROM identity.api_keys'
+```
+
+**When a database is unreachable**: the treasury refuses new transfers with 503 and goes unready (the gateway answers
+transfers 503), keeps what is under way waiting and retries reconciliation; the identity service goes unready (the
+gateway answers keys it has not verified in the last 5 s with 503; dev tokens keep working); the parlay service keeps
+routing requests to the responders approved in memory and refuses approvals and revocations; the oracle keeps running
+the calendar and pauses cases. Each reconnects on its own when the database returns; at start each waits for its
+database with backoff, saying what it cannot reach. Deleting the PostgreSQL pod is a way to watch this.
+
+Earlier versions kept these records in files on volumes; `venue-treasury import --ledger`, `venue-identity import
+--file` and `venue-parlays import --responders` move them into empty databases (the oracle's cases were in memory).
+
 ## What the chart does and does not do
 
 - **One way in.** Customers, bots and the page's trading tabs reach the core only through the gateway; a network
@@ -201,15 +253,15 @@ node, then mapped by `expose`), `ClusterIP` to keep FIX inside the cluster; `fix
 - **No liveness probe on the core.** A fail-stop (spec §18) exits the process; the restart replays to the same stop
   and shows as `CrashLoopBackOff`, which is the signal to look at the journal (`venue-node dump`).
 - **Money through the treasury.** With `treasury.enabled` (the default) the gateway passes `/v4/transfers` to the dummy
-  treasury, which keeps its ledger on a volume of its own and moves buying power in the core only as sequenced grants
+  treasury, which keeps its ledger in its PostgreSQL database and moves buying power in the core only as sequenced grants
   and reclaims; only the gateway may reach it, and the web page for its reconciliation summary. Its fake bank's
   delays and failure rate are `treasury.bank` values. It reconciles its ledger against the fake bank's statement and
   the journal every `treasury.reconciliation.everyMs`; `treasury.faults: demo` loses a few percent of the bank's
   notices and of sleeve-adjustment answers on purpose, so the account tab's reconciliation section has breaks to show.
   The seed's grants are still how accounts start.
 - **API keys through the identity service.** With `identity.enabled` (the default) the gateway verifies API keys with
-  the identity service and passes `/v4/keys` to it; the key store is on a volume of its own and only the gateway may
-  reach it. Dev tokens keep working beside keys. Test-environment identity only (`core/identity/README.md`).
+  the identity service and passes `/v4/keys` to it; accounts and keys are in its PostgreSQL database and only the
+  gateway may reach the service. Dev tokens keep working beside keys. Test-environment identity only (`core/identity/README.md`).
 - **Seeding is idempotent.** The seed job runs after every install and upgrade; its commands have fixed IDs.
 - **Not production.** Production runs the core on dedicated hosts behind Aeron Cluster (blueprint §5, §9). Tokens are
   fixed dev tokens, and the page and operator actions are unauthenticated; never expose them beyond a private network
@@ -219,8 +271,9 @@ node, then mapped by `expose`), `ClusterIP` to keep FIX inside the cluster; `fix
   runs indefinitely on the `small` profile.
 - **Requests for quote are not journaled.** Open requests and responders' subscriptions live in the parlay service's
   memory; replacing its pod forgets them (the gateway subscribes its sessions again), while parlays and quotes
-  (listings and orders) stay in the journal, and the approved responders on the service's own volume. It lists at most
+  (listings and orders) stay in the journal, and the approved responders in its PostgreSQL database. It lists at most
   `parlays.maxParlays` parlays at once, because every book reserves its levels until its settled event is released,
   and none that would take the core past 95% of its capacity profile, which the oracle's rounds share.
-- **Not yet in the chart:** the resolution console behind the dummy oracle (its cases live in the oracle process), the
-  scenario player and the environment manifest of §16.
+- **Not yet in the chart:** the resolution console behind the dummy oracle (its cases are in its PostgreSQL database,
+  shown on the settlement tab), object storage for the archive, ClickHouse, Valkey, the scenario player and the
+  environment manifest of §16.

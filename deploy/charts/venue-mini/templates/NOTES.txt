@@ -11,6 +11,12 @@ The mini venue {{ .Release.Name }} is installed: the core, the gateway (interfac
   kubectl logs statefulset/{{ include "venue-mini.fullname" . }}-fix          FIX logons, and what the adapter refuses
 {{- end }}
   helm test {{ .Release.Name }} --logs                 smoke test through the core's ingress
+{{- if .Values.postgres.enabled }}
+  kubectl exec -it statefulset/{{ include "venue-mini.fullname" . }}-postgres -- psql -U postgres -d treasury     the services' records (a database each)
+{{- else }}
+  the services' records are in the databases database.<service> names (postgres.enabled is false)
+{{- end }}
+  kubectl logs job/{{ include "venue-mini.fullname" . }}-migrate --all-containers     schema migrations (-migrate-first when the release created its PostgreSQL)
 {{- if .Values.gateway.split.enabled }}
   kubectl logs statefulset/{{ include "venue-mini.fullname" . }}-gateway-private     what a private gateway refuses, and why
 {{- else }}
