@@ -35,7 +35,9 @@ book until the new pod logs in) and, as an approved responder, subscribes to req
 synthetic taker trades over REST, leaving parlays alone. The parlay service (`venue-parlays`) lists a parlay on its
 first request, routes requests to approved responders that subscribe and quotes back for the gateway, and expires,
 resolves or voids each parlay as its legs resolve (interfaces/gateway/README.md, parlays). Responders are approved
-and revoked through its operator API, port 7104 of the `parlays` service (`core/parlays/README.md`).
+and revoked through its operator API, port 7104 of the `parlays` service (`core/parlays/README.md`), which a
+network policy keeps from every pod: reach it with `kubectl port-forward svc/venue-parlays 7104` (release `venue`).
+Only the gateway reaches the parlay service's port 7103, and the identity service's 8084.
 The same port also serves the gateway itself under `/v4`:
 
 ```sh

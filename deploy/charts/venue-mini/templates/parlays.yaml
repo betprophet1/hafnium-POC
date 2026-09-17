@@ -120,4 +120,26 @@ spec:
         - name: responders
           persistentVolumeClaim:
             claimName: {{ $name }}-parlays
+---
+# Only the gateway talks to the parlay service (requests, quotes, subscriptions), and nothing in the cluster reaches its
+# operator API: approving a responder is a person's act, through `kubectl port-forward svc/<release>-parlays 7104`,
+# which enters the pod's own network namespace and is not subject to this policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-parlays
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "parlays") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "venue-mini.selector" (dict "ctx" $ "component" "gateway") | nindent 14 }}
+      ports:
+        - port: 7103
 {{- end }}
