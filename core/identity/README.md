@@ -6,7 +6,7 @@ choice are in interfaces/gateway/decisions.md, G-1 to G-12). Clients never reach
 through the private half of the gateway (`/v4/keys`), which authenticates them and passes the call on.
 
 It is test-environment identity. Production needs interface 6 and the environment manifest's issuer (interface 22):
-a store with encryption at rest and replication rather than one file on one disk, secrets kept or at least peppered
+a store with encryption at rest and replication, secrets kept or at least peppered
 with a key in a hardware security module, a second factor and approvals for making keys that move money, alerts on a
 key used from somewhere new, and the people who own accounts, which this service does not know about at all.
 
@@ -23,13 +23,33 @@ key used from somewhere new, and the people who own accounts, which this service
 
 At most 20 keys of an account are neither revoked nor expired at once. A key cannot be changed, only revoked.
 
-## The store
+## The records
 
-An append-only file of JSON lines (`--store`). The first line is `{"format":"venue-identity/1"}`; each later line is a
-`create` (the key without its secret, with its hash), a `revoke`, or a `used` (a key's last use, at most once a minute
-per key). A line is written, and synced unless `--fsync false`, before the change it records is made or answered. On
-start the service replays the file, drops a last line cut short by a stop mid-write, and refuses to start on anything
-else it cannot read. One writer: two services on one file would interleave lines.
+Accounts and keys are kept in PostgreSQL (`migrations/`, through `core/store`), in the database and schema `identity`;
+the decisions are S-13 to S-16 of `core/store/decisions.md`.
+
+| Table | Holds |
+|---|---|
+| `accounts` | each account of the environment: its ID, display name and, in test environments, `SHA-256("venue-dev-token/1:" + token)` of its dev token; seeded from the catalogue at every start (new accounts added, names and tokens brought up to date, none removed) |
+| `api_keys` | each key: account, label, permissions, `secret_sha256` (never the secret), when it was made and by which key, expiry, revocation, last use |
+
+`accounts` holds no personal data. It is where the mapping from pseudonymous account IDs to people will live (blueprint
+§12: the journal, ClickHouse and Valkey carry account IDs only; the mapping lives only in the accounts database), in
+tables of their own that refer to it, with retention of their own; an account is never deleted.
+
+The database refuses a key's deletion, any change to its terms, and a revocation undone or moved; only its last use
+moves, written at most once a minute per key. Every key is read into memory at start, and verification is answered
+from memory. A change is written before it is made in memory or answered; a write that fails is refused with 503, and
+the keys are read again from the database before the next call, so a revocation whose acknowledgement was lost is not
+missed.
+
+When the database cannot be reached: at start the service tries again with backoff, saying why, and does not listen
+until it can, then waits for its schema to be at this build's migration (`venue-identity migrate`, the chart's
+migrate job). While running, making and revoking keys answer 503; verification carries on from memory; `/healthz`
+answers 503, so the pod is taken out of its Service and gateways answer keys they have not verified in the last 5 s
+with 503 (G-7), while dev tokens keep working. `--store memory` keeps keys in memory only, for tests and throwaway
+local venues (the FIX adapter's test uses it when there is no test database). `venue-identity import --file FILE`
+moves a key store kept in a JSON-lines file by earlier versions into empty records.
 
 ## Its own API
 
@@ -59,8 +79,9 @@ refuses keys and `/v4/keys` with 503.
 ## Running it
 
 ```sh
-target/release/venue-identity --catalogue ../deploy/charts/venue-mini/files/markets.json \
-  --store /tmp/venue/identity.jsonl --listen 127.0.0.1:8084
+export VENUE_DATABASE_URL='postgres://postgres:dev@127.0.0.1:5432/postgres?sslmode=disable'
+target/release/venue-identity migrate
+target/release/venue-identity --catalogue ../deploy/charts/venue-mini/files/markets.json --listen 127.0.0.1:8084
 target/release/venue-gateway --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 \
   --catalogue ../deploy/charts/venue-mini/files/markets.json --identity 127.0.0.1:8084
 

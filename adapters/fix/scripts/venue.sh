@@ -38,7 +38,13 @@ case "${1:-}" in
     wait_port "$BASE" "the node"
     "$BIN/venue-sim" seed --ingress "$ingress" --catalogue "$CATALOGUE" >"$dir/seed.log" 2>&1
     identity="127.0.0.1:$((BASE + 3))"
-    "$BIN/venue-identity" --catalogue "$CATALOGUE" --store "$dir/identity.jsonl" --fsync false --listen "$identity" \
+    # Keys in PostgreSQL, in a schema of this run's own, when ./check has a test database; in memory otherwise.
+    if [[ -n "${VENUE_TEST_DATABASE_URL:-}" ]]; then
+      identity_store=(--database-url "$VENUE_TEST_DATABASE_URL" --database-schema "fix_identity_$$" --migrate-on-start true)
+    else
+      identity_store=(--store memory)
+    fi
+    "$BIN/venue-identity" --catalogue "$CATALOGUE" "${identity_store[@]}" --listen "$identity" \
       >"$dir/identity.log" 2>&1 &
     echo $! >>"$dir/pids"
     wait_port "$((BASE + 3))" "the identity service"

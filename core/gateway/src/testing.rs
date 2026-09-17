@@ -230,14 +230,19 @@ fn start_parlays(ingress: &str, feed: &str) -> (Arc<venue_parlays::service::Serv
     (service, listen)
 }
 
-/// Starts an identity service of the test's own, with a fresh store, and returns where it listens.
+/// Starts an identity service of the test's own, with a fresh store, and returns where it listens. Its keys are in
+/// PostgreSQL, in a schema of the test's own, when `VENUE_TEST_DATABASE_URL` names a server, and in memory otherwise.
 fn start_identity(name: &str) -> String {
-    let store = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}.identity", std::process::id()));
-    let _ = std::fs::remove_file(&store);
-    let settings = venue_identity::Settings { catalogue: CATALOGUE.to_string(), store, fsync: false };
+    let settings = venue_identity::Settings { catalogue: CATALOGUE.to_string() };
+    let storage =
+        match venue_store::testing::url().and_then(|_| venue_store::testing::config(&format!("gw_identity_{name}"))) {
+            Some(config) => venue_identity::Storage::Postgres { config, migrate: true },
+            None => venue_identity::Storage::Memory(venue_identity::records::Memory::default()),
+        };
+    let records = venue_identity::records(&storage).expect("the identity service's records");
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the identity service");
     let address = listener.local_addr().expect("its address").to_string();
-    venue_identity::start(&settings, listener).expect("an identity service");
+    venue_identity::start(&settings, records, listener).expect("an identity service");
     address
 }
 
