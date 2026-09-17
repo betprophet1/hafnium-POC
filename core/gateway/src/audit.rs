@@ -1078,14 +1078,23 @@ mod recorded {
     }
 
     /// The next frame of `kind` the client is sent, as text, so a test can check what the log says about it against
-    /// the bytes that were actually sent.
+    /// the bytes that were actually sent. The socket's read timeout is short, and a loaded machine can take longer
+    /// than that to answer, so a timeout is waited through rather than failed on, as `eventually` does.
     fn streamed(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>, kind: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
-            if let Message::Text(text) = socket.read().expect("a message") {
-                let m: Value = serde_json::from_str(text.as_str()).expect("JSON");
-                if m["type"] == kind {
-                    return text.to_string();
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    let m: Value = serde_json::from_str(text.as_str()).expect("JSON");
+                    if m["type"] == kind {
+                        return text.to_string();
+                    }
                 }
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+                        && std::time::Instant::now() < deadline => {}
+                Err(e) => panic!("no {kind} frame arrived: {e}"),
             }
         }
     }
