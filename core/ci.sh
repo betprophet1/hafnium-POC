@@ -11,7 +11,7 @@ HANDWRITTEN=(-p venue-engine -p venue-harness -p venue-node -p venue-link -p ven
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
-step "Interfaces: schema, committed codec, catalogue"
+step "Interfaces: schema, committed codec, catalogue, audit log verifier"
 if [[ -n "${JAVA:-}" && -n "${SBE_JAR:-}" ]]; then
   "$ROOT/interfaces/tools/sbe.sh"
 else
@@ -21,6 +21,7 @@ fi
   || fail "core/journal was generated from a different schema: run interfaces/tools/sbe.sh"
 echo "core/journal matches interfaces/sbe/venue-journal.xml"
 python3 "$ROOT/interfaces/tools/catalogue.py" check
+python3 "$ROOT/interfaces/tools/audit_verify.py" --self-test
 
 step "Reference model: normative scenarios and random sequences"
 python3 "$ROOT/spec/engine/reference/run_scenarios.py"

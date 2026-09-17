@@ -15,11 +15,16 @@ One specification per interface between components of the venue, and one catalog
 |---|---|---|
 | Journal inputs, engine results, binary messages | SBE 2.0 XML | `sbe/` |
 | FIX 4.4 dialect (interface 4) | QuickFIX XML dictionary, rules of engagement in Markdown | `fix/` |
+| Edge audit logs (FIX adapter, gateway) | JSON Lines, hash-chained, one file per day per instance | `audit/` |
 | REST and WebSocket | OpenAPI 3.1, AsyncAPI 3 | `openapi/`, `asyncapi/` (not started) |
 | Payment and oracle contracts | Rust traits plus conformance suites | `contracts/` (not started) |
 | Stores read by more than one component | ClickHouse DDL, Valkey key layout | `stores/` (not started) |
 
 A store owned by a single service is not an interface. A table or key that two components depend on is.
+
+The edge audit logs have no catalogue entry of their own: they are files each edge writes for itself, not an arrow
+between two components, and taking them to the retention archive is part of interface 29 (planned), whose export
+and manifest format will name them when it is specified.
 
 ## Order of work
 
