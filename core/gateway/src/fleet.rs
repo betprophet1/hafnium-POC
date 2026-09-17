@@ -208,6 +208,36 @@ fn an_order_placed_through_one_private_gateway_is_seen_and_cancelled_through_ano
     retail_on_b.execution(&taken, "fill");
 }
 
+/// An order just placed through one gateway, amended and cancelled through another straight away, without waiting to
+/// see it there: the other gateway may not have had it from the feed yet, and waits for it rather than saying there is
+/// no such order. An order that has gone is still not found at once, and one no feed ever delivers is refused as
+/// unavailable, with nothing sent.
+#[test]
+fn an_order_placed_through_one_gateway_can_be_amended_and_cancelled_through_another_at_once() {
+    let mut fleet = Fleet::start("fleet-at-once");
+    let (a, b) = (fleet.add(Serve::Private), fleet.add(Serve::Private));
+    let (a, b) = (&fleet.gateways[a], &fleet.gateways[b]);
+    let mut on_b = Client::connect(&b.ws_private);
+    on_b.login(MAKER_TOKEN, &json!({}));
+    let mut last: u64 = 0;
+    for i in 0..20 {
+        let order = place(&a.address, MAKER_TOKEN, &order_body(&format!("now-{i}"), "buy", 4, 10));
+        let amended = on_b.ask(&json!({"op": "amend", "id": format!("a{i}"), "orderId": order, "quantity": 5}));
+        assert_eq!(amended["result"]["status"], "amended", "order {i}: {amended}");
+        let path = format!("/v4/orders/{order}");
+        let (status, cancelled) = request(&b.address, "DELETE", &path, Some(MAKER_TOKEN), None);
+        assert_eq!((status, cancelled["status"].as_str()), (200, Some("cancelled")), "order {i}: {cancelled}");
+        last = order.parse().expect("a numeric order ID");
+    }
+    let gone = request(&b.address, "DELETE", &format!("/v4/orders/{last}"), Some(MAKER_TOKEN), None);
+    assert_eq!((gone.0, gone.1["error"]["code"].as_str()), (404, Some("NOT_FOUND")), "{}", gone.1);
+    let never = last + 1_000_000;
+    let started = monotonic();
+    let unseen = request(&b.address, "DELETE", &format!("/v4/orders/{never}"), Some(MAKER_TOKEN), None);
+    assert_eq!((unseen.0, unseen.1["error"]["code"].as_str()), (503, Some("UNAVAILABLE")), "{}", unseen.1);
+    assert!(monotonic().duration_since(started) >= Duration::from_secs(2), "refused before waiting for the feed");
+}
+
 /// Market data is the same whichever public gateway serves it: book changes caused through a private gateway reach
 /// subscribers on every public gateway, the trades topic carries the same trades under the same sequences everywhere,
 /// and once each has caught up every gateway's book is the same book at the same sequence.

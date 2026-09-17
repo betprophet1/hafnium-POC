@@ -216,6 +216,13 @@ map one to one onto `NewOrder` (spec §9). `expiresAt` is converted to nanosecon
 Amending needs no instrument: the gateway knows each resting order's instrument. A new price is in YES terms unless
 `outcome` says otherwise.
 
+A venue may run several gateways, and each learns of orders from the sequencer group's feed, which can reach it a
+moment after another gateway has answered the client that placed the order. An amendment or cancel naming an order ID
+the gateway's feed has not delivered yet waits up to two seconds for it, and is then sent as usual; one still not
+delivered is refused with 503 `UNAVAILABLE`, and nothing was sent (decision G-14). An order ID the feed has passed and
+that no longer rests is 404 `NOT_FOUND` at once. Reads are as of their `sequence`: `GET /v4/account` on one gateway
+shows an order placed through another once that gateway's feed has reached it.
+
 ## Fees
 
 Each party to a fill, the maker (the resting order's account) and the taker (the incoming order's), pays a fee on

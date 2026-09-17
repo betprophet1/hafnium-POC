@@ -11,7 +11,7 @@ use crate::treasury::Treasury;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use venue_identity::key;
 use venue_link::submit::{self, Notify, Submit};
 use venue_link::wire;
@@ -23,6 +23,10 @@ fn unavailable() -> ApiError {
         "the sequencer group did not answer; the outcome is unknown, so resend with the same client order ID",
     )
 }
+
+/// How long an amendment or a cancel naming an order this gateway's feed has not delivered yet waits for it before it
+/// is refused. The feed is normally a moment behind the node's reply to whichever gateway placed the order.
+const UNSEEN_ORDER_WAIT: Duration = Duration::from_secs(2);
 
 /// The input for a mass cancel of one account's orders in `scope` (spec E-12.6).
 fn mass_cancel_input(account: u64, session: u64, scope: &str, reference: u64, cause: &str) -> Value {
@@ -52,6 +56,20 @@ enum Inner {
     Node(Answer, submit::Pending),
     /// Given to the parlay service, which answers in interface 1's terms already.
     Parlays(parlays::Pending),
+    /// An amendment or a cancel of an order the node has accepted but this gateway's feed had not delivered yet, as
+    /// happens when it was placed through another gateway a moment ago: sent once the feed delivers it.
+    Unseen(Mutex<Unseen>),
+}
+
+enum Unseen {
+    Waiting { order: u64, change: Change, deadline: Instant, notify: Option<Notify> },
+    Sent(submit::Pending),
+}
+
+/// What is to be done to an order not delivered yet.
+enum Change {
+    Cancel { session: u64 },
+    Amend { session: u64, body: Value },
 }
 
 #[derive(Clone, Copy)]
@@ -433,6 +451,12 @@ impl Gateway {
                 }
             },
             Inner::Parlays(inner) => self.parlay_answer(inner.wait()),
+            Inner::Unseen(_) => loop {
+                if let Some(answer) = self.finish(&pending) {
+                    return answer;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            },
         }
     }
 
@@ -448,7 +472,72 @@ impl Gateway {
                 }
             },
             Inner::Parlays(inner) => self.parlay_answer(inner.take()?),
+            Inner::Unseen(unseen) => return self.finish_unseen(pending.account, unseen),
         })
+    }
+
+    /// An amendment or cancel waiting for its order: sent once the feed has delivered the order, and answered as any
+    /// other once the node has; refused if the feed has not delivered it by the deadline.
+    fn finish_unseen(&self, account: u64, unseen: &Mutex<Unseen>) -> Option<Result<Value, ApiError>> {
+        let mut unseen = locked(unseen);
+        if let Unseen::Waiting { order, change, deadline, notify } = &*unseen {
+            if self.hub().unseen(*order) {
+                return (monotonic() >= *deadline).then(|| {
+                    Err(ApiError::unavailable(
+                        "this gateway has not had that order from the sequencer group's feed yet; nothing was sent, so \
+                         try again",
+                    ))
+                });
+            }
+            let input = match change {
+                Change::Cancel { session } => self.cancel_input(account, *session, *order),
+                Change::Amend { session, body } => self.amend_input(account, *session, *order, body),
+            };
+            let submitted = input.and_then(|input| {
+                self.ingress()?.submit_notifying(input, notify.clone()).map_err(|e| {
+                    eprintln!("gateway: ingress: {e}");
+                    unavailable()
+                })
+            });
+            match submitted {
+                Ok(sent) => *unseen = Unseen::Sent(sent),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        let Unseen::Sent(sent) = &*unseen else { return None };
+        Some(match sent.take()? {
+            Ok(results) => Ok(self.outcome(account, Answer::Order, &results)),
+            Err(e) => {
+                eprintln!("gateway: ingress: {e}");
+                Err(unavailable())
+            }
+        })
+    }
+
+    /// For an amendment or cancel refused as naming no resting order: if the order is one the feed has not delivered
+    /// yet, a request that waits for it. `None` when the feed has delivered it, so the refusal stands — or, if it was
+    /// delivered since the refusal, the caller asks again.
+    fn await_unseen(
+        &self,
+        account: u64,
+        order: u64,
+        change: Change,
+        notify: Option<Notify>,
+    ) -> Option<Result<Pending, ApiError>> {
+        let mut hub = self.hub();
+        if !hub.unseen(order) {
+            return None;
+        }
+        let deadline = monotonic() + UNSEEN_ORDER_WAIT;
+        let wake = notify.clone().unwrap_or_else(|| Arc::new(|| {}));
+        if !hub.await_order(order, deadline, wake) {
+            return Some(Err(ApiError::unavailable(
+                "too many requests are waiting for orders this gateway has not had from the feed yet; nothing was sent, \
+                 so try again",
+            )));
+        }
+        let waiting = Unseen::Waiting { order, change, deadline, notify };
+        Some(Ok(Pending { account, inner: Inner::Unseen(Mutex::new(waiting)) }))
     }
 
     /// Connects this half to the parlay service at `addr`: requests for quote go there, and what it sends for an
@@ -764,8 +853,19 @@ impl Gateway {
         body: &Value,
         notify: Option<Notify>,
     ) -> Result<Pending, ApiError> {
-        let input = self.amend_input(account, session, order, body)?;
-        self.submit(account, input, Answer::Order, notify)
+        match self.amend_input(account, session, order, body) {
+            Ok(input) => self.submit(account, input, Answer::Order, notify),
+            Err(e) if e.status == 404 => {
+                let change = Change::Amend { session, body: body.clone() };
+                match self.await_unseen(account, order, change, notify.clone()) {
+                    Some(waiting) => waiting,
+                    None => {
+                        self.submit(account, self.amend_input(account, session, order, body)?, Answer::Order, notify)
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The input for a cancellation, once the order has been resolved to this account's.
@@ -796,8 +896,16 @@ impl Gateway {
         order: u64,
         notify: Option<Notify>,
     ) -> Result<Pending, ApiError> {
-        let input = self.cancel_input(account, session, order)?;
-        self.submit(account, input, Answer::Order, notify)
+        match self.cancel_input(account, session, order) {
+            Ok(input) => self.submit(account, input, Answer::Order, notify),
+            Err(e) if e.status == 404 => {
+                match self.await_unseen(account, order, Change::Cancel { session }, notify.clone()) {
+                    Some(waiting) => waiting,
+                    None => self.submit(account, self.cancel_input(account, session, order)?, Answer::Order, notify),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The scope of a `cancelAll`: the whole account, one market, or one event.

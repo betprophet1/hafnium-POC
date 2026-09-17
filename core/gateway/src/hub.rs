@@ -15,6 +15,10 @@ use venue_link::wire::Unit;
 /// Private messages kept per account for sessions resuming by sequence.
 const HISTORY: usize = 2_000;
 
+/// Requests at most waiting for an order the feed has not delivered yet (`Hub::await_order`); past this one is refused
+/// rather than queued.
+pub const MAX_AWAITING: usize = 4_096;
+
 /// Accepted orders remembered while the feed catches up. A bound, not a working size: entries leave as soon as the
 /// feed passes them, so this only matters if the feed stalls.
 const ACCEPTED: usize = 65_536;
@@ -197,6 +201,11 @@ pub struct Hub {
     accepted_order: VecDeque<u64>,
     /// The highest input sequence the view has applied.
     last_sequence: u64,
+    /// The highest order ID the feed has delivered. The engine numbers a group's orders in the order it accepts them
+    /// (spec E-2.8, E-9.8), so an order ID above this is one the feed has not delivered yet, not one that has gone.
+    highest_order: u64,
+    /// Requests waiting for the feed to deliver an order, each with its deadline and whom to tell (`await_order`).
+    awaiting: Vec<(u64, Instant, Notify)>,
 }
 
 impl Hub {
@@ -221,6 +230,8 @@ impl Hub {
             accepted: BTreeMap::new(),
             accepted_order: VecDeque::new(),
             last_sequence: 0,
+            highest_order: 0,
+            awaiting: Vec::new(),
         }
     }
 
@@ -281,6 +292,35 @@ impl Hub {
         }
     }
 
+    /// Whether `order` is past every order ID the feed has delivered: accepted by the node, as far as this gateway
+    /// can tell, but not delivered here yet. Another gateway's client learns an order ID from its own gateway's reply,
+    /// which can reach it before this gateway's feed has the order.
+    pub fn unseen(&self, order: u64) -> bool {
+        order > self.highest_order && !self.accepted.contains_key(&order)
+    }
+
+    /// Calls `notify` once the feed has delivered `order`, or once `deadline` has passed (`expire_awaiting`), whichever
+    /// is first. False, and nothing remembered, when too many requests are waiting already.
+    pub fn await_order(&mut self, order: u64, deadline: Instant, notify: Notify) -> bool {
+        if self.awaiting.len() >= MAX_AWAITING {
+            return false;
+        }
+        self.awaiting.push((order, deadline, notify));
+        true
+    }
+
+    /// Tells the requests whose deadline has passed, so they can be answered.
+    pub fn expire_awaiting(&mut self) {
+        let now = monotonic();
+        self.awaiting.retain(|(_, deadline, notify)| {
+            let expired = *deadline <= now;
+            if expired {
+                notify();
+            }
+            !expired
+        });
+    }
+
     fn quote(&self, instrument: u64, tick: u64) -> Value {
         price::quote(ladder(&self.view, instrument), tick)
     }
@@ -308,6 +348,17 @@ impl Hub {
         self.last_unit = Some((monotonic(), u(&input["record"]["sequencedAt"])));
         // The view has now applied this unit, so every order accepted at or before it can be forgotten here.
         self.last_sequence = self.last_sequence.max(sequence);
+        let highest = unit.results.iter().filter(|r| r["msg"] == "OrderAccepted").map(|r| u(&r["orderId"])).max();
+        if let Some(highest) = highest.filter(|h| *h > self.highest_order) {
+            self.highest_order = highest;
+            self.awaiting.retain(|(order, _, notify)| {
+                let delivered = *order <= highest;
+                if delivered {
+                    notify();
+                }
+                !delivered
+            });
+        }
         while let Some(&oldest) = self.accepted_order.front() {
             if self.accepted.get(&oldest).is_some_and(|&(at, _, _)| at > self.last_sequence) {
                 break;
@@ -820,6 +871,35 @@ mod tests {
         let cancelled = json!({"msg": "OrderCancelled", "orderId": 7, "accountId": 1, "instrumentId": 1000});
         hub.apply(&unit(6, vec![cancelled]));
         assert_eq!(hub.order(7), None);
+    }
+
+    /// An order ID above every one the feed has delivered is one not delivered yet: whoever waits for it is told when it
+    /// is, and one past its deadline is told too. An ID the feed has passed is not waited for, resting or not.
+    #[test]
+    fn an_order_the_feed_has_not_delivered_is_waited_for() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut hub = hub();
+        hub.apply(&unit(1, vec![accepted(7)]));
+        assert!(!hub.unseen(6) && !hub.unseen(7) && hub.unseen(8));
+        let told = Arc::new(AtomicUsize::new(0));
+        let counter = |told: &Arc<AtomicUsize>| -> Notify {
+            let told = Arc::clone(told);
+            Arc::new(move || {
+                told.fetch_add(1, Ordering::SeqCst);
+            })
+        };
+        let later = monotonic() + Duration::from_secs(60);
+        assert!(hub.await_order(9, later, counter(&told)));
+        assert!(hub.await_order(12, later, counter(&told)));
+        hub.apply(&unit(2, vec![accepted(8)]));
+        assert_eq!(told.load(Ordering::SeqCst), 0, "told before its order was delivered");
+        hub.apply(&unit(3, vec![accepted(9), accepted(10)]));
+        assert_eq!(told.load(Ordering::SeqCst), 1, "not told once its order was delivered");
+        assert!(!hub.unseen(9) && hub.unseen(12));
+        let expired = Arc::new(AtomicUsize::new(0));
+        assert!(hub.await_order(40, monotonic(), counter(&expired)));
+        hub.expire_awaiting();
+        assert_eq!((told.load(Ordering::SeqCst), expired.load(Ordering::SeqCst)), (1, 1));
     }
 
     #[test]

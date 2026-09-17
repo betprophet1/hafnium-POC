@@ -224,7 +224,10 @@ fn conflate(gateway: &Arc<Gateway>) {
     thread::spawn(move || loop {
         // Book topics carry at most ten snapshots a second (interface 1 README, market data).
         thread::sleep(Duration::from_millis(100));
-        conflater.hub().flush_books();
+        let mut hub = conflater.hub();
+        hub.flush_books();
+        // Amendments and cancels waiting for an order the feed has not delivered are answered once past their wait.
+        hub.expire_awaiting();
     });
 }
 
