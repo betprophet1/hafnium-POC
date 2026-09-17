@@ -90,13 +90,18 @@ public final class FixAdapter implements AutoCloseable
         System.err.printf("fix adapter: FIX 4.4 on %s:%d as %s, gateway %s, public gateway %s, audit log %s%n",
             config.listenHost(), config.listenPort(), config.compId(), config.gateway(), config.publicGateway(),
             adapter.audit.currentFile());
+        // The barrier's shutdown hook holds the JVM until the barrier is closed, so the adapter closes inside it: closed
+        // after it, the JVM would halt midway, leaving the audit file open and Artio's archive marked active.
         try (ShutdownSignalBarrier barrier = new ShutdownSignalBarrier())
         {
-            barrier.await();
-        }
-        finally
-        {
-            adapter.close();
+            try
+            {
+                barrier.await();
+            }
+            finally
+            {
+                adapter.close();
+            }
         }
     }
 

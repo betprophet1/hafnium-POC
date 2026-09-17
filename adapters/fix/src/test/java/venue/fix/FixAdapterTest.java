@@ -55,7 +55,8 @@ final class FixAdapterTest
 {
     /**
      * Ports: the venue takes 17430-17435 (node ingress, feed, gateway, identity service, a second gateway serving the
-     * private half, a third serving the public half), the adapter 17440, and an adapter on the split halves 17441.
+     * private half, a third serving the public half), the adapter 17440, an adapter on the split halves 17441, and an
+     * adapter process of its own 17442.
      */
     private static final int VENUE_PORTS_BASE = 17430;
     private static final int ADAPTER_PORT = 17440;
@@ -65,6 +66,7 @@ final class FixAdapterTest
     /** A gateway process serving only the public half. */
     private static final String PUBLIC_GATEWAY = "127.0.0.1:" + (VENUE_PORTS_BASE + 5);
     private static final int SPLIT_ADAPTER_PORT = 17441;
+    private static final int SIGNAL_ADAPTER_PORT = 17442;
     /** Two binary markets the mini venue's catalogue lists and opens, and one categorical market. */
     private static final String RAIN = "100000100";
     private static final String BITCOIN = "300000100";
@@ -844,6 +846,69 @@ final class FixAdapterTest
         client.pollUntil("the desk is disconnected", () -> client.isDisconnected(desk));
         adapter.close();
         adapter = null;
+    }
+
+    @Test
+    @Order(17)
+    void aTerminatedAdapterProcessStopsCleanlyAndStartsAgainAtOnce() throws Exception
+    {
+        // As a container is stopped: SIGTERM to the adapter's own process, with a session logged on. The JVM must not
+        // halt before the adapter has closed, or its audit file is left open and Artio's archive left marked active,
+        // which refuses the next start for as long as the mark looks live.
+        final Path data = scratch.resolve("signal-adapter");
+        deleteRecursively(data);
+        final List<String> command = new ArrayList<>();
+        command.add(ProcessHandle.current().info().command().orElseThrow());
+        command.addAll(java.lang.management.ManagementFactory.getRuntimeMXBean().getInputArguments().stream()
+            .filter(arg -> arg.startsWith("--add-")).toList());
+        command.addAll(List.of("-cp", System.getProperty("java.class.path"), FixAdapter.class.getName(),
+            "--listen", "127.0.0.1:" + SIGNAL_ADAPTER_PORT, "--gateway", SECOND_GATEWAY, "--public-gateway",
+            PUBLIC_GATEWAY, "--data", data.toString(), "--audit-instance", "signal", "--audit-fsync", "false"));
+        final Process process = new ProcessBuilder(command).redirectErrorStream(true)
+            .redirectOutput(scratch.resolve("signal-adapter.log").toFile()).start();
+        try
+        {
+            client.pollUntil("the adapter process listens", () -> Files.exists(scratch.resolve("signal-adapter.log")) &&
+                readString(scratch.resolve("signal-adapter.log")).contains("fix adapter: FIX 4.4 on"));
+            final Session desk = client.logon("SIGNAL1", "dev-market-maker", SIGNAL_ADAPTER_PORT, false);
+            assertNotNull(desk, "the desk logs on to the adapter process");
+
+            process.destroy();
+            assertTrue(process.waitFor(30, TimeUnit.SECONDS), "the adapter process stops on SIGTERM");
+            client.pollUntil("the desk is disconnected", () -> client.isDisconnected(desk));
+        }
+        finally
+        {
+            process.destroyForcibly();
+        }
+
+        final List<Path> files;
+        try (var listing = Files.list(data.resolve("audit")))
+        {
+            files = listing.filter(f -> f.getFileName().toString().endsWith(".jsonl")).toList();
+        }
+        assertEquals(1, files.size(), files.toString());
+        final List<String> lines = Files.readAllLines(files.get(0));
+        assertEquals("close", GatewayLink.JSON.readTree(lines.get(lines.size() - 1)).path("kind").asText(),
+            "the audit file is closed: " + readString(scratch.resolve("signal-adapter.log")));
+
+        // Straight away, on the same data: the archive was closed, not left for dead.
+        adapter = FixAdapter.start(new AdapterConfig("127.0.0.1", SIGNAL_ADAPTER_PORT, "VENUE", SECOND_GATEWAY,
+            PUBLIC_GATEWAY, data, true, Set.of(), data.resolve("audit"), "signal", false));
+        adapter.close();
+        adapter = null;
+    }
+
+    private static String readString(final Path file)
+    {
+        try
+        {
+            return Files.readString(file);
+        }
+        catch (final IOException e)
+        {
+            return "";
+        }
     }
 
     // -------------------------------------------------------------------------------------------------------------
