@@ -877,6 +877,8 @@ function caseHtml(e) {
 }
 
 let settleListAt = 0;
+// Parlays the whole market list was fetched for and did not name: released with their event (E-8.4), so not asked again.
+const settleGone = new Set();
 function renderSettle() {
   if (!O) {
     setHTML($('#calendar'), '');
@@ -925,10 +927,16 @@ function renderSettle() {
     let si = null;
     for (const e of S.events) for (const i of e.instruments) if (i.id === instrument) si = i;
     // Parlay IDs start at 2^52 (core/parlays rules.rs), so a parlay this view has trimmed away is still recognised.
-    if ((si ? si.legs && si.legs.length : instrument >= 2 ** 52) && Date.now() - settleListAt > 5000) {
-      // Settled parlays and their legs are only in the whole market list, which the Parlays tab fetches.
+    if ((si ? si.legs && si.legs.length : instrument >= 2 ** 52) && !settleGone.has(instrument) && Date.now() - settleListAt > 5000) {
+      // Settled parlays and their legs are only in the whole market list, which the Parlays tab fetches. A payout
+      // comes after its parlay was listed, so a list without it means the engine has released it: stop asking.
       settleListAt = Date.now();
-      fetch('/v4/markets').then(r => r.ok ? r.json() : null).then(j => { if (j) { A = j; if (tab === 'settle') renderSettle(); } }).catch(() => {});
+      fetch('/v4/markets').then(r => r.ok ? r.json() : null).then(j => {
+        if (!j) return;
+        A = j;
+        if (!findAny(String(instrument))[1]) settleGone.add(instrument);
+        if (tab === 'settle') renderSettle();
+      }).catch(() => {});
     }
     if (!si || !si.legs || !si.legs.length) return null;
     return 'Parlay: ' + si.legs.map(l => {
