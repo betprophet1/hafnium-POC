@@ -5,20 +5,19 @@
 //! this book has sent is there to be found. This is the outbox relay of blueprint §18 in miniature: a command is done
 //! only once its outcome has been seen.
 
-use crate::treasury::{Adjusted, Sequencer};
+use crate::treasury::{Adjusted, Journal, Recorded, Sequencer};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use venue_link::wire::{self, Ingress};
 
-/// The first outcome of each of the treasury's commands seen on the feed: the input sequence, and the rejection
-/// reason if it was rejected.
-type Outcomes = Arc<Mutex<BTreeMap<String, (u64, Option<String>)>>>;
+/// Every one of the treasury's commands seen on the feed, with its first outcome, and how far the feed has been read.
+/// Reconciliation reads it whole; a duplicate answer reads one command's outcome from it.
+type Seen = Arc<Mutex<Journal>>;
 
 pub struct Node {
     ingress: Ingress,
-    outcomes: Outcomes,
+    seen: Seen,
 }
 
 fn adjusted(sequence: u64, outcome: &str, reason: &Value) -> Option<Adjusted> {
@@ -33,32 +32,38 @@ impl Node {
     /// Sends to the ingress at `ingress`, and follows the feed at `feed` for the outcomes of commands whose IDs start
     /// with `prefix`.
     pub fn new(ingress: &str, feed: &str, prefix: String) -> Self {
-        let outcomes: Outcomes = Arc::default();
-        let (seen, feed) = (Arc::clone(&outcomes), feed.to_string());
+        let seen: Seen = Arc::default();
+        let (journal, feed) = (Arc::clone(&seen), feed.to_string());
         thread::spawn(move || {
             wire::follow(
                 &feed,
                 || {},
                 |unit| {
+                    let sequence = unit.input["record"]["sequence"].as_u64().unwrap_or(0);
+                    let mut journal = journal.lock().unwrap_or_else(PoisonError::into_inner);
+                    journal.through = journal.through.max(sequence);
                     let id = unit.input["commandId"].as_str().unwrap_or("");
                     if unit.input["msg"] != "SleeveAdjust" || !id.starts_with(&prefix) {
                         return;
                     }
                     let first =
                         unit.results.iter().find(|r| r["msg"] == "CommandApplied" && r["outcome"] != "DUPLICATE");
-                    if let Some(r) = first {
-                        let sequence = r["result"]["inputSequence"].as_u64().unwrap_or(0);
-                        let reason =
-                            (r["outcome"] == "REJECTED").then(|| r["rejectReason"].as_str().unwrap_or("").to_string());
-                        seen.lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .entry(id.to_string())
-                            .or_insert((sequence, reason));
-                    }
+                    let Some(r) = first else { return };
+                    let applied_at = r["result"]["inputSequence"].as_u64().unwrap_or(sequence);
+                    let Some(outcome) = adjusted(applied_at, r["outcome"].as_str().unwrap_or(""), &r["rejectReason"])
+                    else {
+                        return;
+                    };
+                    journal.commands.entry(id.to_string()).or_insert(Recorded {
+                        account: unit.input["accountId"].as_u64().unwrap_or(0),
+                        cents: unit.input["deltaCents"].as_u64().unwrap_or(0),
+                        reason: unit.input["reason"].as_str().unwrap_or("").to_string(),
+                        outcome,
+                    });
                 },
             );
         });
-        Self { ingress: Ingress::new(ingress), outcomes }
+        Self { ingress: Ingress::new(ingress), seen }
     }
 }
 
@@ -80,11 +85,11 @@ impl Sequencer for Node {
             return Ok(adjusted);
         }
         // A duplicate: its first outcome is on the feed, or will be once the feed catches up.
-        let first = self.outcomes.lock().unwrap_or_else(PoisonError::into_inner).get(command_id).cloned();
-        Ok(match first {
-            Some((sequence, None)) => Adjusted::Applied(sequence),
-            Some((_, Some(reason))) => Adjusted::Rejected(reason.to_lowercase()),
-            None => Adjusted::Unknown,
-        })
+        let first = self.seen.lock().unwrap_or_else(PoisonError::into_inner).commands.get(command_id).cloned();
+        Ok(first.map_or(Adjusted::Unknown, |r| r.outcome))
+    }
+
+    fn journal(&self) -> Journal {
+        self.seen.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 }

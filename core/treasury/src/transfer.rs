@@ -42,10 +42,10 @@ pub enum Stage {
     Reclaiming,
     /// Accepted and not yet handed to the bank.
     ToBank,
-    /// With the bank, which will settle it or fail it once `due` (wall-clock milliseconds) has passed.
+    /// With the bank, which has said it will decide by `due` (wall-clock milliseconds). The treasury learns what it
+    /// decided from the bank's notice, or failing that from its statement.
     AtBank {
         due: u64,
-        settles: bool,
     },
     /// A grant to send: a deposit the bank settled, or a withdrawal coming back. The transfer becomes `then` once
     /// the sequencer group has applied it.
@@ -70,6 +70,9 @@ pub struct Transfer {
     pub created: u64,
     pub updated: u64,
     pub stage: Stage,
+    /// When the reclaim or grant this stage waits on was sent without an answer coming back, if it was: the treasury
+    /// does not know whether the sequencer group applied it, and leaves it to reconciliation to find out.
+    pub in_doubt: Option<u64>,
 }
 
 impl Transfer {

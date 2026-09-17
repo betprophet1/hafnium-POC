@@ -6,8 +6,10 @@
 pub mod bank;
 pub mod book;
 pub mod clock;
+pub mod faults;
 pub mod ledger;
 pub mod node;
+pub mod recon;
 pub mod service;
 pub mod transfer;
 pub mod treasury;
@@ -31,6 +33,8 @@ pub struct Settings {
     pub fsync: bool,
     pub bank: bank::FakeBank,
     pub max_cents: u64,
+    /// Messages to lose on purpose, and when to reconcile.
+    pub recon: recon::Options,
 }
 
 /// Opens the book, and starts sending to the node and serving on `listener`, each on threads of their own.
@@ -41,9 +45,10 @@ pub fn start(settings: &Settings, listener: TcpListener) -> Result<Arc<Treasury>
         .iter()
         .filter_map(|a| Some((a["id"].as_u64()?, a["cents"].as_u64().unwrap_or(0))))
         .collect();
-    let config = Config { bank: settings.bank, max_cents: settings.max_cents, accounts };
+    let config = Config { bank: settings.bank, max_cents: settings.max_cents, accounts, recon: settings.recon };
     let treasury = Arc::new(Treasury::open(config, &settings.ledger, settings.fsync, clock::wall_ms())?);
-    let mut node = node::Node::new(&settings.ingress, &settings.feed, treasury.command_prefix());
+    let node = node::Node::new(&settings.ingress, &settings.feed, treasury.command_prefix());
+    let mut node = faults::Lossy::new(node, settings.recon.faults, settings.bank.seed);
     let driver = Arc::clone(&treasury);
     thread::spawn(move || loop {
         let seen = driver.generation();

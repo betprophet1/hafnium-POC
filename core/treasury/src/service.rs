@@ -8,6 +8,11 @@
 //! - `GET /v1/updates`: every transfer change from now on, one JSON line each, `{"accountId", "transfer"}`, with an
 //!   empty line every 15 s so a follower can tell a quiet treasury from a gone one
 //! - `GET /v1/ledger`: the trial balance
+//! - `GET /v1/bank/statement?from=&to=`: the fake bank's statement of the omnibus, wall-clock milliseconds
+//! - `GET /v1/reconciliation`: the schedule, lost messages being injected, the last run, open and recent breaks
+//! - `GET /v1/reconciliation/runs?limit=`, and `POST` the same to run now (waits up to ten seconds for it)
+//! - `GET /v1/reconciliation/breaks?state=open|resolved|all&limit=`
+//! - `POST /v1/reconciliation/breaks/{breakId}/resolve` with `{"note"}`: an operator marks a break resolved
 //! - `GET /healthz`
 //!
 //! One thread per connection and one request per connection, like the web page's server: a treasury's traffic is a
@@ -27,6 +32,9 @@ const ARRIVAL: Duration = Duration::from_secs(10);
 const MAX_BODY: usize = 64 * 1024;
 /// How often an update stream with nothing to say says so.
 const KEEPALIVE: Duration = Duration::from_secs(15);
+/// How long an operator's request for a run waits for it: a run is in memory, but waits for the driver to finish
+/// whatever send it is in the middle of.
+const RUN_WAIT: Duration = Duration::from_secs(10);
 
 pub fn serve(listener: &TcpListener, treasury: &Arc<Treasury>) {
     for stream in listener.incoming() {
@@ -96,6 +104,21 @@ fn respond(mut stream: &TcpStream, status: u16, body: &Value) -> Result<(), Stri
     .map_err(|e| e.to_string())
 }
 
+fn param<'a>(request: &'a Request, name: &str) -> Option<&'a str> {
+    request.query.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+fn limit(request: &Request) -> Result<usize, Refusal> {
+    match param(request, "limit") {
+        None => Ok(100),
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|l| (1..=MAX_LIST).contains(l))
+            .ok_or_else(|| Refusal::bad(format!("limit must be from 1 to {MAX_LIST}"))),
+    }
+}
+
 fn id(text: &str, name: &str) -> Result<u64, Refusal> {
     let digits = !text.is_empty() && text.len() <= 20 && text.bytes().all(|b| b.is_ascii_digit());
     digits.then(|| text.parse().ok()).flatten().ok_or_else(|| Refusal::bad(format!("{name} must be a decimal string")))
@@ -122,6 +145,23 @@ fn route(treasury: &Treasury, request: &Request, segments: &[&str]) -> Result<Va
     match (request.method.as_str(), segments) {
         ("GET", ["healthz"]) => Ok(json!({"ready": true})),
         ("GET", ["v1", "ledger"]) => Ok(treasury.trial_balance()),
+        ("GET", ["v1", "bank", "statement"]) => {
+            let to = match param(request, "to") {
+                None => now(),
+                Some(v) => id(v, "to")?,
+            };
+            let from = param(request, "from").map_or(Ok(0), |v| id(v, "from"))?;
+            Ok(treasury.statement(from, to))
+        }
+        ("GET", ["v1", "reconciliation"]) => Ok(treasury.reconciliation()),
+        ("GET", ["v1", "reconciliation", "runs"]) => Ok(treasury.runs(limit(request)?)),
+        ("POST", ["v1", "reconciliation", "runs"]) => Ok(treasury.request_run(RUN_WAIT)),
+        ("GET", ["v1", "reconciliation", "breaks"]) => treasury.breaks(param(request, "state"), limit(request)?),
+        ("POST", ["v1", "reconciliation", "breaks", b, "resolve"]) => {
+            let body: Value = serde_json::from_slice(&request.body)
+                .map_err(|e| Refusal::bad(format!("the body is not JSON: {e}")))?;
+            treasury.resolve_break(id(b, "breakId")?, &body, now())
+        }
         ("POST", ["v1", "accounts", account, "transfers"]) => {
             let account = id(account, "accountId")?;
             let body: Value = serde_json::from_slice(&request.body)
@@ -131,15 +171,7 @@ fn route(treasury: &Treasury, request: &Request, segments: &[&str]) -> Result<Va
         }
         ("GET", ["v1", "accounts", account, "transfers"]) => {
             let account = id(account, "accountId")?;
-            let limit = match request.query.iter().find(|(k, _)| k == "limit") {
-                None => 100,
-                Some((_, v)) => v
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|l| (1..=MAX_LIST).contains(l))
-                    .ok_or_else(|| Refusal::bad(format!("limit must be from 1 to {MAX_LIST}")))?,
-            };
-            treasury.list(account, limit)
+            treasury.list(account, limit(request)?)
         }
         ("GET", ["v1", "accounts", account, "transfers", transfer]) => {
             treasury.get(id(account, "accountId")?, id(transfer, "transferId")?)

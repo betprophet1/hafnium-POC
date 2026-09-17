@@ -194,6 +194,7 @@ fn start_treasury(name: &str, ingress: &str, feed: &str) -> String {
         fsync: false,
         bank: venue_treasury::bank::FakeBank { seed: 1, min_delay_ms: 200, max_delay_ms: 500, failure_per_mille: 0 },
         max_cents: 100_000_000,
+        recon: venue_treasury::recon::Options::default(),
     };
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the treasury");
     let address = listener.local_addr().expect("its address").to_string();

@@ -8,10 +8,14 @@
 //!
 //! Nothing here waits on the network while holding the lock: `step` takes one piece of work out, does it, and puts
 //! the outcome back.
+//!
+//! Messages can be lost on the way: a bank's notice, or the answer to a grant. `step` also reconciles, on a schedule
+//! and when an operator asks (`recon`), against the bank's statement and what the sequencer group applied.
 
-use crate::bank::FakeBank;
+use crate::bank::{Bank, FakeBank, Notice};
 use crate::book::Book;
 use crate::ledger::{self, Ledger, Posting};
+use crate::recon;
 use crate::transfer::{Kind, Method, Reason, Stage, State, Transfer};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, VecDeque};
@@ -46,11 +50,36 @@ pub enum Adjusted {
     Rejected(String),
     /// Answered as a duplicate of a command whose outcome is not known yet: try again later.
     Unknown,
+    /// Sent, and no answer came back. An error says the command may never have left and is tried again shortly; this
+    /// is what a relay sees when an answer goes missing without a failure to show for it, as `faults::Lossy` makes
+    /// happen. The transfer waits, in doubt, until reconciliation reads what the sequencer group applied.
+    NoAnswer,
 }
 
-/// The sequencer group, as far as the treasury needs it: sleeve grants and reclaims (spec E-7.2).
+/// A treasury command as the sequencer group's journal records it, with its first outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recorded {
+    pub account: u64,
+    pub cents: u64,
+    /// `GRANT` or `RECLAIM`.
+    pub reason: String,
+    /// `Applied` or `Rejected`.
+    pub outcome: Adjusted,
+}
+
+/// Every treasury command the journal holds so far, by command ID, and how far through the journal that is.
+#[derive(Clone, Debug, Default)]
+pub struct Journal {
+    pub commands: BTreeMap<String, Recorded>,
+    /// The highest input sequence read: a command sequenced at or before it is in `commands` if it is anywhere.
+    pub through: u64,
+}
+
+/// The sequencer group, as far as the treasury needs it: sleeve grants and reclaims (spec E-7.2), and the record of
+/// those it has applied.
 pub trait Sequencer {
     fn adjust(&mut self, command_id: &str, account: u64, cents: u64, reason: &str) -> Result<Adjusted, String>;
+    fn journal(&self) -> Journal;
 }
 
 /// A refusal at the treasury's edge, in interface 1's `Error` form. Nothing was created or changed.
@@ -62,7 +91,7 @@ pub struct Refusal {
 }
 
 impl Refusal {
-    fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
         Self { status, code, message: message.into() }
     }
 
@@ -89,42 +118,69 @@ pub struct Config {
     pub max_cents: u64,
     /// The accounts transfers may be made for, each with the cents the environment's seed grants it.
     pub accounts: BTreeMap<u64, u64>,
+    /// Lost messages to inject, and when to reconcile.
+    pub recon: recon::Options,
 }
 
-struct Inner {
+pub(crate) struct Inner {
     /// Unique to this book, so that its command IDs never meet those of an earlier book on the same sequencer group.
-    nonce: u32,
-    transfers: BTreeMap<u64, Transfer>,
+    pub(crate) nonce: u32,
+    pub(crate) transfers: BTreeMap<u64, Transfer>,
     by_client: BTreeMap<(u64, String), u64>,
-    ledger: Ledger,
-    book: Option<Book>,
+    pub(crate) ledger: Ledger,
+    book: Book,
+    pub(crate) bank: Bank,
+    /// The bank's notices that have arrived and are not yet acted on.
+    inbox: VecDeque<Notice>,
+    /// How much each transfer's postings have moved the FBO omnibus, to match against the bank's statement line by
+    /// line.
+    pub(crate) fbo: BTreeMap<u64, i64>,
+    pub(crate) recon: recon::State,
     /// Transfers that changed, oldest first, each numbered, for streams.
     updates: VecDeque<(u64, u64, Value)>,
     next_update: u64,
     /// When work that failed may be tried again, by transfer.
-    retry_at: BTreeMap<u64, u64>,
+    pub(crate) retry_at: BTreeMap<u64, u64>,
     /// Counts every change, so that whoever waits for one cannot miss one made just before it started waiting.
-    generation: u64,
+    pub(crate) generation: u64,
 }
 
 pub struct Treasury {
-    config: Config,
-    inner: Mutex<Inner>,
+    pub(crate) config: Config,
+    pub(crate) inner: Mutex<Inner>,
     /// Signalled whenever anything changes: a new transfer for `step`, a new stage for a request waiting on one, a new
     /// update for a stream.
     pub changed: Condvar,
 }
 
 /// One piece of work that needs the sequencer group.
-struct Command {
-    transfer: u64,
-    command_id: String,
+pub(crate) struct Command {
+    pub(crate) transfer: u64,
+    pub(crate) command_id: String,
     account: u64,
     cents: u64,
     reason: &'static str,
 }
 
-fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+impl Command {
+    /// The reclaim or grant a transfer's stage waits on, if it waits on one.
+    pub(crate) fn for_transfer(nonce: u32, t: &Transfer) -> Option<Self> {
+        let (what, reason) = match t.stage {
+            Stage::Reclaiming => ('r', "RECLAIM"),
+            Stage::Granting { .. } => ('g', "GRANT"),
+            _ => return None,
+        };
+        Some(Self {
+            transfer: t.id,
+            command_id: command_id(nonce, t.id, what),
+            account: t.account,
+            cents: t.amount,
+            reason,
+        })
+    }
+}
+
+pub(crate) fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -141,7 +197,7 @@ fn stage_json(stage: Stage) -> Value {
     match stage {
         Stage::Reclaiming => json!({"at": "reclaiming"}),
         Stage::ToBank => json!({"at": "to_bank"}),
-        Stage::AtBank { due, settles } => json!({"at": "at_bank", "due": due, "settles": settles}),
+        Stage::AtBank { due } => json!({"at": "at_bank", "due": due}),
         Stage::Granting { then, reason } => {
             json!({"at": "granting", "then": then.name(), "reason": reason.map(Reason::name)})
         }
@@ -153,10 +209,9 @@ fn stage_from(v: &Value) -> Result<Stage, String> {
     Ok(match v["at"].as_str().unwrap_or("") {
         "reclaiming" => Stage::Reclaiming,
         "to_bank" => Stage::ToBank,
-        "at_bank" => Stage::AtBank {
-            due: v["due"].as_u64().ok_or("an at_bank stage needs due")?,
-            settles: v["settles"].as_bool().ok_or("an at_bank stage needs settles")?,
-        },
+        // A book from before the bank kept its own record also says which way the bank will decide; the bank's
+        // record is what counts now.
+        "at_bank" => Stage::AtBank { due: v["due"].as_u64().ok_or("an at_bank stage needs due")? },
         "granting" => Stage::Granting {
             then: v["then"].as_str().and_then(State::parse).ok_or("a granting stage needs then")?,
             reason: v["reason"].as_str().and_then(Reason::parse),
@@ -172,7 +227,7 @@ fn record(t: &Transfer) -> Value {
         "id": t.id, "account": t.account, "clientTransferId": t.client_id, "kind": t.kind.name(),
         "amountCents": t.amount, "method": t.method.name(), "state": t.state.name(),
         "reason": t.reason.map(Reason::name), "sequence": t.sequence, "created": t.created, "updated": t.updated,
-        "stage": stage_json(t.stage)
+        "stage": stage_json(t.stage), "inDoubt": t.in_doubt
     })
 }
 
@@ -191,12 +246,13 @@ fn from_record(v: &Value) -> Result<Transfer, String> {
         created: number("created")?,
         updated: number("updated")?,
         stage: stage_from(&v["stage"])?,
+        in_doubt: v["inDoubt"].as_u64(),
     })
 }
 
 /// The command ID of a transfer's reclaim (`r`) or grant (`g`): fixed by the transfer, so that sending it again after
 /// a restart is answered as a duplicate rather than moving the money twice (spec E-7.1). Sixteen bytes exactly.
-fn command_id(nonce: u32, transfer: u64, what: char) -> String {
+pub(crate) fn command_id(nonce: u32, transfer: u64, what: char) -> String {
     format!("T{nonce:08x}{transfer:06x}{what}")
 }
 
@@ -222,66 +278,88 @@ impl Treasury {
     /// covers every customer's cash from the first posting (blueprint §11): a withdrawal of seeded money is paid out
     /// of money the bank holds, not out of nothing.
     pub fn open(config: Config, path: &Path, fsync: bool, now: u64) -> Result<Self, String> {
-        let (book, records) = Book::open(path, fsync)?;
-        let mut inner = Inner {
-            nonce: 0,
-            transfers: BTreeMap::new(),
-            by_client: BTreeMap::new(),
-            ledger: Ledger::default(),
-            book: None,
-            updates: VecDeque::new(),
-            next_update: 0,
-            retry_at: BTreeMap::new(),
-            generation: 0,
-        };
+        let (mut book, records) = Book::open(path, fsync)?;
+        let mut ledger = Ledger::default();
+        let mut transfers = BTreeMap::new();
+        let mut by_client = BTreeMap::new();
+        let mut fbo: BTreeMap<u64, i64> = BTreeMap::new();
+        let mut recon = recon::State::new(&config.recon, now);
         let mut records = records.into_iter();
-        match records.next() {
+        let nonce = match records.next() {
             Some(first) => {
                 let nonce = first["book"]["nonce"].as_u64().ok_or("the ledger's first line must name its book")?;
-                inner.nonce = u32::try_from(nonce).map_err(|_| "a book nonce out of range")?;
+                u32::try_from(nonce).map_err(|_| "a book nonce out of range")?
             }
-            None => inner.nonce = nonce()?,
-        }
+            None => nonce()?,
+        };
         for r in records {
+            let mut moved = 0i64;
             for p in r["postings"].as_array().into_iter().flatten() {
-                inner.ledger.post(&Posting::from_json(&p["entries"])?)?;
+                let posting = Posting::from_json(&p["entries"])?;
+                ledger.post(&posting)?;
+                moved = moved.saturating_add(posting.cents(ledger::FBO));
             }
             if !r["transfer"].is_null() {
                 let t = from_record(&r["transfer"])?;
-                inner.by_client.insert((t.account, t.client_id.clone()), t.id);
-                inner.transfers.insert(t.id, t);
+                if moved != 0 {
+                    *fbo.entry(t.id).or_default() += moved;
+                }
+                by_client.insert((t.account, t.client_id.clone()), t.id);
+                transfers.insert(t.id, t);
             }
+            recon.replay(&r)?;
         }
-        let fresh = inner.transfers.is_empty() && inner.ledger.trial_balance()["postings"] == 0;
-        inner.book = Some(book);
-        let treasury = Self { config, inner: Mutex::new(inner), changed: Condvar::new() };
+        let fresh = transfers.is_empty() && ledger.trial_balance()["postings"] == 0;
         if fresh {
-            let mut inner = locked(&treasury.inner);
-            let nonce = inner.nonce;
-            Self::write(&mut inner, json!({"book": {"nonce": nonce, "created": now}}))?;
+            book.append(&json!({"book": {"nonce": nonce, "created": now}}))?;
             let mut postings = Vec::new();
-            for (&account, &cents) in treasury.config.accounts.iter().filter(|(_, c)| **c > 0) {
+            for (&account, &cents) in config.accounts.iter().filter(|(_, c)| **c > 0) {
                 postings.push(Posting::moving(cents, ledger::FBO, &ledger::customer(account))?);
             }
             if !postings.is_empty() {
                 let memo = "opening balance: the environment's seed grant, held at the fake bank";
                 let written: Vec<Value> = postings.iter().map(|p| posting_json(memo, p)).collect();
-                Self::write(&mut inner, json!({"postings": written}))?;
+                book.append(&json!({"postings": written}))?;
                 for posting in &postings {
-                    inner.ledger.post(posting)?;
+                    ledger.post(posting)?;
                 }
             }
         }
-        Ok(treasury)
+        // The bank opens holding what the ledger says it holds, so a bank added beside an older book starts level
+        // with it rather than with nothing.
+        let bank_path = path.with_extension("bank.jsonl");
+        let (mut bank, bank_fresh) =
+            Bank::open(config.bank, config.recon.faults, &bank_path, fsync, nonce, ledger.balance(ledger::FBO), now)?;
+        if bank_fresh {
+            for t in transfers.values().filter(|t| matches!(t.stage, Stage::AtBank { .. })) {
+                bank.receive(t, now)?;
+            }
+        }
+        let inner = Inner {
+            nonce,
+            transfers,
+            by_client,
+            ledger,
+            book,
+            bank,
+            inbox: VecDeque::new(),
+            fbo,
+            recon,
+            updates: VecDeque::new(),
+            next_update: 0,
+            retry_at: BTreeMap::new(),
+            generation: 0,
+        };
+        Ok(Self { config, inner: Mutex::new(inner), changed: Condvar::new() })
     }
 
-    fn write(inner: &mut Inner, record: Value) -> Result<(), String> {
-        inner.book.as_mut().ok_or("the book is closed")?.append(&record)
+    pub(crate) fn write(inner: &mut Inner, record: &Value) -> Result<(), String> {
+        inner.book.append(record)
     }
 
     /// Writes a transfer's new stage, with the postings that go with it, and only then applies them: a line that
     /// could not be written changes nothing. Tells streams and waiters if a client can see the difference.
-    fn commit(
+    pub(crate) fn commit(
         &self,
         inner: &mut Inner,
         mut next: Transfer,
@@ -293,9 +371,13 @@ impl Treasury {
             next.updated = now;
         }
         let written: Vec<Value> = postings.iter().map(|(memo, p)| posting_json(memo, p)).collect();
-        Self::write(inner, json!({"transfer": record(&next), "postings": written}))?;
+        Self::write(inner, &json!({"transfer": record(&next), "postings": written}))?;
         for (_, posting) in postings {
             inner.ledger.post(posting)?;
+            let moved = posting.cents(ledger::FBO);
+            if moved != 0 {
+                *inner.fbo.entry(next.id).or_default() += moved;
+            }
         }
         if before != Some(next.visible()) {
             let n = inner.next_update;
@@ -376,6 +458,7 @@ impl Treasury {
                 Kind::Deposit => Stage::ToBank,
                 Kind::Withdrawal => Stage::Reclaiming,
             },
+            in_doubt: None,
         };
         self.commit(&mut inner, transfer, &[], now).map_err(|e| {
             eprintln!("treasury: {e}");
@@ -399,6 +482,21 @@ impl Treasury {
                 "TRANSFER_NOT_CANCELLABLE",
                 format!("transfer {id} is {} and no longer waiting on the bank", t.state.name()),
             ));
+        }
+        // The bank has a say once it has the transfer: it cannot take back what it has already decided, whether or not
+        // its notice has arrived.
+        if matches!(t.stage, Stage::AtBank { .. }) {
+            let cancelled = inner.bank.cancel(id, now).map_err(|e| {
+                eprintln!("treasury: {e}");
+                Refusal::unavailable("the bank could not record the cancellation; nothing was done")
+            })?;
+            if !cancelled {
+                return Err(Refusal::new(
+                    409,
+                    "TRANSFER_NOT_CANCELLABLE",
+                    format!("the bank has already decided transfer {id}"),
+                ));
+            }
         }
         match t.kind {
             Kind::Deposit => {
@@ -446,9 +544,9 @@ impl Treasury {
     pub fn wait_quick(&self, id: u64, limit: Duration) -> Value {
         let inner = locked(&self.inner);
         let quick = |i: &mut Inner| {
-            i.transfers
-                .get(&id)
-                .is_some_and(|t| matches!(t.stage, Stage::Reclaiming | Stage::ToBank | Stage::Granting { .. }))
+            i.transfers.get(&id).is_some_and(|t| {
+                t.in_doubt.is_none() && matches!(t.stage, Stage::Reclaiming | Stage::ToBank | Stage::Granting { .. })
+            })
         };
         let (inner, _) = self.changed.wait_timeout_while(inner, limit, quick).unwrap_or_else(PoisonError::into_inner);
         inner.transfers.get(&id).map_or(Value::Null, Transfer::to_json)
@@ -498,6 +596,15 @@ impl Treasury {
     /// most that long for a change.
     pub fn step(&self, sequencer: &mut dyn Sequencer, now: u64) -> Duration {
         loop {
+            let due = locked(&self.inner).recon.due(now);
+            if let Some(trigger) = due {
+                // The journal is read before the lock is taken, so it is never newer than the transfers it is matched
+                // against: a command the treasury has seen answered is on the feed or the feed is behind it.
+                let journal = sequencer.journal();
+                let mut inner = locked(&self.inner);
+                self.reconcile(&mut inner, &journal, trigger, now);
+                continue;
+            }
             let command = {
                 let mut inner = locked(&self.inner);
                 match self.local_work(&mut inner, now) {
@@ -524,79 +631,82 @@ impl Treasury {
 
     /// One stage that needs nothing but the bank, if there is one due. Says whether it did anything.
     fn local_work(&self, inner: &mut Inner, now: u64) -> Result<bool, String> {
-        let due = inner.transfers.values().find(|t| match t.stage {
-            Stage::ToBank => true,
-            Stage::AtBank { due, .. } => due <= now,
-            _ => false,
-        });
-        let Some(mut t) = due.cloned() else { return Ok(false) };
-        if t.stage == Stage::ToBank {
-            let decision = self.config.bank.decide(t.id, t.kind, t.method);
-            let due = now.saturating_add(decision.delay_ms);
-            t.stage = Stage::AtBank { due, settles: decision.settles };
+        let arrived = inner.bank.deliver(now)?;
+        inner.inbox.extend(arrived);
+        if let Some(mut t) = inner.transfers.values().find(|t| t.stage == Stage::ToBank).cloned() {
+            let receipt = inner.bank.receive(&t, now)?;
+            t.stage = Stage::AtBank { due: receipt.decided };
             // A bank that decides at once is decided in the same breath, so nobody waiting sees it at the bank.
-            if due > now {
-                self.commit(inner, t, &[], now)?;
-                return Ok(true);
+            let arrived = inner.bank.deliver(now)?;
+            inner.inbox.extend(arrived);
+            let mut postings = Vec::new();
+            if let Some(i) = inner.inbox.iter().position(|n| n.transfer == t.id) {
+                let notice = inner.inbox.remove(i).ok_or("a notice that vanished")?;
+                postings.extend(Self::decide(&mut t, notice.settles)?);
             }
+            self.commit(inner, t, &postings, now)?;
+            return Ok(true);
         }
-        let mut postings = Vec::new();
-        match (t.stage, t.kind) {
-            (Stage::AtBank { settles: true, .. }, Kind::Deposit) => {
-                postings.push((
-                    "deposit received at the bank",
-                    Posting::moving(t.amount, ledger::FBO, ledger::DEPOSITS_IN_TRANSIT)?,
-                ));
-                t.stage = Stage::Granting { then: State::Settled, reason: None };
-            }
-            (Stage::AtBank { settles: false, .. }, Kind::Deposit) => {
-                (t.state, t.reason, t.stage) = (State::Failed, Some(Reason::DeclinedByBank), Stage::Done);
-            }
-            (Stage::AtBank { settles: true, .. }, Kind::Withdrawal) => {
-                postings.push((
-                    "withdrawal paid out by the bank",
-                    Posting::moving(t.amount, ledger::WITHDRAWALS_IN_TRANSIT, ledger::FBO)?,
-                ));
-                (t.state, t.stage) = (State::Settled, Stage::Done);
-            }
-            (Stage::AtBank { settles: false, .. }, Kind::Withdrawal) => {
-                t.stage = Stage::Granting { then: State::Failed, reason: Some(Reason::ReturnedByBank) };
-            }
-            _ => return Ok(false),
+        let Some(notice) = inner.inbox.pop_front() else { return Ok(false) };
+        let at_bank = inner.transfers.get(&notice.transfer).filter(|t| matches!(t.stage, Stage::AtBank { .. }));
+        let Some(mut t) = at_bank.cloned() else {
+            // Already past the bank: a duplicate, or a notice that came after reconciliation booked it. Acting on it
+            // again would post it twice; reconciliation reports that it came.
+            inner.recon.ignored.push((notice.transfer, now));
+            return Ok(true);
+        };
+        let postings: Vec<_> = Self::decide(&mut t, notice.settles)?.into_iter().collect();
+        if let Err(e) = self.commit(inner, t, &postings, now) {
+            inner.inbox.push_front(notice);
+            return Err(e);
         }
-        self.commit(inner, t, &postings, now)?;
         Ok(true)
     }
 
-    fn next_command(inner: &Inner, now: u64) -> Option<Command> {
-        let ready = |t: &&Transfer| inner.retry_at.get(&t.id).is_none_or(|at| *at <= now);
-        inner.transfers.values().filter(ready).find_map(|t| {
-            let (what, reason) = match t.stage {
-                Stage::Reclaiming => ('r', "RECLAIM"),
-                Stage::Granting { .. } => ('g', "GRANT"),
-                _ => return None,
-            };
-            Some(Command {
-                transfer: t.id,
-                command_id: command_id(inner.nonce, t.id, what),
-                account: t.account,
-                cents: t.amount,
-                reason,
-            })
+    /// Moves a transfer at the bank past it, the way the bank decided, and returns the posting that goes with it.
+    pub(crate) fn decide(t: &mut Transfer, settles: bool) -> Result<Option<(&'static str, Posting)>, String> {
+        Ok(match (settles, t.kind) {
+            (true, Kind::Deposit) => {
+                t.stage = Stage::Granting { then: State::Settled, reason: None };
+                Some((
+                    "deposit received at the bank",
+                    Posting::moving(t.amount, ledger::FBO, ledger::DEPOSITS_IN_TRANSIT)?,
+                ))
+            }
+            (false, Kind::Deposit) => {
+                (t.state, t.reason, t.stage) = (State::Failed, Some(Reason::DeclinedByBank), Stage::Done);
+                None
+            }
+            (true, Kind::Withdrawal) => {
+                (t.state, t.stage) = (State::Settled, Stage::Done);
+                Some((
+                    "withdrawal paid out by the bank",
+                    Posting::moving(t.amount, ledger::WITHDRAWALS_IN_TRANSIT, ledger::FBO)?,
+                ))
+            }
+            (false, Kind::Withdrawal) => {
+                t.stage = Stage::Granting { then: State::Failed, reason: Some(Reason::ReturnedByBank) };
+                None
+            }
         })
     }
 
+    fn next_command(inner: &Inner, now: u64) -> Option<Command> {
+        let ready = |t: &&Transfer| t.in_doubt.is_none() && inner.retry_at.get(&t.id).is_none_or(|at| *at <= now);
+        inner.transfers.values().filter(ready).find_map(|t| Command::for_transfer(inner.nonce, t))
+    }
+
     fn next_due(inner: &Inner, now: u64) -> Duration {
-        let due = inner.transfers.values().filter_map(|t| match t.stage {
-            Stage::AtBank { due, .. } => Some(due),
+        let retries = inner.transfers.values().filter_map(|t| match t.stage {
             Stage::Reclaiming | Stage::Granting { .. } => inner.retry_at.get(&t.id).copied(),
             _ => None,
         });
-        Duration::from_millis(due.min().map_or(RETRY_MS, |d| d.saturating_sub(now).clamp(1, RETRY_MS)))
+        let due = retries.chain(inner.bank.next_delivery()).chain([inner.recon.due_at]).min();
+        Duration::from_millis(due.map_or(RETRY_MS, |d| d.saturating_sub(now).clamp(1, RETRY_MS)))
     }
 
     /// Puts what the sequencer group said about a command back into its transfer.
-    fn apply(
+    pub(crate) fn apply(
         &self,
         inner: &mut Inner,
         command: &Command,
@@ -609,6 +719,12 @@ impl Treasury {
         let mut postings = Vec::new();
         match (t.stage, outcome) {
             (_, Adjusted::Unknown) => return Err("a duplicate whose first outcome is not known yet".into()),
+            (Stage::Reclaiming | Stage::Granting { .. }, Adjusted::NoAnswer) => {
+                eprintln!("treasury: transfer {}: {} sent and no answer came back", t.id, command.command_id);
+                t.in_doubt = Some(now);
+                inner.retry_at.remove(&t.id);
+                return self.commit(inner, t, &[], now);
+            }
             (Stage::Reclaiming, Adjusted::Applied(sequence)) => {
                 postings.push((
                     "withdrawal reclaimed from the sleeve",
@@ -637,25 +753,27 @@ impl Treasury {
             }
             _ => return Ok(()),
         }
+        t.in_doubt = None;
         inner.retry_at.remove(&t.id);
         self.commit(inner, t, &postings, now)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ledger::{customer, DEPOSITS_IN_TRANSIT, FBO, WITHDRAWALS_IN_TRANSIT};
 
     /// A sequencer group that keeps sleeves and remembers command IDs as E-7.1 and E-7.2 say, and can be told to
     /// stop answering.
     #[derive(Default)]
-    struct Group {
-        sleeves: BTreeMap<u64, i64>,
-        outcomes: BTreeMap<String, Adjusted>,
+    pub(crate) struct Group {
+        pub(crate) sleeves: BTreeMap<u64, i64>,
+        pub(crate) outcomes: BTreeMap<String, Adjusted>,
+        pub(crate) journal: Journal,
         sequence: u64,
-        down: bool,
-        sent: usize,
+        pub(crate) down: bool,
+        pub(crate) sent: usize,
     }
 
     impl Sequencer for Group {
@@ -682,38 +800,52 @@ mod tests {
                 }
             };
             self.outcomes.insert(command_id.to_string(), outcome.clone());
+            let recorded =
+                Recorded { account, cents: cents.unsigned_abs(), reason: reason.to_string(), outcome: outcome.clone() };
+            self.journal.commands.insert(command_id.to_string(), recorded);
+            self.journal.through = self.sequence;
             Ok(outcome)
+        }
+
+        fn journal(&self) -> Journal {
+            self.journal.clone()
         }
     }
 
-    const ACCOUNT: u64 = 2;
+    pub(crate) const ACCOUNT: u64 = 2;
 
-    fn path(name: &str) -> std::path::PathBuf {
+    pub(crate) fn path(name: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("venue-treasury-{name}-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(p.with_extension("bank.jsonl"));
         p
     }
 
-    fn open(path: &Path) -> Treasury {
+    pub(crate) fn open(path: &Path) -> Treasury {
+        open_with(path, recon::Options { every_ms: 0, ..recon::Options::default() })
+    }
+
+    pub(crate) fn open_with(path: &Path, recon: recon::Options) -> Treasury {
         let config = Config {
             bank: FakeBank { seed: 5, min_delay_ms: 100, max_delay_ms: 200, failure_per_mille: 0 },
             max_cents: 1_000_000,
             accounts: [(1, 0), (ACCOUNT, 50_000)].into_iter().collect(),
+            recon,
         };
         Treasury::open(config, path, false, 1_000).expect("a treasury")
     }
 
-    fn body(client: &str, kind: &str, cents: u64, method: &str) -> Value {
+    pub(crate) fn body(client: &str, kind: &str, cents: u64, method: &str) -> Value {
         json!({"clientTransferId": client, "kind": kind, "amountCents": cents, "method": method})
     }
 
-    fn state(treasury: &Treasury, id: u64) -> (String, Value) {
+    pub(crate) fn state(treasury: &Treasury, id: u64) -> (String, Value) {
         let t = treasury.get(ACCOUNT, id).expect("the transfer");
         (t["state"].as_str().unwrap_or("").to_string(), t["reason"].clone())
     }
 
     /// Runs the treasury until nothing more is due before `until`.
-    fn run(treasury: &Treasury, group: &mut Group, until: u64) {
+    pub(crate) fn run(treasury: &Treasury, group: &mut Group, until: u64) {
         for now in (1_000..=until).step_by(50) {
             treasury.step(group, now);
         }
@@ -721,7 +853,7 @@ mod tests {
 
     /// The ledger sums to zero, and the omnibus holds exactly the customers' cash plus what is in transit
     /// (blueprint §11: the sum of customer cash equals the FBO balance minus in-flight transfers).
-    fn balanced(treasury: &Treasury) {
+    pub(crate) fn balanced(treasury: &Treasury) {
         let trial = treasury.trial_balance();
         assert_eq!(trial["total"], "0", "{trial}");
         let customers: i64 = [1, ACCOUNT].iter().map(|a| treasury.balance(&customer(*a))).sum();
@@ -859,6 +991,10 @@ mod tests {
         fn adjust(&mut self, command_id: &str, account: u64, cents: u64, reason: &str) -> Result<Adjusted, String> {
             self.0.adjust(command_id, account, cents, reason)?;
             Err("the answer was lost".into())
+        }
+
+        fn journal(&self) -> Journal {
+            self.0.journal()
         }
     }
 

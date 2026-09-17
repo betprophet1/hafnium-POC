@@ -29,6 +29,11 @@ impl Posting {
         Ok(Self(vec![(debit.to_string(), cents), (credit.to_string(), -cents)]))
     }
 
+    /// What this posting moves into `account` (negative: out of it).
+    pub fn cents(&self, account: &str) -> i64 {
+        self.0.iter().filter(|(a, _)| a == account).map(|(_, c)| *c).sum()
+    }
+
     pub fn to_json(&self) -> Value {
         Value::Array(self.0.iter().map(|(account, cents)| json!([account, cents])).collect())
     }
@@ -70,6 +75,10 @@ impl Ledger {
         self.balances.extend(next);
         self.postings += 1;
         Ok(())
+    }
+
+    pub const fn balances(&self) -> &BTreeMap<String, i64> {
+        &self.balances
     }
 
     pub fn balance(&self, account: &str) -> i64 {

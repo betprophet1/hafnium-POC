@@ -3,8 +3,19 @@
 //!
 //! Its decisions are a function of its seed and the transfer alone, never of the clock or of the order transfers
 //! arrive in, so a run can be repeated exactly and a failure found in one can be found again.
+//!
+//! `Bank` is the bank's side of the story: the transfers it received, what it decided and when, and the FBO omnibus
+//! balance that follows. It keeps its own book, apart from the treasury's, because it stands for another company's
+//! system: the treasury learns what the bank did only from its notices, which can go missing (`faults`), and checks
+//! its ledger against the bank's statement (`recon`).
 
-use crate::transfer::{Kind, Method};
+use crate::book::Book;
+use crate::clock;
+use crate::faults::Faults;
+use crate::transfer::{Kind, Method, Transfer};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FakeBank {
@@ -25,7 +36,7 @@ pub struct Decision {
 
 /// SplitMix64's output function: a well-mixed 64 bits from any input, so neighbouring transfer IDs draw unrelated
 /// numbers.
-const fn mix(mut z: u64) -> u64 {
+pub(crate) const fn mix(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -46,6 +57,312 @@ impl FakeBank {
             Method::DummyFailing => Decision { delay_ms, settles: false },
             Method::DummyBank => Decision { delay_ms, settles: (draw & 0xffff) % 1000 >= self.failure_per_mille },
         }
+    }
+}
+
+/// A transfer as the bank holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Receipt {
+    pub transfer: u64,
+    pub account: u64,
+    pub kind: Kind,
+    pub amount: u64,
+    pub received: u64,
+    /// When the bank decides it, and which way. Fixed on receipt: the bank's own business, not the treasury's.
+    pub decided: u64,
+    pub settles: bool,
+    pub cancelled: Option<u64>,
+    /// When each copy of its notice reaches the treasury: none if it is lost. Drawn on receipt and written down with
+    /// it, so a restart with other faults injected neither brings a lost notice back nor loses one on its way.
+    pub arrivals: Vec<u64>,
+}
+
+/// Where a transfer stands at the bank at some moment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Pending,
+    Settled,
+    Failed,
+    Cancelled,
+}
+
+impl Outcome {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Settled => "settled",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl Receipt {
+    pub fn outcome(&self, at: u64) -> Outcome {
+        if self.cancelled.is_some_and(|c| c <= at) {
+            Outcome::Cancelled
+        } else if self.decided > at {
+            Outcome::Pending
+        } else if self.settles {
+            Outcome::Settled
+        } else {
+            Outcome::Failed
+        }
+    }
+
+    /// How much this transfer has moved the omnibus by `at`: a settled deposit brings money in, a settled withdrawal
+    /// pays it out, anything else moves nothing.
+    pub fn movement(&self, at: u64) -> i64 {
+        let amount = i64::try_from(self.amount).unwrap_or(i64::MAX);
+        match (self.outcome(at), self.kind) {
+            (Outcome::Settled, Kind::Deposit) => amount,
+            (Outcome::Settled, Kind::Withdrawal) => -amount,
+            _ => 0,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "transfer": self.transfer, "account": self.account, "kind": self.kind.name(), "amountCents": self.amount,
+            "received": self.received, "decided": self.decided, "settles": self.settles, "cancelled": self.cancelled,
+            "arrivals": self.arrivals
+        })
+    }
+
+    fn from_json(v: &Value) -> Result<Self, String> {
+        let number = |name: &str| v[name].as_u64().ok_or_else(|| format!("a bank receipt needs {name}: {v}"));
+        Ok(Self {
+            transfer: number("transfer")?,
+            account: number("account")?,
+            kind: v["kind"].as_str().and_then(Kind::parse).ok_or("a bank receipt needs kind")?,
+            amount: number("amountCents")?,
+            received: number("received")?,
+            decided: number("decided")?,
+            settles: v["settles"].as_bool().ok_or("a bank receipt needs settles")?,
+            cancelled: v["cancelled"].as_u64(),
+            arrivals: v["arrivals"]
+                .as_array()
+                .ok_or("a bank receipt needs arrivals")?
+                .iter()
+                .map(|a| a.as_u64().ok_or("an arrival is a time"))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+/// The bank telling the treasury what it decided about a transfer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Notice {
+    pub transfer: u64,
+    pub settles: bool,
+}
+
+/// The bank's account of a period, as a statement file or a statement API would give it.
+pub struct Statement {
+    pub from: u64,
+    pub to: u64,
+    pub opening: i64,
+    pub closing: i64,
+    /// Every transfer the bank had received by `to` that was still pending then or was decided or cancelled in the
+    /// period, with its outcome as of `to`.
+    pub lines: Vec<(Receipt, Outcome)>,
+}
+
+impl Statement {
+    pub fn to_json(&self) -> Value {
+        let lines: Vec<Value> = self
+            .lines
+            .iter()
+            .map(|(r, outcome)| {
+                json!({
+                    "transferId": r.transfer.to_string(), "accountId": r.account.to_string(), "kind": r.kind.name(),
+                    "amountCents": r.amount, "receivedAt": clock::rfc3339(r.received), "outcome": outcome.name(),
+                    "valueAt": match outcome {
+                        Outcome::Pending => Value::Null,
+                        Outcome::Cancelled => json!(r.cancelled.map(clock::rfc3339)),
+                        _ => json!(clock::rfc3339(r.decided)),
+                    },
+                    "movementCents": r.movement(self.to)
+                })
+            })
+            .collect();
+        json!({
+            "account": crate::ledger::FBO, "from": clock::rfc3339(self.from), "to": clock::rfc3339(self.to),
+            "openingCents": self.opening, "closingCents": self.closing, "lines": lines
+        })
+    }
+}
+
+pub struct Bank {
+    pub fake: FakeBank,
+    faults: Faults,
+    book: Book,
+    /// The omnibus balance when the bank's book was opened: whatever the treasury's ledger said the bank held then.
+    opening: i64,
+    receipts: BTreeMap<u64, Receipt>,
+    /// Notices still to arrive: when, for which transfer, and which copy.
+    outbox: BTreeSet<(u64, u64, u8)>,
+    /// Copies of each transfer's notice already sent, so a restart does not send them again.
+    sent: BTreeMap<u64, u8>,
+}
+
+impl Bank {
+    /// The bank whose book is the file at `path`, replayed if it exists. A new book opens with `opening` in the
+    /// omnibus, for the treasury book named by `nonce`; an existing one must be that book's. Says whether it is new.
+    pub fn open(
+        fake: FakeBank,
+        faults: Faults,
+        path: &Path,
+        fsync: bool,
+        nonce: u32,
+        opening: i64,
+        now: u64,
+    ) -> Result<(Self, bool), String> {
+        let (book, records) = Book::open(path, fsync)?;
+        let fresh = records.is_empty();
+        let mut bank = Self {
+            fake,
+            faults,
+            book,
+            opening,
+            receipts: BTreeMap::new(),
+            outbox: BTreeSet::new(),
+            sent: BTreeMap::new(),
+        };
+        if fresh {
+            bank.book.append(&json!({"bank": {"openingCents": opening, "opened": now, "treasuryBook": nonce}}))?;
+        }
+        for r in records {
+            if let Some(o) = r["bank"]["openingCents"].as_i64() {
+                if r["bank"]["treasuryBook"].as_u64() != Some(u64::from(nonce)) {
+                    return Err(format!(
+                        "{} belongs to another treasury book: remove it with the book it belongs to",
+                        path.display()
+                    ));
+                }
+                bank.opening = o;
+            } else if !r["receipt"].is_null() {
+                let receipt = Receipt::from_json(&r["receipt"])?;
+                bank.receipts.insert(receipt.transfer, receipt);
+            } else if let Some(id) = r["cancelled"].as_u64() {
+                if let Some(receipt) = bank.receipts.get_mut(&id) {
+                    receipt.cancelled = r["at"].as_u64();
+                }
+            } else if let Some(id) = r["sent"].as_u64() {
+                bank.sent.insert(id, u8::try_from(r["copies"].as_u64().unwrap_or(0)).unwrap_or(u8::MAX));
+            }
+        }
+        let ids: Vec<u64> = bank.receipts.keys().copied().collect();
+        for id in ids {
+            bank.queue(id);
+        }
+        Ok((bank, fresh))
+    }
+
+    fn queue(&mut self, id: u64) {
+        let Some(r) = self.receipts.get(&id) else { return };
+        if r.cancelled.is_some() {
+            return;
+        }
+        let sent = self.sent.get(&id).copied().unwrap_or(0);
+        for (copy, &at) in r.arrivals.iter().enumerate() {
+            let copy = u8::try_from(copy).unwrap_or(u8::MAX);
+            if copy >= sent {
+                self.outbox.insert((at, id, copy));
+            }
+        }
+    }
+
+    /// Takes a transfer in, once: a transfer handed over again, after a treasury stopped between the two, is the one
+    /// already received.
+    pub fn receive(&mut self, t: &Transfer, now: u64) -> Result<Receipt, String> {
+        if let Some(r) = self.receipts.get(&t.id) {
+            return Ok(r.clone());
+        }
+        let decision = self.fake.decide(t.id, t.kind, t.method);
+        let receipt = Receipt {
+            transfer: t.id,
+            account: t.account,
+            kind: t.kind,
+            amount: t.amount,
+            received: now,
+            decided: now.saturating_add(decision.delay_ms),
+            settles: decision.settles,
+            cancelled: None,
+            arrivals: self.faults.arrivals(self.fake.seed, t.id, now.saturating_add(decision.delay_ms)),
+        };
+        self.book.append(&json!({"receipt": receipt.to_json()}))?;
+        self.receipts.insert(t.id, receipt.clone());
+        self.queue(t.id);
+        Ok(receipt)
+    }
+
+    /// Cancels a transfer the bank has not decided yet. Says whether it did: once decided, it is too late.
+    pub fn cancel(&mut self, id: u64, now: u64) -> Result<bool, String> {
+        match self.receipts.get(&id) {
+            Some(r) if r.outcome(now) == Outcome::Pending => {}
+            _ => return Ok(false),
+        }
+        self.book.append(&json!({"cancelled": id, "at": now}))?;
+        if let Some(r) = self.receipts.get_mut(&id) {
+            r.cancelled = Some(now);
+        }
+        self.outbox.retain(|(_, t, _)| *t != id);
+        Ok(true)
+    }
+
+    /// The notices that have arrived by `now`, each written down as sent before it is handed over.
+    pub fn deliver(&mut self, now: u64) -> Result<Vec<Notice>, String> {
+        let mut notices = Vec::new();
+        while let Some(&(at, id, copy)) = self.outbox.first() {
+            if at > now {
+                break;
+            }
+            self.book.append(&json!({"sent": id, "copies": copy + 1}))?;
+            self.outbox.pop_first();
+            self.sent.insert(id, copy + 1);
+            if let Some(r) = self.receipts.get(&id) {
+                notices.push(Notice { transfer: id, settles: r.settles });
+            }
+        }
+        Ok(notices)
+    }
+
+    /// When the next notice arrives, if one is on its way.
+    pub fn next_delivery(&self) -> Option<u64> {
+        self.outbox.first().map(|(at, _, _)| *at)
+    }
+
+    pub fn receipt(&self, id: u64) -> Option<&Receipt> {
+        self.receipts.get(&id)
+    }
+
+    pub const fn receipts(&self) -> &BTreeMap<u64, Receipt> {
+        &self.receipts
+    }
+
+    /// The omnibus balance at `at`.
+    pub fn balance(&self, at: u64) -> i64 {
+        self.opening.saturating_add(self.receipts.values().map(|r| r.movement(at)).sum())
+    }
+
+    pub fn statement(&self, from: u64, to: u64) -> Statement {
+        let lines = self
+            .receipts
+            .values()
+            .filter(|r| r.received <= to)
+            .filter_map(|r| {
+                let outcome = r.outcome(to);
+                let when = match outcome {
+                    Outcome::Pending => return Some((r.clone(), outcome)),
+                    Outcome::Cancelled => r.cancelled.unwrap_or(0),
+                    _ => r.decided,
+                };
+                (when >= from).then(|| (r.clone(), outcome))
+            })
+            .collect();
+        let opening = if from == 0 { self.opening } else { self.balance(from - 1) };
+        Statement { from, to, opening, closing: self.balance(to), lines }
     }
 }
 
@@ -84,5 +401,85 @@ mod tests {
             assert_eq!(bank(1).decide(t, Kind::Deposit, Method::DummyInstant), Decision { delay_ms: 0, settles: true });
             assert!(!bank(1).decide(t, Kind::Withdrawal, Method::DummyFailing).settles);
         }
+    }
+
+    fn transfer(id: u64, kind: Kind, amount: u64, method: Method) -> Transfer {
+        Transfer {
+            id,
+            account: 2,
+            client_id: format!("c{id}"),
+            kind,
+            amount,
+            method,
+            state: crate::transfer::State::Pending,
+            reason: None,
+            sequence: None,
+            created: 0,
+            updated: 0,
+            stage: crate::transfer::Stage::ToBank,
+            in_doubt: None,
+        }
+    }
+
+    fn open(path: &Path, faults: Faults) -> Bank {
+        let fake = FakeBank { seed: 1, min_delay_ms: 1000, max_delay_ms: 1000, failure_per_mille: 0 };
+        Bank::open(fake, faults, path, false, 7, 10_000, 0).expect("a bank").0
+    }
+
+    #[test]
+    fn the_bank_takes_a_transfer_once_and_its_statement_follows_its_decisions() {
+        let path = std::env::temp_dir().join(format!("venue-treasury-bank-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut b = open(&path, Faults::NONE);
+        let first = b.receive(&transfer(1, Kind::Deposit, 500, Method::DummyBank), 100).expect("received");
+        assert_eq!(b.receive(&transfer(1, Kind::Deposit, 500, Method::DummyBank), 900).expect("again"), first);
+        b.receive(&transfer(2, Kind::Withdrawal, 200, Method::DummyBank), 100).expect("received");
+        b.receive(&transfer(3, Kind::Withdrawal, 300, Method::DummyBank), 100).expect("received");
+        assert!(b.cancel(3, 500).expect("cancelled"), "undecided, so cancellable");
+        assert!(!b.cancel(2, 1_100).expect("refused"), "decided at 1100, so too late");
+        assert_eq!(b.deliver(1_000).expect("nothing yet"), vec![]);
+        let notices = b.deliver(1_100).expect("two notices");
+        assert_eq!(notices, vec![Notice { transfer: 1, settles: true }, Notice { transfer: 2, settles: true }]);
+
+        let statement = b.statement(0, 2_000);
+        assert_eq!((statement.opening, statement.closing), (10_000, 10_300));
+        let outcomes: Vec<(u64, Outcome)> = statement.lines.iter().map(|(r, o)| (r.transfer, *o)).collect();
+        assert_eq!(outcomes, vec![(1, Outcome::Settled), (2, Outcome::Settled), (3, Outcome::Cancelled)]);
+        let later = b.statement(1_500, 2_000);
+        assert_eq!((later.opening, later.closing, later.lines.len()), (10_300, 10_300, 0));
+        assert_eq!(b.balance(1_000), 10_000);
+
+        // Reopened, it holds the same and sends nothing twice.
+        drop(b);
+        let mut b = open(&path, Faults::NONE);
+        assert_eq!(b.balance(2_000), 10_300);
+        assert_eq!(b.deliver(5_000).expect("nothing"), vec![]);
+        assert!(b.receipt(3).is_some_and(|r| r.cancelled == Some(500)));
+        let fake = b.fake;
+        drop(b);
+        let other = Bank::open(fake, Faults::NONE, &path, false, 8, 10_000, 0).map(|_| ());
+        assert!(other.is_err(), "a bank's book opened for another treasury book");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_lost_notice_never_comes_and_a_duplicate_comes_twice() {
+        let path = std::env::temp_dir().join(format!("venue-treasury-bank-lost-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut b = open(&path, Faults { lost_notice_per_mille: 1000, ..Faults::NONE });
+        b.receive(&transfer(1, Kind::Deposit, 500, Method::DummyInstant), 100).expect("received");
+        assert_eq!(b.deliver(u64::MAX).expect("nothing"), vec![]);
+        assert_eq!(b.balance(100), 10_500, "the bank settled it all the same");
+        drop(b);
+        let mut b = open(&path, Faults::NONE);
+        assert_eq!(b.deliver(u64::MAX).expect("still nothing"), vec![], "a lost notice came back after a restart");
+        drop(b);
+        let _ = std::fs::remove_file(&path);
+        let mut b = open(&path, Faults { duplicate_notice_per_mille: 1000, ..Faults::NONE });
+        b.receive(&transfer(1, Kind::Deposit, 500, Method::DummyInstant), 100).expect("received");
+        assert_eq!(b.deliver(100).expect("the first").len(), 1);
+        assert_eq!(b.next_delivery(), Some(100 + crate::faults::DUPLICATE_GAP_MS));
+        assert_eq!(b.deliver(100 + crate::faults::DUPLICATE_GAP_MS).expect("the second").len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 }
