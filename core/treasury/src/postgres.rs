@@ -18,8 +18,11 @@ use venue_store::postgres::{Row, Transaction};
 use venue_store::{big, millis, time, unsigned, Database, Migration};
 
 /// The treasury's schema, in order. A released migration is never edited: a change is a new one.
-pub const MIGRATIONS: &[Migration] =
-    &[Migration { version: 1, name: "ledger", sql: include_str!("../migrations/V001__ledger.sql") }];
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    version: "20260917000001",
+    name: "ledger",
+    sql: include_str!("../migrations/20260917000001_ledger.sql"),
+}];
 
 pub struct Postgres {
     db: Database,
@@ -445,7 +448,7 @@ mod tests {
     fn records(name: &str) -> Option<(Database, Arc<Postgres>)> {
         let config = testing::owned_config(name)?;
         let db = Database::connect(&config).expect("the test database");
-        db.migrate(MIGRATIONS).expect("migrated");
+        db.migrate(&venue_store::migrations_dir!()).expect("migrated");
         Some((db.clone(), Arc::new(Postgres::new(db))))
     }
 

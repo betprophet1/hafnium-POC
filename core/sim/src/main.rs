@@ -120,7 +120,7 @@ fn main() -> ExitCode {
 fn oracle_migrate(args: &Args) -> Result<(), Error> {
     let config = args.database()?.ok_or("--database-url (or VENUE_DATABASE_URL) is required")?;
     let db = venue_store::Database::connect_retrying(&config, "venue-sim oracle")?;
-    let applied = db.migrate(cases::MIGRATIONS)?;
+    let applied = db.migrate(&venue_store::migrations_dir!())?;
     eprintln!(
         "venue-sim oracle: schema {} of {} is at migration {} (applied now: {applied:?})",
         config.schema,
@@ -209,7 +209,7 @@ fn oracle(args: &Args) -> Result<(), Error> {
             eprintln!("oracle: cases in {}", config.describe());
             let db = venue_store::Database::connect_retrying(&config, "venue-sim oracle")?;
             if args.get("migrate-on-start", Some("false"))? == "true" {
-                db.migrate(cases::MIGRATIONS)?;
+                db.migrate(&venue_store::migrations_dir!())?;
             }
             db.wait_for_schema(cases::MIGRATIONS, "venue-sim oracle")?;
             Some(cases::CaseStore::new(db))

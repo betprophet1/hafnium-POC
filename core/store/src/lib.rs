@@ -8,9 +8,10 @@
 //! - [`Database`]: a small blocking pool that fits the services' threads. A connection that broke is dropped rather
 //!   than handed out again, and a new one is made on the next checkout, so a database that comes back is used again
 //!   without a restart.
-//! - [`Database::migrate`]: versioned migrations, applied in order in one transaction under an advisory lock, each
-//!   recorded with a checksum; a migration changed after it was applied, or a database newer than the binary, stops
-//!   the service rather than being guessed at.
+//! - [`Database::migrate`]: the service's migrations, applied by Atlas, which keeps their history and takes its own
+//!   lock. A database newer than the binary, or a migration edited after it was applied, stops the service rather
+//!   than being guessed at: the first of those is Atlas's history, the second this crate's record of the SQL each
+//!   applied version held, which Atlas does not keep.
 //! - [`Database::transaction`]: a closure run in a transaction, committed if it returns `Ok`.
 //! - [`testing`]: a fresh schema on `VENUE_TEST_DATABASE_URL` for tests, or a clear line saying they were skipped.
 
@@ -21,6 +22,8 @@ use postgres_openssl::MakeTlsConnector;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -99,6 +102,17 @@ pub enum Tls {
 }
 
 impl Tls {
+    /// The name libpq and Atlas both know it by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Disable => "disable",
+            Self::Prefer => "prefer",
+            Self::Require => "require",
+            Self::VerifyCa => "verify-ca",
+            Self::VerifyFull => "verify-full",
+        }
+    }
+
     pub fn parse(text: &str) -> Result<Self, String> {
         Ok(match text {
             "disable" => Self::Disable,
@@ -184,6 +198,30 @@ impl Config {
         pg.tcp_user_timeout(TCP_USER_TIMEOUT).keepalives(true).keepalives_idle(Duration::from_secs(30));
         pg.application_name(&self.application);
         Ok((pg, tls, self.ca_file.clone().or(ca)))
+    }
+
+    /// The URL as Atlas takes it: the service's own, with the schema its tables live in and the TLS the settings ask
+    /// for, so that Atlas connects exactly where the service does. Atlas reads libpq's `sslmode` and `sslrootcert`.
+    pub fn atlas_url(&self) -> String {
+        let (base, query) = self.url.split_once('?').unwrap_or((self.url.as_str(), ""));
+        let mut kept: Vec<String> = query
+            .split('&')
+            // The schema and, where the settings give one, the TLS mode are this method's to say; anything else the
+            // URL carries is kept as it is.
+            .filter(|p| {
+                let ours = p.starts_with("search_path=") || (self.tls.is_some() && p.starts_with("sslmode="));
+                !p.is_empty() && !ours
+            })
+            .map(str::to_string)
+            .collect();
+        kept.push(format!("search_path={}", self.schema));
+        if let Some(tls) = self.tls {
+            kept.push(format!("sslmode={}", tls.name()));
+        }
+        if let Some(ca) = &self.ca_file {
+            kept.push(format!("sslrootcert={ca}"));
+        }
+        format!("{base}?{}", kept.join("&"))
     }
 
     /// Where the database is, for logs: host, port and database, never the user or password.
@@ -302,17 +340,14 @@ impl Drop for Conn {
     }
 }
 
-/// One migration of a service's schema. Versions start at 1 and go up by one; a migration is never edited once
-/// released, only followed by another.
+/// One migration of a service's schema, as Atlas keeps them (`core/store/README.md`): the version its file name
+/// begins with, its name, and the SQL, embedded so that a build knows the schema it was written against. Applying
+/// them is Atlas's (`Database::migrate`); a migration is never edited once released, only followed by another.
 #[derive(Clone, Copy, Debug)]
 pub struct Migration {
-    pub version: i32,
+    pub version: &'static str,
     pub name: &'static str,
     pub sql: &'static str,
-}
-
-fn checksum(sql: &str) -> String {
-    Sha256::digest(sql.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl Database {
@@ -435,50 +470,133 @@ impl Database {
     /// run from several processes at once: they queue on an advisory lock and later ones find nothing to do. This is
     /// what a service's `migrate` subcommand runs; a service itself only checks (`wait_for_schema`), unless told to
     /// migrate at start.
-    pub fn migrate(&self, migrations: &[Migration]) -> Result<Vec<i32>, Error> {
-        in_order(migrations)?;
+    /// Applies the migrations in `dir` with Atlas, which keeps the history in `atlas_schema_revisions` and takes its
+    /// own lock, and returns the versions it applied. The schema is created first if it is missing, since Atlas writes
+    /// into one that exists. A deployment does not come through here: its migrate job runs the same Atlas against the
+    /// same directory (deploy/README.md). This is for tests and for `--migrate-on-start` on a laptop.
+    pub fn migrate(&self, dir: &Path) -> Result<Vec<String>, Error> {
         let schema = self.schema().to_string();
         self.transaction(|tx| {
-            tx.execute("SELECT pg_advisory_xact_lock(hashtext('venue-store migrate ' || $1::text))", &[&schema])?;
             let exists = tx.query_opt("SELECT 1 FROM pg_namespace WHERE nspname = $1", &[&schema])?.is_some();
             if !exists {
                 tx.batch_execute(&format!("CREATE SCHEMA {schema}"))?;
             }
+            Ok(())
+        })?;
+        let before = self.applied_versions()?;
+        let atlas = atlas_binary()?;
+        let outcome = Command::new(&atlas)
+            .arg("migrate")
+            .arg("apply")
+            .arg("--dir")
+            .arg(format!("file://{}", dir.display()))
+            .arg("--url")
+            .arg(self.config().atlas_url())
+            .arg("--revisions-schema")
+            .arg(&schema)
+            .output()
+            .map_err(|e| Error::refused(format!("running {}: {e}", atlas.display())))?;
+        if !outcome.status.success() {
+            let said = String::from_utf8_lossy(&outcome.stderr);
+            let said = if said.trim().is_empty() { String::from_utf8_lossy(&outcome.stdout) } else { said };
+            return Err(Error::refused(format!(
+                "atlas could not apply {} to schema {schema}: {}",
+                dir.display(),
+                said.trim()
+            )));
+        }
+        let after = self.applied_versions()?;
+        Ok(after.into_iter().filter(|v| !before.contains(v)).collect())
+    }
+
+    /// The versions Atlas records as applied, in order. A version whose run failed or was left part-way is not one of
+    /// them: Atlas keeps such a row with its error, and applying again is what mends it.
+    fn applied_versions(&self) -> Result<Vec<String>, Error> {
+        let schema = self.schema().to_string();
+        self.transaction(|tx| {
+            let table = format!("{schema}.atlas_schema_revisions");
+            if !tx.query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])?.get::<_, bool>(0) {
+                return Ok(Vec::new());
+            }
+            let rows = tx.query(
+                &format!(
+                    "SELECT version FROM {table} WHERE applied = total AND coalesce(error, '') = '' ORDER BY version"
+                ),
+                &[],
+            )?;
+            Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
+        })
+    }
+
+    /// The SQL each applied version was built from, kept beside Atlas's history. Atlas hashes a migration directory,
+    /// but hashing it again after editing a file it has already applied leaves nothing to notice: `apply`, `status`
+    /// and `validate` all pass. A released migration must never be edited (decisions.md, S-2), so the first build to
+    /// see a version applied records what it held, and any later build that holds something else stops here.
+    fn checked_against_this_build(&self, migrations: &[Migration], applied: &[String]) -> Result<(), Error> {
+        let schema = self.schema().to_string();
+        self.transaction(|tx| {
             tx.batch_execute(
-                "CREATE TABLE IF NOT EXISTS schema_migrations (
-                   version integer PRIMARY KEY,
-                   name text NOT NULL,
-                   checksum text NOT NULL,
-                   applied_at timestamptz NOT NULL DEFAULT now()
+                "CREATE TABLE IF NOT EXISTS venue_migration_sql (
+                   version text PRIMARY KEY,
+                   sha256 text NOT NULL,
+                   first_seen timestamptz NOT NULL DEFAULT now()
                  )",
             )?;
-            let applied = applied(tx, &schema, migrations)?;
-            let mut done = Vec::new();
-            for m in migrations.iter().skip(applied) {
-                tx.batch_execute(m.sql).map_err(|e| Error::from(e).in_migration(m))?;
-                tx.execute(
-                    "INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)",
-                    &[&m.version, &m.name, &checksum(m.sql)],
-                )?;
-                done.push(m.version);
+            for version in applied {
+                let Some(m) = migrations.iter().find(|m| m.version == *version) else { continue };
+                let sum = checksum(m.sql);
+                let row = tx.query_opt("SELECT sha256 FROM venue_migration_sql WHERE version = $1", &[version])?;
+                match row {
+                    Some(row) if row.get::<_, String>(0) == sum => {}
+                    Some(_) => {
+                        return Err(Error::refused(format!(
+                            "migration {version} ({}) of schema {schema} differs from the one applied: a released \
+                             migration must never be edited, and a correction is a migration of its own",
+                            m.name
+                        )))
+                    }
+                    None => {
+                        tx.execute(
+                            "INSERT INTO venue_migration_sql (version, sha256) VALUES ($1, $2)",
+                            &[version, &sum],
+                        )?;
+                    }
+                }
             }
-            Ok(done)
+            Ok(())
         })
     }
 
     /// How many of `migrations` the schema has had applied: all of them is the schema this build expects. An error if
-    /// the schema has a migration this build does not know, or one that differs from this build's.
+    /// the schema holds a version this build does not know, or holds them in another order: waiting cannot mend
+    /// either, and a build rolled back onto a newer schema must not write rows the newer one defined.
     pub fn schema_version(&self, migrations: &[Migration]) -> Result<usize, Error> {
         in_order(migrations)?;
-        let schema = self.schema().to_string();
-        self.transaction(|tx| {
-            let table = format!("{schema}.schema_migrations");
-            if tx.query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])?.get::<_, bool>(0) {
-                applied(tx, &schema, migrations)
-            } else {
-                Ok(0)
+        let applied = self.applied_versions()?;
+        self.checked_against_this_build(migrations, &applied)?;
+        for (i, version) in applied.iter().enumerate() {
+            match migrations.get(i) {
+                Some(m) if m.version == version => {}
+                Some(m) => {
+                    return Err(Error::refused(format!(
+                        "schema {} has migration {version} where this build has {} ({}): the directory they were \
+                         applied from is not this build's",
+                        self.schema(),
+                        m.version,
+                        m.name
+                    )))
+                }
+                None => {
+                    return Err(Error::refused(format!(
+                        "schema {} is at migration {version}, newer than this build knows (it ends at {}): run a \
+                         build that has it",
+                        self.schema(),
+                        migrations.last().map_or("none", |m| m.version)
+                    )))
+                }
             }
-        })
+        }
+        Ok(applied.len())
     }
 
     /// Waits until the schema is at the last of `migrations`, as a service does at start: while it is behind, or the
@@ -507,37 +625,21 @@ impl Database {
     }
 }
 
-/// Versions from 1, each one more than the last.
+fn checksum(sql: &str) -> String {
+    Sha256::digest(sql.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Versions in ascending order, none repeated: the order Atlas applies its files in.
 fn in_order(migrations: &[Migration]) -> Result<(), Error> {
-    for (i, m) in migrations.iter().enumerate() {
-        if usize::try_from(m.version).ok() != Some(i + 1) {
-            return Err(Error::refused(format!("migration {} ({}) is out of order", m.version, m.name)));
+    for pair in migrations.windows(2) {
+        if pair[0].version >= pair[1].version {
+            return Err(Error::refused(format!(
+                "migration {} ({}) does not come before {} ({})",
+                pair[0].version, pair[0].name, pair[1].version, pair[1].name
+            )));
         }
     }
     Ok(())
-}
-
-/// How many migrations `schema_migrations` records, each checked against this build's.
-fn applied(tx: &mut Transaction<'_>, schema: &str, migrations: &[Migration]) -> Result<usize, Error> {
-    let rows = tx.query("SELECT version, name, checksum FROM schema_migrations ORDER BY version", &[])?;
-    for row in &rows {
-        let (version, name, sum): (i32, String, String) = (row.get(0), row.get(1), row.get(2));
-        let known = usize::try_from(version).ok().and_then(|v| v.checked_sub(1)).and_then(|i| migrations.get(i));
-        let Some(m) = known else {
-            return Err(Error::refused(format!(
-                "schema {schema} is at migration {version} ({name}), newer than this build knows ({}): run a build \
-                 that has it",
-                migrations.len()
-            )));
-        };
-        if sum != checksum(m.sql) || name != m.name {
-            return Err(Error::refused(format!(
-                "migration {version} ({name}) of schema {schema} differs from the one applied: a released migration \
-                 must never be edited"
-            )));
-        }
-    }
-    Ok(rows.len())
 }
 
 /// Checks that `dir` holds exactly `migrations` as files named `V<version, three digits>__<name>.sql` with the same
@@ -549,9 +651,20 @@ pub fn check_files(dir: &std::path::Path, migrations: &[Migration]) -> Result<()
         .filter_map(|entry| entry.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
         .collect();
     names.sort();
-    let expected: Vec<String> = migrations.iter().map(|m| format!("V{:03}__{}.sql", m.version, m.name)).collect();
-    if names != expected {
-        return Err(format!("{} holds {names:?}, and the build embeds {expected:?}", dir.display()));
+    let expected: Vec<String> = migrations.iter().map(|m| format!("{}_{}.sql", m.version, m.name)).collect();
+    let sum = "atlas.sum".to_string();
+    let files: Vec<String> = names.iter().filter(|n| **n != sum).cloned().collect();
+    if files != expected {
+        return Err(format!("{} holds {files:?}, and the build embeds {expected:?}", dir.display()));
+    }
+    if !names.contains(&sum) {
+        return Err(format!("{} has no atlas.sum: run `atlas migrate hash`", dir.display()));
+    }
+    let listed = std::fs::read_to_string(dir.join(&sum)).map_err(|e| format!("{sum}: {e}"))?;
+    for name in &expected {
+        if !listed.contains(name.as_str()) {
+            return Err(format!("{sum} does not list {name}: run `atlas migrate hash`"));
+        }
     }
     for (m, name) in migrations.iter().zip(&expected) {
         let text = std::fs::read_to_string(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
@@ -562,13 +675,38 @@ pub fn check_files(dir: &std::path::Path, migrations: &[Migration]) -> Result<()
     Ok(())
 }
 
-impl Error {
-    fn in_migration(self, m: &Migration) -> Self {
-        match self {
-            Self::Refused(e) => Self::Refused(format!("migration {} ({}): {e}", m.version, m.name)),
-            other => other,
+/// Where this build's migrations are: `VENUE_MIGRATIONS` when something says so — an image carries them apart from
+/// the source — and otherwise the `migrations` directory beside the crate's `Cargo.toml`, which is where they live in
+/// a checkout. This is for tests and `--migrate-on-start`; a deployment's migrate job names the directory itself.
+#[macro_export]
+macro_rules! migrations_dir {
+    () => {
+        std::env::var("VENUE_MIGRATIONS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations")))
+    };
+}
+
+/// The Atlas binary: `VENUE_ATLAS`, or `atlas` on the PATH. It applies every migration this venue runs, in tests and
+/// in a deployment alike (core/store/decisions.md, S-2).
+pub fn atlas_binary() -> Result<PathBuf, Error> {
+    if let Ok(named) = std::env::var("VENUE_ATLAS") {
+        let path = PathBuf::from(&named);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(Error::refused(format!("VENUE_ATLAS is {named}, which is not a file")));
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
+        let candidate = Path::new(dir).join("atlas");
+        if candidate.is_file() {
+            return Ok(candidate);
         }
     }
+    Err(Error::refused(
+        "no atlas binary: put one on the PATH or name it in VENUE_ATLAS (deploy/README.md, migrations)".to_string(),
+    ))
 }
 
 /// Converts between the services' unsigned numbers and PostgreSQL's signed `bigint`, refusing what does not fit.
@@ -648,12 +786,35 @@ pub mod testing {
         Some(Config { url: format!("{scheme}://{role}:{password}@{host}"), ..config })
     }
 
-    /// A pool on a fresh schema with `migrations` applied, or `None` (skipped, and said so).
-    pub fn database(name: &str, migrations: &[Migration]) -> Option<Database> {
+    /// A pool on a fresh schema with the migrations in `dir` applied, or `None` (skipped, and said so). Applying is
+    /// Atlas's, exactly as it is in a deployment, so a test runs the migrations the venue runs.
+    pub fn database(name: &str, dir: &std::path::Path) -> Option<Database> {
         let config = config(name)?;
         let db = Database::connect(&config).unwrap_or_else(|e| panic!("the test database: {e}"));
-        db.migrate(migrations).unwrap_or_else(|e| panic!("migrating {}: {e}", config.schema));
+        db.migrate(dir).unwrap_or_else(|e| panic!("migrating {}: {e}", config.schema));
         Some(db)
+    }
+
+    /// A directory holding `migrations` as files, hashed as Atlas keeps them, for tests of the runner itself. Left
+    /// behind on failure, so a broken run can be looked at; the temporary directory is the test's own.
+    pub fn written(name: &str, migrations: &[Migration]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("venue-migrations-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        for m in migrations {
+            let file = dir.join(format!("{}_{}.sql", m.version, m.name));
+            std::fs::write(&file, m.sql).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        }
+        let atlas = super::atlas_binary().unwrap_or_else(|e| panic!("{e}"));
+        let outcome = std::process::Command::new(atlas)
+            .arg("migrate")
+            .arg("hash")
+            .arg("--dir")
+            .arg(format!("file://{}", dir.display()))
+            .output()
+            .unwrap_or_else(|e| panic!("atlas migrate hash: {e}"));
+        assert!(outcome.status.success(), "atlas migrate hash: {}", String::from_utf8_lossy(&outcome.stderr));
+        dir
     }
 }
 
@@ -662,8 +823,16 @@ mod tests {
     use super::*;
 
     const MIGRATIONS: [Migration; 2] = [
-        Migration { version: 1, name: "notes", sql: "CREATE TABLE notes (id bigint PRIMARY KEY, text text NOT NULL)" },
-        Migration { version: 2, name: "notes_at", sql: "ALTER TABLE notes ADD COLUMN at bigint NOT NULL DEFAULT 0" },
+        Migration {
+            version: "20260101000001",
+            name: "notes",
+            sql: "CREATE TABLE notes (id bigint PRIMARY KEY, text text NOT NULL)",
+        },
+        Migration {
+            version: "20260101000002",
+            name: "notes_at",
+            sql: "ALTER TABLE notes ADD COLUMN at bigint NOT NULL DEFAULT 0",
+        },
     ];
 
     #[test]
@@ -708,41 +877,49 @@ mod tests {
     }
 
     #[test]
-    fn migrations_apply_once_in_order_and_refuse_an_edited_or_newer_history() {
+    fn migrations_apply_once_and_a_schema_newer_than_the_build_stops_it() {
         let Some(config) = testing::config("store_migrations") else { return };
         let db = Database::connect(&config).expect("a database");
+        let first = testing::written("store_first", &MIGRATIONS[..1]);
+        let both = testing::written("store_both", &MIGRATIONS);
         assert_eq!(db.schema_version(&MIGRATIONS).expect("readable"), 0, "nothing applied yet");
-        assert_eq!(db.migrate(&MIGRATIONS[..1]).expect("first"), vec![1]);
+        assert_eq!(db.migrate(&first).expect("first"), vec![MIGRATIONS[0].version.to_string()]);
         assert_eq!(db.schema_version(&MIGRATIONS).expect("readable"), 1, "behind");
-        assert_eq!(db.migrate(&MIGRATIONS).expect("second"), vec![2]);
+        assert_eq!(db.migrate(&both).expect("second"), vec![MIGRATIONS[1].version.to_string()]);
         db.wait_for_schema(&MIGRATIONS, "test").expect("current");
-        assert_eq!(db.migrate(&MIGRATIONS).expect("again"), Vec::<i32>::new(), "idempotent");
-        let edited = [MIGRATIONS[0], Migration { sql: "ALTER TABLE notes ADD COLUMN at2 bigint", ..MIGRATIONS[1] }];
-        assert!(matches!(db.migrate(&edited), Err(Error::Refused(e)) if e.contains("never be edited")));
-        assert!(matches!(db.migrate(&MIGRATIONS[..1]), Err(Error::Refused(e)) if e.contains("newer than this build")));
-        assert!(
-            db.wait_for_schema(&MIGRATIONS[..1], "test").is_err(),
-            "an older build does not wait for a newer schema"
-        );
-        let gap = [MIGRATIONS[1]];
-        assert!(db.migrate(&gap).is_err(), "out of order");
+        assert_eq!(db.migrate(&both).expect("again"), Vec::<String>::new(), "applying again changes nothing");
 
-        // Several processes starting at once: one applies, the others find it done.
-        let Some(config) = testing::config("store_migrations_race") else { return };
-        let threads: Vec<_> = (0..4)
-            .map(|_| {
-                let config = config.clone();
-                thread::spawn(move || Database::connect(&config).expect("a database").migrate(&MIGRATIONS))
-            })
-            .collect();
-        let applied: Vec<Vec<i32>> =
-            threads.into_iter().map(|t| t.join().expect("a thread").expect("migrated")).collect();
-        assert_eq!(applied.iter().filter(|a| !a.is_empty()).count(), 1, "{applied:?}");
+        // A build that does not know the schema's latest migration must not write rows the newer one defined.
+        assert!(
+            matches!(db.schema_version(&MIGRATIONS[..1]), Err(Error::Refused(e)) if e.contains("newer than this build")),
+            "an older build accepted a newer schema"
+        );
+        assert!(db.wait_for_schema(&MIGRATIONS[..1], "test").is_err(), "an older build waited instead of stopping");
+
+        // A migration edited after it was applied. Atlas notices nothing once its directory has been hashed again,
+        // so what refuses it is the build's own record of what each applied version held.
+        let edited = [MIGRATIONS[0], Migration { sql: "ALTER TABLE notes ADD COLUMN at2 bigint", ..MIGRATIONS[1] }];
+        assert!(
+            matches!(db.schema_version(&edited), Err(Error::Refused(e)) if e.contains("never be edited")),
+            "an edited migration passed for the one that was applied"
+        );
+        assert!(db.wait_for_schema(&edited, "test").is_err(), "a build with an edited migration started");
+    }
+
+    #[test]
+    fn migrations_must_be_in_order_and_match_their_files() {
+        let out_of_order = [MIGRATIONS[1], MIGRATIONS[0]];
+        assert!(in_order(&out_of_order).is_err(), "versions that go backwards");
+        let dir = testing::written("store_files", &MIGRATIONS);
+        check_files(&dir, &MIGRATIONS).expect("the files and the build agree");
+        std::fs::write(dir.join("20260101000002_notes_at.sql"), "SELECT 1").expect("written");
+        assert!(check_files(&dir, &MIGRATIONS).is_err(), "a file that differs from the build");
     }
 
     #[test]
     fn a_transaction_commits_whole_or_not_at_all_and_the_pool_recovers_from_broken_connections() {
-        let Some(db) = testing::database("store_transactions", &MIGRATIONS) else { return };
+        let dir = testing::written("store_transactions", &MIGRATIONS);
+        let Some(db) = testing::database("store_transactions", &dir) else { return };
         db.transaction(|tx| {
             tx.execute("INSERT INTO notes (id, text) VALUES (1, 'kept')", &[])?;
             Ok(())
@@ -767,7 +944,8 @@ mod tests {
         let mut conn = db.get().expect("a connection");
         let pid: i32 = conn.query_one("SELECT pg_backend_pid()", &[]).expect("a pid").get(0);
         drop(conn);
-        let Some(admin) = testing::database("store_transactions_admin", &[]) else { return };
+        let empty = testing::written("store_empty", &[]);
+        let Some(admin) = testing::database("store_transactions_admin", &empty) else { return };
         admin.get().expect("a connection").execute("SELECT pg_terminate_backend($1)", &[&pid]).expect("terminated");
         let mut recovered = false;
         for _ in 0..3 {

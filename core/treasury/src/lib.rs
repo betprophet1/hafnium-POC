@@ -54,7 +54,7 @@ pub fn records(storage: &Storage) -> Result<Arc<dyn Records>, String> {
         Storage::Postgres { config, migrate } => {
             let db = Database::connect_retrying(config, "venue-treasury")?;
             if *migrate {
-                let applied = db.migrate(postgres::MIGRATIONS)?;
+                let applied = db.migrate(&venue_store::migrations_dir!())?;
                 if !applied.is_empty() {
                     eprintln!("treasury: applied migrations {applied:?} to schema {}", db.schema());
                 }

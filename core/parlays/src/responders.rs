@@ -105,8 +105,11 @@ impl Filter {
 }
 
 /// The parlay service's schema, in order. A released migration is never edited: a change is a new one.
-pub const MIGRATIONS: &[Migration] =
-    &[Migration { version: 1, name: "responders", sql: include_str!("../migrations/V001__responders.sql") }];
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    version: "20260917000001",
+    name: "responders",
+    sql: include_str!("../migrations/20260917000001_responders.sql"),
+}];
 
 /// The approved responder accounts, kept in the parlay service's schema (`responders`, with every approval and
 /// revocation in `responder_changes`) and held in memory, where every request is routed from. The records are the
@@ -326,7 +329,7 @@ mod tests {
     fn approvals_start_from_the_catalogue_once_and_survive_a_restart_in_postgres() {
         let Some(config) = venue_store::testing::owned_config("parlays_approvals") else { return };
         let db = Database::connect(&config).expect("the test database");
-        db.migrate(MIGRATIONS).expect("migrated");
+        db.migrate(&venue_store::migrations_dir!()).expect("migrated");
         let mut approvals = Approvals::load(Some(&db), [10]).expect("seeded");
         assert!(approvals.contains(10), "the catalogue's responders start the list");
         assert_eq!(approvals.approve(12).ok(), Some(true));

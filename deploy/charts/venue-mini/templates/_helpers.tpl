@@ -205,6 +205,9 @@ it comes whole from a Secret.
 {{- end }}
 - name: VENUE_DATABASE_SCHEMA
   value: {{ .service }}
+# Where the image keeps this service's migration files, for --migrate-on-start; the migrate job names them itself.
+- name: VENUE_MIGRATIONS
+  value: /usr/share/venue/migrations/{{ .service }}
 - name: VENUE_DATABASE_POOL_SIZE
   value: {{ $.Values.database.poolSize | quote }}
 {{- end -}}

@@ -225,12 +225,27 @@ helm upgrade --install venue deploy/charts/venue-mini --set postgres.enabled=fal
   --set database.parlays.existingSecret=venue-parlays-db --set database.oracle.existingSecret=venue-oracle-db
 ```
 
-**Migrations** run in one Job, `<release>-migrate`, a pre-install and pre-upgrade hook, so a schema is current before
-pods of a new build start; while an in-cluster PostgreSQL does not exist yet (the install or upgrade that creates it),
-a Job `<release>-migrate-first` runs beside it instead, since a hook could only wait for a server not yet created. Services never migrate in the chart: at start each waits, saying so in its log,
-until its schema is at the migration it was built with, and refuses to start against a newer or edited one. Every run
-holds an advisory lock, so overlapping runs are safe. DevOps may run the same SQL files (`core/*/migrations/`) with
-another tool instead.
+**Migrations** are applied by **Atlas** (`core/store/README.md`), which the image carries beside the SQL files, in one
+Job, `<release>-migrate`, a pre-install and pre-upgrade hook, so a schema is current before pods of a new build start;
+while an in-cluster PostgreSQL does not exist yet (the install or upgrade that creates it), a Job
+`<release>-migrate-first` runs beside it instead, since a hook could only wait for a server not yet created. Services
+never migrate in the chart: at start each waits, saying so in its log, until its schema is at the migration it was
+built with, and refuses to start against a newer one or one whose SQL has changed since it was applied. Every run takes
+Atlas's lock, so overlapping runs are safe, and a run repeated applies nothing.
+
+**Rolling back a migration** is Atlas's `migrate down`, which plans the revert against a throwaway dev database and
+checks before it destroys anything (a column with data in it stops the revert rather than being dropped). It needs a
+database Atlas may create for the planning, so it is run from a machine with Docker rather than from the job:
+
+```sh
+kubectl port-forward --address 127.0.0.1 svc/venue-postgres 15432:5432 &
+atlas migrate down 1 --dir file://core/treasury/migrations --revisions-schema treasury \
+  --url "postgres://treasury:$(kubectl get secret venue-postgres -o jsonpath='{.data.treasury-password}' | base64 -d)@127.0.0.1:15432/treasury?sslmode=disable&search_path=treasury" \
+  --dev-url "docker://postgres/18/dev"
+```
+
+Roll the services back to the build that matches, or they will refuse to start against a schema they no longer know.
+DevOps may run the same files with another tool: they are ordinary SQL in Atlas's layout (`core/*/migrations/`).
 
 **Looking inside**, in the cluster:
 

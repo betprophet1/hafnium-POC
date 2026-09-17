@@ -22,9 +22,9 @@ use venue_store::{big, millis, time, unsigned, Database, Migration};
 
 /// The identity service's schema, in order. A released migration is never edited: a change is a new one.
 pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
+    version: "20260917000001",
     name: "accounts_and_keys",
-    sql: include_str!("../migrations/V001__accounts_and_keys.sql"),
+    sql: include_str!("../migrations/20260917000001_accounts_and_keys.sql"),
 }];
 
 /// An account as the catalogue describes it.
@@ -299,7 +299,7 @@ mod tests {
     fn postgres(name: &str) -> Option<(Database, Arc<dyn KeyRecords>)> {
         let config = testing::owned_config(name)?;
         let db = Database::connect(&config).expect("the test database");
-        db.migrate(MIGRATIONS).expect("migrated");
+        db.migrate(&venue_store::migrations_dir!()).expect("migrated");
         let records: Arc<dyn KeyRecords> = Arc::new(Postgres::new(db.clone()));
         let accounts = [1, 2].map(|id| Account { id, name: format!("account {id}"), dev_token: None });
         records.seed_accounts(&accounts, 1_000).expect("seeded");

@@ -10,6 +10,15 @@ WORKDIR /src
 COPY core/ core/
 RUN cd core && cargo build --release --locked -p venue-node -p venue-gateway -p venue-parlays -p venue-sim -p venue-treasury -p venue-identity -p venue-observer
 
+# Atlas applies the schemas (core/store/decisions.md, S-2), pinned by version and by the hash of the binary.
+FROM debian:bookworm-slim AS atlas
+ARG ATLAS_VERSION=v1.3.3
+ARG ATLAS_SHA256=a41ea66b5aaad1e363fd829613a6725c3934378792d0be5591269c041c112b96
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL -o /atlas "https://release.ariga.io/atlas/atlas-linux-amd64-${ATLAS_VERSION}" \
+ && echo "${ATLAS_SHA256}  /atlas" | sha256sum -c - \
+ && chmod +x /atlas
+
 FROM debian:bookworm-slim
 # tini runs as PID 1 so SIGTERM stops the binaries at once. The kernel gives PID 1 no default signal actions, and a
 # process ignoring SIGTERM holds its sessions open until the kill after the grace period; a deleted maker pod would
@@ -24,6 +33,13 @@ COPY --from=build /src/core/target/release/venue-node /src/core/target/release/v
      /src/core/target/release/venue-parlays /src/core/target/release/venue-sim \
      /src/core/target/release/venue-treasury /src/core/target/release/venue-identity \
      /src/core/target/release/venue-observer /usr/local/bin/
+COPY --from=atlas /atlas /usr/local/bin/atlas
+# The migrations as files, which is what Atlas applies: the same directories the services embed, under the service
+# name (the migrate job names one of them, deploy/charts/venue-mini/templates/migrate.yaml).
+COPY core/treasury/migrations/ /usr/share/venue/migrations/treasury/
+COPY core/identity/migrations/ /usr/share/venue/migrations/identity/
+COPY core/parlays/migrations/ /usr/share/venue/migrations/parlays/
+COPY core/sim/migrations/ /usr/share/venue/migrations/oracle/
 USER 10001
 ENV VENUE_LISTEN=0.0.0.0:7101 VENUE_DATA=/var/lib/venue
 EXPOSE 7101 7102 7103 8080 8081 8082 8083 8084 9101 9102 9103

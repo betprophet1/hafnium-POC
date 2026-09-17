@@ -3,7 +3,6 @@
 {{- if $services }}
 {{- /* Before the in-cluster server exists (a first install, or an upgrade that turns it on) a hook could only wait for it. */}}
 {{- $first := and .Values.postgres.enabled (not (lookup "apps/v1" "StatefulSet" .Release.Namespace (printf "%s-postgres" $name))) }}
-{{- $binaries := dict "treasury" (list "venue-treasury" "migrate") "identity" (list "venue-identity" "migrate") "parlays" (list "venue-parlays" "migrate") "oracle" (list "venue-sim" "oracle" "migrate") }}
 # Each service's schema migrations (core/store/README.md), run before the services need them: a pre-install and
 # pre-upgrade hook, except while an in-cluster PostgreSQL does not exist yet (the release that creates it): there the
 # job runs beside it, and the services wait until their schemas are current. Every migration run takes
@@ -63,7 +62,22 @@ spec:
         - name: {{ $service }}
           image: {{ include "venue-mini.image" $ | quote }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
-          command: {{ prepend (prepend (index $binaries $service) "--") "tini" | toJson }}
+          # Atlas applies them (core/store/decisions.md, S-2), from the files in the image, keeping its history in the
+          # service's own schema. A run repeated or overlapping changes nothing: it takes its own lock and applies only
+          # what is missing. The URL is the service's own with the schema and TLS it uses added, so that Atlas connects
+          # exactly where the service will.
+          command: ["tini", "--", "sh", "-c"]
+          args:
+            - |
+              set -eu
+              case "$VENUE_DATABASE_URL" in *\?*) sep='&' ;; *) sep='?' ;; esac
+              url="${VENUE_DATABASE_URL}${sep}search_path=${VENUE_DATABASE_SCHEMA}&sslmode=${VENUE_DATABASE_TLS:-prefer}"
+              if [ -n "${VENUE_DATABASE_CA_FILE:-}" ]; then url="${url}&sslrootcert=${VENUE_DATABASE_CA_FILE}"; fi
+              exec atlas migrate apply \
+                --dir "file:///usr/share/venue/migrations/{{ $service }}" \
+                --url "$url" \
+                --revisions-schema "$VENUE_DATABASE_SCHEMA" \
+                --lock-timeout {{ $.Values.migrations.lockTimeout | quote }}
           env:
             {{- include "venue-mini.databaseEnv" (dict "ctx" $ "service" $service) | trim | nindent 12 }}
           securityContext:

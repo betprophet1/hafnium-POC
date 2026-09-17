@@ -41,7 +41,7 @@ pub fn records(storage: &Storage) -> Result<Arc<dyn KeyRecords>, String> {
         Storage::Postgres { config, migrate } => {
             let db = Database::connect_retrying(config, "venue-identity")?;
             if *migrate {
-                let applied = db.migrate(records::MIGRATIONS)?;
+                let applied = db.migrate(&venue_store::migrations_dir!())?;
                 if !applied.is_empty() {
                     eprintln!("identity: applied migrations {applied:?} to schema {}", db.schema());
                 }

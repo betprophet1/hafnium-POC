@@ -132,6 +132,8 @@ database:
 # which the services wait for). Each migration run takes an advisory lock, so two runs never collide.
 migrations:
   backoffLimit: 20
+  # How long Atlas waits for another run's lock before giving up (its --lock-timeout).
+  lockTimeout: 5m
 
 # Interface 1. Flood limits per WebSocket session, and per account for REST: messages a second and burst, logons a
 # minute per account (blueprint §12). Set well above what the page and bots need: a maker requoting every market can

@@ -106,7 +106,7 @@ fn main() -> ExitCode {
 fn migrate(args: &Args) -> Result<(), String> {
     let config = args.database()?;
     let db = Database::connect_retrying(&config, "venue-treasury")?;
-    let applied = db.migrate(postgres::MIGRATIONS)?;
+    let applied = db.migrate(&venue_store::migrations_dir!())?;
     eprintln!(
         "venue-treasury: schema {} of {} is at migration {} (applied now: {applied:?})",
         config.schema,

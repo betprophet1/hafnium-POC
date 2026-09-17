@@ -100,7 +100,7 @@ fn main() -> ExitCode {
 fn migrate(args: &Args) -> Result<(), Error> {
     let config = args.database()?;
     let db = Database::connect_retrying(&config, "venue-parlays")?;
-    let applied = db.migrate(responders::MIGRATIONS)?;
+    let applied = db.migrate(&venue_store::migrations_dir!())?;
     eprintln!(
         "venue-parlays: schema {} of {} is at migration {} (applied now: {applied:?})",
         config.schema,
@@ -135,7 +135,7 @@ fn run(args: &Args) -> Result<(), Error> {
             eprintln!("parlay service: approved responders in {}", config.describe());
             let db = Database::connect_retrying(&config, "venue-parlays")?;
             if args.get("migrate-on-start", Some("false"))? == "true" {
-                db.migrate(responders::MIGRATIONS)?;
+                db.migrate(&venue_store::migrations_dir!())?;
             }
             db.wait_for_schema(responders::MIGRATIONS, "venue-parlays")?;
             Some(db)

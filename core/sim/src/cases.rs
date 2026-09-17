@@ -10,9 +10,9 @@ use venue_store::{big, unsigned, Database, Error, Migration};
 
 /// The oracle's schema, in order. A released migration is never edited: a change is a new one.
 pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
+    version: "20260917000001",
     name: "resolution_cases",
-    sql: include_str!("../migrations/V001__resolution_cases.sql"),
+    sql: include_str!("../migrations/20260917000001_resolution_cases.sql"),
 }];
 
 /// What the oracle holds that the journal does not, as the records have it.
@@ -294,7 +294,7 @@ mod tests {
     fn store(name: &str) -> Option<(Database, CaseStore)> {
         let config = venue_store::testing::owned_config(name)?;
         let db = Database::connect(&config).expect("the test database");
-        db.migrate(MIGRATIONS).expect("migrated");
+        db.migrate(&venue_store::migrations_dir!()).expect("migrated");
         Some((db.clone(), CaseStore::new(db)))
     }
 

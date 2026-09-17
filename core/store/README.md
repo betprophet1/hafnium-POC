@@ -25,21 +25,43 @@ service's schema first on its `search_path`.
 
 ## Migrations
 
-Each service keeps its migrations as plain SQL files, `migrations/V001__<name>.sql`, `V002__...`, forward-only, and
-embeds them in its binary (`Migration { version, name, sql: include_str!(...) }`); a test checks that the files and
-the embedded list agree (`check_files`), so DevOps can also run the files with another tool. `Database::migrate`:
+Each service keeps its migrations as plain SQL files in `migrations/`, named as Atlas names them,
+`<version>_<name>.sql`, with the `atlas.sum` Atlas keeps beside them, and embeds them in its binary
+(`Migration { version, name, sql: include_str!(...) }`); a test checks that the files, the sum and the embedded list
+agree (`check_files`). They are forward-only: a mistake is fixed by a new migration, never by editing one.
 
-1. takes a transaction-scoped advisory lock for the schema, so two runs at once queue rather than collide;
-2. creates the schema if it does not exist (when the role may) and the `schema_migrations` table;
-3. refuses to go on if a migration already applied has a different name or checksum (a released migration was
-   edited) or the schema is at a version this build does not know (an older build against a newer database);
-4. applies the rest in order and records each, all in that one transaction: a failure leaves the schema as it was.
+**Atlas applies them**, in a test, on a laptop and in a deployment alike (`decisions.md`, S-2). It keeps its history
+in `atlas_schema_revisions` in the service's own schema, takes its own lock so two runs queue rather than collide, and
+applies only what is missing:
 
-Migrations run explicitly, through each service's `migrate` subcommand (the chart runs it as a Helm hook job). A
-service at start calls `Database::wait_for_schema`: it carries on once its schema is at the last migration it knows,
-waits with backoff while the schema is behind (saying so), and refuses to start if the schema is ahead or edited. For
-laptops and tests, `--migrate-on-start true` (`VENUE_MIGRATE_ON_START`) applies the migrations at start under the same
-lock. A mistake is fixed by a new migration, never by editing or undoing one.
+```sh
+atlas migrate apply --dir file://core/treasury/migrations --revisions-schema treasury \
+  --url "$VENUE_DATABASE_URL?search_path=treasury&sslmode=verify-full"
+atlas migrate status --dir file://core/treasury/migrations --revisions-schema treasury --url "..."
+```
+
+A deployment runs exactly that, from the files in the image, as the chart's migrate job (`deploy/README.md`).
+`Database::migrate` runs the same Atlas for tests and for `--migrate-on-start true` on a laptop; it finds the binary
+at `VENUE_ATLAS` or on the PATH, and `./check` downloads a pinned one when it is missing. `VENUE_MIGRATIONS` says
+where the files are when they are not beside the crate, as they are not in an image.
+
+**Rolling back** is `atlas migrate down`, which plans the revert against a throwaway dev database and checks before
+it destroys anything — reverting a column it has data in stops rather than dropping it:
+
+```sh
+atlas migrate down 1 --dir file://core/treasury/migrations --revisions-schema treasury \
+  --url "$VENUE_DATABASE_URL?search_path=treasury" --dev-url "docker://postgres/18/dev"
+```
+
+**A service at start** calls `Database::wait_for_schema`: it carries on once its schema is at the last migration it
+knows, waits with backoff while the schema is behind (saying so), and refuses to start when the schema is ahead of
+this build — an older build must not write rows a newer migration defined.
+
+**What Atlas does not catch**, and this does: a migration edited *after* it was applied, once its directory has been
+hashed again. `atlas migrate apply`, `status` and `validate` all pass in that case, because the sum file and the files
+agree again. So the first build to see a version applied records the SHA-256 of the SQL it embeds
+(`venue_migration_sql`), and any later build holding something else for that version refuses to start. A released
+migration must never be edited; this is what makes that more than a rule in a document.
 
 ## Pool and transactions
 
@@ -54,12 +76,14 @@ constraint, a trigger, or a check of the service's own).
 
 ## Tests
 
-`testing::database(name, migrations)` gives a test a schema of its own on the server `VENUE_TEST_DATABASE_URL`
-names, or prints `skipping <name>: VENUE_TEST_DATABASE_URL is not set` and returns `None`. `./check` starts a throwaway
+`testing::database(name, dir)` gives a test a schema of its own, with the migrations in `dir` applied by Atlas, on the server `VENUE_TEST_DATABASE_URL`
+names, or prints `skipping <name>: VENUE_TEST_DATABASE_URL is not set` and returns `None`. Without Atlas the database
+tests are skipped too, since it is what builds their schemas. `./check` starts a throwaway
 server in a container for the run when Docker is usable (directly or through `sg docker`) and removes it afterwards; by
 hand:
 
 ```sh
 docker run -d --rm --name venue-pg -e POSTGRES_PASSWORD=dev -p 127.0.0.1:18400:5432 postgres:18.6-alpine3.24
-VENUE_TEST_DATABASE_URL='postgres://postgres:dev@127.0.0.1:18400/postgres?sslmode=disable' cargo test --workspace
+VENUE_TEST_DATABASE_URL='postgres://postgres:dev@127.0.0.1:18400/postgres?sslmode=disable' \
+  VENUE_ATLAS=core/target/tools/atlas-v1.3.3 cargo test --workspace
 ```
