@@ -1,0 +1,6 @@
+apiVersion: v2
+name: venue-observability
+description: The venue's dashboards, alerts and Grafana data sources, on top of Prometheus, Grafana and Loki (deploy/observability/README.md).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

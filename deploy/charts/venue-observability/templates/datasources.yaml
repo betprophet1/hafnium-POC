@@ -1,0 +1,28 @@
+{{- if .Values.datasources.enabled }}
+# Grafana's data sources, read by its sidecar (label grafana_datasource) from any namespace.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-datasources
+  labels:
+    {{- include "venue-observability.labels" . | nindent 4 }}
+    grafana_datasource: "1"
+data:
+  venue-datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      {{- include "venue-observability.datasource" (dict "ds" .Values.datasources.prometheus "type" "prometheus") | nindent 6 }}
+        isDefault: true
+      {{- include "venue-observability.datasource" (dict "ds" .Values.datasources.loki "type" "loki") | nindent 6 }}
+      {{- if .Values.datasources.alertmanager.enabled }}
+      - name: {{ .Values.datasources.alertmanager.name }}
+        uid: {{ .Values.datasources.alertmanager.uid }}
+        type: alertmanager
+        access: proxy
+        url: {{ .Values.datasources.alertmanager.url }}
+        editable: false
+        jsonData:
+          implementation: prometheus
+          handleGrafanaManagedAlerts: false
+      {{- end }}
+{{- end }}

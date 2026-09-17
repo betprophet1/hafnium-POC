@@ -197,6 +197,34 @@ restricted. Its network policy lets anything reach its FIX port (a Logon's crede
 adapter reach only the gateway pods and cluster DNS. `fix.service.type` is `LoadBalancer` for k3d (published on the
 node, then mapped by `expose`), `ClusterIP` to keep FIX inside the cluster; `fix.service.port` is its port.
 
+## Observability
+
+Prometheus, Alertmanager, Grafana, Loki and Alloy, with the venue's dashboards and alerts, install into namespace
+`monitoring` of the same cluster with one command, from community charts pinned in `observability/versions.env`:
+
+```sh
+deploy/observability/install.sh
+kubectl -n monitoring get secret grafana -o jsonpath='{.data.admin-password}' | base64 -d; echo
+kubectl -n monitoring port-forward --address 127.0.0.1 svc/grafana 13000:80        # then http://127.0.0.1:13000
+```
+
+Nothing is exposed by default; exposing Grafana, sending metrics and logs to managed services, and alert receivers are
+all configuration (`observability/README.md`). What each process exports, with units and labels, is
+`observability/metrics.md`; the dashboards and alert rules are `charts/venue-observability`. Grafana, Loki and Alloy
+are AGPL-3.0, used unmodified (the licence note in `observability/README.md`).
+
+In the venue-mini chart, `metrics.enabled` (on by default) gives the core, the gateways and the FIX adapter a metrics
+port, runs the observer (`<release>-observer`, `core/observer`: metrics derived from the journal and read-only
+operator endpoints), writes every log line of those as JSON (`metrics.logFormat`), and, where the Prometheus
+Operator's API exists, a PodMonitor labelling every series with `metrics.env` and `metrics.profile` (a laptop is
+`functional`, blueprint §16). `metrics.monitoringNamespace` is the namespace let in to the metrics ports. The observer's
+operator endpoints are internal too:
+
+```sh
+kubectl port-forward --address 127.0.0.1 svc/venue-observer 19103:9103
+curl -s 127.0.0.1:19103/v1/markets; curl -s '127.0.0.1:19103/v1/markets/<market-id>?depth=5'; curl -s 127.0.0.1:19103/v1/accounts/1
+```
+
 ## What the chart does and does not do
 
 - **One way in.** Customers, bots and the page's trading tabs reach the core only through the gateway; a network

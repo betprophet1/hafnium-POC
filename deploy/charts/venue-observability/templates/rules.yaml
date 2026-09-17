@@ -1,0 +1,162 @@
+{{- if and .Values.rules.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+{{- $r := .Values.rules }}
+# The venue's alerts (deploy/observability/README.md, alerts). Series come from the venue-mini PodMonitor, which adds
+# `component`, `env` and `profile`; kube-state-metrics and the kubelet add the Kubernetes ones. Every alert groups by
+# namespace, so each venue environment in a cluster alerts on its own.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ .Release.Name }}-venue
+  labels:
+    {{- include "venue-observability.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: venue.availability
+      rules:
+        - alert: VenueComponentDown
+          expr: up{component=~"core|gateway|observer|fix"} == 0
+          for: 1m
+          labels:
+            severity: critical
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"{{ $labels.component }} {{ $labels.pod }} in {{ $labels.namespace }} does not answer its metrics scrape"`}}
+            description: {{`"Prometheus cannot scrape {{ $labels.pod }} ({{ $labels.component }}) for a minute. Check the pod (kubectl -n {{ $labels.namespace }} describe pod {{ $labels.pod }}) and its logs in Grafana (Explore, Loki, {namespace=\"{{ $labels.namespace }}\", pod=\"{{ $labels.pod }}\"}). A core that exits is a fail-stop (spec §18): look at the journal before restarting anything."`}}
+        {{- range $component := list "core" "gateway" "observer" }}
+        - alert: VenueComponentAbsent
+          expr: absent(up{component="{{ $component }}"})
+          for: 2m
+          labels:
+            severity: critical
+            component: {{ $component }}
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: "No {{ $component }} pod is being scraped"
+            description: "No {{ $component }} target has existed for two minutes: the component is scaled to zero, not scheduled, or its PodMonitor no longer matches it (metrics.enabled in the venue-mini release). A venue with no {{ $component }} is down."
+        {{- end }}
+        - alert: VenueContainerRestarted
+          expr: increase(kube_pod_container_status_restarts_total{container=~"core|gateway|observer|fix"}[15m]) > 0
+          labels:
+            severity: warning
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"{{ $labels.container }} in {{ $labels.pod }} ({{ $labels.namespace }}) restarted"`}}
+            description: {{`"The container exited and was restarted in the last 15 minutes. A gateway exits on purpose when its audit log fails (exit status 74); the core exits on a fail-stop and replays to the same stop. kubectl -n {{ $labels.namespace }} describe pod {{ $labels.pod }} shows the last exit code; its logs before the restart are in Loki."`}}
+    - name: venue.gateway
+      rules:
+        - alert: VenueGatewayServerErrors
+          expr: |
+            sum by (namespace, half) (rate(venue_gateway_http_requests_total{status=~"5.."}[5m]))
+              / sum by (namespace, half) (rate(venue_gateway_http_requests_total[5m]))
+              > {{ $r.serverErrorRatio }}
+            and sum by (namespace, half) (rate(venue_gateway_http_requests_total[5m])) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"{{ $value | humanizePercentage }} of {{ $labels.half }} REST requests in {{ $labels.namespace }} answer 5xx"`}}
+            description: {{`"Mostly 503: the node, treasury, identity or parlay service did not answer. The Gateways dashboard's upstream panels show which."`}}
+        - alert: VenueGatewayRefusalSpike
+          expr: |
+            sum by (namespace, half) (rate(venue_gateway_refusals_total{reason=~"auth|permission|rate_limit|unavailable|other"}[5m]))
+              / (sum by (namespace, half) (rate(venue_gateway_http_requests_total[5m])) + sum by (namespace, half) (rate(venue_gateway_ws_messages_total[5m])))
+              > {{ $r.refusalRatio }}
+            and sum by (namespace, half) (rate(venue_gateway_refusals_total[5m])) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"{{ $value | humanizePercentage }} of {{ $labels.half }} requests in {{ $labels.namespace }} are refused"`}}
+            description: {{`"Refusals for authentication, permission, flood limits or unavailability are well above normal. Refusals by reason on the Gateways dashboard; which clients, in the gateway's audit log."`}}
+        - alert: VenueFeedBehind
+          expr: max by (namespace, pod, component) (venue_gateway_feed_behind_seconds or venue_observer_feed_behind_seconds) > {{ $r.feedBehindSeconds }}
+          for: 2m
+          labels:
+            severity: warning
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"{{ $labels.pod }} is {{ $value | humanizeDuration }} behind the core's feed"`}}
+            description: {{`"What this reader shows clients or derives is that far behind the journal. After a restart it is catching up; otherwise the reader is saturated (event loop turn times) or the node's feed subscribers are backing up (Core and journal dashboard)."`}}
+        - alert: VenueGatewayAuditQueueBackingUp
+          expr: max by (namespace, pod) (venue_gateway_audit_queue_depth) > {{ $r.auditQueueDepth }}
+          for: 1m
+          labels:
+            severity: critical
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"{{ $labels.pod }}'s audit queue holds {{ $value }} records"`}}
+            description: {{`"The audit writer is not keeping up with the disk. At 65,536 records the event loops wait, and after 10 s of waiting the gateway exits rather than serve unaudited (interfaces/audit/README.md). Check the audit fsync latency and the volume."`}}
+        - alert: VenueGatewayAuditQueueFull
+          expr: increase(venue_gateway_audit_queue_full_waits_total[5m]) > 0
+          labels:
+            severity: critical
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"{{ $labels.pod }}'s event loops waited on a full audit queue"`}}
+            description: {{`"Clients were held up while the audit writer caught up; ten seconds of it stops the gateway."`}}
+    - name: venue.core
+      rules:
+        - alert: VenueJournalFsyncSlow
+          expr: histogram_quantile(0.99, sum by (namespace, pod, le) (rate(venue_node_journal_fsync_duration_seconds_bucket[5m]))) > {{ $r.fsyncP99Seconds }}
+          for: 5m
+          labels:
+            severity: warning
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"Journal fsync p99 on {{ $labels.pod }} is {{ $value | humanizeDuration }}"`}}
+            description: {{`"Every input waits for its journal sync before the engine sees it, so this is the floor under every order's round trip. Look at the volume's disk and what else writes to it."`}}
+        - alert: VenueAuditFsyncSlow
+          expr: histogram_quantile(0.99, sum by (namespace, pod, le) (rate(venue_gateway_audit_fsync_duration_seconds_bucket[5m]))) > {{ $r.fsyncP99Seconds }}
+          for: 10m
+          labels:
+            severity: warning
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"Audit log fsync p99 on {{ $labels.pod }} is {{ $value | humanizeDuration }}"`}}
+            description: {{`"The gateway's audit writer syncs after every batch; slow syncs back its queue up (VenueGatewayAuditQueueBackingUp)."`}}
+        - alert: VenueCapacityHigh
+          expr: |
+            max by (namespace, resource) (venue_capacity_used)
+              / on (namespace, resource) min by (namespace, resource) (venue_capacity_limit > 0)
+              > {{ $r.capacityRatio }}
+          for: 5m
+          labels:
+            severity: warning
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"{{ $labels.resource }} in {{ $labels.namespace }} at {{ $value | humanizePercentage }} of its limit"`}}
+            description: {{`"Alert well before the limit, from outside the engine (blueprint §6): past the sequenced listing limit the engine refuses listings and orders, past the capacity profile it fail-stops. Release settled events sooner, hold new listings, or move to a larger profile."`}}
+    - name: venue.fix
+      rules:
+        - alert: VenueFixLogonRefusalSpike
+          expr: sum by (namespace, pod) (increase(venue_fix_logon_refusals_total[5m])) > {{ $r.fixLogonRefusalsPer5m }}
+          labels:
+            severity: warning
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"{{ $value }} FIX logons refused on {{ $labels.pod }} in 5 minutes"`}}
+            description: {{`"A client retrying with bad credentials, a gateway that does not answer (reason gateway_unavailable), or someone guessing. Refusals by reason on the FIX adapter dashboard; the SenderCompIDs in the FIX audit log."`}}
+        - alert: VenueFixAuditQueueBackingUp
+          expr: max by (namespace, pod) (venue_fix_audit_queue_depth) > {{ $r.auditQueueDepth }}
+          for: 1m
+          labels:
+            severity: critical
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"{{ $labels.pod }}'s FIX audit queue holds {{ $value }} records"`}}
+            description: {{`"The FIX adapter's audit writer is not keeping up; an adapter that cannot write its audit log stops."`}}
+    - name: venue.storage
+      rules:
+        - alert: VenueVolumeFilling
+          expr: |
+            kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes > {{ $r.pvcRatio }}
+          for: 5m
+          labels:
+            severity: warning
+            {{- with $r.labels }}{{ toYaml . | nindent 12 }}{{- end }}
+          annotations:
+            summary: {{`"Volume {{ $labels.persistentvolumeclaim }} in {{ $labels.namespace }} is {{ $value | humanizePercentage }} full"`}}
+            description: {{`"The journal, an audit log or a service's store will stop the process that writes it when the volume fills. Grow the claim or move old audit files to retained storage. (k3d's local-path volumes report no usage, so this never fires there.)"`}}
+{{- end }}

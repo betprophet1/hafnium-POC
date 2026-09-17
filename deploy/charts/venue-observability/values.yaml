@@ -1,0 +1,55 @@
+# The venue's side of the observability stack (deploy/observability/README.md): Grafana data sources, dashboards and
+# Prometheus alert rules. The stack itself (Prometheus, Alertmanager, Grafana, Loki, Alloy) is the community charts in
+# deploy/observability/values, or a managed service; this chart only needs Grafana's sidecar and the Prometheus
+# Operator's PrometheusRule CRD.
+
+# Grafana data sources, found by Grafana's sidecar (label grafana_datasource). The dashboards pick one through their
+# datasource variables, so data sources provisioned some other way (a managed Grafana) work as well.
+datasources:
+  enabled: true
+  prometheus:
+    name: Prometheus
+    uid: prometheus
+    # In-cluster by default. For a managed Prometheus, its query URL, for example
+    #   https://aps-workspaces.<region>.amazonaws.com/workspaces/<workspace-id>/
+    #   https://<stack>.grafana.net/api/prom
+    url: http://monitoring-prometheus.monitoring.svc:9090
+    # Extra jsonData for the data source, such as {sigV4Auth: true, sigV4AuthType: default, sigV4Region: <region>}.
+    jsonData: {}
+    # Basic auth, for services that need it; empty user for none. The password is never a value here: name an
+    # environment variable of the Grafana container (set from a Secret with grafana.envValueFrom in the
+    # kube-prometheus-stack values), which Grafana expands when it provisions the data source.
+    basicAuthUser: ""
+    basicAuthPasswordEnv: ""
+  loki:
+    name: Loki
+    uid: loki
+    # In-cluster by default; for Grafana Cloud Logs, https://<stack>.grafana.net.
+    url: http://loki.monitoring.svc:3100
+    jsonData: {}
+    basicAuthUser: ""
+    basicAuthPasswordEnv: ""
+  alertmanager:
+    enabled: true
+    name: Alertmanager
+    uid: alertmanager
+    url: http://monitoring-alertmanager.monitoring.svc:9093
+
+# Dashboards as ConfigMaps for Grafana's sidecar (label grafana_dashboard), in the folders System and Business.
+dashboards:
+  enabled: true
+
+# Alert rules as a PrometheusRule (rendered only where the monitoring.coreos.com/v1 API exists).
+rules:
+  enabled: true
+  # Extra labels on every alert, for routing in Alertmanager.
+  labels: {}
+  # Thresholds. Each alert's description says what it means and what to look at.
+  feedBehindSeconds: 5
+  fsyncP99Seconds: 0.05
+  capacityRatio: 0.8
+  pvcRatio: 0.8
+  refusalRatio: 0.25
+  serverErrorRatio: 0.05
+  auditQueueDepth: 10000
+  fixLogonRefusalsPer5m: 10
