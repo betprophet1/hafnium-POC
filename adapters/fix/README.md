@@ -53,6 +53,14 @@ build/install/venue-fix-adapter/bin/venue-fix-adapter \
 
 A firm then logs on with its SenderCompID, `TargetCompID=VENUE` and its dev token in `Password (554)`.
 
+To try it by hand, `scripts/fix-shell.py` is a FIX console that needs only Python 3: it logs on, keeps the session
+alive, prints reports as they arrive, and turns `list`, `buy`, `sell`, `replace`, `cancel` and `cancelall` into
+messages (`help` lists them). It is a test tool, not a FIX engine: every logon resets sequence numbers.
+
+```sh
+python3 scripts/fix-shell.py --host 127.0.0.1 --port 17420 --token dev-retail-customer --sender ME
+```
+
 The integration test:
 
 ```sh
