@@ -917,6 +917,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "venue-link",
+ "venue-store",
 ]
 
 [[package]]

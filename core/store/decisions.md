@@ -38,3 +38,9 @@ alone, with no cloud-specific code; DevOps decides which later.
 | S-14 | Keys are rows the database keeps from being changed: a trigger refuses any change to a key's terms and any revocation undone or moved; deletes are refused. Only the last use moves. Secrets are never stored, only their hash (G-2). | A key cannot be changed, only revoked (G-6); the database is where that is cheapest to guarantee. | |
 | S-15 | Keys are read into memory at start and verified from memory; writes go to the database first and are refused with 503 if they fail, after which the keys are read again before the next call. | Verification stays a lock and a hash, as G-7 assumes; re-reading after a failed write means a revocation whose acknowledgement was lost still takes effect. | |
 | S-16 | When the database cannot be reached, `/healthz` fails, so the identity pod leaves its Service and gateways answer keys they have not verified in the last 5 s with 503; dev tokens keep working. Key changes answer 503. `--store memory` exists for tests and throwaway local venues, and says so when it starts. | The gateway already treats an unreachable identity service as 503 for uncached keys, which is the behaviour the owner described; keeping the service ready on memory alone would hide an outage in which no key can be made or revoked. | **needs review** |
+
+## Parlays
+
+| # | Decision | Why | |
+|---|---|---|---|
+| S-17 | The parlay service keeps approved responders in `responders` and every change in an append-only `responder_changes` (who: catalogue, operator or import). The catalogue seeds the list once, recorded in `responder_list`. While its database is unreachable the service routes from memory and refuses changes with 503; it stays ready. | Approvals are an operator's decisions and worth a history; routing must not stop for a database blip, but a change that cannot be recorded would silently revert at the next restart. | **needs review** |

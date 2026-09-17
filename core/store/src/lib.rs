@@ -65,6 +65,8 @@ impl fmt::Display for Error {
     }
 }
 
+impl std::error::Error for Error {}
+
 impl From<postgres::Error> for Error {
     fn from(e: postgres::Error) -> Self {
         match e.as_db_error() {

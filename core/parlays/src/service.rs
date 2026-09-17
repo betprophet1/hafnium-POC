@@ -20,7 +20,7 @@
 //! Requests are here rather than in a gateway because a gateway must hold nothing a failover could lose (interface 1
 //! README), and because a requester and the responders are rarely on one gateway. They are not in the journal: the
 //! engine has no RFQ state machine (spec §19), and the quotes that matter, the orders, are journaled already. A
-//! restarted service forgets open requests and subscriptions, rereads its approved responders from their file, and
+//! restarted service forgets open requests and subscriptions, rereads its approved responders from its database, and
 //! relearns everything else (parlays, their legs and how they stand) from the feed.
 
 use crate::responders::{Approvals, Filter, Subscriptions};
@@ -30,7 +30,6 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -61,9 +60,9 @@ pub struct Config {
     pub max_parlays: usize,
     /// The node's capacity profile: no parlay is listed that would take the venue past 95% of it (`rules::no_room`).
     pub capacity: rules::Capacity,
-    /// The file the approved responders are kept in (`responders::Approvals`); `None` keeps them in memory, seeded
-    /// from the catalogue, for tests.
-    pub responders: Option<PathBuf>,
+    /// The database the approved responders are kept in (`responders::Approvals`); `None` keeps them in memory,
+    /// seeded from the catalogue, for tests and throwaway local venues.
+    pub responders: Option<venue_store::Database>,
     /// The fewest contracts a request may ask for: a multiple of the parlay lot step, and at least one lot.
     pub min_quantity: u64,
 }
@@ -253,7 +252,7 @@ fn nonce() -> Result<String, Error> {
 /// Starts the service: follows the feed, accepts gateways on `config.listen`, and returns once it is listening.
 pub fn start(catalogue: Catalogue, config: &Config) -> Result<Arc<Service>, Error> {
     let seed = catalogue.accounts().iter().filter(|a| a["responder"] == true).filter_map(|a| a["id"].as_u64());
-    let approvals = Approvals::load(config.responders.as_deref(), seed.collect::<Vec<u64>>())?;
+    let approvals = Approvals::load(config.responders.as_ref(), seed.collect::<Vec<u64>>())?;
     if config.min_quantity < LOT_STEP || !config.min_quantity.is_multiple_of(LOT_STEP) {
         return Err(format!("the minimum request must be a positive multiple of the lot step, {LOT_STEP}").into());
     }
@@ -551,6 +550,11 @@ impl Service {
             })
             .collect();
         json!({"responders": list})
+    }
+
+    /// Whether the approved responders' database answers: `None` without one. Routing never depends on it.
+    pub fn database_health(&self) -> Option<Result<(), String>> {
+        locked(&self.approvals).health()
     }
 
     /// Whether the service has caught up with the feed and can open requests.

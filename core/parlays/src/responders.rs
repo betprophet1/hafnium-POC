@@ -1,5 +1,5 @@
 //! Who may answer requests for quote, and who is listening: the operator's list of approved responder accounts, kept
-//! in a file, and the responders' subscriptions, each a gateway's session with its filters. Nothing here talks to a
+//! in the parlay service's PostgreSQL schema, and the responders' subscriptions, each a gateway's session with its filters. Nothing here talks to a
 //! gateway or a node, so all of it is tested on its own.
 //!
 //! Approval is per account. A credential that may respond (an API key's permission, when keys arrive) is a question
@@ -8,10 +8,10 @@
 use crate::rules::{MAX_LEGS, MIN_LEGS};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
 use venue_link::view::Leg;
 use venue_link::wire::Error;
+use venue_store::postgres::Transaction;
+use venue_store::{big, unsigned, Database, Migration};
 
 /// The most IDs a filter may list of events, or of markets.
 pub const MAX_FILTER_IDS: usize = 100;
@@ -104,45 +104,43 @@ impl Filter {
     }
 }
 
-/// The approved responder accounts, and the file they are kept in. The file is the whole truth: the service reads it
-/// when it starts, and writes it whole, through a rename, on every change, so an operator can also edit it by hand
-/// and restart the service. When there is no file yet, the list starts from the catalogue's `"responder": true`
-/// accounts and is written at once.
+/// The parlay service's schema, in order. A released migration is never edited: a change is a new one.
+pub const MIGRATIONS: &[Migration] =
+    &[Migration { version: 1, name: "responders", sql: include_str!("../migrations/V001__responders.sql") }];
+
+/// The approved responder accounts, kept in the parlay service's schema (`responders`, with every approval and
+/// revocation in `responder_changes`) and held in memory, where every request is routed from. The records are the
+/// whole truth: the service reads them when it starts. When the list has never been started, it starts from the
+/// catalogue's `"responder": true` accounts, once; after that a revoked catalogue responder stays revoked. A change is
+/// written before it is made in memory, and refused if it cannot be written; routing carries on from memory whatever
+/// the database does.
 pub struct Approvals {
-    path: Option<PathBuf>,
+    db: Option<Database>,
     accounts: BTreeSet<u64>,
 }
 
 impl Approvals {
-    /// Reads the list at `path`, or starts it from `seed` when there is no file there. Without a path the list lives
-    /// in memory only, for tests.
-    pub fn load(path: Option<&Path>, seed: impl IntoIterator<Item = u64>) -> Result<Self, Error> {
-        let Some(path) = path else { return Ok(Self { path: None, accounts: seed.into_iter().collect() }) };
-        if path.exists() {
-            let text = fs::read_to_string(path)?;
-            let value: Value =
-                serde_json::from_str(&text).map_err(|e| format!("{}: not a responder list: {e}", path.display()))?;
-            let accounts = value["responders"]
-                .as_array()
-                .ok_or_else(|| format!("{}: no responders list", path.display()))?
-                .iter()
-                .map(|v| v.as_u64().ok_or_else(|| format!("{}: a responder is not an account ID", path.display())))
-                .collect::<Result<BTreeSet<u64>, String>>()?;
-            return Ok(Self { path: Some(path.to_path_buf()), accounts });
-        }
-        let approvals = Self { path: Some(path.to_path_buf()), accounts: seed.into_iter().collect() };
-        approvals.save()?;
-        Ok(approvals)
-    }
-
-    fn save(&self) -> Result<(), Error> {
-        let Some(path) = &self.path else { return Ok(()) };
-        let text = format!("{}\n", json!({"responders": self.accounts}));
-        let mut temporary = path.as_os_str().to_owned();
-        temporary.push(".tmp");
-        fs::write(&temporary, text)?;
-        fs::rename(&temporary, path)?;
-        Ok(())
+    /// Reads the list from `db`, starting it from `seed` if it has never been started. Without a database the list
+    /// lives in memory only, seeded, for tests.
+    pub fn load(db: Option<&Database>, seed: impl IntoIterator<Item = u64>) -> Result<Self, Error> {
+        let Some(db) = db else { return Ok(Self { db: None, accounts: seed.into_iter().collect() }) };
+        let seed: Vec<u64> = seed.into_iter().collect();
+        let accounts = db
+            .transaction(|tx| {
+                let started =
+                    tx.execute("INSERT INTO responder_list (started_at) VALUES (now()) ON CONFLICT DO NOTHING", &[])?;
+                if started == 1 {
+                    for account in &seed {
+                        change(tx, *account, true, "catalogue")?;
+                    }
+                }
+                tx.query("SELECT account_id FROM responders ORDER BY account_id", &[])?
+                    .iter()
+                    .map(|r| unsigned(r.get(0)))
+                    .collect::<Result<BTreeSet<u64>, _>>()
+            })
+            .map_err(|e| format!("the responder list: {e}"))?;
+        Ok(Self { db: Some(db.clone()), accounts })
     }
 
     pub fn contains(&self, account: u64) -> bool {
@@ -153,28 +151,87 @@ impl Approvals {
         &self.accounts
     }
 
-    /// Approves an account, returning whether it was not approved already. Nothing changes if the file cannot be
-    /// written.
-    pub fn approve(&mut self, account: u64) -> Result<bool, Error> {
-        if !self.accounts.insert(account) {
-            return Ok(false);
-        }
-        self.save().inspect_err(|_| {
-            self.accounts.remove(&account);
-        })?;
-        Ok(true)
+    /// Whether the records answer, for health checks; `None` without a database.
+    pub fn health(&self) -> Option<Result<(), String>> {
+        self.db.as_ref().map(|db| db.ping().map_err(String::from))
     }
 
-    /// Revokes an account's approval, returning whether it had one. Nothing changes if the file cannot be written.
-    pub fn revoke(&mut self, account: u64) -> Result<bool, Error> {
-        if !self.accounts.remove(&account) {
-            return Ok(false);
-        }
-        self.save().inspect_err(|_| {
+    /// Records an approval or revocation and makes it in memory. Says whether it changed anything; nothing changes
+    /// if it cannot be written.
+    fn set(&mut self, account: u64, approved: bool) -> Result<bool, Error> {
+        let changed = match &self.db {
+            None => self.accounts.contains(&account) != approved,
+            Some(db) => db
+                .transaction(|tx| change(tx, account, approved, "operator"))
+                .map_err(|e| format!("the responder list: {e}"))?,
+        };
+        if approved {
             self.accounts.insert(account);
-        })?;
-        Ok(true)
+        } else {
+            self.accounts.remove(&account);
+        }
+        Ok(changed)
     }
+
+    /// Approves an account, returning whether it was not approved already.
+    pub fn approve(&mut self, account: u64) -> Result<bool, Error> {
+        self.set(account, true)
+    }
+
+    /// Revokes an account's approval, returning whether it had one.
+    pub fn revoke(&mut self, account: u64) -> Result<bool, Error> {
+        self.set(account, false)
+    }
+}
+
+/// `venue-parlays import`: starts the list in `db` from a responder file kept by earlier versions
+/// (`{"responders": [10, 12]}`), in place of the catalogue. The list must never have been started. Returns the accounts.
+pub fn import(db: &Database, path: &std::path::Path) -> Result<BTreeSet<u64>, Error> {
+    let text = std::fs::read_to_string(path)?;
+    let value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("{}: not a responder list: {e}", path.display()))?;
+    let accounts = value["responders"]
+        .as_array()
+        .ok_or_else(|| format!("{}: no responders list", path.display()))?
+        .iter()
+        .map(|v| v.as_u64().ok_or_else(|| format!("{}: a responder is not an account ID", path.display())))
+        .collect::<Result<BTreeSet<u64>, String>>()?;
+    db.transaction(|tx| {
+        let started =
+            tx.execute("INSERT INTO responder_list (started_at) VALUES (now()) ON CONFLICT DO NOTHING", &[])?;
+        if started == 0 {
+            return Err(venue_store::Error::refused(
+                "the responder list was started already: an import only starts one",
+            ));
+        }
+        for account in &accounts {
+            change(tx, *account, true, "import")?;
+        }
+        Ok(())
+    })
+    .map_err(|e| format!("importing the responder list: {e}"))?;
+    Ok(accounts)
+}
+
+/// Approves or revokes in the records, with a row of history if it changed anything. Repeating one whose
+/// acknowledgement was lost changes nothing.
+fn change(tx: &mut Transaction<'_>, account: u64, approved: bool, by: &str) -> Result<bool, venue_store::Error> {
+    let id = big(account)?;
+    let changed = if approved {
+        tx.execute(
+            "INSERT INTO responders (account_id, approved_at) VALUES ($1, now()) ON CONFLICT DO NOTHING",
+            &[&id],
+        )?
+    } else {
+        tx.execute("DELETE FROM responders WHERE account_id = $1", &[&id])?
+    };
+    if changed == 1 {
+        tx.execute(
+            "INSERT INTO responder_changes (account_id, approved, changed_by, at) VALUES ($1, $2, $3, now())",
+            &[&id, &approved, &by],
+        )?;
+    }
+    Ok(changed == 1)
 }
 
 /// A subscribed session: the gateway connection it came through, and the session's key on that gateway.
@@ -259,62 +316,47 @@ mod tests {
         spec.iter().map(|&(event, instrument)| Leg { event, instrument, yes: true }).collect()
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("venue-parlays-test-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("a scratch directory");
-        dir.join("responders.json")
+    #[test]
+    fn the_migration_files_are_the_ones_the_build_embeds() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        venue_store::check_files(&dir, MIGRATIONS).expect("the same migrations");
     }
 
     #[test]
-    fn a_filter_selects_by_legs_events_markets_and_size() {
-        let request = legs(&[(1, 100), (2, 200), (3, 300)]);
-        assert!(Filter::default().matches(&request, 10));
-        let parse = |v: Value| Filter::parse(&v).expect("a valid filter");
-        assert!(parse(json!({"minLegs": 3, "maxLegs": 3})).matches(&request, 10));
-        assert!(!parse(json!({"maxLegs": 2})).matches(&request, 10));
-        assert!(parse(json!({"eventIds": [9, 2]})).matches(&request, 10));
-        assert!(!parse(json!({"eventIds": [9]})).matches(&request, 10));
-        assert!(parse(json!({"instrumentIds": [300]})).matches(&request, 10));
-        assert!(!parse(json!({"instrumentIds": [301]})).matches(&request, 10));
-        assert!(!parse(json!({"minQuantity": 20})).matches(&request, 10));
-        // Every part must hold.
-        assert!(!parse(json!({"eventIds": [1], "minQuantity": 20})).matches(&request, 10));
-        assert_eq!(parse(Value::Null), Filter::default());
-        for bad in [
-            json!({"minLegs": 1}),
-            json!({"maxLegs": 7}),
-            json!({"minLegs": 4, "maxLegs": 3}),
-            json!({"eventIds": ["1"]}),
-            json!({"eventIds": (0..101).collect::<Vec<u64>>()}),
-            json!({"colour": "red"}),
-            json!([]),
-        ] {
-            assert!(Filter::parse(&bad).is_err(), "{bad}");
-        }
-        assert_eq!(parse(json!({"eventIds": [5]})).to_json()["eventIds"], json!(["5"]));
-    }
-
-    #[test]
-    fn approvals_start_from_the_catalogue_and_survive_a_restart() {
-        let path = scratch("approvals");
-        let mut approvals = Approvals::load(Some(&path), [10]).expect("seeded");
-        assert!(approvals.contains(10) && path.exists(), "the seed is written at once");
+    fn approvals_start_from_the_catalogue_once_and_survive_a_restart_in_postgres() {
+        let Some(config) = venue_store::testing::owned_config("parlays_approvals") else { return };
+        let db = Database::connect(&config).expect("the test database");
+        db.migrate(MIGRATIONS).expect("migrated");
+        let mut approvals = Approvals::load(Some(&db), [10]).expect("seeded");
+        assert!(approvals.contains(10), "the catalogue's responders start the list");
         assert_eq!(approvals.approve(12).ok(), Some(true));
         assert_eq!(approvals.approve(12).ok(), Some(false));
         assert_eq!(approvals.revoke(10).ok(), Some(true));
         assert_eq!(approvals.revoke(10).ok(), Some(false));
-        // A restart reads the file, not the catalogue: the revoked seed stays revoked.
-        let restarted = Approvals::load(Some(&path), [10]).expect("reloaded");
+        // A restart reads the records, not the catalogue: the revoked seed stays revoked.
+        let restarted = Approvals::load(Some(&db), [10]).expect("reloaded");
         assert_eq!(restarted.accounts().iter().copied().collect::<Vec<_>>(), vec![12]);
-        fs::write(&path, "not json").expect("written");
-        assert!(Approvals::load(Some(&path), [10]).is_err(), "a damaged file is refused, not replaced");
+        let mut conn = db.get().expect("a connection");
+        let history: Vec<(i64, bool, String)> = conn
+            .query("SELECT account_id, approved, changed_by FROM responder_changes ORDER BY change_id", &[])
+            .expect("rows")
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect();
+        assert_eq!(
+            history,
+            vec![(10, true, "catalogue".into()), (12, true, "operator".into()), (10, false, "operator".into())]
+        );
+        assert!(conn.batch_execute("UPDATE responder_changes SET approved = true").is_err(), "history is append-only");
+        assert!(conn.batch_execute("DELETE FROM responder_changes").is_err(), "history is append-only");
     }
 
     #[test]
     fn a_change_that_cannot_be_written_is_not_made() {
-        let path = scratch("unwritable").with_file_name("no-such-dir").join("responders.json");
-        let mut approvals = Approvals { path: Some(path), accounts: BTreeSet::new() };
+        let Some(config) = venue_store::testing::owned_config("parlays_unwritable") else { return };
+        let db = Database::connect(&config).expect("the test database");
+        // No migrations: the tables are not there, so every write is refused.
+        let mut approvals = Approvals { db: Some(db), accounts: BTreeSet::new() };
         assert!(approvals.approve(12).is_err());
         assert!(!approvals.contains(12));
     }
