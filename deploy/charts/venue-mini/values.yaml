@@ -49,6 +49,14 @@ treasury:
     failurePerMille: 100
   # The largest single transfer, in cents: $1,000,000.
   maxCents: 100000000
+  # Messages lost on purpose so reconciliation has something to find (core/treasury/README.md): none, or demo for a
+  # few percent of bank notices and sleeve-adjustment answers lost, late or duplicated.
+  faults: none
+  # Reconciliation against the fake bank's statement and the journal, every everyMs (0: only when asked); a bank
+  # decision younger than graceMs is in flight, not a break. The page's account tab shows the last run.
+  reconciliation:
+    everyMs: 60000
+    graceMs: 10000
   storage:
     size: 256Mi
     # Empty uses the cluster's default class (k3d: local-path).

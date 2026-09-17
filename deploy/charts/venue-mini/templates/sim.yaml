@@ -72,8 +72,8 @@ spec:
       port: 8080
       targetPort: http
 ---
-# The web page, with the dummy oracle's controls passed through under /oracle. No authentication: reach it only
-# through a port-forward.
+# The web page, with the dummy oracle's controls passed through under /oracle and the treasury's reconciliation summary
+# under /treasury. No authentication: reach it only through a port-forward.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -110,6 +110,8 @@ spec:
               value: "{{ $gateway }}"
             - name: VENUE_ORACLE
               value: "{{ $name }}-oracle:8082"
+            - name: VENUE_TREASURY
+              value: "{{ $name }}-treasury:8083"
             - name: VENUE_CATALOGUE
               value: /catalogue/markets.json
           ports:

@@ -22,7 +22,7 @@ use venue_link::wire::{Error, Ids, Ingress};
 const USAGE: &str = "usage:
   venue-sim seed  --ingress ADDR --catalogue FILE [--capacity small]
   venue-sim web   --ingress ADDR --feed ADDR --gateway ADDR --catalogue FILE [--listen 127.0.0.1:8080]
-                  [--oracle 127.0.0.1:8082]
+                  [--oracle 127.0.0.1:8082] [--treasury 127.0.0.1:8083]
   venue-sim oracle --ingress ADDR --feed ADDR --catalogue FILE --calendar FILE [--capacity small]
                   [--listen 127.0.0.1:8082]
   venue-sim maker --gateway ADDR [--token dev-synthetic-maker] [--size 10] [--levels 3] [--spread 1]
@@ -153,7 +153,8 @@ fn web(args: &Args) -> Result<(), Error> {
     let catalogue = Catalogue::load(&args.get("catalogue", None)?)?;
     let live = view::Live::follow(&args.get("feed", None)?);
     let (gateway, oracle) = (args.get("gateway", Some("127.0.0.1:8081"))?, args.get("oracle", Some("127.0.0.1:8082"))?);
-    let app = web::Web::new(catalogue, live, gateway, oracle);
+    let treasury = args.get("treasury", Some("127.0.0.1:8083"))?;
+    let app = web::Web::new(catalogue, live, gateway, oracle, treasury);
     web::serve(&args.get("listen", Some("127.0.0.1:8080"))?, Arc::new(app))
 }
 

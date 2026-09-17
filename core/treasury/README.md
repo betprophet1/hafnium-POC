@@ -156,6 +156,9 @@ Not interface 1, and never exposed beyond the gateway: it trusts the account in 
 | `POST /v1/reconciliation/breaks/{breakId}/resolve` | `{"note": "..."}`: an operator marks a break resolved; `409 BREAK_ALREADY_RESOLVED` if it is. A break whose cause is still there is found again by the next run, as a new break |
 | `GET /healthz` | |
 
+The web page (`venue-sim web --treasury`) passes `GET /v1/reconciliation` and `POST /v1/reconciliation/runs` through
+under `/treasury` for the account tab's reconciliation section, and nothing else of this API.
+
 ## Running it
 
 ```sh

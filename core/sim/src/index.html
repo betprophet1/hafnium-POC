@@ -212,6 +212,7 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
       <p class="note">Money moves through the treasury and a fake bank, never straight into the core. A deposit reaches available cash once the bank settles it; a withdrawal leaves available cash at once and comes back if the bank fails it or you cancel it while the bank has it.</p>
       <h3>Transfers</h3><div id="acctTransfers"></div>
       <h3>Positions</h3><div id="acctPositions"></div>
+      <h3>Reconciliation <button class="link small" id="reconRun">Run now</button></h3><div id="recon"></div>
     </div>
 
     <div id="tab-parlays" hidden>
@@ -785,6 +786,52 @@ function renderAccount() {
       + `<td class="r">${t.state === 'pending' ? `<button class="link" data-cancel-transfer="${t.transferId}">Cancel</button>` : ''}</td></tr>`).join('')
     + '</tbody></table>' : '<p class="muted">None yet.</p>');
 }
+
+// The treasury's reconciliation (core/treasury, recon.rs), passed through under /treasury: the last run against the
+// fake bank's statement and the journal, the invariants it checked, and breaks still open or lately resolved. Read-only
+// but for asking for a run; an operator resolves a break on the treasury's own API.
+let R = null, rError = null;
+
+async function loadRecon() {
+  try {
+    const r = await fetch('/treasury/v1/reconciliation');
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error ? j.error.message : r.statusText);
+    R = j; rError = null;
+  } catch (e) { rError = String(e.message || e); }
+  renderRecon();
+}
+
+function renderRecon() {
+  if (!R) return setHTML($('#recon'), rError ? `<p class="note">The treasury is not reachable: ${esc(rError)}</p>` : '<p class="muted">Connecting…</p>');
+  const run = R.lastRun, when = t => new Date(t).toLocaleTimeString();
+  const status = {clean: 'settled', resolved: 'settled', breaks: 'pending', breach: 'failed'};
+  const head = run
+    ? `<p>Run ${run.runId} at ${when(run.at)} (${run.trigger}): <span class="state ${status[run.status] || ''}">${run.status}</span>`
+      + ` <span class="muted small">${run.found.length} found, ${run.resolved.length} resolved, ${run.open.length} open; bank statement ${money(run.bank.closingCents)}, ${run.journal.commands} treasury commands in the journal</span></p>`
+    : '<p class="muted">No run yet.</p>';
+  const next = `<p class="muted small">${R.nextRunAt ? `Next run at ${when(R.nextRunAt)}.` : 'Runs only when asked.'} ${R.faultsOn ? 'Lost messages are being injected, so breaks are expected.' : 'No lost messages are being injected.'}${rError ? ` Lost the treasury: ${esc(rError)}` : ''}</p>`;
+  const checks = run ? '<p class="small">' + run.invariants.map(c => `<span class="state ${c.ok ? 'settled' : 'failed'}" title="${esc(c.detail)}">${c.ok ? '✓' : '✗'} ${words(c.name)}</span>`).join(' ') + '</p>' : '';
+  const row = (b, last) => `<tr><td>${words(b.kind)}</td><td class="muted">${b.transferId ?? '—'}</td><td class="muted">${when(b.foundAt)}</td><td class="small">${esc(b.detail)}</td><td class="small">${last(b)}</td></tr>`;
+  const table = (list, head5, last) => '<table><thead><tr><th>Break</th><th>Transfer</th><th>Found</th><th>Detail</th><th>' + head5 + '</th></tr></thead><tbody>' + list.map(b => row(b, last)).join('') + '</tbody></table>';
+  const open = R.openBreaks.length ? table(R.openBreaks, 'State', () => '<span class="state failed">open</span>') : '<p class="muted small">No open breaks.</p>';
+  const done = R.recentlyResolved.slice(0, 6);
+  const resolved = done.length ? '<h4>Lately resolved</h4>' + table(done, 'Resolution', b => `${esc(b.resolution.by)}: ${esc(b.resolution.note)}`) : '';
+  setHTML($('#recon'), head + next + checks + open + resolved);
+}
+
+document.addEventListener('click', async ev => {
+  if (!ev.target.closest('#reconRun')) return;
+  try {
+    const r = await fetch('/treasury/v1/reconciliation/runs', {method: 'POST'});
+    const j = await r.json();
+    if (!r.ok) return toast(j.error ? j.error.message : r.statusText, 'bad');
+    if (j.status) toast(`Reconciliation run ${j.runId}: ${j.status}`, j.status === 'breach' ? 'bad' : j.status === 'breaks' ? '' : 'ok');
+  } catch (e) { toast(String(e), 'bad'); }
+  loadRecon();
+});
+loadRecon();
+setInterval(() => { if (tab === 'account') loadRecon(); }, 3000);
 
 // The dummy oracle's schedule (venue-sim oracle, passed through under /oracle). Times are the sequencer's, in ms; the
 // page keeps its offset from this browser's clock so countdowns tick between polls.

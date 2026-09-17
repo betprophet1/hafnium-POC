@@ -57,7 +57,10 @@ it is ready. `down` deletes the cluster and the journal with it.
   and shows as `CrashLoopBackOff`, which is the signal to look at the journal (`venue-node dump`).
 - **Money through the treasury.** With `treasury.enabled` (the default) the gateway passes `/v4/transfers` to the dummy
   treasury, which keeps its ledger on a volume of its own and moves buying power in the core only as sequenced grants
-  and reclaims; only the gateway may reach it. Its fake bank's delays and failure rate are `treasury.bank` values.
+  and reclaims; only the gateway may reach it, and the web page for its reconciliation summary. Its fake bank's
+  delays and failure rate are `treasury.bank` values. It reconciles its ledger against the fake bank's statement and
+  the journal every `treasury.reconciliation.everyMs`; `treasury.faults: demo` loses a few percent of the bank's
+  notices and of sleeve-adjustment answers on purpose, so the account tab's reconciliation section has breaks to show.
   The seed's grants are still how accounts start.
 - **Seeding is idempotent.** The seed job runs after every install and upgrade; its commands have fixed IDs.
 - **Not production.** Production runs the core on dedicated hosts behind Aeron Cluster (blueprint §5, §9). Tokens are

@@ -6,7 +6,9 @@
 //! the treasury too. Settlement goes through the dummy oracle (`venue-sim oracle`), whose control API is passed
 //! through under `/oracle` the same way, so a resolution from the page takes the oracle's proposal, sign-off and
 //! dispute window like any other. Nothing here reaches the core's ingress: accounts are funded by deposits (blueprint
-//! §16: demo balances come from a fake provider, never a ledger shortcut).
+//! §16: demo balances come from a fake provider, never a ledger shortcut). The treasury's reconciliation summary, and
+//! its request to run now, are passed through under `/treasury`; nothing else of the treasury's own API is, because it
+//! trusts the account a request names and only the gateway may speak for one.
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -32,6 +34,7 @@ pub struct Web {
     live: Arc<Live>,
     gateway: String,
     oracle: String,
+    treasury: String,
 }
 
 /// Settled rounds of each market the page's event stream still carries, latest first: enough to label recent payouts,
@@ -43,8 +46,8 @@ fn poisoned<T>(_: T) -> Error {
 }
 
 impl Web {
-    pub fn new(catalogue: Catalogue, live: Arc<Live>, gateway: String, oracle: String) -> Self {
-        Self { catalogue, live, gateway, oracle }
+    pub fn new(catalogue: Catalogue, live: Arc<Live>, gateway: String, oracle: String, treasury: String) -> Self {
+        Self { catalogue, live, gateway, oracle, treasury }
     }
 
     fn snapshot(&self) -> Result<Value, Error> {
@@ -133,6 +136,13 @@ fn handle(web: &Web, stream: TcpStream) -> Result<(), Error> {
     }
     if path == "/oracle" || path.starts_with("/oracle/") {
         return proxy(&web.oracle, "dummy oracle", &head, reader, stream);
+    }
+    // Only the reconciliation summary and a run on demand, with /treasury taken off the path.
+    if let ("GET", "/treasury/v1/reconciliation") | ("POST", "/treasury/v1/reconciliation/runs") =
+        (method.as_str(), path.as_str())
+    {
+        let head = head.replacen("/treasury/v1/", "/v1/", 1);
+        return proxy(&web.treasury, "treasury", &head, reader, stream);
     }
     if length > 1 << 20 {
         return respond(stream, 413, "text/plain", b"too large");

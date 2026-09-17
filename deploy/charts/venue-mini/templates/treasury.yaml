@@ -86,6 +86,12 @@ spec:
               value: {{ .Values.treasury.bank.failurePerMille | int64 | quote }}
             - name: VENUE_MAX_CENTS
               value: {{ .Values.treasury.maxCents | int64 | quote }}
+            - name: VENUE_FAULTS
+              value: {{ .Values.treasury.faults | quote }}
+            - name: VENUE_RECONCILE_EVERY_MS
+              value: {{ .Values.treasury.reconciliation.everyMs | int64 | quote }}
+            - name: VENUE_RECONCILE_GRACE_MS
+              value: {{ .Values.treasury.reconciliation.graceMs | int64 | quote }}
           ports:
             - name: http
               containerPort: 8083
@@ -114,7 +120,7 @@ spec:
             claimName: {{ $name }}-treasury
 ---
 # The treasury trusts the account a request names, because only the gateway's private half, which authenticated it,
-# may reach it.
+# may reach it. The web page reaches it too, but passes through only the reconciliation summary and a run on demand.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -131,6 +137,9 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "venue-mini.selector" (dict "ctx" $ "component" "gateway") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "venue-mini.selector" (dict "ctx" $ "component" "web") | nindent 14 }}
       ports:
         - port: 8083
 {{- end }}

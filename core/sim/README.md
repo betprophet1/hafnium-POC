@@ -113,6 +113,11 @@ through the gateway to the dummy treasury (`core/treasury`) and its fake bank, w
 in the core as sequenced commands. The page has no button that grants money straight into the core: blueprint §16
 has demo balances come from a fake provider, so that a demo exercises the path real money takes.
 
+The account tab also shows the treasury's reconciliation: the last run against the fake bank's statement and the
+journal, its invariants, open breaks and those lately resolved, and a button to run it now. The page passes only those
+two calls through to the treasury (`--treasury`, default 127.0.0.1:8083); an operator resolves a break on the
+treasury's own API (`core/treasury/README.md`).
+
 ## Known shortcuts
 
 - **Dev tokens.** Tokens are fixed per account in the catalogue, and the page is handed them. Test environments only.
