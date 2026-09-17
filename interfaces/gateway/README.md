@@ -6,28 +6,31 @@ through it, and it is the only client-facing component that writes to one (inter
 
 ## What the gateway does, and what it never does
 
-It authenticates the session, validates every message completely, converts prices and stakes into the journal's
-tick ordinals and contract counts, enforces flood limits, turns a disconnect or missed heartbeat into a sequenced
-mass cancel, routes to the sequencer group, and answers once the input is committed. It fans out each account's
-executions and conflated public market data. Deposits and withdrawals it passes to the treasury once it has
-authenticated the account, and it fans out the treasury's updates to the account's private sessions.
+It authenticates the session and checks that its credential holds the permission each request needs, validates
+every message completely, converts prices and stakes into the journal's tick ordinals and contract counts, enforces
+flood limits, turns a disconnect or missed heartbeat into a sequenced mass cancel, routes to the sequencer group, and
+answers once the input is committed. It fans out each account's executions and conflated public market data.
+Deposits and withdrawals it passes to the treasury once it has authenticated the account, and it fans out the
+treasury's updates to the account's private sessions.
 
 It never decides anything the engine decides. Client order ID duplicates, lot steps, market state, rule limits and
 collateral are sequenced checks (spec §9), so their rejections replay. It never decides anything about money either:
-the treasury owns every transfer and its ledger (blueprint §11). The gateway holds no state a failover could lose
-except flood-limit counters, which by design never reach the journal (blueprint §12).
+the treasury owns every transfer and its ledger (blueprint §11). Nor does it keep API keys: the identity service does,
+and the gateway only asks it whether a key is valid and remembers the answer for a few seconds. The gateway holds no
+state a failover could lose except flood-limit counters, which by design never reach the journal (blueprint §12), and
+that cache.
 
 ## Public and private
 
 The gateway has two halves, told apart by path alone: `/v4/ws_private`, `/v4/account`, and `/v4/orders`,
-`/v4/transfers` and `/v4/rfqs` with everything under them are private; `/v4/ws_public` and `/v4/markets` with
-everything under it are public; `/healthz` belongs to both.
+`/v4/transfers`, `/v4/rfqs` and `/v4/keys` with everything under them are private; `/v4/ws_public` and
+`/v4/markets` with everything under it are public; `/healthz` belongs to both.
 
 | | Public | Private |
 |---|---|---|
 | WebSocket | `/v4/ws_public` | `/v4/ws_private` |
-| REST | `GET /v4/markets`, `GET /v4/markets/{instrumentId}/book` | `GET /v4/account`; `/v4/orders`, `/v4/transfers`, `/v4/rfqs` and everything under them |
-| Login | never | required: a token on every REST call, `login` first on a session |
+| REST | `GET /v4/markets`, `GET /v4/markets/{instrumentId}/book` | `GET /v4/account`; `/v4/orders`, `/v4/transfers`, `/v4/rfqs`, `/v4/keys` and everything under them |
+| Login | never | required: a credential (an API key or a dev token) on every REST call, `login` first on a session |
 | Carries | markets (parlays included), books and trades, the same for everyone | one account's orders, executions, account updates, payouts, releases and transfers; its requests for quote and their quotes |
 | Reaches the sequencer group | never | every order, amendment and cancel; transfers through the treasury; a request for a parlay not yet listed, through the parlay service |
 
@@ -44,10 +47,10 @@ choice (blueprint §13), and a client addresses them only by path. `GET /healthz
 
 | | Refused by the gateway | Rejected by the engine |
 |---|---|---|
-| REST | HTTP 400, 401, 404, 429 or 503 with an `Error` | HTTP 200, `OrderResult.status: rejected` |
+| REST | HTTP 400, 401, 403, 404, 429 or 503 with an `Error` | HTTP 200, `OrderResult.status: rejected` |
 | WebSocket | `error` message | `reply` with `status: rejected` |
 | Journaled | Never | Always, with its reason |
-| Examples | malformed body, bad token, price not on the ladder, stake off its step, flood limit | insufficient sleeve, market not open, duplicate client order ID |
+| Examples | malformed body, bad credential, a key without the permission, price not on the ladder, stake off its step, flood limit | insufficient sleeve, market not open, duplicate client order ID |
 
 A transfer the treasury refuses at its edge (a malformed request, a reused client transfer ID, a cancel too late) is an
 HTTP 400 or 409 `Error` and creates nothing. A withdrawal the sequencer group refuses is HTTP 200 with the transfer
@@ -65,8 +68,10 @@ engine and does not use up its ID.
 A refusal at the edge is never journaled, so the gateway keeps the record of it: every REST request and its
 response, and every WebSocket's upgrade, frames and end, in the audit log format of `interfaces/audit/` (blueprint
 §12, flood protection). On the private half every frame both ways is recorded; on the public half the client's frames
-except heartbeats and the errors sent back, but not market data. Tokens are masked: the `Authorization` value becomes
-`Bearer ***`, and the `token` of a `login` becomes `***`.
+except heartbeats and the errors sent back, but not market data. Credentials are masked: the `Authorization` value
+becomes `Bearer ***`, the `token` of a `login` becomes `***`, and so do the `secret` and `credential` of a key just
+created. Every record of a request or session authenticated with an API key names the key (`key`), so an auditor can
+tell which key did what; its secret never appears.
 
 The log is written under `--audit-dir` (`VENUE_AUDIT_DIR`, default `./gateway-audit`), one file per UTC day named for
 `--audit-instance` (`VENUE_AUDIT_INSTANCE`, default the host name), synced unless `--audit-fsync false`
@@ -102,19 +107,68 @@ names the input whose `account` message carries the cash it moved.
 Test environments have only the fake provider's methods (blueprint §16): `dummy_bank` is decided after a delay and
 occasionally fails, `dummy_instant` settles at once, and `dummy_failing` always fails.
 
-## Permissions
+## API keys and permissions
 
-Moving money is a permission of its own, apart from trading, so that a credential for a trading program can be
-issued without it. The contract names it `transfers` in the security requirement of every `/v4/transfers` operation.
-A dev token holds every permission. When API keys arrive, each carries a flag for it: a key without the flag is
-refused with 403 `FORBIDDEN` on `/v4/transfers`, and its sessions are not sent `transfer` messages. Order entry and
-market data never need it.
+A client authenticates with an **API key**: a credential for one account, of which the account may hold several, each
+with its own permissions, label and optional expiry, so that a trading program, a reporting script and a person's
+console each get only what they need and can be revoked alone. Keys are kept by the identity service
+(`core/identity`), which the gateway asks; `decisions.md` beside this file says why each choice below was made.
 
-## Authentication in test environments
+**A key** has a public ID and a secret. The ID is `ak_` and 16 lower-case hex digits, and names the key everywhere,
+in lists and in audit records. The secret is 64 lower-case hex digits (256 random bits), shown once, in the answer
+that creates the key, and never again: the venue keeps only a hash of it and cannot tell anyone what it was. A client
+presents both joined by a dot, `ak_0123456789abcdef.<secret>`, called the key's **credential**.
 
-Each account in an environment's catalogue has a fixed dev token. REST sends `Authorization: Bearer <token>`;
-a WebSocket session sends it in `login`. Tokens exist only in test environments and act only as their account.
-Real identity is interface 6 and the environment manifest's issuer (interface 22).
+| Where | How the credential is sent |
+|---|---|
+| REST | `Authorization: Bearer <keyId>.<secret>` |
+| WebSocket | `login` with `token: "<keyId>.<secret>"` |
+| FIX | Username (553) the key ID and Password (554) the secret, or the whole credential in Password (interfaces/fix) |
+
+**Permissions.** Each key holds some of these; every request needs one.
+
+| Permission | Allows |
+|---|---|
+| `read` | `GET /v4/account`, `GET /v4/transfers` and one transfer, `GET /v4/rfqs/{requestId}`, and logging in to a private session, which streams the account's executions, account updates, payouts, releases, transfers, requests and quotes. **Every key holds it**: a key is refused at creation without it. |
+| `trade` | orders, amendments, cancels and mass cancels (`/v4/orders`, and `order`, `amend`, `cancel`, `cancelAll`); requests for quote and quotes (`POST /v4/rfqs`, `POST /v4/rfqs/{requestId}/quotes`, `requestQuote`, `attachQuote`) |
+| `transfers` | moving money: `POST /v4/transfers` and `DELETE /v4/transfers/{transferId}` |
+| `keys` | managing the account's keys: `/v4/keys` |
+
+A request with a valid credential that lacks the permission is refused with HTTP 403 `FORBIDDEN`, or an `error` with
+`FORBIDDEN` on the WebSocket, naming the permission; nothing is sent on, and the refusal is in the audit log with the
+key's ID. A missing, unknown, wrong, revoked or expired credential is 401 `UNAUTHORIZED`. Cancel-on-disconnect and a
+missed heartbeat cancel a session's orders whatever its key holds: they protect the account, and are not trading.
+
+**Managing keys** (`/v4/keys`, REST only, needs `keys`). `POST /v4/keys` creates a key with a `label`, `permissions`
+and an optional `expiresAt`, and answers with the key, its `secret` and its `credential`. `GET /v4/keys` lists every
+key of the account, revoked and expired ones included, newest first, without secrets. `DELETE /v4/keys/{keyId}`
+revokes a key at once and for good; revoking one already revoked answers it as it is. Nothing about a key can be
+changed after it is made: a key that should hold something else is replaced. A key that manages keys cannot create a
+key with a permission it does not hold itself, nor one that outlives it: a key made by an expiring key must expire no
+later. Revoking a key does not revoke the keys it created. An account holds at most 20 keys that are neither revoked
+nor expired.
+
+**Revocation and expiry take effect within 10 seconds.** A gateway remembers what the identity service said about a
+credential for up to 5 seconds, so a REST call with a key revoked or expired that moment is refused at most 5 seconds
+later; a private session logged in with such a key is sent an `error` (`UNAUTHORIZED`) and closed within 10 seconds,
+which cancels its orders if it asked for cancel-on-disconnect. The identity service not answering is 503
+`UNAVAILABLE` for a key not already remembered; dev tokens do not depend on it.
+
+A key's **last use** is kept to within a minute: the identity service records it when a gateway asks about the key,
+which is at most every few seconds while the key is in use.
+
+## Dev tokens in test environments
+
+Each account in an environment's catalogue also has a fixed dev token (`deploy/charts/venue-mini/files/markets.json`),
+sent exactly as a key's credential is, which the demo, the bots, the tests and the web page use. A dev token holds
+every permission, `keys` included, so it is how the first key of an account is made in a test environment. It is not
+a key: it is not listed, cannot be revoked, and its records carry no `key`. A gateway started with
+`--dev-tokens false` refuses them.
+
+Keys and dev tokens are both test-environment identity: the identity service here keeps its store on a local disk
+with no encryption at rest, no hardware-backed secrets, no second factor for managing keys and no issuer of its own.
+Real identity is interface 6, with the environment manifest's issuer (interface 22); keys and their permissions are
+the shape it should keep.
 
 ## Identifiers
 
@@ -302,8 +356,8 @@ quotes stay on the book as orders.
 
 ## Not in this draft
 
-The binary market-maker gateway (interface 2) and the FIX adapter; API keys and their permissions; real payment rails
-and their holds, limits and clawbacks; minimum-sequence reads from the stores (interface 28); the environment manifest
-(interface 22); real identity (interface 6); a sequenced RFQ state machine (blueprint §6: requests, windows and
-acceptances in the journal) and responder caps and minimum sizes per class; order history beyond what a session
-resumes.
+The binary market-maker gateway (interface 2); keys scoped to markets, IP allow-lists and signed requests; real
+payment rails and their holds, limits and clawbacks; minimum-sequence reads from the stores (interface 28); the
+environment manifest (interface 22); real identity (interface 6); a sequenced RFQ state machine (blueprint §6:
+requests, windows and acceptances in the journal) and responder caps and minimum sizes per class; order history beyond
+what a session resumes.

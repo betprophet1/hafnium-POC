@@ -69,7 +69,7 @@ connections whose Logon was refused.
 | `kind` | Fields |
 |---|---|
 | `fix` | `dir`; `conn` (Artio's connection ID), `session` (Artio's session ID), `sender` and `target` (SenderCompID 49 and TargetCompID 56 as the message carries them), `msgType` (35), `seq` (34), `msg` (the whole message, SOH shown as `\|`, secrets masked), and `status` when Artio did not mark the message OK (`AUTH_REJECT` on the Logon of a refused connection). `session` is -1 on a connection that never logged on. |
-| `gateway-login` | The adapter's login to the gateway for a FIX Logon: `conn`, `sender`, `peer` (the firm's `address:port`), and either `accountId` and `gatewaySession` (the `sessionId` of the gateway's `welcome`), or `refused` with the reason. `gatewaySession` is what ties a FIX session to the gateway's own audit records of the WebSocket the adapter holds for it. |
+| `gateway-login` | The adapter's login to the gateway for a FIX Logon: `conn`, `sender`, `peer` (the firm's `address:port`), and either `accountId`, `gatewaySession` (the `sessionId` of the gateway's `welcome`) and, for an API key, `key` (its ID), or `refused` with the reason. `gatewaySession` is what ties a FIX session to the gateway's own audit records of the WebSocket the adapter holds for it. |
 | `disconnect` | A connection ended, whether or not it logged on: `conn`, `session`, `reason` (Artio's, such as `REMOTE_DISCONNECT` or `FAILED_AUTHENTICATION`). |
 
 The adapter does not log the JSON it exchanges with the gateway: the gateway's audit log has every frame of that
@@ -79,7 +79,8 @@ WebSocket, under the `gatewaySession` above.
 
 Every record has `conn` (a connection number, unique within the process), `peer` (`address:port` as the gateway saw
 it; behind a load balancer, the balancer) and `half` (`public` or `private`); once a session or request is
-authenticated, `account`; on a WebSocket once it has one, `session` (the engine session ID the gateway gave it).
+authenticated, `account`, and `key`, the API key's ID, when it was authenticated with one rather than a dev token; on a
+WebSocket once it has one, `session` (the engine session ID the gateway gave it).
 
 | `kind` | Fields |
 |---|---|
@@ -88,7 +89,7 @@ authenticated, `account`; on a WebSocket once it has one, `session` (the engine 
 | `ws-open` | A WebSocket upgrade completed: `path`. |
 | `ws-refused` | A WebSocket upgrade that failed its handshake: `path`. |
 | `ws-frame` | `dir`, and `msg`, the text frame (secrets masked); for a binary frame from a client, `binary` (its length) instead. |
-| `ws-close` | The connection ended: `reason` (`heartbeat missed`, `too far behind` on what it was sent, or `closed`: by the client, the network or an error). |
+| `ws-close` | The connection ended: `reason` (`heartbeat missed`, `too far behind` on what it was sent, `key no longer valid` for a session whose API key was revoked or expired, or `closed`: by the client, the network or an error). |
 
 What is recorded on each half:
 
@@ -111,7 +112,7 @@ Secrets are replaced by `***` before a record is taken; nothing unmasked is ever
 |---|---|
 | FIX | the values of Password (554), NewPassword (925), EncryptedPassword (1402) and EncryptedNewPassword (1404). Username (553) is an identity, not a secret, and is kept. A masked message's BodyLength (9) and CheckSum (10) are left as they were sent, so they no longer match. |
 | HTTP headers | `authorization`, `proxy-authorization` and `cookie`: the value becomes its scheme and `***` (`Bearer ***`), or `***` when it has no scheme. |
-| JSON, in HTTP bodies and WebSocket frames | the string value of every member named `token`, wherever it appears, found textually so that a frame that is not valid JSON is masked too. |
+| JSON, in HTTP bodies and WebSocket frames | the string value of every member named `token`, `secret` or `credential`, wherever it appears, found textually so that a frame that is not valid JSON is masked too. The last two are how a new API key's secret is answered. |
 
 ## Writing
 

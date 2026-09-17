@@ -8,10 +8,15 @@ info:
 
     - `/v4/ws_public` carries public market data. It needs no login: a session subscribes to topics and receives
       conflated books, trades and market states.
-    - `/v4/ws_private` carries one account. A session logs in with a token, enters and cancels orders, requests
-      quotes for parlays, and receives that account's executions, account updates, payouts, releases and transfer
-      updates, the quotes on its requests and, for a registered responder, other accounts' requests. It carries no
-      public topics.
+    - `/v4/ws_private` carries one account. A session logs in with an API key's credential (or a dev token in a test
+      environment), enters and cancels orders, requests quotes for parlays, and receives that account's executions,
+      account updates, payouts, releases and transfer updates, the quotes on its requests and, for a registered
+      responder, other accounts' requests. It carries no public topics.
+
+    Logging in needs the `read` permission, which every key holds; `order`, `amend`, `cancel`, `cancelAll`,
+    `requestQuote` and `attachQuote` need `trade`, and are answered with an `error` (`FORBIDDEN`) for a key without it
+    (README, API keys and permissions). A session whose key is revoked or expires is sent an `error`
+    (`UNAUTHORIZED`) and closed within 10 seconds.
 
     A client that trades and watches the market opens one of each. The two may be served by one gateway or by
     separate ones (README, public and private); a client addresses them only by path. This document describes the
@@ -64,7 +69,9 @@ operations:
   receiveLogin:
     action: receive
     channel: { $ref: '#/channels/private' }
-    summary: Authenticate the session. Required before anything else on this endpoint.
+    summary: >-
+      Authenticate the session with an API key's credential or a dev token. Required before anything else on this
+      endpoint.
     messages: [{ $ref: '#/channels/private/messages/login' }]
     reply:
       channel: { $ref: '#/channels/private' }
@@ -188,7 +195,7 @@ operations:
     channel: { $ref: '#/channels/private' }
     summary: >-
       After login, each change of state of the account's deposits and withdrawals, from any session or REST call.
-      Only to sessions whose credential holds the transfers permission.
+      Reading them needs only `read`, which every session holds; making and cancelling them needs `transfers`.
     messages: [{ $ref: '#/channels/private/messages/transfer' }]
   sendRfq:
     action: send
@@ -232,7 +239,11 @@ components:
         properties:
           op: { const: login }
           id: { $ref: '#/components/schemas/RequestId' }
-          token: { type: string, description: The account's dev token in test environments. }
+          token:
+            type: string
+            description: >-
+              An API key's credential, `<keyId>.<secret>`; or, in test environments, the account's dev token. The
+              audit log records it as `***`.
           cancelOnDisconnect:
             type: boolean
             default: false
@@ -340,7 +351,7 @@ components:
     welcome:
       payload:
         type: object
-        required: [type, accountId, sessionId, sequence, resumed]
+        required: [type, accountId, sessionId, sequence, resumed, permissions]
         properties:
           type: { const: welcome }
           id: { $ref: '#/components/schemas/RequestId' }
@@ -348,6 +359,13 @@ components:
           sessionId: { $ref: './openapi.yaml#/components/schemas/Id' }
           sequence: { $ref: './openapi.yaml#/components/schemas/Id' }
           resumed: { type: boolean, description: True when every message after `resumeFrom` follows. }
+          keyId:
+            $ref: './openapi.yaml#/components/schemas/KeyId'
+            description: The API key the session logged in with; absent for a dev token.
+          permissions:
+            type: array
+            items: { $ref: './openapi.yaml#/components/schemas/Permission' }
+            description: What the session's credential allows; every permission for a dev token.
     reply:
       payload:
         type: object

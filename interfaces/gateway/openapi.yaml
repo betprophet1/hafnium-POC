@@ -20,12 +20,14 @@ info:
     public and private): they may be served by one gateway or by separate ones behind the same host.
 
     Transfers move money in and out of the account through the treasury, never through the sequencer group directly
-    (README, deposits and withdrawals). They are a permission of their own, named `transfers` in their security
-    requirement: a dev token holds it, and an API key will hold it only when issued with it.
+    (README, deposits and withdrawals). Moving money is a permission of its own, `transfers`: an API key holds it only
+    when it was created with it (README, API keys and permissions). Each operation's security requirement names the
+    permission an API key needs for it; a dev token, in test environments, holds every permission.
 servers:
   - url: http://127.0.0.1:8080
     description: The mini venue on a laptop, after `deploy/laptop.sh web`
 security:
+  - apiKey: [read]
   - devToken: []
 tags:
   - name: markets
@@ -36,6 +38,8 @@ tags:
     description: Deposits and withdrawals through the treasury. The private half, and a permission of its own.
   - name: rfq
     description: Requests for quote on parlays, and quotes attached to them (README, parlays). The private half.
+  - name: keys
+    description: The account's API keys (README, API keys and permissions). The private half.
 paths:
   /v4/markets:
     get:
@@ -79,6 +83,9 @@ paths:
   /v4/account:
     get:
       operationId: getAccount
+      security:
+        - apiKey: [read]
+        - devToken: []
       tags: [account]
       summary: The account's sleeve, positions and resting orders
       responses:
@@ -88,9 +95,13 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Account' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /v4/orders:
     post:
       operationId: placeOrder
+      security:
+        - apiKey: [trade]
+        - devToken: []
       tags: [account]
       summary: Place an order
       description: |
@@ -109,10 +120,14 @@ paths:
               schema: { $ref: '#/components/schemas/OrderResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/Unavailable' }
     delete:
       operationId: cancelAllOrders
+      security:
+        - apiKey: [trade]
+        - devToken: []
       tags: [account]
       summary: Cancel every resting order of the account, or those in one market or event
       parameters:
@@ -130,11 +145,15 @@ paths:
               schema: { $ref: '#/components/schemas/CancelAllResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/Unavailable' }
   /v4/orders/{orderId}:
     patch:
       operationId: amendOrder
+      security:
+        - apiKey: [trade]
+        - devToken: []
       tags: [account]
       summary: Change a resting order's price, quantity or event-start behaviour
       description: A reduction at the same price keeps priority; anything else loses it and may trade (spec E-12.4, E-12.5).
@@ -153,11 +172,15 @@ paths:
               schema: { $ref: '#/components/schemas/OrderResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/Unavailable' }
     delete:
       operationId: cancelOrder
+      security:
+        - apiKey: [trade]
+        - devToken: []
       tags: [account]
       summary: Cancel a resting order
       parameters:
@@ -169,12 +192,16 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OrderResult' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/Unavailable' }
   /v4/transfers:
     post:
       operationId: requestTransfer
+      security:
+        - apiKey: [transfers]
+        - devToken: []
       tags: [transfers]
       summary: Deposit money into the account, or withdraw it
       description: |
@@ -188,8 +215,6 @@ paths:
         group refuses because the amount is more than the account's available cash, the transfer is `failed` with
         reason `insufficient_available_cash` and nothing moved. That refusal is the engine's sequenced decision, so it
         is answered with HTTP 200 and the transfer, as a rejected order is.
-      security:
-        - devToken: [transfers]
       requestBody:
         required: true
         content:
@@ -209,10 +234,11 @@ paths:
         '503': { $ref: '#/components/responses/TreasuryUnavailable' }
     get:
       operationId: listTransfers
+      security:
+        - apiKey: [read]
+        - devToken: []
       tags: [transfers]
       summary: The account's transfers, newest first
-      security:
-        - devToken: [transfers]
       parameters:
         - name: limit
           in: query
@@ -232,10 +258,11 @@ paths:
   /v4/transfers/{transferId}:
     get:
       operationId: getTransfer
+      security:
+        - apiKey: [read]
+        - devToken: []
       tags: [transfers]
       summary: One of the account's transfers
-      security:
-        - devToken: [transfers]
       parameters:
         - $ref: '#/components/parameters/TransferId'
       responses:
@@ -251,13 +278,14 @@ paths:
         '503': { $ref: '#/components/responses/TreasuryUnavailable' }
     delete:
       operationId: cancelTransfer
+      security:
+        - apiKey: [transfers]
+        - devToken: []
       tags: [transfers]
       summary: Cancel a transfer the bank has not yet decided
       description: |
         Only a `pending` transfer that is still waiting on the bank can be cancelled; anything else is refused with
         `TRANSFER_NOT_CANCELLABLE`. A cancelled withdrawal returns its amount to available cash before it answers.
-      security:
-        - devToken: [transfers]
       parameters:
         - $ref: '#/components/parameters/TransferId'
       responses:
@@ -275,6 +303,9 @@ paths:
   /v4/rfqs:
     post:
       operationId: requestQuote
+      security:
+        - apiKey: [trade]
+        - devToken: []
       tags: [rfq]
       summary: Request quotes for a parlay, listing it if it does not exist yet
       description: |
@@ -294,12 +325,16 @@ paths:
               schema: { $ref: '#/components/schemas/Rfq' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/Unavailable' }
   /v4/rfqs/{requestId}:
     get:
       operationId: getRfq
+      security:
+        - apiKey: [read]
+        - devToken: []
       tags: [rfq]
       summary: One of the account's own requests, with its quotes
       parameters:
@@ -311,12 +346,16 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/RfqStatus' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/Unavailable' }
   /v4/rfqs/{requestId}/quotes:
     post:
       operationId: attachQuote
+      security:
+        - apiKey: [trade]
+        - devToken: []
       tags: [rfq]
       summary: Attach a resting order to a request as a quote (responders only)
       description: |
@@ -337,20 +376,97 @@ paths:
               schema: { $ref: '#/components/schemas/Quote' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/Unavailable' }
+  /v4/keys:
+    post:
+      operationId: createKey
+      security:
+        - apiKey: [keys]
+        - devToken: []
+      tags: [keys]
+      summary: Create an API key for the account
+      description: |
+        The answer is the only time the secret is shown: the venue keeps a hash of it. A key calling this cannot give
+        the new key a permission it does not hold itself, nor let it expire after it does (403 `FORBIDDEN`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/KeyRequest' }
+      responses:
+        '200':
+          description: The new key, with its secret and credential.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeyCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/IdentityUnavailable' }
+    get:
+      operationId: listKeys
+      security:
+        - apiKey: [keys]
+        - devToken: []
+      tags: [keys]
+      summary: Every API key of the account, newest first, revoked and expired ones included
+      responses:
+        '200':
+          description: The keys, without their secrets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Keys' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/IdentityUnavailable' }
+  /v4/keys/{keyId}:
+    delete:
+      operationId: revokeKey
+      security:
+        - apiKey: [keys]
+        - devToken: []
+      tags: [keys]
+      summary: Revoke one of the account's API keys, for good
+      description: |
+        Takes effect at once in the identity service, and at every gateway within 10 seconds (README): REST calls with
+        the key are refused, and private sessions logged in with it are closed. Revoking a key already revoked answers
+        the key as it is. A key can revoke itself.
+      parameters:
+        - $ref: '#/components/parameters/KeyId'
+      responses:
+        '200':
+          description: The key, revoked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Key' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/IdentityUnavailable' }
 components:
   securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: '<keyId>.<secret>'
+      description: |
+        An API key's credential: `Authorization: Bearer ak_0123456789abcdef.<64 hex digits>` (README, API keys and
+        permissions). A requirement names the permission the key must hold: `read`, `trade`, `transfers` or `keys`.
+        A valid key without it is refused with 403 `FORBIDDEN`; a missing, unknown, revoked or expired one with 401.
     devToken:
       type: http
       scheme: bearer
       description: |
-        Test environments only: a fixed token per account from the environment's catalogue. Real identity is
-        interface 6 and the issuer named in the environment manifest (interface 22), neither specified yet.
-
-        A requirement may name permissions. `transfers` is the permission to move money: a dev token holds it, and an
-        API key will hold it only if issued with it. A credential without it is refused with 403 `FORBIDDEN`.
+        Test environments only: a fixed token per account from the environment's catalogue, holding every permission.
+        Real identity is interface 6 and the issuer named in the environment manifest (interface 22), neither
+        specified yet.
   parameters:
     InstrumentId:
       name: instrumentId
@@ -372,6 +488,11 @@ components:
       in: path
       required: true
       schema: { $ref: '#/components/schemas/RfqId' }
+    KeyId:
+      name: keyId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/KeyId' }
   responses:
     BadRequest:
       description: Refused at the edge; nothing was journaled.
@@ -384,7 +505,9 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     Forbidden:
-      description: The credential is valid but lacks the permission this call needs. A dev token never gets this.
+      description: |
+        The credential is valid but lacks the permission this call needs, which the message names; or a key tried to
+        create a key with more than it holds. A dev token never gets this.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -395,7 +518,8 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     NotFound:
       description: >-
-        No such market, no such resting order of this account, no such transfer of this account, or no such request.
+        No such market, no such resting order of this account, no such transfer of this account, no such request, or no
+        such key of this account.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -416,6 +540,13 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     TreasuryUnavailable:
       description: The treasury did not answer. The outcome is unknown; resend with the same client transfer ID.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    IdentityUnavailable:
+      description: |
+        The identity service did not answer, or this gateway has none. For a key being created, the outcome is
+        unknown: list the keys, and revoke any that was made.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -697,6 +828,74 @@ components:
         outcome: { type: string, enum: ['yes', 'no'] }
         title: { type: string, description: The leg's event. }
         label: { type: string, description: The leg's market. }
+    KeyId:
+      type: string
+      pattern: '^ak_[0-9a-f]{16}$'
+      description: An API key's public ID.
+    Permission:
+      type: string
+      enum: [read, trade, transfers, keys]
+      description: |
+        `read`: the account, its transfers and requests, and private sessions. `trade`: orders, amendments, cancels,
+        requests for quote and quotes. `transfers`: deposits, withdrawals and their cancellation. `keys`: this
+        account's API keys.
+    KeyRequest:
+      type: object
+      required: [label, permissions]
+      additionalProperties: false
+      properties:
+        label:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[ -~]+$'
+          description: What the key is for, in the owner's words. Printable ASCII.
+        permissions:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/Permission' }
+          description: Must include `read`.
+        expiresAt:
+          type: string
+          format: date-time
+          description: When the key stops working, in UTC (`Z`), in the future. Omitted, it works until revoked.
+    Key:
+      type: object
+      required: [keyId, label, permissions, createdAt, expiresAt, revokedAt, lastUsedAt, createdBy]
+      properties:
+        keyId: { $ref: '#/components/schemas/KeyId' }
+        label: { type: string }
+        permissions: { type: array, items: { $ref: '#/components/schemas/Permission' } }
+        createdAt: { type: string, format: date-time }
+        expiresAt: { type: [string, 'null'], format: date-time, description: Null for a key that never expires. }
+        revokedAt: { type: [string, 'null'], format: date-time, description: Null while the key is not revoked. }
+        lastUsedAt:
+          type: [string, 'null']
+          format: date-time
+          description: When a gateway last checked the key, to within a minute; null if never used.
+        createdBy:
+          type: [string, 'null']
+          pattern: '^ak_[0-9a-f]{16}$'
+          description: The key that created this one, or null when a dev token or an operator did.
+    KeyCreated:
+      allOf:
+        - $ref: '#/components/schemas/Key'
+        - type: object
+          required: [secret, credential]
+          properties:
+            secret:
+              type: string
+              pattern: '^[0-9a-f]{64}$'
+              description: Shown this once. The venue cannot show it again.
+            credential:
+              type: string
+              description: '`keyId.secret`, as REST, WebSocket and FIX take it.'
+    Keys:
+      type: object
+      required: [keys]
+      properties:
+        keys: { type: array, items: { $ref: '#/components/schemas/Key' }, description: Newest first. }
     RfqId:
       type: string
       pattern: '^[0-9a-z]{1,32}$'

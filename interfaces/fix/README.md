@@ -15,9 +15,10 @@ and nothing past the adapter knows it came from FIX.
 |---|---|
 | Version | FIX 4.4 (`8=FIX.4.4`), over TCP. TLS is terminated in front of the adapter where it is needed. |
 | CompIDs | The firm chooses its SenderCompID (49). TargetCompID (56) is the venue's CompID, `VENUE` in test environments. A session is its pair of CompIDs. |
-| Credentials | The account's token in **Password (554)** on Logon. Test environments use the dev tokens of `deploy/charts/venue-mini/files/markets.json`, such as `dev-market-maker`. Username (553) is optional and ignored. |
-| Logon refused | A missing or refused token is answered with a Logout (5) whose Text (58) says why (`token refused`), and the connection is closed. |
-| Account | The token decides the account. Account (1) is optional; on a NewOrderSingle it must equal the logged-on account ID when given. |
+| Credentials | An API key on Logon (interface 1 README, API keys and permissions): the key ID in **Username (553)** and its secret in **Password (554)**, or the whole credential, `<keyId>.<secret>`, in Password with Username free. Test environments also take an account's dev token in Password, such as `dev-market-maker` from `deploy/charts/venue-mini/files/markets.json`. Username is read as a key ID only when it is one (`ak_` and 16 hex digits); otherwise it is the firm's own and ignored. |
+| Logon refused | A missing or refused credential is answered with a Logout (5) whose Text (58) says why (`token refused`, also for a revoked or expired key), and the connection is closed. |
+| Account | The credential decides the account. Account (1) is optional; on a NewOrderSingle it must equal the logged-on account ID when given. |
+| Permissions | Logging on needs `read`, which every key holds, so a key without `trade` can log on and list securities. Its NewOrderSingle is rejected (ExecutionReport 150=8, OrdRejReason 103 = 99, Text `FORBIDDEN: ...` naming the permission), its OrderCancelReplaceRequest and OrderCancelRequest are refused with OrderCancelReject (102 = 99), and its OrderMassCancelRequest with 531=0 and 532=99. A session whose key is revoked or expires is logged out within 10 seconds, which cancels its orders as any disconnect does. |
 | EncryptMethod | 0 only. |
 | HeartBtInt | Chosen by the firm on Logon, and honoured by the venue both ways (TestRequest, then Logout on silence). |
 | Sequence numbers | Persistent: they carry on across logons and across restarts of the adapter, until the firm logs on with ResetSeqNumFlag (141) = Y. |
