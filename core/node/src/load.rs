@@ -16,9 +16,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use venue_harness::codec;
 
-/// The seeded demo market maker and the Heavy Rain market (deploy/charts/venue-mini/files/markets.json).
-const ACCOUNT: u64 = 1;
-const INSTRUMENT: u64 = 10010;
 /// 5¢ YES, below anything the bots quote, so the order never trades.
 const TICK: u64 = 4;
 
@@ -69,25 +66,28 @@ fn encode(input: &Value) -> Result<Vec<u8>, Error> {
 }
 
 /// One connection's run: set up its order, then amend until `deadline`. Returns each round trip in nanoseconds.
-fn drive(addr: &str, index: usize, deadline: Instant) -> Result<Vec<u64>, Error> {
+fn drive(addr: &str, index: usize, deadline: Instant, account: u64, instrument: u64) -> Result<Vec<u64>, Error> {
     let mut c = Connection::open(addr)?;
     let session = 900_000 + index as u64;
     let order = json!({
-        "msg": "NewOrder", "record": zeroed(), "sessionId": session, "accountId": ACCOUNT,
-        "clientOrderId": format!("load-{}-{index}", std::process::id()), "instrumentId": INSTRUMENT, "side": "BUY",
+        "msg": "NewOrder", "record": zeroed(), "sessionId": session, "accountId": account,
+        "clientOrderId": format!("load-{}-{index}", std::process::id()), "instrumentId": instrument, "side": "BUY",
         "enteredContract": "YES", "tick": TICK, "quantity": 10, "timeInForce": "GTC", "expiresAt": null,
         "atEventStart": "KEEP", "flags": [], "protectionTicks": 0, "spendCapCents": null, "enteredStakeCents": null,
         "clientOrderGroup": null
     });
     let results = c.round_trip(&encode(&order)?, true)?;
     let accepted = results.iter().find(|r| r["msg"] == "OrderAccepted").ok_or_else(|| {
-        format!("connection {index}: the resting order was not accepted: {}", Value::Array(results.clone()))
+        format!(
+            "connection {index}: the resting order was not accepted: {}\nthe account and market are --account {account} --instrument {instrument}; a seeded node generates its instrument IDs",
+            Value::Array(results.clone())
+        )
     })?;
     let order_id = accepted["orderId"].clone();
     let amend = |quantity: u64| {
         encode(&json!({
-            "msg": "AmendOrder", "record": zeroed(), "sessionId": session, "accountId": ACCOUNT,
-            "instrumentId": INSTRUMENT, "orderId": order_id, "newTick": null, "newQuantity": quantity,
+            "msg": "AmendOrder", "record": zeroed(), "sessionId": session, "accountId": account,
+            "instrumentId": instrument, "orderId": order_id, "newTick": null, "newQuantity": quantity,
             "atEventStart": "UNCHANGED"
         }))
     };
@@ -112,13 +112,13 @@ fn micros(ns: u64) -> String {
     format!("{}.{:03}", ns / 1000, ns % 1000)
 }
 
-pub fn load(addr: &str, connections: usize, seconds: u64) -> Result<(), Error> {
+pub fn load(addr: &str, connections: usize, seconds: u64, account: u64, instrument: u64) -> Result<(), Error> {
     let started = now();
     let deadline = started + Duration::from_secs(seconds);
     let workers: Vec<_> = (0..connections)
         .map(|index| {
             let addr = addr.to_string();
-            thread::spawn(move || drive(&addr, index, deadline).map_err(|e| e.to_string()))
+            thread::spawn(move || drive(&addr, index, deadline, account, instrument).map_err(|e| e.to_string()))
         })
         .collect();
     let mut all = Vec::new();
