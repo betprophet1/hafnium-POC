@@ -15,6 +15,8 @@
 //! delivered to the session. A resubscription the service refuses (the account's approval was revoked meanwhile) is
 //! forgotten, and the session told with an `rfqSubscription` message.
 
+use crate::limits::monotonic;
+use crate::metrics::{HalfMetrics, Outcome, Service};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
@@ -23,8 +25,10 @@ use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryR
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 use venue_link::submit::Notify;
 use venue_link::wire::Error;
+use venue_telemetry::log;
 
 /// Calls waiting to be written; past this a caller is refused rather than blocked.
 const QUEUE_DEPTH: usize = 1024;
@@ -73,10 +77,21 @@ struct Waiting {
     answer: Option<SyncSender<Answer>>,
     notify: Option<Notify>,
     subscribing: Option<Subscribing>,
+    /// A client's call, when it was handed over and where it is counted.
+    counted: Option<(Instant, Arc<HalfMetrics>)>,
 }
 
 impl Waiting {
     fn send(self, answer: Answer) {
+        if let Some((started, metrics)) = &self.counted {
+            // The service not being reachable is an error; a refusal it sent is an answer.
+            let outcome = if matches!(&answer, Err((503, code, _)) if code == "UNAVAILABLE") {
+                Outcome::Error
+            } else {
+                Outcome::Ok
+            };
+            metrics.upstream(Service::Parlays, outcome, Some(monotonic().duration_since(*started)));
+        }
         match self.subscribing {
             Some(Subscribing::Asked { memory, session, stamp, previous }) => {
                 let mut memory = locked(&memory);
@@ -136,6 +151,7 @@ pub type Deliver = Arc<dyn Fn(Target<'_>, &Value) + Send + Sync>;
 pub struct Parlays {
     queue: SyncSender<Call>,
     subscribed: Arc<Mutex<Subscribed>>,
+    metrics: Arc<HalfMetrics>,
 }
 
 /// A call the service has not answered yet.
@@ -171,13 +187,13 @@ fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl Parlays {
     /// Connects in the background and keeps reconnecting, handing whatever the service sends for sessions to
     /// `deliver`.
-    pub fn spawn(addr: &str, deliver: Deliver) -> Self {
+    pub fn spawn(addr: &str, deliver: Deliver, metrics: Arc<HalfMetrics>) -> Self {
         let (queue, calls) = sync_channel(QUEUE_DEPTH);
         let addr = addr.to_string();
         let subscribed = Arc::new(Mutex::new(Subscribed::default()));
         let memory = Arc::clone(&subscribed);
         thread::spawn(move || connect(&addr, &calls, &deliver, &memory));
-        Self { queue, subscribed }
+        Self { queue, subscribed, metrics }
     }
 
     /// Hands a call to the service without waiting for its answer.
@@ -187,11 +203,13 @@ impl Parlays {
 
     fn send(&self, body: Value, notify: Option<Notify>, subscribing: Option<Subscribing>) -> Result<Pending, Error> {
         let (answer, wait) = sync_channel(1);
-        let call = Call { body, waiting: Waiting { answer: Some(answer), notify, subscribing } };
+        let counted = Some((monotonic(), Arc::clone(&self.metrics)));
+        let call = Call { body, waiting: Waiting { answer: Some(answer), notify, subscribing, counted } };
         self.queue.try_send(call).map_err(|e| {
             let (TrySendError::Full(call) | TrySendError::Disconnected(call)) = e;
+            self.metrics.upstream(Service::Parlays, Outcome::Busy, None);
             // Whatever it would have changed here is put back; nobody is waiting for it.
-            Waiting { answer: None, notify: None, ..call.waiting }.send(Err(gone()));
+            Waiting { answer: None, notify: None, counted: None, ..call.waiting }.send(Err(gone()));
             "the parlay service's queue is full"
         })?;
         Ok(Pending { wait })
@@ -238,12 +256,12 @@ fn connect(addr: &str, calls: &Receiver<Call>, deliver: &Deliver, memory: &Arc<M
     loop {
         match TcpStream::connect(addr) {
             Ok(stream) => {
-                eprintln!("gateway: connected to the parlay service at {addr}");
+                log::info("connected to the parlay service", &[("parlays", &addr)]);
                 if let Err(e) = generation(stream, calls, deliver, memory) {
-                    eprintln!("gateway: parlay service {addr}: {e}; reconnecting");
+                    log::warn("parlay service connection ended; reconnecting", &[("parlays", &addr), ("error", &e)]);
                 }
             }
-            Err(e) => eprintln!("gateway: parlay service {addr}: {e}; retrying"),
+            Err(e) => log::warn("parlay service unreachable; retrying", &[("parlays", &addr), ("error", &e)]),
         }
         // A second between attempts, refusing whatever is asked meanwhile.
         for _ in 0..10 {
@@ -279,7 +297,7 @@ fn generation(
         .map(|(session, r)| (*session, r.stamp, r.call.clone()))
         .collect();
     if !replays.is_empty() {
-        eprintln!("gateway: subscribing {} sessions to the parlay service again", replays.len());
+        log::info("subscribing sessions to the parlay service again", &[("sessions", &replays.len())]);
     }
     let mut replayed = Ok(());
     for (session, stamp, mut body) in replays {
@@ -287,7 +305,8 @@ fn generation(
         body["ref"] = json!(next);
         let subscribing =
             Subscribing::Replayed { memory: Arc::clone(memory), session, stamp, deliver: Arc::clone(deliver) };
-        locked(&waiting).insert(next, Waiting { answer: None, notify: None, subscribing: Some(subscribing) });
+        locked(&waiting)
+            .insert(next, Waiting { answer: None, notify: None, subscribing: Some(subscribing), counted: None });
         if let Err(e) = writer.write_all(format!("{body}\n").as_bytes()) {
             replayed = Err(e);
             break;
@@ -418,7 +437,8 @@ mod tests {
     fn subscriptions_are_sent_again_when_the_connection_to_the_service_is_new() {
         let fake = Fake::new();
         let (deliver, delivered) = deliveries();
-        let parlays = Parlays::spawn(&fake.address(), deliver);
+        let metrics = crate::metrics::Metrics::unregistered().half(crate::api::Half::Private);
+        let parlays = Parlays::spawn(&fake.address(), deliver, metrics);
         let (mut lines, mut stream) = fake.accept();
         let mut pending = Vec::new();
         for session in [1, 2, 3, 4] {

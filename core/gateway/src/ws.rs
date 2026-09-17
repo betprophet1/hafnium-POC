@@ -8,6 +8,7 @@ use crate::api::{only, parse_id, ApiError, Gateway, Half, Pending};
 use crate::hub::{id, Outbox};
 use crate::identity::Credential;
 use crate::limits::{monotonic, Bucket};
+use crate::metrics::{self, Api, Limit};
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
 use std::fs::File;
@@ -17,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use venue_identity::key::Permissions;
 use venue_link::submit::Notify;
+use venue_telemetry::log;
 
 /// Requests one session may have outstanding at once. At this many, whatever serves the connection stops reading
 /// from it until the oldest is answered, which is where one client is stopped from queueing work at every other
@@ -121,7 +123,8 @@ fn cancel_session_orders(gateway: &Arc<Gateway>, session: &Session, cause: &'sta
     let (gateway, engine_session) = (Arc::clone(gateway), session.engine_session);
     thread::spawn(move || {
         if let Err(e) = gateway.cancel_session(account, engine_session, cause) {
-            eprintln!("gateway: {cause} cancel for session {engine_session}: {}", e.message);
+            let session = engine_session.to_string();
+            log::warn("session cancel failed", &[("cause", &cause), ("session", &session), ("error", &e.message)]);
         }
     });
 }
@@ -171,6 +174,9 @@ pub fn ready_replies(gateway: &Gateway, session: &mut Session) -> Vec<String> {
                 }
                 other => other,
             };
+            if let Err(e) = &result {
+                gateway.metrics.refused_status(Api::Ws, e.status);
+            }
             out.push(answer(&id, result));
         }
     }
@@ -213,13 +219,28 @@ pub fn binary_refused() -> String {
 /// `ready_replies`.
 pub fn handle(gateway: &Gateway, session: &mut Session, text: &str) -> Vec<String> {
     let Ok(message) = serde_json::from_str::<Value>(text) else {
-        return vec![error(&Value::Null, &ApiError::bad("not JSON"))];
+        let refused = ApiError::bad("not JSON");
+        gateway.metrics.ws_message(metrics::OP_UNREADABLE, Some(refused.status));
+        return vec![error(&Value::Null, &refused)];
     };
     let request_id = message.get("id").cloned().unwrap_or(Value::Null);
+    let op = metrics::op(message.get("op").and_then(Value::as_str).unwrap_or(""));
     if let Err(wait) = session.bucket.take(monotonic()) {
-        return vec![error(&request_id, &ApiError::rate_limited(wait))];
+        gateway.metrics.rate_limited(Limit::Ws);
+        let refused = ApiError::rate_limited(wait);
+        gateway.metrics.ws_message(op, Some(refused.status));
+        return vec![error(&request_id, &refused)];
     }
-    respond(gateway, session, &message).unwrap_or_else(|e| vec![error(&request_id, &e)])
+    match respond(gateway, session, &message) {
+        Ok(replies) => {
+            gateway.metrics.ws_message(op, None);
+            replies
+        }
+        Err(e) => {
+            gateway.metrics.ws_message(op, Some(e.status));
+            vec![error(&request_id, &e)]
+        }
+    }
 }
 
 /// The request without `op` and `id`, as the REST body would be.

@@ -27,6 +27,7 @@ use crate::forwarded::Forwarding;
 use crate::hub::Outbox;
 use crate::identity::Credential;
 use crate::limits::monotonic;
+use crate::metrics::{self, Api};
 use crate::treasury::Call;
 use crate::ws::{self, Session};
 use crate::{http, rest};
@@ -45,6 +46,7 @@ use tungstenite::handshake::MidHandshake;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{HandshakeError, Message, WebSocket};
 use venue_link::submit::Notify;
+use venue_telemetry::log;
 
 /// The token of a loop's own waker, which no connection can have.
 const WAKER: Token = Token(usize::MAX);
@@ -153,6 +155,9 @@ struct Http {
     written: usize,
     /// The credential the request's token is, for the audit log: its account and, for an API key, the key.
     who: Option<Credential>,
+    /// The request's route template (`metrics::ROUTES`) and when it was whole, once it is.
+    route: usize,
+    whole: Option<Instant>,
     /// Whether the response has been recorded in the audit log.
     recorded: bool,
 }
@@ -171,6 +176,8 @@ struct Conn {
     session: Option<Session>,
     outbox: Option<Outbox>,
     queue: Receiver<String>,
+    /// How many messages the hub has put on `queue` and this loop has not taken (`Outbox::waiting`).
+    waiting: Arc<AtomicU64>,
     notify: Notify,
     /// Whether the socket may hold input not yet read. The loop is told when new input arrives, not that input is
     /// still there, so a session that stopped reading at its limit remembers it has more to read.
@@ -196,10 +203,11 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, reactors: &Reactors, gateway: &Arc<
     loop {
         if let Err(e) = poll.poll(&mut events, Some(SWEEP)) {
             if e.kind() != ErrorKind::Interrupted {
-                eprintln!("gateway: event loop: {e}");
+                log::error("event loop poll failed", &[("half", &gateway.half.name()), ("error", &e)]);
             }
             continue;
         }
+        let turn = monotonic();
         let mut due: Vec<usize> = Vec::new();
         for event in events.iter().filter(|e| e.token() != WAKER) {
             let token = event.token().0;
@@ -215,7 +223,7 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, reactors: &Reactors, gateway: &Arc<
         shared.woken.store(false, Ordering::SeqCst);
         let arrived = std::mem::take(&mut *locked(&shared.incoming));
         for stream in arrived {
-            if let Some(token) = take_on(&poll, shared, &mut conns, &mut free, stream) {
+            if let Some(token) = take_on(gateway, &poll, shared, &mut conns, &mut free, stream) {
                 due.push(token);
             }
         }
@@ -236,6 +244,7 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, reactors: &Reactors, gateway: &Arc<
             swept = now;
             sweep(gateway, &mut conns, &mut free, now);
         }
+        gateway.metrics.loop_turn.observe_duration(monotonic().duration_since(turn));
     }
 }
 
@@ -254,6 +263,7 @@ fn socket_config(max_behind: usize) -> WebSocketConfig {
 
 /// Registers a newly accepted connection, undecided. None if it could not be taken on.
 fn take_on(
+    gateway: &Gateway,
     poll: &Poll,
     shared: &Arc<Shared>,
     conns: &mut Vec<Option<Conn>>,
@@ -278,10 +288,12 @@ fn take_on(
         Arc::new(move || shared.ready(token))
     };
     let (tx, queue) = mpsc::channel();
+    let outbox = Outbox::new(tx, Arc::clone(&notify));
     conns[token] = Some(Conn {
         socket: Some(Socket::Undecided(stream)),
         session: None,
-        outbox: Some(Outbox::new(tx, Arc::clone(&notify))),
+        waiting: outbox.waiting(),
+        outbox: Some(outbox),
         queue,
         notify,
         unread: true,
@@ -296,6 +308,7 @@ fn take_on(
         path: String::new(),
         ending: "closed",
     });
+    gateway.metrics.connection_accepted();
     Some(token)
 }
 
@@ -381,6 +394,8 @@ fn decide(gateway: &Gateway, conn: &mut Conn, max_behind: usize, registry: &Regi
             response: Vec::new(),
             written: 0,
             who: None,
+            route: metrics::route(path),
+            whole: None,
             recorded: false,
         })
     });
@@ -405,6 +420,7 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, origin: &mut 
         match http::parse(&http.request) {
             Ok(None) => return true,
             Ok(Some(request)) => {
+                http.whole = Some(monotonic());
                 http.who = request
                     .headers
                     .get("authorization")
@@ -423,6 +439,8 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, origin: &mut 
                 }
             }
             Err(reason) => {
+                http.whole = Some(monotonic());
+                http.route = metrics::route("");
                 let mut fields = about(gateway, origin, None, None, None);
                 fields.insert("dir".into(), json!("in"));
                 fields.insert("line".into(), json!(request_line(&http.request)));
@@ -480,6 +498,7 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
         let Some(outbox) = conn.outbox.take() else { return false };
         conn.session = Session::open(gateway, outbox, Arc::clone(&conn.notify));
         if let Some(session) = &conn.session {
+            gateway.metrics.session_opened();
             forwarded_client(gateway, &mut conn.origin, conn.upgrade.take());
             let mut fields = about(gateway, &conn.origin, None, None, Some(session.id()));
             fields.insert("path".into(), json!(conn.path));
@@ -508,6 +527,7 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
                     fields.insert("dir".into(), json!("in"));
                     fields.insert("binary".into(), json!(data.len()));
                     gateway.audit.record("ws-frame", fields);
+                    gateway.metrics.ws_message(metrics::OP_UNREADABLE, Some(400));
                     let refused = ws::binary_refused();
                     record_to_client(gateway, origin, session, &refused, true);
                     if !queue(socket, refused, ending) {
@@ -529,7 +549,12 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
             }
         }
         // Messages the hub queued.
+        let queued = conn.waiting.load(Ordering::Relaxed);
+        if queued > 0 {
+            gateway.metrics.backlog.observe(queued);
+        }
         while let Ok(message) = conn.queue.try_recv() {
+            conn.waiting.fetch_sub(1, Ordering::Relaxed);
             record_to_client(gateway, origin, session, &message, false);
             if !queue(socket, message, ending) {
                 return false;
@@ -562,6 +587,7 @@ fn sweep(gateway: &Arc<Gateway>, conns: &mut [Option<Conn>], free: &mut Vec<usiz
         let Some(session) = conn.session.as_mut() else { continue };
         if ws::key_withdrawn(gateway, session) {
             let told = ws::key_withdrawn_error();
+            gateway.metrics.refused_status(Api::Ws, 401);
             record_to_client(gateway, &conn.origin, session, &told, true);
             if let Some(Socket::Open(socket)) = conn.socket.as_mut() {
                 let _ = socket.write(Message::text(told));
@@ -593,7 +619,9 @@ fn close_slot(
     reason: Option<&'static str>,
 ) {
     if let Some(conn) = conns[token].take() {
+        gateway.metrics.connection_closed();
         if let Some(session) = &conn.session {
+            gateway.metrics.session_closed(reason.unwrap_or(conn.ending));
             let mut fields = about(gateway, &conn.origin, session.account(), session.api_key(), Some(session.id()));
             fields.insert("reason".into(), json!(reason.unwrap_or(conn.ending)));
             gateway.audit.record("ws-close", fields);
@@ -693,6 +721,7 @@ fn record_request(gateway: &Gateway, origin: &Origin, http: &Http, request: &htt
 fn record_response(gateway: &Gateway, origin: &Origin, http: &Http) {
     let response = &http.response;
     let status = response.get(9..12).and_then(|s| std::str::from_utf8(s).ok()).and_then(|s| s.parse::<u16>().ok());
+    gateway.metrics.http_answered(http.route, status.unwrap_or(0), http.whole.map(|at| monotonic().duration_since(at)));
     let body = response.windows(4).position(|w| w == b"\r\n\r\n").map_or(&response[..0], |i| &response[i + 4..]);
     let who = http.who.as_ref();
     let mut fields = about(gateway, origin, who.map(|c| c.account), who.and_then(|c| c.key.as_deref()), None);
@@ -756,8 +785,8 @@ fn queue(socket: &mut WebSocket<Stream>, message: String, ending: &mut &'static 
         // A slow consumer: further behind than a connection may be (`socket_config`). Dropped rather than buffered
         // for without limit; a client that reconnects starts again from a fresh image.
         Err(tungstenite::Error::WriteBufferFull(_)) => {
-            let peer = socket.get_ref().peer_addr().map_or_else(|_| "a client".to_string(), |a| a.to_string());
-            eprintln!("gateway: disconnected {peer}: too far behind on what it has been sent");
+            let peer = socket.get_ref().peer_addr().map_or_else(|_| "unknown".to_string(), |a| a.to_string());
+            log::warn("disconnected a client too far behind on what it has been sent", &[("peer", &peer)]);
             *ending = "too far behind";
             false
         }

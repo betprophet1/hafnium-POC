@@ -66,16 +66,27 @@ pub struct Unit {
 }
 
 /// Follows a node's feed for ever. `on_connect` runs before every connection's backlog, so a reader can start over.
-pub fn follow(addr: &str, mut on_connect: impl FnMut(), mut on_unit: impl FnMut(Unit)) -> ! {
+pub fn follow(addr: &str, on_connect: impl FnMut(), on_unit: impl FnMut(Unit)) -> ! {
+    follow_reporting(addr, on_connect, on_unit, |e| eprintln!("feed {addr}: {e}"))
+}
+
+/// As `follow`, telling `on_error` why each connection ended or could not be made (with what happens next), for a
+/// process that logs in its own format.
+pub fn follow_reporting(
+    addr: &str,
+    mut on_connect: impl FnMut(),
+    mut on_unit: impl FnMut(Unit),
+    mut on_error: impl FnMut(&str),
+) -> ! {
     loop {
         match TcpStream::connect(addr) {
             Ok(stream) => {
                 on_connect();
                 if let Err(e) = read_units(stream, &mut on_unit) {
-                    eprintln!("feed {addr}: {e}; reconnecting");
+                    on_error(&format!("{e}; reconnecting"));
                 }
             }
-            Err(e) => eprintln!("feed {addr}: {e}; retrying"),
+            Err(e) => on_error(&format!("{e}; retrying")),
         }
         thread::sleep(Duration::from_secs(1));
     }

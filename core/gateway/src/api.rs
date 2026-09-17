@@ -6,6 +6,7 @@ use crate::forwarded::TrustedProxies;
 use crate::hub::{self, id, Hub};
 use crate::identity::{Credential, Identity};
 use crate::limits::{monotonic, Bucket};
+use crate::metrics::{HalfMetrics, Limit, Metrics};
 use crate::parlays::{self, Parlays};
 use crate::price::{self, PriceError};
 use crate::treasury::Treasury;
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 use venue_identity::key;
 use venue_link::submit::{self, Notify, Submit};
 use venue_link::wire;
+use venue_telemetry::log;
 
 /// What a caller is told when the node did not answer: the outcome is genuinely unknown, so the only safe advice
 /// is to send it again under the same client order ID, which the engine deduplicates (E-9.2, E-17.4).
@@ -325,6 +327,8 @@ pub struct Gateway {
     pub identity: Identity,
     /// The proxies whose forwarding headers name the client a record is about (`forwarded.rs`); none by default.
     pub proxies: TrustedProxies,
+    /// What this half counts (`metrics.rs`); registered nowhere unless `with_metrics` gave it a registry's.
+    pub metrics: Arc<HalfMetrics>,
 }
 
 impl Gateway {
@@ -339,6 +343,7 @@ impl Gateway {
     }
 
     fn new(half: Half, hub: Hub, ingress: Option<Submit>, limits: Limits) -> Self {
+        let metrics = Metrics::unregistered().half(half);
         Self {
             half,
             hub: Mutex::new(hub),
@@ -349,9 +354,17 @@ impl Gateway {
             logon_buckets: Mutex::new(BTreeMap::new()),
             treasury: None,
             audit: Audit::disabled(),
-            identity: Identity::new(None, true),
+            identity: Identity::new(None, true, Arc::clone(&metrics)),
             proxies: TrustedProxies::default(),
+            metrics,
         }
+    }
+
+    /// The same half, counting in `metrics`. Given before the treasury and the identity service, which count their
+    /// calls there too.
+    pub fn with_metrics(mut self, metrics: Arc<HalfMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// The same half, recording what its clients send and are answered in `audit`.
@@ -368,14 +381,14 @@ impl Gateway {
 
     /// The same half, passing deposits and withdrawals to the treasury at `address`.
     pub fn with_treasury(mut self, address: &str) -> Self {
-        self.treasury = Some(Treasury::new(address));
+        self.treasury = Some(Treasury::new(address, Arc::clone(&self.metrics)));
         self
     }
 
     /// The same half, verifying API keys with the identity service at `address`, if any, and taking the catalogue's
     /// dev tokens only if `dev_tokens`.
     pub fn with_identity(mut self, address: Option<String>, dev_tokens: bool) -> Self {
-        self.identity = Identity::new(address, dev_tokens);
+        self.identity = Identity::new(address, dev_tokens, Arc::clone(&self.metrics));
         self
     }
 
@@ -412,14 +425,20 @@ impl Gateway {
         let mut buckets = locked(&self.rest_buckets);
         let bucket =
             buckets.entry(account).or_insert_with(|| Bucket::per_second(self.limits.per_second, self.limits.burst));
-        bucket.take(monotonic()).map_err(ApiError::rate_limited)
+        bucket.take(monotonic()).map_err(|wait| {
+            self.metrics.rate_limited(Limit::Rest);
+            ApiError::rate_limited(wait)
+        })
     }
 
     pub fn logon_rate(&self, account: u64) -> Result<(), ApiError> {
         let mut buckets = locked(&self.logon_buckets);
         let rate = self.limits.logons_per_minute;
         let bucket = buckets.entry(account).or_insert_with(|| Bucket::per_minute(rate, rate));
-        bucket.take(monotonic()).map_err(ApiError::rate_limited)
+        bucket.take(monotonic()).map_err(|wait| {
+            self.metrics.rate_limited(Limit::Logon);
+            ApiError::rate_limited(wait)
+        })
     }
 
     /// Hands an input to the node without waiting for it, so a client with several to send is not held to one at a
@@ -427,7 +446,7 @@ impl Gateway {
     /// `notify` is called once they can be taken, for a caller that waits on many requests at once.
     fn submit(&self, account: u64, input: Value, answer: Answer, notify: Option<Notify>) -> Result<Pending, ApiError> {
         let inner = self.ingress()?.submit_notifying(input, notify).map_err(|e| {
-            eprintln!("gateway: ingress: {e}");
+            log::warn("ingress call failed", &[("half", &self.half.name()), ("error", &e)]);
             unavailable()
         })?;
         Ok(Pending { account, inner: Inner::Node(answer, inner) })
@@ -443,7 +462,7 @@ impl Gateway {
 
     fn send(&self, input: Value) -> Result<Vec<Value>, ApiError> {
         self.ingress()?.send(input).map_err(|e| {
-            eprintln!("gateway: ingress: {e}");
+            log::warn("ingress call failed", &[("half", &self.half.name()), ("error", &e)]);
             unavailable()
         })
     }
@@ -456,7 +475,7 @@ impl Gateway {
             Inner::Node(answer, inner) => match inner.wait() {
                 Ok(results) => Ok(self.outcome(pending.account, answer, &results)),
                 Err(e) => {
-                    eprintln!("gateway: ingress: {e}");
+                    log::warn("ingress call failed", &[("half", &self.half.name()), ("error", &e)]);
                     Err(unavailable())
                 }
             },
@@ -477,7 +496,7 @@ impl Gateway {
             Inner::Node(answer, inner) => match inner.take()? {
                 Ok(results) => Ok(self.outcome(pending.account, *answer, &results)),
                 Err(e) => {
-                    eprintln!("gateway: ingress: {e}");
+                    log::warn("ingress call failed", &[("half", &self.half.name()), ("error", &e)]);
                     Err(unavailable())
                 }
             },
@@ -505,7 +524,7 @@ impl Gateway {
             };
             let submitted = input.and_then(|input| {
                 self.ingress()?.submit_notifying(input, notify.clone()).map_err(|e| {
-                    eprintln!("gateway: ingress: {e}");
+                    log::warn("ingress call failed", &[("half", &self.half.name()), ("error", &e)]);
                     unavailable()
                 })
             });
@@ -518,7 +537,7 @@ impl Gateway {
         Some(match sent.take()? {
             Ok(results) => Ok(self.outcome(account, Answer::Order, &results)),
             Err(e) => {
-                eprintln!("gateway: ingress: {e}");
+                log::warn("ingress call failed", &[("half", &self.half.name()), ("error", &e)]);
                 Err(unavailable())
             }
         })
@@ -562,7 +581,7 @@ impl Gateway {
                 }
             }
         });
-        let _ = gateway.parlays.set(Parlays::spawn(addr, deliver));
+        let _ = gateway.parlays.set(Parlays::spawn(addr, deliver, Arc::clone(&gateway.metrics)));
     }
 
     fn parlay_service(&self) -> Result<&Parlays, ApiError> {
@@ -585,7 +604,7 @@ impl Gateway {
         let service = self.parlay_service()?;
         call["accountId"] = json!(account);
         let inner = send(service, call).map_err(|e| {
-            eprintln!("gateway: parlay service: {e}");
+            log::warn("parlay service call refused", &[("error", &e)]);
             ApiError::unavailable("the parlay service is not taking requests; nothing was requested")
         })?;
         Ok(Pending { account, inner: Inner::Parlays(inner) })
