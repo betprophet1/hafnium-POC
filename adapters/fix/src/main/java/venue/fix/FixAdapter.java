@@ -196,7 +196,15 @@ public final class FixAdapter implements AutoCloseable
                 int work = library.poll(20);
                 for (final VenueSession session : sessions)
                 {
-                    work += session.doWork();
+                    try
+                    {
+                        work += session.doWork();
+                    }
+                    catch (final RuntimeException e)
+                    {
+                        session.fail(e);
+                        work++;
+                    }
                 }
                 sessions.removeIf(VenueSession::isEnded);
                 idle.idle(work);

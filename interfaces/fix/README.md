@@ -42,8 +42,10 @@ A market is named by its **instrument ID**, a decimal string, in **Symbol (55)**
 SecurityIDSource (22) = 8 may repeat it; if given it must equal Symbol. An **event** (the question a group of markets
 answers: a match, an election) is the underlying of its markets, named by event ID in UnderlyingSymbol (311).
 
-SecurityListRequest (x) with SecurityListRequestType (559) = 4 lists every market; = 0 lists the one named in Symbol.
-SecurityList (y) carries, per market in NoRelatedSym (146):
+SecurityListRequest (x) with SecurityListRequestType (559) = 4 lists every market not yet settled; = 0 lists the one
+named in Symbol, if it is not settled. A venue can have more markets than one message holds, so the answer may come in
+several SecurityList (y) messages under one SecurityResponseID (322): each carries TotNoRelatedSym (393), the whole
+count, and LastFragment (893) = Y marks the last. Each carries, per market in NoRelatedSym (146):
 
 | Tag | Content |
 |---|---|

@@ -134,6 +134,12 @@ final class VenueSession implements SessionHandler
         String text;
     }
 
+    /** Markets per SecurityList message: a fragment stays well inside the encoder's buffer with long titles. */
+    private static final int SECURITY_LIST_FRAGMENT = 40;
+
+    /** Set by {@link #fail}: the session only logs out from then on. */
+    private boolean failed;
+
     private final Session session;
     private final GatewayLink link;
     private final HttpClient http;
@@ -200,6 +206,21 @@ final class VenueSession implements SessionHandler
     boolean isEnded()
     {
         return ended;
+    }
+
+    /**
+     * Something failed while translating for this session. The session ends, as if its gateway session had closed, so
+     * the fault stays with the firm that met it instead of stopping every session on the adapter.
+     */
+    void fail(final RuntimeException e)
+    {
+        System.err.println("fix adapter: ending " + session.compositeKey() + " after an error: " + e);
+        failed = true;
+        e.printStackTrace();
+        if (link != null && !link.isClosed())
+        {
+            link.close("adapter error");
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -543,7 +564,7 @@ final class VenueSession implements SessionHandler
         final String reqId = securityListRequest.securityReqIDAsString();
         final int type = securityListRequest.securityListRequestType();
         final String symbol = securityListRequest.hasSymbol() ? securityListRequest.symbolAsString() : null;
-        final HttpRequest get = HttpRequest.newBuilder(URI.create("http://" + gateway + "/v4/markets"))
+        final HttpRequest get = HttpRequest.newBuilder(URI.create("http://" + gateway + "/v4/markets?resolved=false"))
             .timeout(Duration.ofSeconds(10))
             .GET()
             .build();
@@ -582,7 +603,7 @@ final class VenueSession implements SessionHandler
             return 0;
         }
         int work = 0;
-        if (link == null || link.isClosed())
+        if (failed || link == null || link.isClosed())
         {
             if (!logoutRequested)
             {
@@ -591,7 +612,7 @@ final class VenueSession implements SessionHandler
                 logoutRequested = !Pressure.isBackPressured(position);
                 work++;
             }
-            if (link == null)
+            if (failed || link == null)
             {
                 return work;
             }
@@ -947,24 +968,34 @@ final class VenueSession implements SessionHandler
         }
         final int result = markets == null ? 5 : listed.isEmpty() ? 2 : 0;
         final String responseId = "SL" + nextLocalExecId++;
-        send(s ->
+        // A venue whose calendar lists rounds all day has more markets than one message holds (Artio's encoder buffer
+        // is 16 KiB), so the list goes out in fragments: TotNoRelatedSym is the whole count on every one, and
+        // LastFragment says which is last.
+        final int fragments = Math.max(1, (listed.size() + SECURITY_LIST_FRAGMENT - 1) / SECURITY_LIST_FRAGMENT);
+        for (int f = 0; f < fragments; f++)
         {
-            securityList.reset();
-            securityList.securityReqID(fetch.reqId()).securityResponseID(responseId).securityRequestResult(result);
-            if (!listed.isEmpty())
+            final List<Listed> part =
+                listed.subList(f * SECURITY_LIST_FRAGMENT, Math.min(listed.size(), (f + 1) * SECURITY_LIST_FRAGMENT));
+            final boolean last = f == fragments - 1;
+            send(s ->
             {
-                securityList.totNoRelatedSym(listed.size()).lastFragment(true);
-                var group = securityList.relatedSymGroup(listed.size());
-                for (final Listed market : listed)
+                securityList.reset();
+                securityList.securityReqID(fetch.reqId()).securityResponseID(responseId).securityRequestResult(result);
+                if (!part.isEmpty())
                 {
-                    group.instrument().symbol(market.symbol()).securityID(market.symbol()).securityIDSource("8")
-                        .securityDesc(market.description()).securityStatus(market.open() ? "1" : "2");
-                    group.underlyingSymbol(market.event()).roundLot(market.lotStep(), 0);
-                    group = group.next();
+                    securityList.totNoRelatedSym(listed.size()).lastFragment(last);
+                    var group = securityList.relatedSymGroup(part.size());
+                    for (final Listed market : part)
+                    {
+                        group.instrument().symbol(market.symbol()).securityID(market.symbol()).securityIDSource("8")
+                            .securityDesc(market.description()).securityStatus(market.open() ? "1" : "2");
+                        group.underlyingSymbol(market.event()).roundLot(market.lotStep(), 0);
+                        group = group.next();
+                    }
                 }
-            }
-            return s.trySend(securityList);
-        });
+                return s.trySend(securityList);
+            });
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------------------

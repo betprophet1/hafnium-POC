@@ -50,9 +50,9 @@ final class FixAdapterTest
     private static final int ADAPTER_PORT = 17440;
     private static final String GATEWAY = "127.0.0.1:" + (VENUE_PORTS_BASE + 2);
     /** Two binary markets the mini venue's catalogue lists and opens, and one categorical market. */
-    private static final String RAIN = "10010";
-    private static final String BITCOIN = "30010";
-    private static final String ARSENAL = "20010";
+    private static final String RAIN = "100000100";
+    private static final String BITCOIN = "300000100";
+    private static final String ARSENAL = "200000100";
 
     private static final AdapterConfig ADAPTER = new AdapterConfig(
         "127.0.0.1", ADAPTER_PORT, "VENUE", GATEWAY, Path.of(System.getProperty("venue.scratch"), "adapter"), true,
@@ -141,7 +141,7 @@ final class FixAdapterTest
         final FixClient.Message list = client.expect(maker, "a security list", m -> "y".equals(m.type()));
         assertEquals("0", list.get(560), list.toString());
         assertTrue(list.all(55).containsAll(List.of(RAIN, BITCOIN, ARSENAL)), list.toString());
-        assertEquals("1001", list.get(311), "the event is the underlying: " + list);
+        assertEquals("1000001", list.get(311), "the event is the underlying: " + list);
     }
 
     @Test
