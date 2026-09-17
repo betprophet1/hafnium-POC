@@ -18,8 +18,11 @@ agent needs to build its core, and the core itself. Read this before changing an
 | `core/journal/` | The Rust codec generated from the schema. Never edited by hand. |
 | `core/node/` | The single-member node for laptops and test environments: simulated sequencer, journal, result log, TCP ingress and feed. Never on the production path. |
 | `core/link/` | Talking to a node from outside the engine: ingress client, feed follower, a projection of the feed, the demo catalogue. |
-| `core/gateway/` | Interface 1, the REST and WebSocket gateway (`interfaces/gateway/`): the only client-facing component that writes to a sequencer group. |
-| `core/sim/` | The mini venue's actors: synthetic makers and takers, the dummy oracle, demo markets and the web page. Test environments only. |
+| `core/gateway/` | Interface 1, the REST and WebSocket gateway (`interfaces/gateway/`): the only client-facing component that writes to a sequencer group. Its public half (market data) and private half (orders, accounts, transfers, requests for quote) can run in one process or apart (`--serve`). |
+| `core/treasury/` | The dummy treasury: deposits and withdrawals behind the gateway's `/v4/transfers`, a double-entry ledger and a fake bank. Test environments only. |
+| `core/parlays/` | The parlay service: lists parlays, routes requests for quote to responders, and settles each parlay from its legs. Test environments only. |
+| `core/sim/` | The mini venue's actors: synthetic makers (which also answer requests for quote) and takers, the dummy oracle and its calendar, demo markets and the web page. Test environments only. |
+| `adapters/fix/` | Interface 4, the FIX 4.4 adapter (Java, Artio) in front of the gateway's private half; its dialect is `interfaces/fix/`. Not part of the Rust workspace: `bootstrap.sh` fetches its JDK and Gradle, `test.sh` runs its integration test, `scripts/fix-shell.py` is a console for trying it by hand. |
 | `core/prototypes/` | Experiments behind blueprint claims. Learn from them; nothing depends on them. |
 | `core/WORK_PACKAGES.md` | The order in which the core is built, and what "done" means for each piece. |
 | `check` | Every gate in the repository. |
@@ -65,6 +68,10 @@ python3 spec/engine/reference/fuzz.py --seeds 50 --steps 300           # invaria
 ```
 
 `./check` must pass before a change is proposed. Set `ENGINE_REQUIRED=1` once work package WP-5 has landed.
+Its last step, the FIX adapter's integration test, runs only once `adapters/fix/bootstrap.sh` has fetched the Java
+toolchain and is skipped otherwise; a change that touches the gateway's private half or `adapters/fix/` should run
+it. Each gateway test starts a node of its own, so on a machine short of memory limit them with
+`RUST_TEST_THREADS=4`.
 
 ## Changing the specification
 
