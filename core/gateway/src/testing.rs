@@ -89,13 +89,17 @@ fn start_node(name: &str) -> (String, String) {
             let outcome = node::serve(&config).map_err(|e| e.to_string());
             let _ = stopped.send(outcome);
         });
-        // Up to a minute, counted in waits rather than read off a clock.
+        // Up to a minute, counted in waits rather than read off a clock. The ingress accepting once is not enough: the
+        // node binds its feed just after its ingress, and a feed port another test took meanwhile stops it with its
+        // ingress briefly accepting. A node still running a wait after its ingress accepted has bound both.
+        let mut accepted = false;
         for _ in 0..3000 {
             match stop.recv_timeout(Duration::from_millis(20)) {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if TcpStream::connect(&ingress).is_ok() {
+                    if accepted {
                         return (ingress, feed);
                     }
+                    accepted = TcpStream::connect(&ingress).is_ok();
                 }
                 Ok(Err(e)) => {
                     eprintln!("test node for {name} could not start, trying other ports: {e}");
