@@ -21,9 +21,10 @@ const USAGE: &str = "usage:
   venue-node import VECTORS JOURNAL        writes a compiled scenario's inputs, as stamped, as a journal
   venue-node bench JOURNAL [--runs N]      times every input of a journal through a fresh engine; build it with
                                            the perf profile (core/Cargo.toml) for numbers worth reading
-  venue-node load ADDR [--connections N] [--seconds N]
+  venue-node load ADDR [--connections N] [--seconds N] [--account N] [--instrument N]
                                            amends resting orders through a seeded node's ingress, one request at a
-                                           time per connection, and reports messages/s and round-trip percentiles
+                                           time per connection, and reports messages/s and round-trip percentiles;
+                                           --instrument takes an ID the seeded catalogue generated
 
 serve reads VENUE_LISTEN, VENUE_FEED, VENUE_DATA, VENUE_GROUP, VENUE_NODE_ID, VENUE_TICK_MS, VENUE_CAPACITY and
 VENUE_METRICS; flags override them. --metrics serves Prometheus metrics at http://ADDR/metrics (none by default), and
@@ -50,7 +51,7 @@ fn main() -> ExitCode {
         (Some("dump"), 2) => dump(&args[1]),
         (Some("import"), 3) => import(&args[1], &args[2]),
         (Some("bench"), 2 | 4) => bench(&args[1..]),
-        (Some("load"), 2 | 4 | 6) => load(&args[1..]),
+        (Some("load"), n) if n >= 2 && n % 2 == 0 => load(&args[1..]),
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(64);
@@ -174,19 +175,22 @@ fn bench(args: &[String]) -> Result<(), Error> {
 
 fn load(args: &[String]) -> Result<(), Error> {
     let (mut connections, mut seconds) = (1usize, 10u64);
+    let (mut account, mut instrument) = (1u64, 10010u64);
     let mut it = args[1..].iter();
     while let Some(flag) = it.next() {
         let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--connections" => connections = value.parse()?,
             "--seconds" => seconds = value.parse()?,
+            "--account" => account = value.parse()?,
+            "--instrument" => instrument = value.parse()?,
             other => return Err(format!("unknown flag {other}\n{USAGE}").into()),
         }
     }
     if connections == 0 || seconds == 0 {
         return Err("connections and seconds must be at least 1".into());
     }
-    venue_node::load::load(&args[0], connections, seconds)
+    venue_node::load::load(&args[0], connections, seconds, account, instrument)
 }
 
 fn import(vectors: &str, journal: &str) -> Result<(), Error> {

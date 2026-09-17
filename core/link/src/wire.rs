@@ -1,9 +1,11 @@
 //! Talking to a node: inputs through the ingress, everything that happened through the feed.
 
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 use venue_harness::codec;
@@ -63,6 +65,39 @@ impl Ingress {
 pub struct Unit {
     pub input: Value,
     pub results: Vec<Value>,
+}
+
+/// The units a journal and the result log of replaying it make: what the feed carried, rebuilt from the files after
+/// the fact, so that anything the gateway derived from the feed can be derived again (interfaces/audit/README.md,
+/// frames derived from the journal). Inputs are in the order they were sequenced, each with the results of that
+/// input, which name it by `inputSequence`.
+pub fn replayed_units(journal: &Path, results: &Path) -> Result<Vec<Unit>, Error> {
+    let mut by_input: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
+    for result in frames_of(results)? {
+        by_input.entry(result["result"]["inputSequence"].as_u64().unwrap_or(0)).or_default().push(result);
+    }
+    let mut units = Vec::new();
+    for input in frames_of(journal)? {
+        let sequence = input["record"]["sequence"].as_u64().unwrap_or(0);
+        let results = by_input.remove(&sequence).unwrap_or_default();
+        units.push(Unit { input, results });
+    }
+    Ok(units)
+}
+
+/// Every frame of a journal or result log, decoded. A file cut off mid-frame ends where it was cut, as the node's own
+/// reader treats it.
+fn frames_of(path: &Path) -> Result<Vec<Value>, Error> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let (mut frame, mut out) = (Vec::new(), Vec::new());
+    loop {
+        match read_frame(&mut reader, &mut frame) {
+            Ok(Some(n)) => out.push(codec::decode(&frame[..n])?),
+            Ok(None) => return Ok(out),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(out),
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Follows a node's feed for ever. `on_connect` runs before every connection's backlog, so a reader can start over.

@@ -14,7 +14,9 @@ disputes (§12, flood protection), and these files are where. They also hold wha
 byte where it can be, before the edge translated it into the canonical message, and what it was actually told.
 
 The journal stays the authority on what happened in the market. An audit log is the authority on what was said at the
-edge.
+edge. Where the two meet — the venue telling an account what the engine did — the log keeps a reference into the
+journal rather than a second copy of it (below), and the reference carries the hash that proves the copy it stands
+for.
 
 ## Files
 
@@ -61,7 +63,7 @@ connection rather than a message (opened, refused, closed) have no `dir`.
 
 | `kind` | Fields |
 |---|---|
-| `open` | Always line 0. `format` (`venue-audit/1`), `file` (its own name), `pid`, and `after`: the previous file of this component and instance, as `{"file": name, "last": hash of its close line}`, or `{"file": name, "sealed": false}` when that file could not be sealed, or absent when there is none. `after` chains files together for a later manifest; each file still verifies alone. |
+| `open` | Always line 0. `format` (`venue-audit/2`), `file` (its own name), `pid`, `renderer` (the version of the gateway's rules for the frames it derives from the journal, below; absent from a FIX adapter's files, which derive nothing), `build` (the version of the process that wrote the file), and `after`: the previous file of this component and instance, as `{"file": name, "last": hash of its close line}`, or `{"file": name, "sealed": false}` when that file could not be sealed, or absent when there is none. `after` chains files together for a later manifest; each file still verifies alone. |
 | `close` | Always the last line of a closed file. `reason` (`rotate`, `shutdown` or `recovered`) and `records`, the number of lines before it. |
 
 ### FIX adapter (`component: fix-adapter`)
@@ -93,7 +95,7 @@ WebSocket once it has one, `session` (the engine session ID the gateway gave it)
 | `http-response` | `dir: out`. `status`, and `body` (as text, secrets masked); on the public half, for a status below 400, `length` (the body's length in bytes as sent) and `sha256` (the SHA-256 of those bytes, lower-case hex) instead of `body`. |
 | `ws-open` | A WebSocket upgrade completed: `path`. |
 | `ws-refused` | A WebSocket upgrade that failed its handshake: `path`. |
-| `ws-frame` | `dir`, and `msg`, the text frame (secrets masked); for a binary frame from a client, `binary` (its length) instead. |
+| `ws-frame` | `dir`, and `msg`, the text frame (secrets masked); for a binary frame from a client, `binary` (its length) instead. A frame derived from the journal carries `type`, `sequence`, `length` and `sha256` in place of `msg` (below). |
 | `ws-close` | The connection ended: `reason` (`heartbeat missed`, `too far behind` on what it was sent, `key no longer valid` for a session whose API key was revoked or expired, or `closed`: by the client, the network or an error). |
 
 What is recorded on each half:
@@ -102,7 +104,7 @@ What is recorded on each half:
 |---|---|---|
 | REST request | line, headers (masked), body | line, headers (masked), body |
 | REST response | status and body | a refusal or error (4xx, 5xx): status and body; any other: status, `length` and `sha256` of the body, not the body |
-| WebSocket | open, close; every frame from the client; every frame to it (replies, errors, executions, account updates, quotes, transfers) | open, close; every frame from the client except `heartbeat`; every `error` sent to it |
+| WebSocket | open, close; every frame from the client; every frame to it — replies, errors, quotes and transfers in full, and what the engine did (executions, account updates, payouts, releases) by reference to the journal (below) | open, close; every frame from the client except `heartbeat`; every `error` sent to it |
 
 The private half is recorded in full: what an account asked for and was told is what a dispute turns on, and much of
 it (a refused order, a transfer's answer, a quote) is in no journal. The public half serves market data, which is the
@@ -115,6 +117,61 @@ Heartbeats on the public half, which viewers send all day, are not recorded eith
 that never completes a request line, a whole request or a WebSocket handshake within the gateway's arrival time has
 said nothing to record, and is not recorded. Refusals are always recorded: every 4xx and 5xx response, and every `error` frame,
 including flood limits and failed logins.
+
+### Frames derived from the journal
+
+A private session is sent two kinds of frame. Some answer what the client asked — replies, errors, refusals — and
+exist nowhere else. The rest are the venue telling an account what the engine did: an execution, an account snapshot,
+a payout, a release, a trade, a market's state. Those are a rendering of a sequenced input's results, and the journal
+already holds the input, the results and everything they were rendered from.
+
+A frame the gateway did not compose in answer to a request, and which carries a `sequence`, is recorded by reference:
+
+```json
+{"ts":"...","n":812,"component":"gateway","instance":"gateway-0","kind":"ws-frame","dir":"out",
+ "type":"execution","sequence":"222981","length":412,
+ "sha256":"9f2b...","conn":2,"peer":"10.42.0.7:51344","half":"private","account":"1",
+ "session":"992440534292070","prev":"..."}
+```
+
+- `type` is the frame's `type` member, `sequence` the input it came from, `length` the bytes as sent, and `sha256`
+  their SHA-256 in lower-case hex.
+- Reference records of one connection are in the order the frames were sent, so several frames of one type at one
+  sequence are told apart by their order, which the chain makes tamper-evident.
+- Everything else is recorded in full, whatever its volume: every frame from a client, every reply, error and refusal,
+  every authentication, and any queued frame that carries no `sequence`. A message type added later is recorded in
+  full until it is given a sequence, so the failure is towards keeping too much.
+
+**Following a reference.** The journal holds the inputs; replaying it produces their results, and the two together are
+what the feed carried:
+
+```
+venue-node replay data/journal.sbe results.log
+venue-gateway reconstruct --journal data/journal.sbe --results results.log --catalogue markets.json audit/*.jsonl
+```
+
+That renders every referenced frame again and checks it against the record's `length` and `sha256`, reporting any that
+differ: either the journal is not the one that gateway was serving, or the renderers no longer render as they did. A
+session's frames are matched in the order that session was sent them, so several frames of one type at one sequence
+are told apart by their order, and each session of an account is followed through its own copies.
+
+`interfaces/audit/recorded/` holds a session recorded this way — a journal and the audit file written beside it — and
+`core/ci.sh` reconstructs it on every build. A change to a renderer fails there, which is the point: it is found while
+it can still be versioned, rather than in a dispute years later. When a renderer must change, raise `renderer`, record
+a new session beside the old one, and reconstruct each under the rules its file names.
+
+**What the venue owes in return.** A reference is only as good as what it points at:
+
+- **The journal is kept as long as the audit log** — at least five years (blueprint §12), archived with the same
+  protection from alteration and loss. It stops being operational data the venue happens to keep.
+- **Renderers are versioned.** The `renderer` version in each file's `open` record says which rules produced its
+  frames. A change to what a renderer emits raises that version; reconstruction uses the rules of the version the
+  file names, so a file written years ago still resolves.
+- **A reconstruction is proof, not paperwork.** The hash in the record is what makes it one: a rendering that does not
+  hash the same is wrong, and says so.
+
+Public frames are not recorded at all (above), so nothing there is referenced: book data is conflated on a timer, and
+what was sent depends on the moment rather than on the journal alone.
 
 ### The client behind a proxy
 
@@ -138,13 +195,16 @@ The client address is recorded only. Flood and logon limits are kept per account
 
 ### Masking
 
-Secrets are replaced by `***` before a record is taken; nothing unmasked is ever queued or written.
+Secrets are replaced by `***` before a record is written; nothing unmasked ever reaches a file. The gateway queues a
+frame as it arrived and masks it as it writes it, because masking reads the whole message and its event loops are not
+where that work belongs; an unmasked secret therefore lives in the gateway's memory, as it already does in the socket
+it was read from, and nowhere else.
 
 | Where | What |
 |---|---|
 | FIX | the values of Password (554), NewPassword (925), EncryptedPassword (1402) and EncryptedNewPassword (1404). Username (553) is an identity, not a secret, and is kept. A masked message's BodyLength (9) and CheckSum (10) are left as they were sent, so they no longer match. |
 | HTTP headers | `authorization`, `proxy-authorization` and `cookie`: the value becomes its scheme and `***` (`Bearer ***`), or `***` when it has no scheme. |
-| JSON, in HTTP bodies and WebSocket frames | the string value of every member named `token`, `secret` or `credential`, wherever it appears, found textually so that a frame that is not valid JSON is masked too. The last two are how a new API key's secret is answered. |
+| JSON, in HTTP bodies and WebSocket frames | the string value of every member named `token`, `secret`, `credential`, `password`, `passphrase`, `apiKey` or `api_key`, whatever its case, wherever it appears, found textually so that a frame that is not valid JSON is masked too. `secret` and `credential` are how a new API key's secret is answered; the rest are names a client may reach for, and a frame the venue refuses for using one is still recorded in full. Frames sent to a client are masked like frames from one. |
 
 ## Writing
 

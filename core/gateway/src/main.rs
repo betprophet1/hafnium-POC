@@ -14,6 +14,7 @@ mod metrics;
 mod parlays;
 mod price;
 mod reactor;
+mod reconstruct;
 mod rest;
 #[cfg(test)]
 mod testing;
@@ -34,6 +35,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use venue_link::catalogue::Catalogue;
+use venue_link::named;
 use venue_link::submit::Submit;
 use venue_link::wire::{self, Error};
 use venue_telemetry::log;
@@ -41,6 +43,9 @@ use venue_telemetry::prometheus_client::registry::Registry;
 
 const USAGE: &str = "usage:
   venue-gateway verify-audit FILE...
+  venue-gateway reconstruct --journal FILE --results FILE --catalogue FILE AUDIT-FILE...
+                                           renders every frame the audit log kept a reference to and checks it against
+                                           the hash it kept; --results is what `venue-node replay` wrote
   venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--treasury ADDR] [--parlays ADDR]
                 [--identity ADDR] [--dev-tokens true] [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
                 [--audit-dir ./gateway-audit] [--audit-instance HOSTNAME] [--audit-fsync true] [--trusted-proxies ADDRS]
@@ -101,7 +106,12 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("verify-audit") {
         return verify_audit(&args[1..]);
     }
-    log::init("venue-gateway");
+    if args.first().map(String::as_str) == Some("reconstruct") {
+        return follow_references(&args[1..]).unwrap_or_else(|e| {
+            eprintln!("venue-gateway: {e}");
+            ExitCode::FAILURE
+        });
+    }
     match Args::parse(&args).and_then(|a| run(&a)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -109,6 +119,38 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `venue-gateway reconstruct --journal FILE --results FILE --catalogue FILE AUDIT-FILE...`: follows the audit log's
+/// references into the journal (interfaces/audit/README.md, frames derived from the journal).
+fn follow_references(args: &[String]) -> Result<ExitCode, Error> {
+    let (mut flags, mut files) = (Vec::new(), Vec::new());
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg.starts_with("--") {
+            flags.push(arg.clone());
+            flags.push(it.next().cloned().ok_or_else(|| format!("{arg} needs a value"))?);
+        } else {
+            files.push(arg.clone());
+        }
+    }
+    if files.is_empty() {
+        return Err("usage: venue-gateway reconstruct --journal F --results F --catalogue F AUDIT-FILE...".into());
+    }
+    let args = Args::parse(&flags)?;
+    let journal = PathBuf::from(args.get("journal", None)?);
+    let results = PathBuf::from(args.get("results", None)?);
+    let catalogue = PathBuf::from(args.get("catalogue", None)?);
+    let outcome = reconstruct::reconstruct(&journal, &results, &catalogue, &files)?;
+    for broken in &outcome.broken {
+        println!("FAIL {broken}");
+    }
+    if outcome.broken.is_empty() {
+        println!("{} frames rendered again from the journal, every one as the log says it was sent", outcome.checked);
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("{} of {} frames are not what the log says was sent", outcome.broken.len(), outcome.checked);
+    Ok(ExitCode::FAILURE)
 }
 
 /// `venue-gateway verify-audit FILE...`: checks audit log files (interfaces/audit/README.md, verifying), as
@@ -241,7 +283,7 @@ fn start_half(gateway: Gateway, feed: &str) -> Arc<Gateway> {
 /// Keeps the hub's view of the venue current from the node's feed, reconnecting for ever.
 fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
     let follower = Arc::clone(gateway);
-    thread::spawn(move || {
+    named("gw-feed", move || {
         let half = follower.half.name();
         wire::follow_reporting(
             &feed,
@@ -263,7 +305,7 @@ fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
 /// Sends book subscribers what changed, at a fixed rate.
 fn conflate(gateway: &Arc<Gateway>) {
     let conflater = Arc::clone(gateway);
-    thread::spawn(move || loop {
+    named("gw-conflate", move || loop {
         // Book topics carry at most ten snapshots a second (interface 1 README, market data).
         thread::sleep(Duration::from_millis(100));
         let mut hub = conflater.hub();

@@ -7,11 +7,11 @@
 //! again, and how a released event resolved while an unsettled parlay still names it as a leg (`released_legs`).
 
 use crate::catalogue::Catalogue;
+use crate::named;
 use crate::wire::{self, Unit};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
 
 const KEEP: usize = 60;
 
@@ -516,7 +516,7 @@ impl Live {
     pub fn follow(feed: &str) -> Arc<Self> {
         let live = Arc::new(Self { view: Mutex::new(View::default()), changed: Condvar::new() });
         let (me, addr) = (Arc::clone(&live), feed.to_string());
-        thread::spawn(move || {
+        named("link-view", move || {
             wire::follow(
                 &addr,
                 || {

@@ -11,6 +11,7 @@
 //! falls behind. When a connection fails, every request already sent is answered with an error, because its outcome
 //! is genuinely unknown (E-17.4); the caller resends with the same client order ID, which the engine deduplicates.
 
+use crate::named;
 use crate::wire::Error;
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -116,7 +117,7 @@ impl Submit {
         let (queue, requests) = sync_channel(QUEUE_DEPTH);
         let addr = addr.to_string();
         let forwarder_watch = watch.clone();
-        thread::spawn(move || forward(&addr, &requests, &forwarder_watch, report.as_ref()));
+        named("link-submit", move || forward(&addr, &requests, &forwarder_watch, report.as_ref()));
         Self { queue, watch }
     }
 
@@ -210,7 +211,7 @@ fn generation(stream: TcpStream, requests: &Receiver<Request>, watch: &Watcher) 
     let reader_stream = stream.try_clone()?;
     let reading = {
         let (pending, watch) = (Arc::clone(&pending), watch.clone());
-        thread::spawn(move || read_results(reader_stream, &pending, &watch))
+        named("link-results", move || read_results(reader_stream, &pending, &watch))
     };
     let outcome = loop {
         // Timed, so that a connection which dies while the gateway happens to be idle is still noticed: otherwise
