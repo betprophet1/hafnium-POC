@@ -202,12 +202,39 @@ struct Writer {
     day: u64,
     next: u64,
     prev: String,
+    /// The instance's lock, held for as long as this writer lives (`lock_instance`).
+    _lock: File,
+}
+
+/// Takes the exclusive lock that says a live process is writing `instance`'s files in `dir`, and keeps it for as long
+/// as the returned file is open; the operating system lets it go when the process ends, however it ends. Two live
+/// gateways given the same directory and instance — two processes on one host with the default instance, or replicas
+/// sharing a volume and a host name — would otherwise each seal and append to the other's open file and break both
+/// chains, so the second is refused and does not start.
+fn lock_instance(dir: &Path, component: &str, instance: &str) -> io::Result<File> {
+    let path = dir.join(format!(".{component}.{instance}.lock"));
+    let file = OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "another live process is writing audit instance {instance} in {} ({}): give each gateway its own \
+                 --audit-instance",
+                dir.display(),
+                path.display()
+            ),
+        )),
+        Err(fs::TryLockError::Error(e)) => Err(e),
+    }
 }
 
 impl Writer {
     fn open(dir: &Path, component: &str, instance: &str, fsync: bool, micros: u64) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let instance = sanitise(instance);
+        // Before anything is sealed: a file another live process has open is not an earlier process's to seal.
+        let lock = lock_instance(dir, component, &instance)?;
         let after = seal_earlier_files(dir, component, &instance, fsync, micros)?;
         let (file, name) = create_file(dir, component, &instance, micros / MICROS_PER_DAY)?;
         let mut writer = Self {
@@ -220,6 +247,7 @@ impl Writer {
             day: micros / MICROS_PER_DAY,
             next: 0,
             prev: ZEROS.to_string(),
+            _lock: lock,
         };
         writer.begin(micros, after)?;
         Ok(writer)
@@ -613,14 +641,34 @@ mod tests {
         assert_eq!(lines(&left_open).last().map(|r| r["reason"].clone()), Some(json!("recovered")));
         let segment = second.path();
         assert!(segment.to_string_lossy().ends_with(".2026-09-17.0001.jsonl"), "{}", segment.display());
-        // Cut the second file part-way through a line, as a crash mid-write would.
+        // Cut the second file part-way through a line, as a crash mid-write would, and the process with it.
         second.append(LATE - 7, "ws-frame", &fields("cut")).expect("written");
+        drop(second);
         let whole = fs::read(&segment).expect("read");
         fs::write(&segment, &whole[..whole.len() - 10]).expect("cut");
         let third = Writer::open(&dir, COMPONENT, "test", false, LATE - 6).expect("opened a third time");
         assert_eq!(fs::read(&segment).expect("read").len(), whole.len() - 10, "a cut-off file was changed");
         let name = segment.file_name().and_then(|n| n.to_str()).expect("a name");
         assert_eq!(lines(&third.path())[0]["after"], json!({"file": name, "sealed": false}));
+    }
+
+    /// Only one live process writes an instance: a second writer of the same instance in the same directory is refused
+    /// and touches nothing, another instance beside it is not, and the instance is free again once its writer has gone.
+    #[test]
+    fn an_instance_another_live_process_is_writing_is_refused() {
+        let dir = dir("instance-lock");
+        let mut first = Writer::open(&dir, COMPONENT, "test", false, LATE - 10).expect("opened");
+        first.append(LATE - 9, "ws-frame", &fields("mine")).expect("written");
+        let before = fs::read(first.path()).expect("read");
+        let refused = Writer::open(&dir, COMPONENT, "test", false, LATE - 8).err().expect("a second writer refused");
+        assert!(refused.to_string().contains("--audit-instance"), "{refused}");
+        assert_eq!(fs::read(first.path()).expect("read"), before, "the live file was changed");
+        assert_eq!(files(&dir).len(), 1, "a refused writer made a file");
+        assert!(Writer::open(&dir, COMPONENT, "other", false, LATE - 8).is_ok(), "another instance was refused");
+        first.append(LATE - 7, "ws-frame", &fields("still mine")).expect("written");
+        assert_eq!(verify(&first.path()), Ok(false), "the live file's chain broke");
+        drop(first);
+        assert!(Writer::open(&dir, COMPONENT, "test", false, LATE - 6).is_ok(), "the instance stayed locked");
     }
 
     #[test]
@@ -873,7 +921,13 @@ mod recorded {
             "market data or a heartbeat was recorded: {public_records:?}"
         );
 
-        let mut files: Vec<_> = std::fs::read_dir(dir).expect("listed").flatten().map(|e| e.path()).collect();
+        // The log's files, beside the lock that says a live gateway writes them.
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .expect("listed")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .collect();
         files.sort();
         assert_eq!(files.len(), 1, "{files:?}");
         assert_eq!(verify(&files[0]), Ok(false), "the chain verifies, and the file is still open");

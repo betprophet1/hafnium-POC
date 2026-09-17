@@ -661,6 +661,8 @@ fn each_gateway_audits_only_its_own_traffic_and_every_chain_verifies() {
         for file in files_of(instance) {
             assert!(crate::audit::verify(&file).is_ok(), "{}: {:?}", file.display(), crate::audit::verify(&file));
         }
+        // A second live gateway given the same instance would break its chains, so it does not start.
+        assert!(crate::audit::Audit::start(&fleet.audit_dir, instance, false).is_err(), "{instance} started twice");
     }
 }
 

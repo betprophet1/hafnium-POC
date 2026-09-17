@@ -25,6 +25,10 @@ edge.
   `component` is `fix-adapter` or `gateway`; `instance` is the process's instance name (`--audit-instance`, by default
   the host name) with anything but letters, digits, `-` and `_` replaced by `-`. A process that starts again on the same
   day opens the next segment (`0001`, ...) rather than appending to a file another process wrote.
+- **One live process per instance.** Two processes writing one instance's files at once would each seal and append
+  to the other's open file and break both chains. The gateway holds an exclusive lock on `.<component>.<instance>.lock`
+  in the directory for as long as it runs, which the operating system releases however the process ends, and refuses
+  to start while another process holds it: gateways sharing a directory each need an instance of their own.
 - **Rotation.** At the first record of a new UTC day, or within a second of midnight when nothing is being recorded,
   the file is closed with a `close` record and the next day's file is opened. A clean shutdown closes the file too
   (the FIX adapter's). The gateway has no clean shutdown: stopped by a signal, it leaves its file open, and the next
