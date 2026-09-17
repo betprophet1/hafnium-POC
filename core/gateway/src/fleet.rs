@@ -456,10 +456,13 @@ fn a_transfer_requested_through_one_gateway_reaches_the_accounts_sessions_on_the
         heard(client, "across", "pending");
         heard(client, "across", "settled");
     }
-    let before = before.as_i64().expect("available cash");
+    // B's account was read as of its own feed, which may not have had every probe's grant yet; once it has reached the
+    // deposit's sequence it has them all, and the deposit on top.
+    let (before, granted) = (before.as_i64().expect("available cash"), sequence(&made));
     eventually("gateway B's account shows the deposit", || {
-        request(&b.address, "GET", "/v4/account", Some(RETAIL_TOKEN), None).1["availableCents"].as_i64()
-            == Some(before + 1234)
+        let account = request(&b.address, "GET", "/v4/account", Some(RETAIL_TOKEN), None).1;
+        account["sequence"].as_str().and_then(|s| s.parse::<u64>().ok()).is_some_and(|s| s >= granted)
+            && account["availableCents"].as_i64().is_some_and(|cents| cents >= before + 1234)
     });
 
     let slow = json!({"clientTransferId": "slow", "kind": "deposit", "amountCents": 500, "method": "dummy_bank"});
