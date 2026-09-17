@@ -161,6 +161,7 @@ final class VenueSession implements SessionHandler
 
     private final Session session;
     private final GatewayLink link;
+    private final Metrics metrics;
     private final HttpClient http;
     private final String gateway;
     /** Where the security list is read: the public half's gateway. */
@@ -226,9 +227,11 @@ final class VenueSession implements SessionHandler
         final HttpClient http,
         final String gateway,
         final String publicGateway,
-        final SessionMemory.Store memories)
+        final SessionMemory.Store memories,
+        final Metrics metrics)
     {
         this.session = session;
+        this.metrics = metrics;
         this.link = link;
         this.http = http;
         this.gateway = gateway;
@@ -273,9 +276,9 @@ final class VenueSession implements SessionHandler
      */
     void fail(final RuntimeException e)
     {
-        System.err.println("fix adapter: ending " + session.compositeKey() + " after an error: " + e);
+        Log.error("ending a session after an error", "session", session.compositeKey(), "error", e, "stack",
+            Log.stack(e));
         failed = true;
-        e.printStackTrace();
         if (link != null && !link.isClosed())
         {
             link.close("adapter error");
@@ -376,6 +379,7 @@ final class VenueSession implements SessionHandler
             // An application message the dialect does not have. Artio has already checked the header.
             final int refSeqNum = session.lastReceivedMsgSeqNum();
             final String type = msgTypeOf(buffer, offset, length);
+            metrics.reject(Metrics.RejectKind.BUSINESS, 3);
             send(s ->
             {
                 businessReject.reset();
@@ -399,6 +403,7 @@ final class VenueSession implements SessionHandler
             return true;
         }
         final int refSeqNum = header.msgSeqNum();
+        metrics.reject(Metrics.RejectKind.SESSION, reason);
         send(s ->
         {
             sessionReject.reset();
@@ -800,8 +805,8 @@ final class VenueSession implements SessionHandler
                 {
                     if ("error".equals(type))
                     {
-                        System.err.println("fix adapter: gateway error for " + session.compositeKey() + ": " +
-                            message.path("error"));
+                        Log.warn("gateway error for no request in flight", "session", session.compositeKey(),
+                            "error", message.path("error"));
                     }
                     return;
                 }
@@ -828,7 +833,7 @@ final class VenueSession implements SessionHandler
             {
                 // The gateway no longer holds what happened since the session was last here: executions of the
                 // orders it knows may have been missed. Their next snapshot (a status request) is taken as the truth.
-                System.err.println("fix adapter: gateway resync for " + session.compositeKey());
+                Log.warn("gateway resync", "session", session.compositeKey());
                 for (final OrderState order : ordersById.values())
                 {
                     order.stale = !order.done;
@@ -925,6 +930,7 @@ final class VenueSession implements SessionHandler
             {
                 request.order.pending = null;
             }
+            metrics.reject(Metrics.RejectKind.BUSINESS, 4);
             send(s ->
             {
                 businessReject.reset();
@@ -1118,7 +1124,7 @@ final class VenueSession implements SessionHandler
             }
             catch (final Exception e)
             {
-                System.err.println("fix adapter: GET /v4/markets failed: " + e);
+                Log.warn("GET /v4/markets failed", "error", e);
             }
             sendSecurityList(fetch, markets);
         }
@@ -1202,14 +1208,14 @@ final class VenueSession implements SessionHandler
                 else
                 {
                     // The gateway's answer names no credential; the request's own header is never printed.
-                    System.err.println("fix adapter: GET /v4/account answered " + response.statusCode() + " for " +
-                        session.compositeKey() + ": " + response.body());
+                    Log.warn("GET /v4/account refused", "status", response.statusCode(), "session",
+                        session.compositeKey(), "answer", response.body());
                     refused = response.statusCode() == 401;
                 }
             }
             catch (final Exception e)
             {
-                System.err.println("fix adapter: GET /v4/account failed: " + e);
+                Log.warn("GET /v4/account failed", "session", session.compositeKey(), "error", e);
             }
             if (refused)
             {
@@ -1422,6 +1428,7 @@ final class VenueSession implements SessionHandler
     private void businessReject(
         final int refSeqNum, final String msgType, final String refId, final int reason, final String text)
     {
+        metrics.reject(Metrics.RejectKind.BUSINESS, reason);
         send(s ->
         {
             businessReject.reset();
@@ -1464,6 +1471,7 @@ final class VenueSession implements SessionHandler
 
     private void rejectNew(final Request request, final int ordRejReason, final String text, final String execId)
     {
+        metrics.reject(Metrics.RejectKind.ORDER, ordRejReason);
         request.reported = true;
         final Report report = new Report();
         report.clOrdId = request.clOrdId;
@@ -1553,6 +1561,7 @@ final class VenueSession implements SessionHandler
         final char responseTo = request.kind == Kind.CANCEL ? '1' : '2';
         final String orderId = order != null ? order.orderId : "NONE";
         final char status = order != null ? order.status() : '8';
+        metrics.reject(Metrics.RejectKind.ORDER, reason);
         send(s ->
         {
             cancelReject.reset();
@@ -1570,6 +1579,10 @@ final class VenueSession implements SessionHandler
         final Request request, final char response, final int rejectReason, final int affected, final String text)
     {
         final String reportId = "MC" + nextLocalExecId++;
+        if (rejectReason >= 0)
+        {
+            metrics.reject(Metrics.RejectKind.ORDER, rejectReason);
+        }
         send(s ->
         {
             massCancelReport.reset();

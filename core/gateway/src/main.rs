@@ -10,6 +10,7 @@ mod http;
 mod hub;
 mod identity;
 mod limits;
+mod metrics;
 mod parlays;
 mod price;
 mod reactor;
@@ -23,6 +24,7 @@ use api::{Gateway, Limits};
 use audit::Audit;
 use forwarded::TrustedProxies;
 use hub::Hub;
+use metrics::{IngressWatch, Metrics};
 use reactor::Reactors;
 use std::collections::BTreeMap;
 use std::net::TcpListener;
@@ -34,12 +36,15 @@ use std::time::Duration;
 use venue_link::catalogue::Catalogue;
 use venue_link::submit::Submit;
 use venue_link::wire::{self, Error};
+use venue_telemetry::log;
+use venue_telemetry::prometheus_client::registry::Registry;
 
 const USAGE: &str = "usage:
   venue-gateway verify-audit FILE...
   venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--treasury ADDR] [--parlays ADDR]
                 [--identity ADDR] [--dev-tokens true] [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
                 [--audit-dir ./gateway-audit] [--audit-instance HOSTNAME] [--audit-fsync true] [--trusted-proxies ADDRS]
+                [--metrics ADDR]
 
 --serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
 /v4/ws_public and GET /v4/markets; private is orders and accounts on /v4/ws_private, /v4/account and /v4/orders,
@@ -53,6 +58,8 @@ otherwise act as their accounts with every permission. Every request and what it
 --trusted-proxies is a comma-separated list of addresses and networks (such as 10.42.0.0/16) of proxies in front of
 the gateway, an ingress: on a connection from one, the audit log also records the client its X-Forwarded-For or
 Forwarded header names. None by default, and those headers are never believed from any other address.
+--metrics serves Prometheus metrics at http://ADDR/metrics, apart from the client-facing --listen (none by default);
+VENUE_LOG_FORMAT=json writes the log as JSON lines (deploy/observability/metrics.md).
 Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
 struct Args(BTreeMap<String, String>);
@@ -94,10 +101,11 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("verify-audit") {
         return verify_audit(&args[1..]);
     }
+    log::init("venue-gateway");
     match Args::parse(&args).and_then(|a| run(&a)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("venue-gateway: {e}");
+            log::error("stopped", &[("reason", &e)]);
             ExitCode::FAILURE
         }
     }
@@ -152,24 +160,33 @@ fn run(args: &Args) -> Result<(), Error> {
     };
     let proxies = TrustedProxies::parse(&args.get("trusted-proxies", Some(""))?)
         .map_err(|e| format!("--trusted-proxies: {e}"))?;
+    let mut registry = Registry::default();
+    venue_telemetry::build_info(&mut registry, "venue_gateway", env!("CARGO_PKG_VERSION"), &[]);
+    let metrics = Metrics::register(&mut registry);
     // Before anything listens: a gateway that cannot keep its audit log takes no connection.
-    let audit = Audit::start(&audit_dir, &args.get("audit-instance", Some(&hostname))?, fsync)
-        .map_err(|e| format!("audit log in {}: {e}", audit_dir.display()))?;
+    let audit =
+        Audit::start_measured(&audit_dir, &args.get("audit-instance", Some(&hostname))?, fsync, metrics.audit.clone())
+            .map_err(|e| format!("audit log in {}: {e}", audit_dir.display()))?;
     let halves = Halves {
         public: if public {
-            let gateway = Gateway::public(Hub::new(Catalogue::load(&catalogue_file)?), limits);
+            let gateway = Gateway::public(Hub::new(Catalogue::load(&catalogue_file)?), limits)
+                .with_metrics(metrics.half(api::Half::Public));
             Some(start_half(gateway.with_audit(audit.clone()).with_trusted_proxies(proxies.clone()), &feed))
         } else {
             None
         },
         private: if private {
-            let ingress = Submit::spawn(&args.get("ingress", None)?);
+            let half_metrics = metrics.half(api::Half::Private);
+            let watch = Arc::new(IngressWatch(Arc::clone(&half_metrics)));
+            let report = Arc::new(|e: &str| log::warn("ingress connection", &[("error", &e)]));
+            let ingress = Submit::spawn_watched(&args.get("ingress", None)?, Some(watch), report);
             let dev_tokens = match args.get("dev-tokens", Some("true"))?.as_str() {
                 "true" => true,
                 "false" => false,
                 other => return Err(format!("--dev-tokens must be true or false, not {other}").into()),
             };
             let mut gateway = Gateway::private(Hub::new(catalogue), ingress, limits)
+                .with_metrics(half_metrics)
                 .with_audit(audit.clone())
                 .with_trusted_proxies(proxies)
                 .with_identity(args.optional("identity").filter(|a| !a.is_empty()), dev_tokens);
@@ -190,10 +207,13 @@ fn run(args: &Args) -> Result<(), Error> {
         },
     };
     let listener = TcpListener::bind(args.get("listen", Some("127.0.0.1:8081"))?)?;
-    eprintln!(
-        "gateway on {}: serving {serving} (public /v4/ws_public, private /v4/ws_private), audit log in {}",
-        listener.local_addr()?,
-        audit_dir.display()
+    if let Some(address) = args.optional("metrics").filter(|a| !a.is_empty()) {
+        let bound = venue_telemetry::serve::spawn(&address, registry, None)?;
+        log::info("metrics served", &[("address", &bound)]);
+    }
+    log::info(
+        "serving",
+        &[("listen", &listener.local_addr()?), ("halves", &serving), ("audit_dir", &audit_dir.display())],
     );
     serve(&halves, &listener);
     Ok(())
@@ -222,7 +242,21 @@ fn start_half(gateway: Gateway, feed: &str) -> Arc<Gateway> {
 fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
     let follower = Arc::clone(gateway);
     thread::spawn(move || {
-        wire::follow(&feed, || follower.hub().restart(), |unit| follower.hub().apply(&unit));
+        let half = follower.half.name();
+        wire::follow_reporting(
+            &feed,
+            || {
+                follower.hub().restart();
+                follower.metrics.feed_connected();
+            },
+            |unit| {
+                let record = &unit.input["record"];
+                let (sequence, at) = (record["sequence"].as_u64(), record["sequencedAt"].as_u64());
+                follower.hub().apply(&unit);
+                follower.metrics.feed_unit(sequence.unwrap_or(0), at.unwrap_or(0), venue_telemetry::wall_ns());
+            },
+            |e| log::warn("feed connection", &[("half", &half), ("feed", &feed), ("error", &e)]),
+        );
     });
 }
 
@@ -257,7 +291,7 @@ fn serve_with(halves: &Halves, listener: &TcpListener, max_behind: usize) {
         match (halves.public.as_ref().map(start).transpose(), halves.private.as_ref().map(start).transpose()) {
             (Ok(public), Ok(private)) => (public, private),
             (Err(e), _) | (_, Err(e)) => {
-                eprintln!("venue-gateway: event loops: {e}");
+                log::error("event loops could not start", &[("error", &e)]);
                 return;
             }
         };

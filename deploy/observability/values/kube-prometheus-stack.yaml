@@ -1,0 +1,158 @@
+# prometheus-community/kube-prometheus-stack (version in ../versions.env), for a laptop or ephemeral cluster:
+# Prometheus, Alertmanager, Grafana, the Prometheus Operator, kube-state-metrics and the kubelet's cAdvisor metrics.
+# Sized small, keeps two days. Nothing is exposed outside the cluster (README.md, exposure).
+#
+# Override per environment with a second values file (install.sh passes OBSERVABILITY_VALUES files after this one).
+
+# Short, stable resource names: monitoring-prometheus:9090, monitoring-alertmanager:9093, grafana:80.
+fullnameOverride: monitoring
+cleanPrometheusOperatorObjectNames: true
+
+# Control-plane components k3s runs inside its one server process: nothing separate to scrape, and their alerts would
+# only ever fire as TargetDown.
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+# Host metrics are not what this stack is for on a laptop; turn on for a real cluster.
+nodeExporter:
+  enabled: false
+defaultRules:
+  rules:
+    etcd: false
+    kubeControllerManager: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeProxy: false
+    node: false
+    nodeExporterAlerting: false
+    nodeExporterRecording: false
+    windows: false
+
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+
+prometheus:
+  prometheusSpec:
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+    retention: 2d
+    retentionSize: 2GB
+    # Pick up every ServiceMonitor, PodMonitor and PrometheusRule in any namespace, not only this release's: the venue
+    # charts ship their own (venue-mini's PodMonitor, venue-observability's rules).
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+    # Labels every series carries once it leaves this Prometheus (remote write, federation, alerts). Name the cluster.
+    externalLabels:
+      cluster: local
+    # Managed Prometheus: add a remote write here (README.md, managed services). Empty keeps everything in-cluster.
+    #   remoteWrite:
+    #     - url: https://aps-workspaces.<region>.amazonaws.com/workspaces/<workspace-id>/api/v1/remote_write
+    #       sigv4:
+    #         region: <region>
+    #     - url: https://<stack>.grafana.net/api/prom/push
+    #       basicAuth:
+    #         username: {name: grafana-cloud-metrics, key: username}
+    #         password: {name: grafana-cloud-metrics, key: password}
+    remoteWrite: []
+    resources:
+      requests:
+        cpu: 100m
+        memory: 384Mi
+      limits:
+        memory: 1Gi
+    # emptyDir: the two days go with the pod. Give it a volume for anything longer-lived:
+    #   storageSpec:
+    #     volumeClaimTemplate:
+    #       spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 5Gi}}}
+
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+  # No receiver is configured: alerts are visible in Alertmanager and Grafana and go nowhere else. Receivers are
+  # configuration (README.md, alerts): replace this block in an environment's own values file.
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: "null"
+      group_by: [alertname, namespace, component]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 12h
+    receivers:
+      - name: "null"
+    inhibit_rules:
+      - source_matchers: ['severity = critical']
+        target_matchers: ['severity =~ warning|info']
+        equal: [namespace, alertname]
+
+grafana:
+  fullnameOverride: grafana
+  # The chart generates the admin password into the Secret `grafana` (key admin-password) on first install and keeps
+  # it across upgrades. Never set adminPassword in a values file; to bring your own, use admin.existingSecret.
+  adminUser: admin
+  service:
+    type: ClusterIP
+  ingress:
+    enabled: false
+  persistence:
+    enabled: false
+  resources:
+    requests:
+      cpu: 20m
+      memory: 128Mi
+    # Grafana holds a dashboard's whole query result while it renders; 384Mi was killed rendering the venue's busier
+    # dashboards.
+    limits:
+      memory: 768Mi
+  # The venue's dashboards come from venue-observability; the stack's own ~30 Kubernetes dashboards are left out.
+  defaultDashboardsEnabled: false
+  grafana.ini:
+    analytics:
+      reporting_enabled: false
+      check_for_updates: false
+      check_for_plugin_updates: false
+    users:
+      allow_sign_up: false
+    auth.anonymous:
+      enabled: false
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+        allowUiUpdates: false
+    datasources:
+      enabled: true
+      label: grafana_datasource
+      labelValue: "1"
+      searchNamespace: ALL
+      # venue-observability provisions the Prometheus and Loki data sources, with URLs from its values, so that a
+      # managed Prometheus is one value away.
+      defaultDatasourceEnabled: false
+      alertmanager:
+        enabled: false

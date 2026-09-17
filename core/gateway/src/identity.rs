@@ -14,6 +14,7 @@
 use crate::api::{only, ApiError, Gateway};
 use crate::http::Request;
 use crate::limits::monotonic;
+use crate::metrics::{HalfMetrics, Outcome, Service};
 use crate::treasury::{self, Call};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -28,6 +29,7 @@ use std::time::{Duration, Instant};
 use venue_identity::clock;
 use venue_identity::key::{self, Permissions};
 use venue_link::submit::Notify;
+use venue_telemetry::log;
 
 /// How long an answer about a credential is taken as true.
 pub const REMEMBER: Duration = Duration::from_secs(5);
@@ -119,12 +121,23 @@ pub struct Identity {
     pub dev_tokens: bool,
     remembered: Mutex<BTreeMap<[u8; 32], Entry>>,
     calls: Arc<AtomicUsize>,
+    metrics: Arc<HalfMetrics>,
 }
 
 impl Identity {
     /// A gateway's identity: API keys through the service at `address`, if any, and dev tokens if allowed.
-    pub fn new(address: Option<String>, dev_tokens: bool) -> Self {
-        Self { address, dev_tokens, remembered: Mutex::new(BTreeMap::new()), calls: Arc::new(AtomicUsize::new(0)) }
+    pub fn new(address: Option<String>, dev_tokens: bool, metrics: Arc<HalfMetrics>) -> Self {
+        let (remembered, calls) = (Mutex::new(BTreeMap::new()), Arc::new(AtomicUsize::new(0)));
+        Self { address, dev_tokens, remembered, calls, metrics }
+    }
+
+    /// Asks the service about a credential, counting the call.
+    fn ask(&self, address: &str, credential: &str, fingerprint: [u8; 32]) -> Verdict {
+        let started = monotonic();
+        let verdict = ask(address, credential, fingerprint);
+        let outcome = if matches!(verdict, Verdict::Unreachable) { Outcome::Error } else { Outcome::Ok };
+        self.metrics.upstream(Service::Identity, outcome, Some(monotonic().duration_since(started)));
+        verdict
     }
 
     /// Whether API keys are verified here at all.
@@ -149,7 +162,7 @@ impl Identity {
                 return entry.verdict.answer();
             }
         }
-        let verdict = ask(address, credential, fingerprint);
+        let verdict = self.ask(address, credential, fingerprint);
         let answer = verdict.answer();
         self.remember(fingerprint, credential, verdict, now);
         answer
@@ -194,7 +207,7 @@ impl Identity {
         };
         let Some(address) = self.address.as_deref() else { return };
         for (credential, fingerprint) in due {
-            let verdict = ask(address, &credential, fingerprint);
+            let verdict = self.ask(address, &credential, fingerprint);
             // A service that stopped answering leaves the last real answer in place until it answers again.
             if matches!(verdict, Verdict::Unreachable) {
                 continue;
@@ -208,6 +221,7 @@ impl Identity {
         let address = self.address()?.to_string();
         if self.calls.fetch_add(1, Ordering::SeqCst) >= MAX_CALLS {
             self.calls.fetch_sub(1, Ordering::SeqCst);
+            self.metrics.upstream(Service::Identity, Outcome::Busy, None);
             return Err(ApiError::unavailable("too many key requests at once; nothing was sent, so try again"));
         }
         let head = format!(
@@ -217,10 +231,14 @@ impl Identity {
         let mut request = head.into_bytes();
         request.extend_from_slice(body);
         let (tx, response) = sync_channel(1);
-        let calls = Arc::clone(&self.calls);
+        let (calls, metrics) = (Arc::clone(&self.calls), Arc::clone(&self.metrics));
         thread::spawn(move || {
-            let answer = treasury::exchange(&address, &request).unwrap_or_else(|e| {
-                eprintln!("gateway: identity service {address}: {e}");
+            let started = HalfMetrics::started();
+            let exchanged = treasury::exchange(&address, &request);
+            let outcome = if exchanged.is_ok() { Outcome::Ok } else { Outcome::Error };
+            metrics.upstream(Service::Identity, outcome, Some(started.elapsed()));
+            let answer = exchanged.unwrap_or_else(|e| {
+                log::warn("identity service call failed", &[("identity", &address), ("error", &e)]);
                 crate::rest::response(Err(ApiError::unavailable(
                     "the identity service did not answer; list the keys to see whether anything changed",
                 )))
@@ -249,7 +267,7 @@ fn ask(address: &str, credential: &str, fingerprint: [u8; 32]) -> Verdict {
         Ok((200, answer)) => match valid(&answer, fingerprint) {
             Some(credential) => Verdict::Valid(credential),
             None => {
-                eprintln!("gateway: identity service {address}: an answer the gateway cannot read: {answer}");
+                log::warn("identity service answer unreadable", &[("identity", &address), ("answer", &answer)]);
                 Verdict::Unreachable
             }
         },
@@ -257,11 +275,11 @@ fn ask(address: &str, credential: &str, fingerprint: [u8; 32]) -> Verdict {
             Verdict::Refused(answer["error"]["message"].as_str().unwrap_or("the API key is not valid").to_string())
         }
         Ok((status, answer)) => {
-            eprintln!("gateway: identity service {address}: {status} {answer}");
+            log::warn("identity service refused", &[("identity", &address), ("status", &status), ("answer", &answer)]);
             Verdict::Unreachable
         }
         Err(e) => {
-            eprintln!("gateway: identity service {address}: {e}");
+            log::warn("identity service unreachable", &[("identity", &address), ("error", &e)]);
             Verdict::Unreachable
         }
     }
@@ -797,7 +815,8 @@ mod tests {
         assert_eq!(open.authenticate(&key).map(|_| ()).expect_err("no identity service").status, 503);
         let closed = Gateway::private(Hub::new(catalogue()), ingress(), limits).with_identity(None, false);
         assert_eq!(closed.authenticate(MAKER_TOKEN).map(|_| ()).expect_err("dev tokens refused").status, 401);
-        let away = Identity::new(Some("127.0.0.1:17998".into()), true);
+        let metrics = crate::metrics::Metrics::unregistered().half(crate::api::Half::Private);
+        let away = Identity::new(Some("127.0.0.1:17998".into()), true, metrics);
         assert_eq!(away.verify_key(&key).map(|_| ()).expect_err("nobody answers").status, 503);
     }
 }

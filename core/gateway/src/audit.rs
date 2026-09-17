@@ -7,6 +7,8 @@
 //! loop that cannot queue a record for `STALL` takes the disk to have hung, and a record that cannot be written stops
 //! the process (the format document says why).
 
+use crate::limits::monotonic;
+use crate::metrics::AuditMetrics;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -44,7 +46,7 @@ pub type Failure = Arc<dyn Fn(&str) + Send + Sync>;
 
 fn exit_on_failure() -> Failure {
     Arc::new(|reason| {
-        eprintln!("venue-gateway: audit log failed, stopping: {reason}");
+        venue_telemetry::log::error("audit log failed, stopping", &[("reason", &reason)]);
         std::process::exit(EXIT_IO_ERROR);
     })
 }
@@ -60,22 +62,37 @@ struct Record {
 pub struct Audit {
     queue: Option<SyncSender<Record>>,
     failure: Failure,
+    metrics: AuditMetrics,
 }
 
 impl Audit {
     /// A log that records nothing, for a gateway built without one: only tests of the order path build those.
     pub fn disabled() -> Self {
-        Self { queue: None, failure: exit_on_failure() }
+        Self { queue: None, failure: exit_on_failure(), metrics: AuditMetrics::default() }
     }
 
     /// Opens the log in `dir` for `instance`, sealing files an earlier gateway of that instance left open, and starts
     /// its writer. An error means the log cannot be kept, and the gateway must not start.
+    #[cfg(test)]
     pub fn start(dir: &Path, instance: &str, fsync: bool) -> io::Result<Self> {
-        Self::start_with(dir, instance, fsync, CAPACITY, exit_on_failure())
+        Self::start_measured(dir, instance, fsync, AuditMetrics::default())
     }
 
-    pub fn start_with(dir: &Path, instance: &str, fsync: bool, capacity: usize, failure: Failure) -> io::Result<Self> {
+    /// As `start`, with the writer's queue, write and sync times counted in `metrics`.
+    pub fn start_measured(dir: &Path, instance: &str, fsync: bool, metrics: AuditMetrics) -> io::Result<Self> {
+        Self::start_with(dir, instance, fsync, CAPACITY, exit_on_failure(), metrics)
+    }
+
+    pub fn start_with(
+        dir: &Path,
+        instance: &str,
+        fsync: bool,
+        capacity: usize,
+        failure: Failure,
+        metrics: AuditMetrics,
+    ) -> io::Result<Self> {
         let mut writer = Writer::open(dir, COMPONENT, instance, fsync, wall_micros())?;
+        writer.metrics = metrics.clone();
         let (queue, records) = mpsc::sync_channel(capacity);
         let on_failure = Arc::clone(&failure);
         thread::Builder::new().name("gateway-audit".into()).spawn(move || {
@@ -83,7 +100,7 @@ impl Audit {
                 on_failure(&format!("writing {}: {e}", writer.path().display()));
             }
         })?;
-        Ok(Self { queue: Some(queue), failure })
+        Ok(Self { queue: Some(queue), failure, metrics })
     }
 
     /// A handle whose records wait on `capacity` places for whoever holds the receiver: for testing what a full queue
@@ -91,17 +108,23 @@ impl Audit {
     #[cfg(test)]
     fn queue_only(capacity: usize, failure: Failure) -> (Self, Receiver<Record>) {
         let (queue, records) = mpsc::sync_channel(capacity);
-        (Self { queue: Some(queue), failure }, records)
+        (Self { queue: Some(queue), failure, metrics: AuditMetrics::default() }, records)
     }
 
     /// Takes a record of `kind` now. Waits while the queue is full, and fails the log if it stays full.
     pub fn record(&self, kind: &'static str, fields: Map<String, Value>) {
         let Some(queue) = &self.queue else { return };
         let mut record = Record { micros: wall_micros(), kind, fields };
-        for _ in 0..STALL_WAITS {
+        for wait in 0..STALL_WAITS {
             match queue.try_send(record) {
-                Ok(()) => return,
+                Ok(()) => {
+                    self.metrics.queue_depth.inc();
+                    return;
+                }
                 Err(TrySendError::Full(back)) => {
+                    if wait == 0 {
+                        self.metrics.queue_full_waits.inc();
+                    }
                     record = back;
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -205,6 +228,7 @@ struct Writer {
     prev: String,
     /// The instance's lock, held for as long as this writer lives (`lock_instance`).
     _lock: File,
+    metrics: AuditMetrics,
 }
 
 /// Takes the exclusive lock that says a live process is writing `instance`'s files in `dir`, and keeps it for as long
@@ -249,6 +273,7 @@ impl Writer {
             next: 0,
             prev: ZEROS.to_string(),
             _lock: lock,
+            metrics: AuditMetrics::default(),
         };
         writer.begin(micros, after)?;
         Ok(writer)
@@ -263,11 +288,21 @@ impl Writer {
         loop {
             match records.recv_timeout(IDLE) {
                 Ok(first) => {
+                    let started = monotonic();
                     self.append(first.micros, first.kind, &first.fields)?;
+                    let mut written = 1;
                     for record in records.try_iter().take(BATCH - 1) {
                         self.append(record.micros, record.kind, &record.fields)?;
+                        written += 1;
                     }
+                    let appended = monotonic();
+                    self.metrics.queue_depth.dec_by(written);
+                    self.metrics.records.inc_by(written.unsigned_abs());
+                    self.metrics.write.observe_duration(appended.duration_since(started));
                     self.sync()?;
+                    if self.fsync {
+                        self.metrics.fsync.observe_duration(monotonic().duration_since(appended));
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     self.rotate_if_past_midnight(wall_micros())?;
@@ -304,6 +339,7 @@ impl Writer {
     fn rotate_if_past_midnight(&mut self, micros: u64) -> io::Result<()> {
         if micros / MICROS_PER_DAY > self.day {
             let closed = self.name.clone();
+            self.metrics.rotations.inc();
             self.close(micros, "rotate")?;
             let last = self.prev.clone();
             self.open_file(micros, Some(json!({"file": closed, "last": last})))?;
@@ -427,7 +463,10 @@ fn seal_earlier_files(
         let last = last_line(&path)?;
         let record: Option<Value> = last.as_ref().and_then(|l| serde_json::from_slice(l).ok());
         let (Some(last), Some(n)) = (last, record.as_ref().and_then(|r| r["n"].as_u64())) else {
-            eprintln!("venue-gateway: audit file {} ends in a cut-off record; left as it is", path.display());
+            venue_telemetry::log::warn(
+                "audit file ends in a cut-off record; left as it is",
+                &[("file", &path.display())],
+            );
             after = Some(json!({"file": name, "sealed": false}));
             continue;
         };
@@ -444,7 +483,7 @@ fn seal_earlier_files(
         if fsync {
             file.sync_data()?;
         }
-        eprintln!("venue-gateway: sealed audit file {}, left open by an earlier process", path.display());
+        venue_telemetry::log::info("sealed an audit file an earlier process left open", &[("file", &path.display())]);
         after = Some(json!({"file": name, "last": sha256_hex(text.as_bytes())}));
     }
     Ok(after)
@@ -888,15 +927,15 @@ mod recorded {
         // The test's connections come from 127.0.0.1, which plays the ingress.
         let venue = testing::venue_trusting("audit-proxy", "127.0.0.1, 10.42.0.0/16");
         let dir = &venue.audit_dir;
-        let hops = "X-Forwarded-For: 203.0.113.9, 198.51.100.7\r\nX-Forwarded-For: 10.42.0.3\r\n";
+        let hops = "X-Forwarded-For: 203.0.113.9, 198.51.100.77\r\nX-Forwarded-For: 10.42.0.3\r\n";
         assert_eq!(exchange_with(&venue.address, "GET", "/v4/markets", None, hops, "").0, 200);
         let asked = find(dir, "the public request", |r| {
             is(r, "http-request", "in") && r["half"] == "public" && r["line"] == "GET /v4/markets HTTP/1.1"
         });
-        assert_eq!(asked["client"], "198.51.100.7", "the right-most entry no trusted proxy wrote: {asked}");
+        assert_eq!(asked["client"], "198.51.100.77", "the right-most entry no trusted proxy wrote: {asked}");
         assert!(asked["peer"].as_str().is_some_and(|p| p.starts_with("127.0.0.1:")), "the peer is the proxy: {asked}");
         let answered = find(dir, "its answer", |r| is(r, "http-response", "out") && r["conn"] == asked["conn"]);
-        assert_eq!(answered["client"], "198.51.100.7", "{answered}");
+        assert_eq!(answered["client"], "198.51.100.77", "{answered}");
 
         let forwarded = "Forwarded: for=192.0.2.60;proto=http\r\n";
         assert_eq!(exchange_with(&venue.address, "GET", "/v4/account", Some(MAKER_TOKEN), forwarded, "").0, 200);

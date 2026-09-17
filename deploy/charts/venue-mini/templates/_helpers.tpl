@@ -106,6 +106,12 @@ containers:
       {{- end }}
       - name: VENUE_AUDIT_FSYNC
         value: {{ $.Values.gateway.audit.fsync | quote }}
+      {{- if $.Values.metrics.enabled }}
+      - name: VENUE_METRICS
+        value: "0.0.0.0:9102"
+      - name: VENUE_LOG_FORMAT
+        value: {{ $.Values.metrics.logFormat | quote }}
+      {{- end }}
       {{- if and $.Values.ingress.enabled $.Values.ingress.trustedProxies }}
       # Behind the ingress every connection comes from its pods: their X-Forwarded-For names the client.
       - name: VENUE_TRUSTED_PROXIES
@@ -114,6 +120,10 @@ containers:
     ports:
       - name: http
         containerPort: 8081
+      {{- if $.Values.metrics.enabled }}
+      - name: metrics
+        containerPort: 9102
+      {{- end }}
     # Taken out of the Service's endpoints as soon as it is stopping; the ingress and kube-proxy stop picking it while
     # it still answers.
     lifecycle:

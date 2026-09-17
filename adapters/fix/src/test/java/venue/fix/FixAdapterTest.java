@@ -54,19 +54,22 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 final class FixAdapterTest
 {
     /**
-     * Ports: the venue takes 17430-17435 (node ingress, feed, gateway, identity service, a second gateway serving the
-     * private half, a third serving the public half), the adapter 17440, an adapter on the split halves 17441, and an
-     * adapter process of its own 17442.
+     * Ports, from a base of 17430 (system property venue.fix.portsBase, from VENUE_FIX_PORTS_BASE): the venue takes
+     * base to base+5 (node ingress, feed, gateway, identity service, a second gateway serving the private half, a
+     * third serving the public half), the adapter base+10, an adapter on the split halves base+11, and an adapter
+     * process of its own base+12, which serves its metrics on base+13.
      */
-    private static final int VENUE_PORTS_BASE = 17430;
-    private static final int ADAPTER_PORT = 17440;
+    private static final int VENUE_PORTS_BASE = Integer.getInteger("venue.fix.portsBase", 17430);
+    private static final int ADAPTER_PORT = VENUE_PORTS_BASE + 10;
     private static final String GATEWAY = "127.0.0.1:" + (VENUE_PORTS_BASE + 2);
     /** Another gateway process on the same venue, serving the private half, which the adapter does not use. */
     private static final String SECOND_GATEWAY = "127.0.0.1:" + (VENUE_PORTS_BASE + 4);
     /** A gateway process serving only the public half. */
     private static final String PUBLIC_GATEWAY = "127.0.0.1:" + (VENUE_PORTS_BASE + 5);
-    private static final int SPLIT_ADAPTER_PORT = 17441;
-    private static final int SIGNAL_ADAPTER_PORT = 17442;
+    private static final int SPLIT_ADAPTER_PORT = VENUE_PORTS_BASE + 11;
+    private static final int SIGNAL_ADAPTER_PORT = VENUE_PORTS_BASE + 12;
+    /** Where the adapter process serves its metrics. */
+    private static final int SIGNAL_METRICS_PORT = VENUE_PORTS_BASE + 13;
     /** Two binary markets the mini venue's catalogue lists and opens, and one categorical market. */
     private static final String RAIN = "100000100";
     private static final String BITCOIN = "300000100";
@@ -79,7 +82,7 @@ final class FixAdapterTest
      */
     private static final AdapterConfig ADAPTER = new AdapterConfig(
         "127.0.0.1", ADAPTER_PORT, "VENUE", GATEWAY, GATEWAY, ADAPTER_DATA, true, Set.of("KEEPER1"),
-        ADAPTER_DATA.resolve("audit"), "test", false);
+        ADAPTER_DATA.resolve("audit"), "test", false, null);
 
     private static Path root;
     private static Path scratch;
@@ -827,7 +830,7 @@ final class FixAdapterTest
         final Path data = scratch.resolve("split-adapter");
         deleteRecursively(data);
         adapter = FixAdapter.start(new AdapterConfig("127.0.0.1", SPLIT_ADAPTER_PORT, "VENUE", SECOND_GATEWAY,
-            PUBLIC_GATEWAY, data, true, Set.of(), data.resolve("audit"), "split", false));
+            PUBLIC_GATEWAY, data, true, Set.of(), data.resolve("audit"), "split", false, null));
         final Session desk = client.logon("SPLIT2", "dev-market-maker", SPLIT_ADAPTER_PORT, false);
         assertNotNull(desk, "the desk logs on through the private gateway");
         client.send(desk, new SecurityListRequestEncoder().securityReqID("split-markets").securityListRequestType(4));
@@ -863,15 +866,30 @@ final class FixAdapterTest
             .filter(arg -> arg.startsWith("--add-")).toList());
         command.addAll(List.of("-cp", System.getProperty("java.class.path"), FixAdapter.class.getName(),
             "--listen", "127.0.0.1:" + SIGNAL_ADAPTER_PORT, "--gateway", SECOND_GATEWAY, "--public-gateway",
-            PUBLIC_GATEWAY, "--data", data.toString(), "--audit-instance", "signal", "--audit-fsync", "false"));
-        final Process process = new ProcessBuilder(command).redirectErrorStream(true)
-            .redirectOutput(scratch.resolve("signal-adapter.log").toFile()).start();
+            PUBLIC_GATEWAY, "--data", data.toString(), "--audit-instance", "signal", "--audit-fsync", "false",
+            "--metrics-listen", "127.0.0.1:" + SIGNAL_METRICS_PORT));
+        final ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true)
+            .redirectOutput(scratch.resolve("signal-adapter.log").toFile());
+        // As the chart runs it: JSON log lines, and metrics on a port of their own.
+        builder.environment().put("VENUE_LOG_FORMAT", "json");
+        final Process process = builder.start();
         try
         {
             client.pollUntil("the adapter process listens", () -> Files.exists(scratch.resolve("signal-adapter.log")) &&
-                readString(scratch.resolve("signal-adapter.log")).contains("fix adapter: FIX 4.4 on"));
+                readString(scratch.resolve("signal-adapter.log")).contains("FIX 4.4 on"));
+            final JsonNode started = GatewayLink.JSON.readTree(readString(scratch.resolve("signal-adapter.log"))
+                .lines().filter(l -> l.contains("FIX 4.4 on")).findFirst().orElseThrow());
+            assertEquals("venue-fix", started.path("service").asText(), started.toString());
+            assertEquals("info", started.path("level").asText(), started.toString());
             final Session desk = client.logon("SIGNAL1", "dev-market-maker", SIGNAL_ADAPTER_PORT, false);
             assertNotNull(desk, "the desk logs on to the adapter process");
+            final List<String> expected = List.of("venue_fix_logons_total 1.0",
+                "venue_fix_messages_total{direction=\"in\",msg_type=\"Logon\"} 1.0",
+                "venue_fix_messages_total{direction=\"out\",msg_type=\"Logon\"} 1.0",
+                "venue_fix_sessions{state=\"active\"} 1.0", "venue_fix_gateway_links{state=\"connected\"} 1.0",
+                "venue_fix_audit_records_total", "jvm_memory_used_bytes");
+            client.pollUntil("the adapter process's metrics count the logon", () ->
+                expected.stream().allMatch(scrape(SIGNAL_METRICS_PORT)::contains));
 
             process.destroy();
             assertTrue(process.waitFor(30, TimeUnit.SECONDS), "the adapter process stops on SIGTERM");
@@ -894,9 +912,29 @@ final class FixAdapterTest
 
         // Straight away, on the same data: the archive was closed, not left for dead.
         adapter = FixAdapter.start(new AdapterConfig("127.0.0.1", SIGNAL_ADAPTER_PORT, "VENUE", SECOND_GATEWAY,
-            PUBLIC_GATEWAY, data, true, Set.of(), data.resolve("audit"), "signal", false));
+            PUBLIC_GATEWAY, data, true, Set.of(), data.resolve("audit"), "signal", false, null));
         adapter.close();
         adapter = null;
+    }
+
+    /** The metrics an adapter serves on {@code port}, or nothing while it does not answer. */
+    private static String scrape(final int port)
+    {
+        try
+        {
+            return HttpClient.newHttpClient().send(
+                HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/metrics")).build(),
+                HttpResponse.BodyHandlers.ofString()).body();
+        }
+        catch (final IOException e)
+        {
+            return "";
+        }
+        catch (final InterruptedException e)
+        {
+            Thread.currentThread().interrupt();
+            return "";
+        }
     }
 
     private static String readString(final Path file)

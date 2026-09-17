@@ -8,6 +8,7 @@
 //! thread each is plenty, and a bound on how many at once keeps a flood from costing more than refusals.
 
 use crate::api::{ApiError, Gateway};
+use crate::metrics::{HalfMetrics, Outcome, Service};
 use crate::{http, rest};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -18,6 +19,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use venue_link::submit::Notify;
+use venue_telemetry::log;
 
 /// Calls to the treasury outstanding at once, across every client of this gateway.
 const MAX_CALLS: usize = 64;
@@ -38,6 +40,7 @@ fn unavailable() -> ApiError {
 pub struct Treasury {
     address: String,
     calls: Arc<AtomicUsize>,
+    metrics: Arc<HalfMetrics>,
 }
 
 /// A request passed to the treasury or the identity service, whose response `take` has once the notify it was given is
@@ -63,8 +66,8 @@ impl Call {
 }
 
 impl Treasury {
-    pub fn new(address: &str) -> Self {
-        Self { address: address.to_string(), calls: Arc::new(AtomicUsize::new(0)) }
+    pub fn new(address: &str, metrics: Arc<HalfMetrics>) -> Self {
+        Self { address: address.to_string(), calls: Arc::new(AtomicUsize::new(0)), metrics }
     }
 
     /// Passes a request under `/v4` for an authenticated account on to the treasury, as the same request under the
@@ -80,6 +83,7 @@ impl Treasury {
     ) -> Result<Call, ApiError> {
         if self.calls.fetch_add(1, Ordering::SeqCst) >= MAX_CALLS {
             self.calls.fetch_sub(1, Ordering::SeqCst);
+            self.metrics.upstream(Service::Treasury, Outcome::Busy, None);
             return Err(ApiError::unavailable("too many transfer requests at once; nothing was sent, so try again"));
         }
         let suffix = path.strip_prefix("/v4").unwrap_or(path);
@@ -95,10 +99,14 @@ impl Treasury {
         let mut request = request.into_bytes();
         request.extend_from_slice(body);
         let (tx, response) = sync_channel(1);
-        let (address, calls) = (self.address.clone(), Arc::clone(&self.calls));
+        let (address, calls, metrics) = (self.address.clone(), Arc::clone(&self.calls), Arc::clone(&self.metrics));
         thread::spawn(move || {
-            let answer = exchange(&address, &request).unwrap_or_else(|e| {
-                eprintln!("gateway: treasury {address}: {e}");
+            let started = HalfMetrics::started();
+            let exchanged = exchange(&address, &request);
+            let outcome = if exchanged.is_ok() { Outcome::Ok } else { Outcome::Error };
+            metrics.upstream(Service::Treasury, outcome, Some(started.elapsed()));
+            let answer = exchanged.unwrap_or_else(|e| {
+                log::warn("treasury call failed", &[("treasury", &address), ("error", &e)]);
                 rest::response(Err(unavailable()))
             });
             calls.fetch_sub(1, Ordering::SeqCst);
@@ -142,7 +150,7 @@ pub fn follow_updates(gateway: &Arc<Gateway>, address: String) {
     let gateway = Arc::clone(gateway);
     thread::spawn(move || loop {
         if let Err(e) = follow(&gateway, &address) {
-            eprintln!("gateway: treasury updates from {address}: {e}; reconnecting");
+            log::warn("treasury updates ended; reconnecting", &[("treasury", &address), ("error", &e)]);
         }
         thread::sleep(Duration::from_secs(1));
     });

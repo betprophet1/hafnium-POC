@@ -1,0 +1,62 @@
+# grafana/loki (version in ../versions.env) as one process with its chunks on a small volume: enough for a laptop or
+# an ephemeral environment. Reached inside the cluster at http://loki.monitoring.svc:3100; nothing is exposed.
+# Multi-tenancy is off (auth_enabled: false), so only put it where the network policy of the cluster is trusted.
+
+fullnameOverride: loki
+deploymentMode: SingleBinary
+
+loki:
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  storage:
+    type: filesystem
+  schemaConfig:
+    configs:
+      - from: "2026-01-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: index_
+          period: 24h
+  limits_config:
+    retention_period: 72h
+    ingestion_rate_mb: 8
+    ingestion_burst_size_mb: 16
+    volume_enabled: true
+  compactor:
+    retention_enabled: true
+    delete_request_store: filesystem
+  pattern_ingester:
+    enabled: false
+
+singleBinary:
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 2Gi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+# The scalable targets, caches, gateway, canary and self-test are not needed for one process.
+read:
+  replicas: 0
+write:
+  replicas: 0
+backend:
+  replicas: 0
+gateway:
+  enabled: false
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+lokiCanary:
+  enabled: false
+test:
+  enabled: false

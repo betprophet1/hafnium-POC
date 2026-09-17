@@ -13,7 +13,7 @@ use venue_node::node::{self, Config, Error};
 
 const USAGE: &str = "usage:
   venue-node serve [--listen ADDR] [--feed ADDR] [--data DIR] [--group N] [--node-id N] [--tick-ms N] [--fsync]
-                   [--capacity small|launch|scale]
+                   [--capacity small|launch|scale] [--metrics ADDR]
   venue-node send ADDR [INPUTS]            JSON inputs (an array, or one per line; stdin without a file);
                                            prints each result as a JSON line
   venue-node replay JOURNAL RESULTS        runs a journal through a fresh engine and writes its result log
@@ -25,14 +25,24 @@ const USAGE: &str = "usage:
                                            amends resting orders through a seeded node's ingress, one request at a
                                            time per connection, and reports messages/s and round-trip percentiles
 
-serve reads VENUE_LISTEN, VENUE_FEED, VENUE_DATA, VENUE_GROUP, VENUE_NODE_ID, VENUE_TICK_MS and VENUE_CAPACITY; flags
-override them. The capacity profile (default small) is recorded beside the journal; serve refuses a journal recorded
+serve reads VENUE_LISTEN, VENUE_FEED, VENUE_DATA, VENUE_GROUP, VENUE_NODE_ID, VENUE_TICK_MS, VENUE_CAPACITY and
+VENUE_METRICS; flags override them. --metrics serves Prometheus metrics at http://ADDR/metrics (none by default), and
+VENUE_LOG_FORMAT=json writes its log as JSON lines (deploy/observability/metrics.md). The capacity profile (default small) is recorded beside the journal; serve refuses a journal recorded
 under another, and replay and bench use the one recorded.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let outcome = match (args.first().map(String::as_str), args.len()) {
-        (Some("serve"), _) => serve(&args[1..]),
+        (Some("serve"), _) => {
+            venue_telemetry::log::init("venue-node");
+            return match serve(&args[1..]) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    venue_telemetry::log::error("stopped", &[("reason", &e)]);
+                    ExitCode::FAILURE
+                }
+            };
+        }
         (Some("send"), 2 | 3) => send(&args[1], args.get(2)),
         (Some("replay"), 3) => {
             node::replay(Path::new(&args[1]), Path::new(&args[2])).map(|n| eprintln!("replayed {n} inputs"))
@@ -64,6 +74,7 @@ fn serve(args: &[String]) -> Result<(), Error> {
     let mut node_id = env("VENUE_NODE_ID", "1");
     let mut tick_ms = env("VENUE_TICK_MS", "100");
     let mut capacity = env("VENUE_CAPACITY", "small");
+    let mut metrics = std::env::var("VENUE_METRICS").ok().filter(|m| !m.is_empty());
     let mut fsync = false;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -77,6 +88,7 @@ fn serve(args: &[String]) -> Result<(), Error> {
             "--tick-ms" => tick_ms = value()?,
             "--fsync" => fsync = true,
             "--capacity" => capacity = value()?,
+            "--metrics" => metrics = Some(value()?),
             other => return Err(format!("unknown flag {other}\n{USAGE}").into()),
         }
     }
@@ -89,6 +101,7 @@ fn serve(args: &[String]) -> Result<(), Error> {
         tick: Duration::from_millis(tick_ms.parse()?),
         fsync,
         capacity,
+        metrics,
     };
     if config.tick.is_zero() {
         return Err("the tick must be at least 1 ms".into());

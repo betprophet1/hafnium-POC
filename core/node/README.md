@@ -45,5 +45,12 @@ venue-node import core/target/differential/fuzz-90000.json golden.journal
 
 `serve` also reads `VENUE_LISTEN`, `VENUE_FEED`, `VENUE_DATA`, `VENUE_GROUP`, `VENUE_NODE_ID` and `VENUE_TICK_MS`.
 
+## Metrics and logs
+
+`serve --metrics ADDR` (or `VENUE_METRICS`) serves Prometheus metrics at `http://ADDR/metrics`: inputs by type, the
+journal's append and `fsync` times and bytes, the sequence, and the feed's subscribers and their backlog
+(`deploy/observability/metrics.md`). None by default. They are counted around the engine, never in it, and the engine
+is not timed. `VENUE_LOG_FORMAT=json` writes the log as JSON lines on standard output; otherwise it is readable text.
+
 A replay on another architecture yields the same result log, but its `EngineStarted` names a different binary hash.
 Build with the release profile to compare against a release node (overflow checks are on in both, blueprint §16).

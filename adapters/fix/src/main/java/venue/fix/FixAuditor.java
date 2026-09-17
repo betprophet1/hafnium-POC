@@ -32,15 +32,17 @@ import java.util.concurrent.TimeUnit;
 final class FixAuditor implements AutoCloseable
 {
     private final AuditLog audit;
+    private final Metrics metrics;
     private final FixMessageLogger logger;
     private final Thread thread;
     private final CountDownLatch stopped = new CountDownLatch(1);
     private final int inboundStream;
     private volatile boolean running = true;
 
-    FixAuditor(final AuditLog audit, final String aeronDir, final String libraryChannel)
+    FixAuditor(final AuditLog audit, final Metrics metrics, final String aeronDir, final String libraryChannel)
     {
         this.audit = audit;
+        this.metrics = metrics;
         this.inboundStream = CommonConfiguration.DEFAULT_INBOUND_LIBRARY_STREAM;
         final FixMessageLogger.Configuration configuration = new FixMessageLogger.Configuration()
             .fixMessageConsumer(this::onMessage)
@@ -89,13 +91,16 @@ final class FixAuditor implements AutoCloseable
         final long connection = message.connection();
         final long timestampNanos = message.timestamp();
         final String raw = message.body();
+        final boolean inbound = header.streamId() == inboundStream;
+        final String msgType = AuditLog.fixField(raw, "35");
+        metrics.message(inbound, msgType);
         final var fields = audit.fields()
-            .put("dir", header.streamId() == inboundStream ? "in" : "out")
+            .put("dir", inbound ? "in" : "out")
             .put("conn", connection)
             .put("session", session)
             .put("sender", AuditLog.fixField(raw, "49"))
             .put("target", AuditLog.fixField(raw, "56"))
-            .put("msgType", AuditLog.fixField(raw, "35"))
+            .put("msgType", msgType)
             .put("seq", AuditLog.fixField(raw, "34"))
             .put("msg", AuditLog.fixMessage(raw));
         if (status != MessageStatus.OK)

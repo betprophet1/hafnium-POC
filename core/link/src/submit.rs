@@ -28,6 +28,9 @@ use venue_node::frames::{read_frame, write_frame, MAX_FRAME};
 /// backpressure long before memory becomes a problem.
 const QUEUE_DEPTH: usize = 1024;
 
+/// Where `ResultHeader.sequencedAt` sits in a result: after `inputSequence` (8 bytes) and `resultIndex` (4).
+const SEQUENCED_AT: usize = INPUT_SEQUENCE + 12;
+
 /// Where `ResultHeader.inputSequence` sits in a result. The schema puts that header first in every result's body
 /// (`interfaces/sbe/venue-journal.xml`), after SBE's fixed message header, which is
 /// `venue_journal::message_header_codec::ENCODED_LENGTH` bytes.
@@ -40,10 +43,24 @@ type Frames = Vec<Vec<u8>>;
 /// requests at once, such as an event loop, is told this way rather than waiting on any one of them.
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
+/// Told what becomes of each request, for a process that measures its round trips to the node (a gateway's metrics).
+/// Called on the ingress threads, never on the caller's.
+pub trait Watch: Send + Sync {
+    /// Wall-clock nanoseconds since the epoch, from the watcher's own clock.
+    fn now_ns(&self) -> u64;
+    /// Results arrived: when the request was queued and when its results were read, by `now_ns`, and the
+    /// `sequencedAt` they carry (none for an input with no results).
+    fn answered(&self, queued_ns: u64, read_ns: u64, sequenced_at: Option<u64>);
+    /// The request's outcome is unknown: its connection ended first.
+    fn failed(&self);
+}
+
 /// Where a request's results go, and who to tell once they are there.
 struct Answer {
     results: SyncSender<Result<Frames, String>>,
     notify: Option<Notify>,
+    /// When it was queued, by the watcher's clock (0 unwatched).
+    queued_ns: u64,
 }
 
 impl Answer {
@@ -69,25 +86,38 @@ fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+type Watcher = Option<Arc<dyn Watch>>;
+
 /// Fails every request whose results can no longer arrive.
-fn fail_pending(pending: &Mutex<VecDeque<Answer>>) {
+fn fail_pending(pending: &Mutex<VecDeque<Answer>>, watch: &Watcher) {
     let failed: Vec<Answer> = locked(pending).drain(..).collect();
     for answer in failed {
+        if let Some(watch) = watch {
+            watch.failed();
+        }
         answer.send(Err("the connection to the sequencer group ended".to_string()));
     }
 }
 
 pub struct Submit {
     queue: SyncSender<Request>,
+    watch: Watcher,
 }
 
 impl Submit {
     /// Connects in the background and keeps reconnecting; sends before the first connection simply wait.
     pub fn spawn(addr: &str) -> Self {
+        Self::spawn_watched(addr, None, Arc::new(|e: &str| eprintln!("{e}")))
+    }
+
+    /// As `spawn`, telling `watch` what becomes of every request and `report` why a connection ended or could not be
+    /// made.
+    pub fn spawn_watched(addr: &str, watch: Watcher, report: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
         let (queue, requests) = sync_channel(QUEUE_DEPTH);
         let addr = addr.to_string();
-        thread::spawn(move || forward(&addr, &requests));
-        Self { queue }
+        let forwarder_watch = watch.clone();
+        thread::spawn(move || forward(&addr, &requests, &forwarder_watch, report.as_ref()));
+        Self { queue, watch }
     }
 
     /// Hands one input to the forwarder, with a zeroed record header (the sequencer stamps it, spec E-17.2), and
@@ -106,7 +136,8 @@ impl Submit {
             Ok::<Vec<u8>, Error>(buffer[..n].to_vec())
         })?;
         let (results, wait) = sync_channel(1);
-        let answer = Answer { results, notify };
+        let queued_ns = self.watch.as_ref().map_or(0, |w| w.now_ns());
+        let answer = Answer { results, notify, queued_ns };
         self.queue.send(Request { bytes, answer }).map_err(|_| "the ingress forwarder stopped")?;
         Ok(Pending { wait })
     }
@@ -157,29 +188,29 @@ fn decode(frames: Result<Frames, String>) -> Result<Vec<Value>, Error> {
 }
 
 /// Owns the connection: one generation at a time, reconnecting for ever.
-fn forward(addr: &str, requests: &Receiver<Request>) {
+fn forward(addr: &str, requests: &Receiver<Request>, watch: &Watcher, report: &(dyn Fn(&str) + Send + Sync)) {
     loop {
         match TcpStream::connect(addr) {
             Ok(stream) => {
-                if let Err(e) = generation(stream, requests) {
-                    eprintln!("ingress {addr}: {e}; reconnecting");
+                if let Err(e) = generation(stream, requests, watch) {
+                    report(&format!("ingress {addr}: {e}; reconnecting"));
                 }
             }
-            Err(e) => eprintln!("ingress {addr}: {e}; retrying"),
+            Err(e) => report(&format!("ingress {addr}: {e}; retrying")),
         }
         thread::sleep(Duration::from_millis(200));
     }
 }
 
 /// Writes requests and lets a reader thread answer them, until the connection or the queue ends.
-fn generation(stream: TcpStream, requests: &Receiver<Request>) -> Result<(), Error> {
+fn generation(stream: TcpStream, requests: &Receiver<Request>, watch: &Watcher) -> Result<(), Error> {
     stream.set_nodelay(true)?;
     let pending: Arc<Mutex<VecDeque<Answer>>> = Arc::new(Mutex::new(VecDeque::new()));
     let mut writer = BufWriter::new(stream.try_clone()?);
     let reader_stream = stream.try_clone()?;
     let reading = {
-        let pending = Arc::clone(&pending);
-        thread::spawn(move || read_results(reader_stream, &pending))
+        let (pending, watch) = (Arc::clone(&pending), watch.clone());
+        thread::spawn(move || read_results(reader_stream, &pending, &watch))
     };
     let outcome = loop {
         // Timed, so that a connection which dies while the gateway happens to be idle is still noticed: otherwise
@@ -199,7 +230,7 @@ fn generation(stream: TcpStream, requests: &Receiver<Request>) -> Result<(), Err
     };
     let _ = stream.shutdown(Shutdown::Both);
     let _ = reading.join();
-    fail_pending(&pending);
+    fail_pending(&pending, watch);
     outcome
 }
 
@@ -209,9 +240,15 @@ fn input_sequence(frame: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes))
 }
 
+/// When the input a result answers was sequenced.
+fn sequenced_at(frame: &[u8]) -> Option<u64> {
+    let bytes: [u8; 8] = frame.get(SEQUENCED_AT..SEQUENCED_AT + 8)?.try_into().ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
 /// Matches each batch of results, terminated by an empty frame, to the oldest request still waiting, checking as
 /// it goes that the stream still lines up with that queue.
-fn read_results(stream: TcpStream, pending: &Mutex<VecDeque<Answer>>) {
+fn read_results(stream: TcpStream, pending: &Mutex<VecDeque<Answer>>, watch: &Watcher) {
     let mut reader = BufReader::new(stream);
     let mut frame = Vec::new();
     let mut last = 0u64;
@@ -221,7 +258,7 @@ fn read_results(stream: TcpStream, pending: &Mutex<VecDeque<Answer>>) {
             match read_frame(&mut reader, &mut frame) {
                 Ok(Some(0)) => break,
                 Ok(Some(n)) => batch.push(frame[..n].to_vec()),
-                Ok(None) | Err(_) => return fail_pending(pending),
+                Ok(None) | Err(_) => return fail_pending(pending, watch),
             }
         }
         // Requests are answered by position, so the stream has to stay in step with the queue. The node commits
@@ -230,17 +267,22 @@ fn read_results(stream: TcpStream, pending: &Mutex<VecDeque<Answer>>) {
         // another caller's results. An empty batch names no input and is perfectly normal: a mass cancel that
         // cancels nothing emits only its terminator, since E-5.2 gives `MassCancel` no outcome result.
         if let Some(first) = batch.first() {
-            let Some(sequence) = input_sequence(first) else { return fail_pending(pending) };
+            let Some(sequence) = input_sequence(first) else { return fail_pending(pending, watch) };
             if sequence <= last {
-                return fail_pending(pending);
+                return fail_pending(pending, watch);
             }
             last = sequence;
         }
         let waiting = locked(pending).pop_front();
         match waiting {
-            Some(answer) => answer.send(Ok(batch)),
+            Some(answer) => {
+                if let Some(watch) = watch {
+                    watch.answered(answer.queued_ns, watch.now_ns(), batch.first().and_then(|f| sequenced_at(f)));
+                }
+                answer.send(Ok(batch));
+            }
             // Results with nothing waiting for them mean the stream is not what this thread thinks it is.
-            None => return fail_pending(pending),
+            None => return fail_pending(pending, watch),
         }
     }
 }
@@ -310,6 +352,20 @@ mod tests {
     /// The smallest input there is: the stub never looks at it.
     fn tick() -> Value {
         json!({"msg": "TimeTick"})
+    }
+
+    #[test]
+    fn a_result_says_when_its_input_was_sequenced() {
+        let result = json!({
+            "msg": "OrderRejected",
+            "result": {"inputSequence": 3, "resultIndex": 1, "sequencedAt": 1_789_000_000_123_456_789u64, "sequencerGroup": 1},
+            "accountId": 1, "sessionId": 10, "clientOrderId": "a1", "instrumentId": 1000, "reason": "MALFORMED",
+            "originalOrderId": 0
+        });
+        let mut buffer = vec![0u8; MAX_FRAME];
+        let n = codec::encode(&result, &mut buffer).expect("a result the codec can encode");
+        assert_eq!(sequenced_at(&buffer[..n]), Some(1_789_000_000_123_456_789));
+        assert_eq!(sequenced_at(&buffer[..SEQUENCED_AT + 7]), None);
     }
 
     #[test]

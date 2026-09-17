@@ -1,0 +1,81 @@
+{{- if and .Values.metrics.enabled .Values.observer.enabled }}
+{{- $name := include "venue-mini.fullname" . }}
+{{- $core := printf "%s-core" $name }}
+# The observer (core/observer): follows the core's feed like any downstream reader and derives the journal's metrics
+# (per-hop latency, trading, fees, lifecycle, capacity headroom, market quality) and read-only operator endpoints
+# from it (deploy/observability/metrics.md). It writes nothing and holds nothing a restart would lose. Reach its
+# operator endpoints with kubectl port-forward svc/<release>-observer 9103.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-observer
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: observer
+spec:
+  selector:
+    {{- include "venue-mini.selector" (dict "ctx" . "component" "observer") | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9103
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-observer
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: observer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "observer") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" . | nindent 8 }}
+        app.kubernetes.io/component: observer
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "venue-mini.podSecurity" . | nindent 8 }}
+      containers:
+        - name: observer
+          image: {{ include "venue-mini.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["tini", "--", "venue-observer"]
+          env:
+            - name: VENUE_FEED
+              value: "{{ $core }}:7102"
+            - name: VENUE_LISTEN
+              value: "0.0.0.0:9103"
+            - name: VENUE_CATALOGUE
+              value: /catalogue/markets.json
+            - name: VENUE_CAPACITY
+              value: {{ .Values.core.capacity | quote }}
+            - name: VENUE_MAX_MARKET_SERIES
+              value: {{ .Values.observer.maxMarketSeries | quote }}
+            - name: VENUE_LOG_FORMAT
+              value: {{ .Values.metrics.logFormat | quote }}
+          ports:
+            - name: metrics
+              containerPort: 9103
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.observer.resources | nindent 12 }}
+          securityContext:
+            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: catalogue
+              mountPath: /catalogue
+      volumes:
+        - name: catalogue
+          configMap:
+            name: {{ $name }}-catalogue
+{{- end }}

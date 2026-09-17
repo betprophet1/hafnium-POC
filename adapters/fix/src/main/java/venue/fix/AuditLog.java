@@ -27,6 +27,7 @@ import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -70,6 +71,8 @@ final class AuditLog implements AutoCloseable
     private final Consumer<String> onFailure;
     private final BlockingQueue<Entry> queue = new ArrayBlockingQueue<>(CAPACITY);
     private final Thread writer;
+    /** Records written, for the metrics. */
+    private final AtomicLong written = new AtomicLong();
 
     // Touched by the writer thread only, once started.
     private FileChannel channel;
@@ -175,6 +178,18 @@ final class AuditLog implements AutoCloseable
         }
     }
 
+    /** Records queued and not yet taken by the writer. */
+    int queueDepth()
+    {
+        return queue.size();
+    }
+
+    /** Records written since the log was opened. */
+    long recordsWritten()
+    {
+        return written.get();
+    }
+
     /** The log cannot go on: in the adapter, the process stops. */
     void fail(final String reason)
     {
@@ -234,6 +249,7 @@ final class AuditLog implements AutoCloseable
                     }
                     rotateIfPastMidnight(entry.micros);
                     append(entry.micros, entry.kind, entry.fields);
+                    written.incrementAndGet();
                 }
                 batch.clear();
                 sync();
@@ -413,7 +429,7 @@ final class AuditLog implements AutoCloseable
             }
             if (record == null || !record.path("n").canConvertToLong())
             {
-                System.err.println("fix adapter: audit file " + path + " ends in a cut-off record; left as it is");
+                Log.warn("audit file ends in a cut-off record; left as it is", "file", path);
                 after = JSON.createObjectNode().put("file", name).put("sealed", false);
                 continue;
             }
@@ -437,7 +453,7 @@ final class AuditLog implements AutoCloseable
                     file.force(false);
                 }
             }
-            System.err.println("fix adapter: sealed audit file " + path + ", left open by an earlier process");
+            Log.info("sealed an audit file left open by an earlier process", "file", path);
             after = JSON.createObjectNode().put("file", name).put("last", sha256(close));
         }
         return after;
@@ -611,8 +627,7 @@ final class AuditLog implements AutoCloseable
     /** What a process does when its audit log fails: says why, and stops at once (the format document says why). */
     private static void halt(final String reason)
     {
-        System.err.println("audit log failed, stopping: " + reason);
-        System.err.flush();
+        Log.error("audit log failed, stopping", "reason", reason);
         Runtime.getRuntime().halt(EXIT_IO_ERROR);
     }
 }

@@ -54,6 +54,14 @@ build/install/venue-fix-adapter/bin/venue-fix-adapter \
 | `--audit-dir` | `<data>/audit` | the audit log of every FIX message (below) |
 | `--audit-instance` | `$HOSTNAME`, else `fix-adapter` | this adapter's name in the audit log's file names |
 | `--audit-fsync` | `true` | whether the audit log syncs what it writes; `false` only for tests |
+| `--metrics-listen` | none | `host:port` to serve Prometheus metrics on (`/metrics`); none without it |
+
+**Metrics and logs.** With `--metrics-listen`, the adapter serves its sessions, logons and refusals, messages in and out
+by MsgType, rejects, gateway links and audit queue, and the JVM's own metrics, through the Prometheus Java client; the
+names and labels are in `deploy/observability/metrics.md`. No label carries a CompID, account or credential. Its
+operational log goes to standard output, one line an event: readable text by default, a JSON object per line
+(`ts`, `level`, `service`, `instance`, `msg` and the event's fields) with `VENUE_LOG_FORMAT=json`, as the chart runs it.
+Neither holds a Password (554); the audit log below is a separate record and unchanged.
 
 A firm then logs on with its SenderCompID, `TargetCompID=VENUE` and an API key: the key ID in `Username (553)` and
 the secret in `Password (554)`, or the whole `keyId.secret` in Password. In test environments a dev token in Password
@@ -75,7 +83,8 @@ adapters/fix/test.sh                        # bootstrap, cargo build --release o
 
 It builds `venue-node`, `venue-gateway`, `venue-sim` and `venue-identity` in release, starts a node seeded with the
 mini venue's catalogue, an identity service, a gateway and a second gateway serving the private half beside it
-(`scripts/venue.sh`, ports 17430-17434), runs the adapter in the test's JVM on 17440, and
+(`scripts/venue.sh`, ports 17430-17435; `VENUE_FIX_PORTS_BASE` moves every port the test uses), runs the adapter in
+the test's JVM on 17440, and
 logs on two Artio initiators as a market maker and a retail customer. It checks: a refused token and a missing one;
 the security list; place, replace, cancel, a cancel too late and one of an unknown order; a price off the ladder, a
 duplicate ClOrdID, a malformed OrdType and a GTD without ExpireTime; a mass cancel by market and of everything; a
@@ -240,6 +249,8 @@ To get there:
 | `src/main/java/venue/fix/SessionMemory.java` | What a SenderCompID's sessions know beyond one logon, and where it is kept |
 | `src/main/java/venue/fix/Report.java` | One execution report as data, so an undelivered one can be kept |
 | `src/main/java/venue/fix/Translate.java` | Fixed mappings: prices, quantities, reject reasons |
+| `src/main/java/venue/fix/Metrics.java` | The Prometheus metrics and their `/metrics` server |
+| `src/main/java/venue/fix/Log.java` | The operational log: text or JSON lines on standard output |
 | `src/test/java/venue/fix/` | The integration test and its Artio initiator |
 | `scripts/venue.sh` | A private node, identity service and gateway for tests and manual runs |
 | `bootstrap.sh`, `test.sh` | Toolchain, and the whole test from nothing |

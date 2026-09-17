@@ -5,7 +5,9 @@ use crate::limits::monotonic;
 use crate::price;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SendError, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use venue_link::catalogue::Catalogue;
 use venue_link::submit::Notify;
@@ -147,17 +149,26 @@ where
 pub struct Outbox {
     queue: Sender<String>,
     notify: Notify,
+    /// Messages sent and not yet taken off the queue by whatever serves the session, which takes one off as it takes
+    /// each message (`taken`): the backlog the gateway's metrics report.
+    waiting: Arc<AtomicU64>,
 }
 
 impl Outbox {
     pub fn new(queue: Sender<String>, notify: Notify) -> Self {
-        Self { queue, notify }
+        Self { queue, notify, waiting: Arc::new(AtomicU64::new(0)) }
     }
 
     pub fn send(&self, message: String) -> Result<(), SendError<String>> {
         self.queue.send(message)?;
+        self.waiting.fetch_add(1, Ordering::Relaxed);
         (self.notify)();
         Ok(())
+    }
+
+    /// The count of messages waiting, shared with whatever takes them off the queue.
+    pub fn waiting(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.waiting)
     }
 }
 

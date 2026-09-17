@@ -141,7 +141,7 @@ spec:
 {{- end }}
 ---
 # Only the gateway, the treasury, the operator tools (seed job, parlay service, dummy oracle, the web page's event
-# list) and the core's own smoke test may reach the core's ingress and feed. Everything a customer or bot does goes
+# list), the observer (which only reads the feed) and the core's own smoke test may reach the core's ingress and feed. Everything a customer or bot does goes
 # through the gateway (blueprint §16).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -156,7 +156,7 @@ spec:
   policyTypes: [Ingress]
   ingress:
     - from:
-        {{- range list "gateway" "treasury" "web" "seed" "parlays" "smoke" "oracle" }}
+        {{- range list "gateway" "treasury" "web" "seed" "parlays" "smoke" "oracle" "observer" }}
         - podSelector:
             matchLabels:
               {{- include "venue-mini.selector" (dict "ctx" $ "component" .) | nindent 14 }}

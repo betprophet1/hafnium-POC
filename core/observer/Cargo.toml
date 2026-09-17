@@ -1,0 +1,20 @@
+[package]
+name = "venue-observer"
+version = "0.1.0"
+description = "Journal-derived metrics and read-only operator endpoints, from the node's feed like any downstream reader"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The feed follower, the projection of the feed and the demo catalogue's titles.
+venue-link = { path = "../link" }
+# Only for the capacity profiles' table sizes (`Capacities::named`), which are public constants: nothing here runs
+# or reads an engine.
+venue-engine = { path = "../engine" }
+venue-telemetry = { path = "../telemetry" }
+serde_json = "1"
