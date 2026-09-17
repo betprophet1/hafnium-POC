@@ -99,9 +99,11 @@ cargo build --release -p venue-node -p venue-gateway -p venue-parlays -p venue-s
 CAT=../deploy/charts/venue-mini/files/markets.json
 target/release/venue-node serve --data /tmp/venue --tick-ms 100 &
 target/release/venue-sim seed --ingress 127.0.0.1:7101 --catalogue $CAT
-target/release/venue-treasury --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT --ledger /tmp/venue/treasury.jsonl &
-target/release/venue-parlays --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT --responders /tmp/venue/parlay-responders.json &
-target/release/venue-identity --catalogue $CAT --store /tmp/venue/identity.jsonl &
+# The services' records in a local PostgreSQL, a schema each, migrated at start (core/store/README.md).
+export VENUE_DATABASE_URL='postgres://postgres:dev@127.0.0.1:5432/postgres?sslmode=disable' VENUE_MIGRATE_ON_START=true
+target/release/venue-treasury --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT &
+target/release/venue-parlays --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT &
+target/release/venue-identity --catalogue $CAT &
 target/release/venue-gateway --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT --treasury 127.0.0.1:8083 \
   --parlays 127.0.0.1:7103 --identity 127.0.0.1:8084 --audit-dir /tmp/venue/gateway-audit &
 target/release/venue-sim oracle --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT \
@@ -130,10 +132,14 @@ treasury's own API (`core/treasury/README.md`).
 - **Dev tokens.** Tokens are fixed per account in the catalogue, and the page is handed them. Test environments only.
   The account tab's API keys section makes, lists and revokes keys with them (`core/identity`); the page, the bots
   and the tests still act with the dev tokens rather than keys.
-- **No resolution console.** Proposals, sign-offs and disputes live inside the oracle process rather than behind
-  interface 24, and are lost if it restarts: a case still open is opened again from the sources, which report the
-  same outcomes. Postponements and suspensions by hand are lost the same way. The auto-approver's two credentials are
-  names, not credentials from an issuer.
+- **No resolution console.** Proposals, sign-offs and disputes are driven by the oracle process rather than behind
+  interface 24. They are kept in PostgreSQL (`migrations/`, `src/cases.rs`; schema `oracle`): every case with its
+  reports, proposals, sign-offs, disputes and history, and postponements and suspensions by hand, written whenever
+  they change and before the oracle acts on the change, so a restarted oracle carries each case on where it was and
+  sends again (under the same command ID) a `ResolveEvent` it was sequencing. While the database cannot be reached,
+  cases do not move and manual case actions, postponements and suspensions answer 503; the schedule's `cases` field
+  says so, and the calendar carries on. `venue-sim oracle migrate` applies the schema; `--store memory` keeps cases in
+  the process only. The auto-approver's two credentials are names, not credentials from an issuer.
 - **One oracle.** Run exactly one per venue: two would both act on every round.
 - **One flow each.** The maker trades over a WebSocket session, as market makers do; the taker over REST, as simple
   programmatic clients do. Between them and the page's tabs, both of interface 1's order flows carry load.

@@ -41,6 +41,12 @@ pub enum Source {
 }
 
 impl Source {
+    pub fn parse(name: &str) -> Option<Self> {
+        [Self::Alpha, Self::Beta, Self::Referee, Self::Operator, Self::AutoApprover]
+            .into_iter()
+            .find(|s| s.name() == name)
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::Alpha => "alpha",
@@ -110,7 +116,7 @@ pub enum Action {
     Sequence(Proposal),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Case {
     pub event: u64,
     pub states: u64,
@@ -140,6 +146,24 @@ impl Case {
             history: vec![(now, "case opened".to_string())],
             revisions: 0,
         }
+    }
+
+    /// A case as the records hold it (`cases.rs`).
+    pub const fn restore(
+        event: u64,
+        states: u64,
+        opened_at: u64,
+        reports: Vec<Report>,
+        stage: Stage,
+        history: Vec<(u64, String)>,
+        revisions: u64,
+    ) -> Self {
+        Self { event, states, opened_at, reports, stage, history, revisions }
+    }
+
+    /// How many proposals the case has signed.
+    pub const fn revisions(&self) -> u64 {
+        self.revisions
     }
 
     /// The case ID `ResolveEvent` carries: the event and the revision that settled it, so the journal says which

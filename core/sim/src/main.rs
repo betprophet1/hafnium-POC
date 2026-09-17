@@ -2,6 +2,7 @@
 
 mod bots;
 mod calendar;
+mod cases;
 mod client;
 mod oracle;
 mod resolution;
@@ -23,8 +24,9 @@ const USAGE: &str = "usage:
   venue-sim seed  --ingress ADDR --catalogue FILE [--capacity small]
   venue-sim web   --ingress ADDR --feed ADDR --gateway ADDR --catalogue FILE [--listen 127.0.0.1:8080]
                   [--public-gateway ADDR] [--oracle 127.0.0.1:8082] [--treasury 127.0.0.1:8083]
-  venue-sim oracle --ingress ADDR --feed ADDR --catalogue FILE --calendar FILE [--capacity small]
-                  [--listen 127.0.0.1:8082]
+  venue-sim oracle --ingress ADDR --feed ADDR --catalogue FILE --calendar FILE --database-url URL [--capacity small]
+                  [--listen 127.0.0.1:8082] [--migrate-on-start false] [--store postgres|memory]
+  venue-sim oracle migrate --database-url URL
   venue-sim maker --gateway ADDR [--public-gateway ADDR] [--token dev-synthetic-maker] [--size 10] [--levels 3] [--spread 1]
                   [--interval-ms 700] [--seed 1] [--margin 100]
   venue-sim taker --gateway ADDR [--public-gateway ADDR] [--token dev-synthetic-taker] [--max-quantity 5] [--chance 250]
@@ -39,7 +41,10 @@ The bots are clients of the gateway. --gateway serves the private half (orders, 
 the gateway serving the public half (markets, books), defaults to it. The maker subscribes to requests for quote and answers them when its account is an
 approved responder, adding --margin thousandths to its price for a parlay. seed, workload and the dummy oracle are operator
 tools and use the core's ingress and feed; the web page's settlement tab drives the dummy oracle's control API.
-workload puts a venue-shaped load on a core on its own, with no gateway in the way.
+workload puts a venue-shaped load on a core on its own, with no gateway in the way. The dummy oracle keeps its
+resolution cases in PostgreSQL (--database-url postgres://USER:PASSWORD@HOST:5432/DATABASE, --database-schema oracle,
+--database-tls, --database-ca-file: core/store/README.md) and waits for its schema, which oracle migrate applies;
+--store memory keeps them in memory only.
 Every flag can also be given as VENUE_<FLAG> in the environment, for example VENUE_GATEWAY.";
 
 struct Args(BTreeMap<String, String>);
@@ -68,6 +73,11 @@ impl Args {
             .ok_or_else(|| Error::from(format!("--{key} (or {env}) is required")))
     }
 
+    /// The dummy oracle's database, if a URL is given.
+    fn database(&self) -> Result<Option<venue_store::Config>, Error> {
+        Ok(venue_store::Config::from_settings(|k| self.get(k, None).ok(), "venue-sim oracle", "oracle")?)
+    }
+
     fn number(&self, key: &str, default: u64) -> Result<u64, Error> {
         Ok(self.get(key, Some(default.to_string().as_str()))?.parse()?)
     }
@@ -79,6 +89,15 @@ fn main() -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(64);
     };
+    if command == "oracle" && args.get(1).map(String::as_str) == Some("migrate") {
+        return match Args::parse(&args[2..]).and_then(|a| oracle_migrate(&a)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("venue-sim: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let outcome = Args::parse(&args[1..]).and_then(|a| match command.as_str() {
         "seed" => seed(&a),
         "web" => web(&a),
@@ -95,6 +114,20 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Applies the dummy oracle's migrations and exits: the chart's migrate job, or an operator.
+fn oracle_migrate(args: &Args) -> Result<(), Error> {
+    let config = args.database()?.ok_or("--database-url (or VENUE_DATABASE_URL) is required")?;
+    let db = venue_store::Database::connect_retrying(&config, "venue-sim oracle")?;
+    let applied = db.migrate(cases::MIGRATIONS)?;
+    eprintln!(
+        "venue-sim oracle: schema {} of {} is at migration {} (applied now: {applied:?})",
+        config.schema,
+        config.describe(),
+        cases::MIGRATIONS.len()
+    );
+    Ok(())
 }
 
 /// A venue-shaped load straight onto a core: many books, most of them quiet, a few busy, and orders that trade.
@@ -170,7 +203,24 @@ fn oracle(args: &Args) -> Result<(), Error> {
         oracle::Capacity { events: profile.events, instruments: profile.instruments, levels: profile.levels };
     let live = view::Live::follow(&args.get("feed", None)?);
     let ingress = Ingress::new(&args.get("ingress", None)?);
-    let oracle = oracle::Oracle::new(calendar, catalogue, capacity, live, ingress)?;
+    let store = match args.get("store", Some("postgres"))?.as_str() {
+        "postgres" => {
+            let config = args.database()?.ok_or("--database-url (or VENUE_DATABASE_URL) is required: the dummy oracle keeps its cases in PostgreSQL; --store memory keeps them in memory only")?;
+            eprintln!("oracle: cases in {}", config.describe());
+            let db = venue_store::Database::connect_retrying(&config, "venue-sim oracle")?;
+            if args.get("migrate-on-start", Some("false"))? == "true" {
+                db.migrate(cases::MIGRATIONS)?;
+            }
+            db.wait_for_schema(cases::MIGRATIONS, "venue-sim oracle")?;
+            Some(cases::CaseStore::new(db))
+        }
+        "memory" => {
+            eprintln!("oracle: cases kept in memory only (--store memory): a restart opens them afresh");
+            None
+        }
+        other => return Err(format!("--store must be postgres or memory, not {other}").into()),
+    };
+    let oracle = oracle::Oracle::new(calendar, catalogue, capacity, live, ingress, store)?;
     oracle::serve(&args.get("listen", Some("127.0.0.1:8082"))?, Arc::new(oracle))
 }
 

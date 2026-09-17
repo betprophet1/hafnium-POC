@@ -927,6 +927,7 @@ dependencies = [
  "serde_json",
  "tungstenite",
  "venue-link",
+ "venue-store",
 ]
 
 [[package]]
