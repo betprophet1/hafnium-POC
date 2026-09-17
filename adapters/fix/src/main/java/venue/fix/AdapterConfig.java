@@ -22,6 +22,8 @@ import java.util.Set;
  * @param auditDir            where the audit log of every FIX message is written (interfaces/audit/README.md)
  * @param auditInstance       this adapter's instance name in the audit log's file names
  * @param auditFsync          whether the audit log syncs what it writes; off only for tests
+ * @param metricsListen       {@code host:port} to serve Prometheus metrics on (deploy/observability/metrics.md), or
+ *                            null for none
  */
 public record AdapterConfig(
     String listenHost,
@@ -34,7 +36,8 @@ public record AdapterConfig(
     Set<String> keepOrdersFor,
     Path auditDir,
     String auditInstance,
-    boolean auditFsync)
+    boolean auditFsync,
+    String metricsListen)
 {
     static final String USAGE = """
         usage:
@@ -42,11 +45,13 @@ public record AdapterConfig(
                             [--public-gateway GATEWAY] [--data ./fix-data] [--cancel-on-disconnect true]
                             [--keep-orders-for COMPID,...]
                             [--audit-dir DATA/audit] [--audit-instance HOSTNAME] [--audit-fsync true]
+                            [--metrics-listen HOST:PORT]
 
         FIX 4.4 on --listen, translated to the gateway's private WebSocket. The security list comes from
         GET /v4/markets on --public-gateway, which defaults to --gateway. A session logs on with its dev token in
         Password (554). Every FIX message in and out is written to the audit log in --audit-dir, by default the audit
-        directory inside --data. Every flag can also be given as VENUE_FIX_<FLAG>, for example VENUE_FIX_GATEWAY.""";
+        directory inside --data. With --metrics-listen, Prometheus metrics are served on /metrics there
+        (deploy/observability/metrics.md); without it, none. Every flag can also be given as VENUE_FIX_<FLAG>, for example VENUE_FIX_GATEWAY.""";
 
     /** Whether a session with this SenderCompID asks the gateway to cancel its orders when it ends. */
     public boolean cancelOnDisconnectFor(final String senderCompId)
@@ -86,13 +91,19 @@ public record AdapterConfig(
             keep.isBlank() ? Set.of() : Set.of(keep.split(",")),
             Path.of(value(flags, "audit-dir", data.resolve("audit").toString())),
             value(flags, "audit-instance", hostname == null || hostname.isBlank() ? "fix-adapter" : hostname),
-            Boolean.parseBoolean(value(flags, "audit-fsync", "true")));
+            Boolean.parseBoolean(value(flags, "audit-fsync", "true")),
+            blankToNull(value(flags, "metrics-listen", "")));
         // Every flag read above was taken out of the map, so whatever is left was never going to be used.
         if (!flags.isEmpty())
         {
             throw new IllegalArgumentException("unknown flags " + flags.keySet() + "\n" + USAGE);
         }
         return config;
+    }
+
+    private static String blankToNull(final String value)
+    {
+        return value.isBlank() ? null : value;
     }
 
     private static String value(final Map<String, String> flags, final String name, final String fallback)

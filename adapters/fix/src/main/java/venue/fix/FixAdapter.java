@@ -52,6 +52,7 @@ public final class FixAdapter implements AutoCloseable
     private final AdapterConfig config;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
     private final AuditLog audit;
+    private final Metrics metrics = new Metrics();
     private final GatewayAuthenticator authenticator;
     private final SessionMemory.Store memories;
     private final List<VenueSession> sessions = new ArrayList<>();
@@ -70,7 +71,8 @@ public final class FixAdapter implements AutoCloseable
         // First, so that an adapter that cannot keep its audit log never takes a connection.
         this.audit = AuditLog.open(config.auditDir(), "fix-adapter", config.auditInstance(), config.auditFsync());
         this.memories = new SessionMemory.Store(config.dataDir().resolve("sessions"));
-        this.authenticator = new GatewayAuthenticator(config, http, audit, memories);
+        this.authenticator = new GatewayAuthenticator(config, http, audit, memories, metrics);
+        metrics.audit(audit);
     }
 
     public static void main(final String[] args)
@@ -87,9 +89,9 @@ public final class FixAdapter implements AutoCloseable
             return;
         }
         final FixAdapter adapter = start(config);
-        System.err.printf("fix adapter: FIX 4.4 on %s:%d as %s, gateway %s, public gateway %s, audit log %s%n",
-            config.listenHost(), config.listenPort(), config.compId(), config.gateway(), config.publicGateway(),
-            adapter.audit.currentFile());
+        Log.info("FIX 4.4 on " + config.listenHost() + ":" + config.listenPort(), "compId", config.compId(),
+            "gateway", config.gateway(), "publicGateway", config.publicGateway(), "auditFile",
+            adapter.audit.currentFile(), "metrics", config.metricsListen() != null ? config.metricsListen() : "off");
         // The barrier's shutdown hook holds the JVM until the barrier is closed, so the adapter closes inside it: closed
         // after it, the JVM would halt midway, leaving the audit file open and Artio's archive marked active.
         try (ShutdownSignalBarrier barrier = new ShutdownSignalBarrier())
@@ -123,6 +125,10 @@ public final class FixAdapter implements AutoCloseable
 
     private void launch()
     {
+        if (config.metricsListen() != null)
+        {
+            metrics.serve(config.metricsListen());
+        }
         final Path data = config.dataDir().toAbsolutePath();
         final String aeronDir = data.resolve("aeron").toString();
         // Every idle loop sleeps rather than spins: the adapter shares its machine, and a millisecond is nothing
@@ -148,7 +154,7 @@ public final class FixAdapter implements AutoCloseable
             .deleteArchiveOnStart(false);
         driver = ArchivingMediaDriver.launch(driverContext, archiveContext);
         // Subscribed before the engine starts, so its streams are read from their first message.
-        auditor = new FixAuditor(audit, aeronDir, LIBRARY_CHANNEL);
+        auditor = new FixAuditor(audit, metrics, aeronDir, LIBRARY_CHANNEL);
 
         final EngineConfiguration engineConfiguration = new EngineConfiguration()
             .bindTo(config.listenHost(), config.listenPort())
@@ -197,9 +203,10 @@ public final class FixAdapter implements AutoCloseable
     private SessionHandler onAcquired(final Session session)
     {
         final VenueSession venueSession = new VenueSession(session, authenticator.take(session.connectionId()), http,
-            config.gateway(), config.publicGateway(), memories);
+            config.gateway(), config.publicGateway(), memories, metrics);
         sessions.add(venueSession);
-        System.err.println("fix adapter: " + session.compositeKey() + " logged on");
+        metrics.activeSessions.set(sessions.size());
+        Log.info("session logged on", "session", session.compositeKey());
         return venueSession;
     }
 
@@ -224,14 +231,16 @@ public final class FixAdapter implements AutoCloseable
                         work++;
                     }
                 }
-                sessions.removeIf(VenueSession::isEnded);
+                if (sessions.removeIf(VenueSession::isEnded))
+                {
+                    metrics.activeSessions.set(sessions.size());
+                }
                 idle.idle(work);
             }
         }
         catch (final RuntimeException e)
         {
-            System.err.println("fix adapter: poller stopped: " + e);
-            e.printStackTrace();
+            Log.error("poller stopped", "error", e, "stack", Log.stack(e));
         }
         finally
         {
@@ -263,6 +272,6 @@ public final class FixAdapter implements AutoCloseable
         CloseHelper.closeAll(library, engine);
         // After the engine, whose last messages (the Logouts it sends as it closes) are still on the streams, and
         // before the media driver that holds them.
-        CloseHelper.closeAll(auditor, audit, driver);
+        CloseHelper.closeAll(auditor, audit, driver, metrics);
     }
 }

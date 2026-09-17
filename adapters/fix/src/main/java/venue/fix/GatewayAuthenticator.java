@@ -40,11 +40,14 @@ final class GatewayAuthenticator implements AuthenticationStrategy
     private final HttpClient http;
     private final AuditLog audit;
     private final SessionMemory.Store memories;
+    private final Metrics metrics;
     private final Map<Long, GatewayLink> accepted = new ConcurrentHashMap<>();
 
     GatewayAuthenticator(
-        final AdapterConfig config, final HttpClient http, final AuditLog audit, final SessionMemory.Store memories)
+        final AdapterConfig config, final HttpClient http, final AuditLog audit, final SessionMemory.Store memories,
+        final Metrics metrics)
     {
+        this.metrics = metrics;
         this.config = config;
         this.http = http;
         this.audit = audit;
@@ -69,6 +72,7 @@ final class GatewayAuthenticator implements AuthenticationStrategy
         if (token.isEmpty())
         {
             recordLogin(proxy, sender, audit.fields().put("refused", "no token in Password (554)"));
+            metrics.logonRefused(Metrics.Refusal.INVALID);
             reject(proxy, "Password (554) must carry the account's token");
             return;
         }
@@ -92,7 +96,7 @@ final class GatewayAuthenticator implements AuthenticationStrategy
             login.put("resumeFrom", Long.toString(resumeFrom));
         }
         final URI uri = URI.create("ws://" + config.gateway() + "/v4/ws_private");
-        GatewayLink.open(http, uri, login, LOGIN_TIMEOUT).whenComplete((link, failure) ->
+        GatewayLink.open(http, uri, login, LOGIN_TIMEOUT, metrics).whenComplete((link, failure) ->
         {
             if (failure == null)
             {
@@ -109,6 +113,7 @@ final class GatewayAuthenticator implements AuthenticationStrategy
                 try
                 {
                     proxy.accept();
+                    metrics.logon();
                 }
                 catch (final IllegalStateException timedOut)
                 {
@@ -124,11 +129,20 @@ final class GatewayAuthenticator implements AuthenticationStrategy
                 refusedBy.getMessage() : "gateway unavailable: " + cause));
             if (cause instanceof GatewayLink.Refused refused)
             {
+                metrics.logonRefused(switch (refused.code)
+                {
+                    case "UNAUTHORIZED", "FORBIDDEN" -> Metrics.Refusal.CREDENTIALS;
+                    case "RATE_LIMITED" -> Metrics.Refusal.RATE_LIMIT;
+                    case "BAD_REQUEST" -> Metrics.Refusal.INVALID;
+                    case "UNAVAILABLE" -> Metrics.Refusal.GATEWAY_UNAVAILABLE;
+                    default -> Metrics.Refusal.OTHER;
+                });
                 reject(proxy, "UNAUTHORIZED".equals(refused.code) ? "token refused" : refused.getMessage());
             }
             else
             {
-                System.err.println("fix adapter: gateway login failed for " + sender + ": " + cause);
+                metrics.logonRefused(Metrics.Refusal.GATEWAY_UNAVAILABLE);
+                Log.warn("gateway login failed", "sender", sender, "error", cause);
                 reject(proxy, "venue gateway unavailable");
             }
         });

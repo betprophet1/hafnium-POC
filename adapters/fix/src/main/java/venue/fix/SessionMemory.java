@@ -204,7 +204,7 @@ final class SessionMemory
                     catch (final IOException | RuntimeException e)
                     {
                         // A memory that cannot be read costs the firm only the replay: it can still ask for status.
-                        System.err.println("fix adapter: ignoring unreadable session memory " + file + ": " + e);
+                        Log.warn("ignoring unreadable session memory", "file", file, "error", e);
                     }
                 }
             }
@@ -240,7 +240,7 @@ final class SessionMemory
             }
             catch (final IOException e)
             {
-                System.err.println("fix adapter: could not save the memory of " + memory.senderCompId + ": " + e);
+                Log.error("could not save a session's memory", "sender", memory.senderCompId, "error", e);
             }
         }
     }

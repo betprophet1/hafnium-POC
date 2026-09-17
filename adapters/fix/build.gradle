@@ -10,6 +10,8 @@ version = '0.1.0'
 // Pinned: the engine this adapter adopts, and what it needs beside it.
 def artioVersion = '0.183'
 def jacksonVersion = '2.20.0'
+// The Prometheus Java client: metrics on --metrics-listen (deploy/observability/metrics.md).
+def prometheusVersion = '1.9.0'
 def junitVersion = '5.13.4'
 
 java {
@@ -33,6 +35,9 @@ dependencies {
     implementation "uk.co.real-logic:artio-codecs:$artioVersion"
     implementation "uk.co.real-logic:artio-core:$artioVersion"
     implementation "com.fasterxml.jackson.core:jackson-databind:$jacksonVersion"
+    implementation "io.prometheus:prometheus-metrics-core:$prometheusVersion"
+    implementation "io.prometheus:prometheus-metrics-exporter-httpserver:$prometheusVersion"
+    implementation "io.prometheus:prometheus-metrics-instrumentation-jvm:$prometheusVersion"
 
     testImplementation platform("org.junit:junit-bom:$junitVersion")
     testImplementation 'org.junit.jupiter:junit-jupiter'
@@ -85,6 +90,9 @@ tasks.named('test') {
     // (test.sh does that); it skips itself when they are missing.
     systemProperty 'venue.root', file('../..').absolutePath
     systemProperty 'venue.scratch', layout.buildDirectory.dir('it').get().asFile.absolutePath
+    // The first of the test's ports (FixAdapterTest): 17430 unless VENUE_FIX_PORTS_BASE moves them, as for two
+    // checkouts testing on one machine at once.
+    systemProperty 'venue.fix.portsBase', System.getenv('VENUE_FIX_PORTS_BASE') ?: '17430'
     testLogging {
         events 'passed', 'skipped', 'failed'
         exceptionFormat = 'full'

@@ -14,6 +14,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * One private session on the gateway ({@code /v4/ws_private}), standing in for one FIX session.
@@ -45,12 +46,34 @@ final class GatewayLink implements WebSocket.Listener
     private final StringBuilder partial = new StringBuilder();
     private CompletableFuture<WebSocket> sending;
     private volatile boolean closed;
+    private final AtomicBoolean ended = new AtomicBoolean();
+    /** Whether the gateway welcomed the login, from which the link counts as connected. */
+    private volatile boolean welcomed;
+    /** Whether the adapter itself ended the link, rather than the gateway or the network. */
+    private volatile boolean closing;
+    private final Metrics metrics;
     private volatile long lastSentNanos = System.nanoTime();
     /** The credential the session logged in with, which the same account's REST calls carry too. */
     private String token;
 
-    private GatewayLink()
+    private GatewayLink(final Metrics metrics)
     {
+        this.metrics = metrics;
+    }
+
+    /** The link has ended, whoever ended it: counted once. */
+    private void ended()
+    {
+        closed = true;
+        if (ended.getAndSet(true) || !welcomed)
+        {
+            return;
+        }
+        metrics.linksConnected.decrementAndGet();
+        if (!closing)
+        {
+            metrics.gatewayDisconnected();
+        }
     }
 
     /**
@@ -58,9 +81,10 @@ final class GatewayLink implements WebSocket.Listener
      * {@link Refused} when it refuses the login, or with whatever stopped the connection.
      */
     static CompletableFuture<GatewayLink> open(
-        final HttpClient http, final URI uri, final ObjectNode login, final Duration timeout)
+        final HttpClient http, final URI uri, final ObjectNode login, final Duration timeout, final Metrics metrics)
     {
-        final GatewayLink link = new GatewayLink();
+        final GatewayLink link = new GatewayLink(metrics);
+        metrics.linksConnecting.incrementAndGet();
         link.token = login.path("token").asText();
         final CompletableFuture<WebSocket> connected =
             http.newWebSocketBuilder().connectTimeout(timeout).buildAsync(uri, link);
@@ -73,6 +97,7 @@ final class GatewayLink implements WebSocket.Listener
             .orTimeout(timeout.toMillis(), TimeUnit.MILLISECONDS)
             .handle((w, failure) ->
             {
+                metrics.linksConnecting.decrementAndGet();
                 if (failure != null)
                 {
                     link.close("login failed");
@@ -130,7 +155,7 @@ final class GatewayLink implements WebSocket.Listener
             {
                 if (failure != null)
                 {
-                    closed = true;
+                    ended();
                 }
             });
         }
@@ -142,6 +167,7 @@ final class GatewayLink implements WebSocket.Listener
      */
     void close(final String reason)
     {
+        closing = true;
         final CompletableFuture<WebSocket> last;
         synchronized (this)
         {
@@ -151,7 +177,7 @@ final class GatewayLink implements WebSocket.Listener
             .orTimeout(2, TimeUnit.SECONDS)
             .whenComplete((ws, failure) ->
             {
-                closed = true;
+                ended();
                 last.thenAccept(WebSocket::abort);
             });
     }
@@ -178,7 +204,7 @@ final class GatewayLink implements WebSocket.Listener
             }
             catch (final JsonProcessingException e)
             {
-                System.err.println("fix adapter: gateway sent something that is not JSON: " + text);
+                Log.warn("the gateway sent something that is not JSON", "text", text);
             }
         }
         ws.request(1);
@@ -190,6 +216,9 @@ final class GatewayLink implements WebSocket.Listener
         final String type = message.path("type").asText();
         if ("welcome".equals(type))
         {
+            // Counted as connected before the welcome completes, so an end right after it is counted against it.
+            welcomed = true;
+            metrics.linksConnected.incrementAndGet();
             welcome.complete(message);
         }
         else if ("error".equals(type))
@@ -206,7 +235,7 @@ final class GatewayLink implements WebSocket.Listener
     @Override
     public CompletionStage<?> onClose(final WebSocket ws, final int statusCode, final String reason)
     {
-        closed = true;
+        ended();
         welcome.completeExceptionally(new IllegalStateException("the gateway closed the session: " + reason));
         return null;
     }
@@ -214,7 +243,7 @@ final class GatewayLink implements WebSocket.Listener
     @Override
     public void onError(final WebSocket ws, final Throwable error)
     {
-        closed = true;
+        ended();
         welcome.completeExceptionally(error);
     }
 }
