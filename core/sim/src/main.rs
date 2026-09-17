@@ -22,12 +22,12 @@ use venue_link::wire::{Error, Ids, Ingress};
 const USAGE: &str = "usage:
   venue-sim seed  --ingress ADDR --catalogue FILE [--capacity small]
   venue-sim web   --ingress ADDR --feed ADDR --gateway ADDR --catalogue FILE [--listen 127.0.0.1:8080]
-                  [--oracle 127.0.0.1:8082] [--treasury 127.0.0.1:8083]
+                  [--public-gateway ADDR] [--oracle 127.0.0.1:8082] [--treasury 127.0.0.1:8083]
   venue-sim oracle --ingress ADDR --feed ADDR --catalogue FILE --calendar FILE [--capacity small]
                   [--listen 127.0.0.1:8082]
-  venue-sim maker --gateway ADDR [--token dev-synthetic-maker] [--size 10] [--levels 3] [--spread 1]
+  venue-sim maker --gateway ADDR [--public-gateway ADDR] [--token dev-synthetic-maker] [--size 10] [--levels 3] [--spread 1]
                   [--interval-ms 700] [--seed 1] [--margin 100]
-  venue-sim taker --gateway ADDR [--token dev-synthetic-taker] [--max-quantity 5] [--chance 250]
+  venue-sim taker --gateway ADDR [--public-gateway ADDR] [--token dev-synthetic-taker] [--max-quantity 5] [--chance 250]
                   [--sweep-chance 30] [--interval-ms 1000] [--seed 2]
   venue-sim workload --ingress ADDR [--books 600] [--hot 15] [--warm 100] [--accounts 500]
                   [--makers 5] [--seconds 60] [--seed 7] [--depth 16] [--capacity small]
@@ -35,7 +35,8 @@ const USAGE: &str = "usage:
                   (the last two default from the node's capacity profile: 3/4 of its orders, and its
                   client order ID table's entries / 120 000 seconds)
 
-The bots are clients of the gateway. The maker subscribes to requests for quote and answers them when its account is an
+The bots are clients of the gateway. --gateway serves the private half (orders, accounts, sessions); --public-gateway,
+the gateway serving the public half (markets, books), defaults to it. The maker subscribes to requests for quote and answers them when its account is an
 approved responder, adding --margin thousandths to its price for a parlay. seed, workload and the dummy oracle are operator
 tools and use the core's ingress and feed; the web page's settlement tab drives the dummy oracle's control API.
 workload puts a venue-shaped load on a core on its own, with no gateway in the way.
@@ -153,8 +154,9 @@ fn web(args: &Args) -> Result<(), Error> {
     let catalogue = Catalogue::load(&args.get("catalogue", None)?)?;
     let live = view::Live::follow(&args.get("feed", None)?);
     let (gateway, oracle) = (args.get("gateway", Some("127.0.0.1:8081"))?, args.get("oracle", Some("127.0.0.1:8082"))?);
+    let public = args.get("public-gateway", Some(&gateway))?;
     let treasury = args.get("treasury", Some("127.0.0.1:8083"))?;
-    let app = web::Web::new(catalogue, live, gateway, oracle, treasury);
+    let app = web::Web::new(catalogue, live, session::Gateways { private: gateway, public }, oracle, treasury);
     web::serve(&args.get("listen", Some("127.0.0.1:8080"))?, Arc::new(app))
 }
 
@@ -182,8 +184,10 @@ fn maker(args: &Args) -> Result<(), Error> {
         margin_per_mille: args.number("margin", 100)?,
     };
     let (gateway, token) = (args.get("gateway", None)?, args.get("token", Some("dev-synthetic-maker"))?);
-    let api = client::Api::new(&gateway, &token);
-    bots::maker(&api, &gateway, &token, &config, Ids::new('m')?, Ids::new('q')?)
+    let public = args.get("public-gateway", Some(&gateway))?;
+    let api = client::Api::new(&gateway, &token).with_public(&public);
+    let gateways = session::Gateways { private: gateway, public };
+    bots::maker(&api, &gateways, &token, &config, Ids::new('m')?, Ids::new('q')?)
 }
 
 fn taker(args: &Args) -> Result<(), Error> {
@@ -194,6 +198,8 @@ fn taker(args: &Args) -> Result<(), Error> {
         interval: Duration::from_millis(args.number("interval-ms", 1000)?),
         seed: args.number("seed", 2)?,
     };
-    let api = client::Api::new(&args.get("gateway", None)?, &args.get("token", Some("dev-synthetic-taker"))?);
+    let gateway = args.get("gateway", None)?;
+    let api = client::Api::new(&gateway, &args.get("token", Some("dev-synthetic-taker"))?)
+        .with_public(&args.get("public-gateway", Some(&gateway))?);
     bots::taker(&api, &config, Ids::new('t')?)
 }

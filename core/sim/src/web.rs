@@ -10,6 +10,7 @@
 //! its request to run now, are passed through under `/treasury`; nothing else of the treasury's own API is, because it
 //! trusts the account a request names and only the gateway may speak for one.
 
+use crate::session::Gateways;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -32,7 +33,8 @@ const SESSION_SILENCE: Duration = Duration::from_secs(45);
 pub struct Web {
     catalogue: Catalogue,
     live: Arc<Live>,
-    gateway: String,
+    /// Where `/v4` is passed through to: `/v4/ws_public` and `/v4/markets` to the public half, the rest to the private.
+    gateway: Gateways,
     oracle: String,
     treasury: String,
 }
@@ -46,7 +48,7 @@ fn poisoned<T>(_: T) -> Error {
 }
 
 impl Web {
-    pub fn new(catalogue: Catalogue, live: Arc<Live>, gateway: String, oracle: String, treasury: String) -> Self {
+    pub fn new(catalogue: Catalogue, live: Arc<Live>, gateway: Gateways, oracle: String, treasury: String) -> Self {
         Self { catalogue, live, gateway, oracle, treasury }
     }
 
@@ -94,7 +96,7 @@ fn trimmed(mut snapshot: Value) -> Value {
 
 pub fn serve(listen: &str, web: Arc<Web>) -> Result<(), Error> {
     let listener = TcpListener::bind(listen)?;
-    eprintln!("web page on http://{}, gateway at {}", listener.local_addr()?, web.gateway);
+    eprintln!("web page on http://{}, gateway at {}", listener.local_addr()?, web.gateway.private);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let web = Arc::clone(&web);
@@ -131,8 +133,11 @@ fn handle(web: &Web, stream: TcpStream) -> Result<(), Error> {
             }
         }
     }
+    if path.starts_with("/v4/ws_public") || path.starts_with("/v4/markets") {
+        return proxy(&web.gateway.public, "gateway", &head, reader, stream);
+    }
     if path.starts_with("/v4") {
-        return proxy(&web.gateway, "gateway", &head, reader, stream);
+        return proxy(&web.gateway.private, "gateway", &head, reader, stream);
     }
     if path == "/oracle" || path.starts_with("/oracle/") {
         return proxy(&web.oracle, "dummy oracle", &head, reader, stream);

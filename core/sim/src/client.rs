@@ -7,6 +7,8 @@ use venue_link::wire::Error;
 
 pub struct Api {
     addr: String,
+    /// Where market data (`/v4/markets` and under it) is asked for: the public half, which may be another gateway.
+    public: String,
     token: String,
 }
 
@@ -25,7 +27,14 @@ impl Response {
 
 impl Api {
     pub fn new(addr: &str, token: &str) -> Self {
-        Self { addr: addr.to_string(), token: token.to_string() }
+        Self { addr: addr.to_string(), public: addr.to_string(), token: token.to_string() }
+    }
+
+    /// The same, asking the gateway at `public` for market data: a venue may serve the public half apart from the
+    /// private one (interfaces/gateway/README.md, public and private).
+    pub fn with_public(mut self, public: &str) -> Self {
+        self.public = public.to_string();
+        self
     }
 
     pub fn get(&self, path: &str) -> Result<Response, Error> {
@@ -45,7 +54,8 @@ impl Api {
     }
 
     fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Response, Error> {
-        let mut stream = crate::session::connect(&self.addr)?;
+        let addr = if path.starts_with("/v4/markets") { &self.public } else { &self.addr };
+        let mut stream = crate::session::connect(addr)?;
         let body = body.map(Value::to_string).unwrap_or_default();
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: gateway\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

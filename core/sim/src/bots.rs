@@ -4,7 +4,7 @@
 //! responder: it answers requests for quote on parlays with resting sells (interfaces/gateway/README.md, parlays).
 
 use crate::client::{Api, Response};
-use crate::session::{self, Session};
+use crate::session::{self, Gateways, Session};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
@@ -410,7 +410,7 @@ type Respond<'a> = dyn FnMut(&[Market], &dyn Fn(u64) -> Option<Book>, &Value) ->
 /// are answered as they come rather than on the planning interval: a request's window is short.
 fn run_session(
     api: &Api,
-    gateway: &str,
+    gateway: &Gateways,
     token: &str,
     interval: Duration,
     who: &str,
@@ -427,17 +427,17 @@ fn run_session(
 
 fn session_pass(
     api: &Api,
-    gateway: &str,
+    gateway: &Gateways,
     token: &str,
     interval: Duration,
     who: &str,
     plan: &mut Plan<'_>,
     respond: &mut Respond<'_>,
 ) -> Result<(), Error> {
-    let (mut session, welcome) = Session::open(gateway, token, HEARTBEAT_SECONDS)?;
+    let (mut session, welcome) = Session::open(&gateway.private, token, HEARTBEAT_SECONDS)?;
     eprintln!("{who}: session {} logged in", welcome["sessionId"].as_str().unwrap_or("?"));
     // Books and market states come on a public session of their own: the private one carries only this account.
-    let mut market = Session::watch(gateway)?;
+    let mut market = Session::watch(&gateway.public)?;
     let mut markets = markets(api)?;
     // Cancel-on-disconnect covers one session's orders, and only while its gateway lives to send the MassCancel: a
     // gateway that died took an earlier session's orders' cover with it (interface 1 README, sessions). Cancelling
@@ -625,7 +625,7 @@ fn parlay_tick(markets: &[Market], books: &dyn Fn(u64) -> Option<Book>, rfq: &Va
 /// to 100¢ across an event's outcomes, over a WebSocket session with cancel-on-disconnect. Pulls its quotes when an
 /// event ends or is suspended. Answers each request for quote with a sell of the whole size, good until the request's
 /// window closes, priced by `parlay_tick`; parlays are otherwise left to their requesters and anyone who takes a quote.
-pub fn maker(api: &Api, gateway: &str, token: &str, config: &Maker, mut ids: Ids, mut quote_ids: Ids) -> ! {
+pub fn maker(api: &Api, gateway: &Gateways, token: &str, config: &Maker, mut ids: Ids, mut quote_ids: Ids) -> ! {
     let mut rng = Rng::new(config.seed);
     let mut fair: BTreeMap<u64, u64> = BTreeMap::new();
     let margin = config.margin_per_mille;

@@ -29,6 +29,13 @@ pub fn connect(addr: &str) -> Result<TcpStream, Error> {
     Ok(stream)
 }
 
+/// Where a client reaches interface 1: the gateway serving the private half, and the one serving the public half,
+/// which is the same gateway unless the venue runs the halves apart (interfaces/gateway/README.md, public and private).
+pub struct Gateways {
+    pub private: String,
+    pub public: String,
+}
+
 pub struct Session {
     socket: WebSocket<TcpStream>,
     inbox: VecDeque<Value>,

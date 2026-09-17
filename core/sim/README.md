@@ -13,6 +13,10 @@ The mini venue's actors (blueprint §16), for laptops and test clusters only.
 Parlays themselves are the parlay service's (`core/parlays`, `venue-parlays`), not an actor here: it lists them on
 request, routes requests for quote, and settles them from their legs.
 
+`maker`, `taker` and `web` reach the gateway's private half at `--gateway` and its public half (`/v4/ws_public`,
+`/v4/markets` and books) at `--public-gateway`, which defaults to the same address: a venue that serves the halves from
+separate gateway processes (interfaces/gateway/README.md, public and private) points them at one of each.
+
 The bots and the trading tabs are ordinary clients of interface 1 (`interfaces/gateway/`): the core cannot tell them
 from customers, which is the point of §16's rule that activity arrives through the real edge.
 
