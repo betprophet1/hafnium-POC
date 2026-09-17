@@ -364,6 +364,7 @@ impl Oracle {
             .map(|(event, _)| *event)
             .collect();
         let mut failure = None;
+        let quiet = changed.is_empty();
         for event in changed {
             let Some(case) = desk.cases.get(&event) else { continue };
             if let Err(e) = store.save(case) {
@@ -385,6 +386,8 @@ impl Oracle {
                 eprintln!("oracle: cases paused, their records could not be written: {e}");
                 desk.cases_paused = Some(format!("cases paused: the oracle's database is unavailable ({e})"));
             }
+            // Nothing was written this pass: only an answering database lifts the pause.
+            (None, true) if quiet && store.ping().is_err() => {}
             (None, true) => {
                 eprintln!("oracle: cases carry on, their records can be written again");
                 desk.cases_paused = None;

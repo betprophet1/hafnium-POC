@@ -16,26 +16,8 @@ spec:
       port: 8083
       targetPort: http
 ---
-# The ledger's book outlives the pod, as the core's journal does: a treasury that forgot its transfers would forget
-# money in flight.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: {{ $name }}-treasury
-  labels:
-    {{- include "venue-mini.labels" . | nindent 4 }}
-    app.kubernetes.io/component: treasury
-spec:
-  accessModes: ["ReadWriteOnce"]
-  {{- with .Values.treasury.storage.className }}
-  storageClassName: {{ . }}
-  {{- end }}
-  resources:
-    requests:
-      storage: {{ .Values.treasury.storage.size }}
----
-# The dummy treasury (core/treasury): deposits and withdrawals, a double-entry ledger and a fake bank. One writer to
-# its book, so an old pod stops before a new one starts.
+# The dummy treasury (core/treasury): deposits and withdrawals, a double-entry ledger and a fake bank, its records in
+# PostgreSQL. One writer to its records, so an old pod stops before a new one starts.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -72,10 +54,7 @@ spec:
               value: "{{ $core }}:7102"
             - name: VENUE_CATALOGUE
               value: /catalogue/markets.json
-            - name: VENUE_LEDGER
-              value: /var/lib/treasury/ledger.jsonl
-            - name: VENUE_FSYNC
-              value: {{ .Values.core.fsync | quote }}
+            {{- include "venue-mini.databaseEnv" (dict "ctx" . "service" "treasury") | trim | nindent 12 }}
             - name: VENUE_SEED
               value: {{ .Values.treasury.bank.seed | int64 | quote }}
             - name: VENUE_MIN_DELAY_MS
@@ -95,6 +74,7 @@ spec:
           ports:
             - name: http
               containerPort: 8083
+          # Ready while its records answer: without them it can take no transfer, and the gateway answers 503.
           readinessProbe:
             httpGet:
               path: /healthz
@@ -109,15 +89,12 @@ spec:
           volumeMounts:
             - name: catalogue
               mountPath: /catalogue
-            - name: ledger
-              mountPath: /var/lib/treasury
+            {{- include "venue-mini.databaseCaMount" . | trim | nindent 12 }}
       volumes:
         - name: catalogue
           configMap:
             name: {{ $name }}-catalogue
-        - name: ledger
-          persistentVolumeClaim:
-            claimName: {{ $name }}-treasury
+        {{- include "venue-mini.databaseCaVolume" . | trim | nindent 8 }}
 ---
 # The treasury trusts the account a request names, because only the gateway's private half, which authenticated it,
 # may reach it. The web page reaches it too, but passes through only the reconciliation summary and a run on demand.

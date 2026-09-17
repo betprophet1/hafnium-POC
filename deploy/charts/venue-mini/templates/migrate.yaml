@@ -1,0 +1,86 @@
+{{- $name := include "venue-mini.fullname" . }}
+{{- $services := splitList " " (include "venue-mini.databaseServices" .) | compact }}
+{{- if $services }}
+{{- /* Before the in-cluster server exists (a first install, or an upgrade that turns it on) a hook could only wait for it. */}}
+{{- $first := and .Values.postgres.enabled (not (lookup "apps/v1" "StatefulSet" .Release.Namespace (printf "%s-postgres" $name))) }}
+{{- $binaries := dict "treasury" (list "venue-treasury" "migrate") "identity" (list "venue-identity" "migrate") "parlays" (list "venue-parlays" "migrate") "oracle" (list "venue-sim" "oracle" "migrate") }}
+# Each service's schema migrations (core/store/README.md), run before the services need them: a pre-install and
+# pre-upgrade hook, except while an in-cluster PostgreSQL does not exist yet (the release that creates it): there the
+# job runs beside it, and the services wait until their schemas are current. Every migration run takes
+# an advisory lock, so a run repeated or overlapping changes nothing.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}-migrate{{ if $first }}-first{{ end }}
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  {{- if not $first }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation
+  {{- end }}
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        {{- include "venue-mini.podSecurity" . | nindent 8 }}
+      {{- if .Values.postgres.enabled }}
+      initContainers:
+        # Each service's role, database and schema, made if missing, with the role's password kept as the Secret says.
+        - name: bootstrap
+          image: "{{ .Values.postgres.image.repository }}:{{ .Values.postgres.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "/bootstrap/bootstrap.sh"]
+          env:
+            - name: PGHOST
+              value: {{ $name }}-postgres
+            - name: PGUSER
+              value: postgres
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "venue-mini.postgresSecret" . }}
+                  key: postgres-password
+          securityContext:
+            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /bootstrap
+            - name: passwords
+              mountPath: /etc/venue/postgres
+              readOnly: true
+      {{- end }}
+      containers:
+        {{- range $service := $services }}
+        - name: {{ $service }}
+          image: {{ include "venue-mini.image" $ | quote }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          command: {{ prepend (prepend (index $binaries $service) "--") "tini" | toJson }}
+          env:
+            {{- include "venue-mini.databaseEnv" (dict "ctx" $ "service" $service) | trim | nindent 12 }}
+          securityContext:
+            {{- include "venue-mini.containerSecurity" $ | nindent 12 }}
+          {{- if and (not $.Values.postgres.enabled) $.Values.database.caSecret }}
+          volumeMounts:
+            {{- include "venue-mini.databaseCaMount" $ | trim | nindent 12 }}
+          {{- end }}
+        {{- end }}
+      volumes:
+        {{- if .Values.postgres.enabled }}
+        - name: bootstrap
+          configMap:
+            name: {{ $name }}-postgres-bootstrap
+        - name: passwords
+          secret:
+            secretName: {{ include "venue-mini.postgresSecret" . }}
+        {{- end }}
+        {{- include "venue-mini.databaseCaVolume" . | trim | nindent 8 }}
+{{- end }}

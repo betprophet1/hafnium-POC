@@ -1,6 +1,6 @@
 apiVersion: v2
 name: venue-mini
-description: The mini venue of blueprint §16, for laptops (k3d) and ephemeral namespaces. So far, the core.
+description: The mini venue of blueprint §16, for laptops (k3d) and ephemeral namespaces, with PostgreSQL for its services' records (in the cluster or external).
 type: application
 version: 0.1.0
 appVersion: "0.1.0"

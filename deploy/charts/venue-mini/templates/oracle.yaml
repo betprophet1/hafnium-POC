@@ -73,6 +73,8 @@ spec:
             # Listing stops short of the node's capacities, so the oracle reads the profile the core runs with.
             - name: VENUE_CAPACITY
               value: {{ .Values.core.capacity | quote }}
+            # Resolution cases and what operators did by hand, so a replaced pod carries on where it was.
+            {{- include "venue-mini.databaseEnv" (dict "ctx" . "service" "oracle") | trim | nindent 12 }}
           ports:
             - name: http
               containerPort: 8082
@@ -92,6 +94,7 @@ spec:
               mountPath: /catalogue
             - name: calendar
               mountPath: /calendar
+            {{- include "venue-mini.databaseCaMount" . | trim | nindent 12 }}
       volumes:
         - name: catalogue
           configMap:
@@ -99,4 +102,5 @@ spec:
         - name: calendar
           configMap:
             name: {{ $name }}-calendar
+        {{- include "venue-mini.databaseCaVolume" . | trim | nindent 8 }}
 {{- end }}
