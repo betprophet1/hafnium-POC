@@ -2,7 +2,11 @@ The mini venue {{ .Release.Name }} is installed: the core, the gateway (interfac
 
   deploy/laptop.sh web                      then open http://127.0.0.1:8080 (the page, and the gateway under /v4)
   helm test {{ .Release.Name }} --logs                 smoke test through the core's ingress
+{{- if .Values.gateway.split.enabled }}
+  kubectl logs statefulset/{{ include "venue-mini.fullname" . }}-gateway-private     what a private gateway refuses, and why
+{{- else }}
   kubectl logs deploy/{{ include "venue-mini.fullname" . }}-gateway     what the gateway refuses, and why
+{{- end }}
 {{- if .Values.oracle.enabled }}
   kubectl logs deploy/{{ include "venue-mini.fullname" . }}-oracle      what the dummy oracle listed, ran and settled
 {{- end }}

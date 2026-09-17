@@ -39,3 +39,88 @@ readOnlyRootFilesystem: true
 capabilities:
   drop: ["ALL"]
 {{- end -}}
+
+{{/*
+A gateway pod's spec but its volumes, which name `catalogue` and `audit`: the halves of interface 1 given by `serve`
+(both, public or private), with `ctx` the chart's root. A private half reaches the core's ingress and the services it
+forwards to; a public one only follows the feed. Each pod of a split gateway writes the audit instance of its own name.
+*/}}
+{{- define "venue-mini.gatewayPod" -}}
+{{- $ := .ctx }}
+{{- $name := include "venue-mini.fullname" $ }}
+{{- $core := printf "%s-core" $name -}}
+securityContext:
+  {{- include "venue-mini.podSecurity" $ | nindent 2 }}
+containers:
+  - name: gateway
+    image: {{ include "venue-mini.image" $ | quote }}
+    imagePullPolicy: {{ $.Values.image.pullPolicy }}
+    command: ["tini", "--", "venue-gateway"]
+    env:
+      - name: VENUE_LISTEN
+        value: "0.0.0.0:8081"
+      {{- if ne .serve "both" }}
+      - name: VENUE_SERVE
+        value: {{ .serve }}
+      {{- end }}
+      {{- if ne .serve "public" }}
+      - name: VENUE_INGRESS
+        value: "{{ $core }}:7101"
+      {{- end }}
+      - name: VENUE_FEED
+        value: "{{ $core }}:7102"
+      - name: VENUE_CATALOGUE
+        value: /catalogue/markets.json
+      {{- if ne .serve "public" }}
+      {{- if $.Values.treasury.enabled }}
+      - name: VENUE_TREASURY
+        value: "{{ $name }}-treasury:8083"
+      {{- end }}
+      {{- if $.Values.identity.enabled }}
+      - name: VENUE_IDENTITY
+        value: "{{ $name }}-identity:8084"
+      {{- end }}
+      {{- if $.Values.parlays.enabled }}
+      - name: VENUE_PARLAYS
+        value: "{{ $name }}-parlays:7103"
+      {{- end }}
+      {{- end }}
+      - name: VENUE_PER_SECOND
+        value: {{ $.Values.gateway.perSecond | quote }}
+      - name: VENUE_BURST
+        value: {{ $.Values.gateway.burst | quote }}
+      - name: VENUE_LOGONS_PER_MINUTE
+        value: {{ $.Values.gateway.logonsPerMinute | quote }}
+      - name: VENUE_AUDIT_DIR
+        value: /var/lib/gateway-audit
+      - name: VENUE_AUDIT_INSTANCE
+      {{- if eq .serve "both" }}
+        value: "{{ $name }}-gateway"
+      {{- else }}
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+      {{- end }}
+      - name: VENUE_AUDIT_FSYNC
+        value: {{ $.Values.gateway.audit.fsync | quote }}
+    ports:
+      - name: http
+        containerPort: 8081
+    # Ready once the gateway has caught up with the core's feed.
+    readinessProbe:
+      httpGet:
+        path: /healthz
+        port: http
+      periodSeconds: 3
+    resources:
+      requests:
+        cpu: 20m
+        memory: 32Mi
+    securityContext:
+      {{- include "venue-mini.containerSecurity" $ | nindent 6 }}
+    volumeMounts:
+      - name: catalogue
+        mountPath: /catalogue
+      - name: audit
+        mountPath: /var/lib/gateway-audit
+{{- end -}}

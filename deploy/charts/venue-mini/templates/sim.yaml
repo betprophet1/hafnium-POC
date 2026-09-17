@@ -1,6 +1,11 @@
 {{- $name := include "venue-mini.fullname" . }}
 {{- $core := printf "%s-core" $name }}
 {{- $gateway := printf "%s-gateway:8081" $name }}
+{{- $publicGateway := $gateway }}
+{{- if .Values.gateway.split.enabled }}
+{{- $gateway = printf "%s-gateway-private:8081" $name }}
+{{- $publicGateway = printf "%s-gateway-public:8081" $name }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -108,6 +113,10 @@ spec:
               value: "{{ $core }}:7102"
             - name: VENUE_GATEWAY
               value: "{{ $gateway }}"
+            {{- if .Values.gateway.split.enabled }}
+            - name: VENUE_PUBLIC_GATEWAY
+              value: "{{ $publicGateway }}"
+            {{- end }}
             - name: VENUE_ORACLE
               value: "{{ $name }}-oracle:8082"
             - name: VENUE_TREASURY
@@ -169,6 +178,10 @@ spec:
           env:
             - name: VENUE_GATEWAY
               value: "{{ $gateway }}"
+            {{- if $.Values.gateway.split.enabled }}
+            - name: VENUE_PUBLIC_GATEWAY
+              value: "{{ $publicGateway }}"
+            {{- end }}
             {{- range $key, $value := $cfg }}
             {{- if ne $key "enabled" }}
             - name: VENUE_{{ $key | snakecase | upper }}

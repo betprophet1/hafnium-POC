@@ -1,5 +1,6 @@
 {{- $name := include "venue-mini.fullname" . }}
 {{- $core := printf "%s-core" $name }}
+{{- if not .Values.gateway.split.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -56,66 +57,7 @@ spec:
         {{- include "venue-mini.labels" . | nindent 8 }}
         app.kubernetes.io/component: gateway
     spec:
-      securityContext:
-        {{- include "venue-mini.podSecurity" . | nindent 8 }}
-      containers:
-        - name: gateway
-          image: {{ include "venue-mini.image" . | quote }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: ["tini", "--", "venue-gateway"]
-          env:
-            - name: VENUE_LISTEN
-              value: "0.0.0.0:8081"
-            - name: VENUE_INGRESS
-              value: "{{ $core }}:7101"
-            - name: VENUE_FEED
-              value: "{{ $core }}:7102"
-            - name: VENUE_CATALOGUE
-              value: /catalogue/markets.json
-            {{- if .Values.treasury.enabled }}
-            - name: VENUE_TREASURY
-              value: "{{ $name }}-treasury:8083"
-            {{- end }}
-            {{- if .Values.identity.enabled }}
-            - name: VENUE_IDENTITY
-              value: "{{ $name }}-identity:8084"
-            {{- end }}
-            {{- if .Values.parlays.enabled }}
-            - name: VENUE_PARLAYS
-              value: "{{ $name }}-parlays:7103"
-            {{- end }}
-            - name: VENUE_PER_SECOND
-              value: {{ .Values.gateway.perSecond | quote }}
-            - name: VENUE_BURST
-              value: {{ .Values.gateway.burst | quote }}
-            - name: VENUE_LOGONS_PER_MINUTE
-              value: {{ .Values.gateway.logonsPerMinute | quote }}
-            - name: VENUE_AUDIT_DIR
-              value: /var/lib/gateway-audit
-            - name: VENUE_AUDIT_INSTANCE
-              value: "{{ $name }}-gateway"
-            - name: VENUE_AUDIT_FSYNC
-              value: {{ .Values.gateway.audit.fsync | quote }}
-          ports:
-            - name: http
-              containerPort: 8081
-          # Ready once the gateway has caught up with the core's feed.
-          readinessProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            periodSeconds: 3
-          resources:
-            requests:
-              cpu: 20m
-              memory: 32Mi
-          securityContext:
-            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
-          volumeMounts:
-            - name: catalogue
-              mountPath: /catalogue
-            - name: audit
-              mountPath: /var/lib/gateway-audit
+      {{- include "venue-mini.gatewayPod" (dict "ctx" . "serve" "both") | nindent 6 }}
       volumes:
         - name: catalogue
           configMap:
@@ -123,6 +65,75 @@ spec:
         - name: audit
           persistentVolumeClaim:
             claimName: {{ $name }}-gateway-audit
+{{- else }}
+{{- range $half := list "public" "private" }}
+{{- $replicas := index $.Values.gateway.split $half "replicas" }}
+---
+# The gateway's {{ $half }} half on its own (interfaces/gateway/README.md, public and private), for clients that
+# address it by this Service: {{ if eq $half "public" }}/v4/ws_public and /v4/markets{{ else }}/v4/ws_private, /v4/account, /v4/orders, /v4/transfers, /v4/rfqs and /v4/keys{{ end }}.
+# A WebSocket stays on the pod it connected to, and a REST call needs no pod in particular, so no session affinity.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-gateway-{{ $half }}
+  labels:
+    {{- include "venue-mini.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  selector:
+    {{- include "venue-mini.selector" (dict "ctx" $ "component" "gateway") | nindent 4 }}
+    venue-mini/gateway-half: {{ $half }}
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+---
+# {{ $replicas }} gateway processes serving the {{ $half }} half. Each pod writes its own audit instance, named for the
+# pod, on a volume of its own: a pod replaced under the same name seals the file its predecessor left open, and no two
+# live pods ever write one instance.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}-gateway-{{ $half }}
+  labels:
+    {{- include "venue-mini.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  serviceName: {{ $name }}-gateway-{{ $half }}
+  replicas: {{ $replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" $ "component" "gateway") | nindent 6 }}
+      venue-mini/gateway-half: {{ $half }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" $ | nindent 8 }}
+        app.kubernetes.io/component: gateway
+        venue-mini/gateway-half: {{ $half }}
+    spec:
+      {{- include "venue-mini.gatewayPod" (dict "ctx" $ "serve" $half) | nindent 6 }}
+      volumes:
+        - name: catalogue
+          configMap:
+            name: {{ $name }}-catalogue
+  volumeClaimTemplates:
+    - metadata:
+        name: audit
+        labels:
+          {{- include "venue-mini.labels" $ | nindent 10 }}
+          app.kubernetes.io/component: gateway
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $.Values.gateway.audit.storage.className }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $.Values.gateway.audit.storage.size }}
+{{- end }}
+{{- end }}
 ---
 # Only the gateway, the treasury, the operator tools (seed job, parlay service, dummy oracle, the web page's event
 # list) and the core's own smoke test may reach the core's ingress and feed. Everything a customer or bot does goes

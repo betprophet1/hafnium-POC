@@ -94,6 +94,17 @@ gateway:
       size: 1Gi
       # Empty uses the cluster's default class (k3d: local-path).
       className: ""
+  # The public half (market data) and the private half (orders, accounts, transfers, requests for quote, keys) served
+  # by separate gateway processes, each half a StatefulSet of its own with replicas, a Service each
+  # (<release>-gateway-public, <release>-gateway-private) and an audit volume per pod (deploy/README.md, several
+  # gateways). Off, one gateway serves both halves behind <release>-gateway. Flood and logon limits are per pod, so an
+  # account may reach replicas times them.
+  split:
+    enabled: false
+    public:
+      replicas: 2
+    private:
+      replicas: 2
 
 # The parlay service: parlays listed on request, requests for quote routed to approved responders that subscribe, and
 # settlement from the legs. Responders start from the catalogue's "responder": true accounts and are approved and

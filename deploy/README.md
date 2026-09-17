@@ -9,7 +9,7 @@ through ArgoCD. There is no compose file; the laptop runs the same chart.
 | `charts/venue-mini/` | The chart: the core, the gateway, the identity service, the dummy treasury, the parlay service, a seed job for the demo markets, the dummy oracle, synthetic maker and taker, the web page, network policies and a `helm test` smoke test |
 | `charts/venue-mini/files/markets.json` | The demo catalogue: accounts with their dev tokens, tabs and whether they respond to requests for quote, markets and their outcome names |
 | `charts/venue-mini/files/calendar.json` | The dummy oracle's calendar: how often each market lists a new round, its timings, and the resolution timers (`core/sim/README.md`) |
-| `charts/venue-mini/templates/gateway.yaml` | Also the gateway's audit log volume (`/var/lib/gateway-audit`, `gateway.audit` in values): every request and answer, in the format of `interfaces/audit/`. Nothing ships it to retained storage yet |
+| `charts/venue-mini/templates/gateway.yaml` | Also the gateway's audit log volume (`/var/lib/gateway-audit`, `gateway.audit` in values): every request and answer, in the format of `interfaces/audit/`. Nothing ships it to retained storage yet. With `gateway.split.enabled`, the public and private halves as StatefulSets of their own (several gateways, below) |
 | `laptop.sh` | `up`, `web`, `restart` and `down` for a local k3d cluster |
 
 ## On a laptop
@@ -52,6 +52,57 @@ curl -s -H 'Authorization: Bearer dev-retail-customer' localhost:8080/v4/keys \
 
 `up` is safe to repeat. After rebuilding, it replaces every pod, the core included, which replays its journal before
 it is ready. `down` deletes the cluster and the journal with it.
+
+## Several gateways
+
+Interface 1's halves can be served by separate gateway processes, several of each (interfaces/gateway/README.md,
+public and private). Nothing a client relies on is held by one gateway alone: every gateway follows the core's feed,
+and transfers, API keys and requests for quote live in the services they all forward to, so a client may use any
+gateway for anything its half serves, and resume on another with `resumeFrom`. What is per gateway process: flood and
+logon limits (decision G-13), and its audit instance, which no two live gateways may share.
+
+**On one machine**, from built release binaries (`cargo build --release` in `core/`), with `CAT` the catalogue and
+`BIN` `core/target/release`; clients pick a gateway, nothing balances them:
+
+```sh
+mkdir -p run
+$BIN/venue-node serve --listen 127.0.0.1:18200 --feed 127.0.0.1:18201 --data run/node &
+$BIN/venue-sim seed --ingress 127.0.0.1:18200 --catalogue $CAT
+$BIN/venue-identity --catalogue $CAT --store run/identity.jsonl --listen 127.0.0.1:18202 &
+$BIN/venue-treasury --ingress 127.0.0.1:18200 --feed 127.0.0.1:18201 --catalogue $CAT --ledger run/ledger.jsonl \
+  --listen 127.0.0.1:18203 &
+$BIN/venue-parlays --ingress 127.0.0.1:18200 --feed 127.0.0.1:18201 --catalogue $CAT --listen 127.0.0.1:18204 \
+  --operator 127.0.0.1:18205 --responders run/responders.json &
+# Two private and two public gateways, each with its own port and audit instance.
+for g in private-a:private:18210 private-b:private:18211 public-c:public:18212 public-d:public:18213; do
+  IFS=: read -r instance serve port <<<"$g"
+  $BIN/venue-gateway --serve $serve --listen 127.0.0.1:$port --feed 127.0.0.1:18201 --ingress 127.0.0.1:18200 \
+    --catalogue $CAT --identity 127.0.0.1:18202 --treasury 127.0.0.1:18203 --parlays 127.0.0.1:18204 \
+    --audit-dir run/gateway-audit --audit-instance $instance &
+done
+# The maker trades on one private gateway and watches books on a public one; the taker uses the other pair.
+$BIN/venue-sim maker --gateway 127.0.0.1:18210 --public-gateway 127.0.0.1:18212 &
+$BIN/venue-sim taker --gateway 127.0.0.1:18211 --public-gateway 127.0.0.1:18213 &
+# The page passes /v4/ws_public and /v4/markets to the public gateway, the rest of /v4 to the private one.
+$BIN/venue-sim web --ingress 127.0.0.1:18200 --feed 127.0.0.1:18201 --catalogue $CAT --listen 127.0.0.1:18230 \
+  --gateway 127.0.0.1:18211 --public-gateway 127.0.0.1:18213 --treasury 127.0.0.1:18203 &
+```
+
+Stop them by the PIDs they were started with. `interfaces/tools/audit_verify.py run/gateway-audit/*.jsonl` checks
+every gateway's log; each file holds only its own gateway's traffic.
+
+**In the chart**, `gateway.split.enabled: true` replaces the one gateway with two StatefulSets,
+`<release>-gateway-public` and `<release>-gateway-private`, of `gateway.split.public.replicas` and
+`gateway.split.private.replicas` pods, each half behind a Service of the same name, and each pod with an audit volume
+of its own and the audit instance of its pod name. The web page and the bots are given both Services. A Service
+balances connections, not requests: a WebSocket stays on the pod it reached, a REST call may land on any, and neither
+needs session affinity, since nothing a client depends on lives in one pod; a client whose pod goes reconnects to
+another and resumes. Two things are not in the chart. An Ingress that exposes the venue under one host name routes by
+path: `/v4/ws_public` and `/v4/markets` with everything under it to the public Service, and `/v4/ws_private`,
+`/v4/account`, `/v4/orders`, `/v4/transfers`, `/v4/rfqs` and `/v4/keys` with everything under them to the private
+one, with WebSocket idle timeouts above the clients' heartbeat interval. And `deploy/laptop.sh up` restarts
+Deployments after a rebuild, not these StatefulSets: `kubectl rollout restart statefulset <release>-gateway-public
+<release>-gateway-private` does.
 
 ## What the chart does and does not do
 
