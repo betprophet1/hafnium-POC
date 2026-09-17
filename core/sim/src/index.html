@@ -545,7 +545,7 @@ function renderParlays() {
   setHTML($('#rfqs'), rfqs.map(r => {
     const left = secondsUntil(r.rfq.expiresAt), quotes = [...r.quotes.values()];
     const table = quotes.length
-      ? '<table><thead><tr><th class="r">Price</th><th class="r">Offered</th><th class="r">Bought</th><th>Valid for</th><th>State</th><th></th></tr></thead><tbody>'
+      ? '<table><thead><tr><th class="r">Price</th><th class="r">Remaining qty</th><th class="r">Filled qty</th><th>Valid for</th><th>State</th><th></th></tr></thead><tbody>'
         + quotes.map(q => {
           const live = q.state === 'open' && q.quantity > 0;
           const valid = !live ? '—' : q.expiresAt ? `${secondsUntil(q.expiresAt)} s` : 'until cancelled';

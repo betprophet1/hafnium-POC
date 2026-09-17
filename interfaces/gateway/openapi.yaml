@@ -745,11 +745,11 @@ components:
         orderId: { $ref: '#/components/schemas/Id' }
         instrumentId: { $ref: '#/components/schemas/Id' }
         price: { $ref: '#/components/schemas/PriceQuote' }
-        quantity: { type: integer, minimum: 0, description: Contracts still offered. }
+        quantity: { type: integer, minimum: 0, description: Remaining quantity, the contracts of this quote not yet bought. }
         filled:
           type: integer
           minimum: 0
-          description: Contracts of this quote bought so far, by anyone. A quote taken in full is `filled` with `quantity` 0 and `filled` its size.
+          description: Filled quantity, the contracts of this quote bought so far by anyone. A quote taken in full is `filled` with `quantity` 0 and `filled` its size.
         expiresAt:
           type: [string, 'null']
           format: date-time
