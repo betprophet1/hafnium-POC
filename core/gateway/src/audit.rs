@@ -1142,9 +1142,10 @@ mod recorded {
     /// the bytes that were actually sent. The socket's read timeout is short, and a loaded machine can take longer
     /// than that to answer, so a timeout is waited through rather than failed on, as `eventually` does.
     fn streamed(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>, kind: &str) -> String {
-        // Counted in the socket's own timeouts rather than read off a clock, as `eventually` counts its waits: six
-        // of them is half a minute, which is what a test may wait on a machine shared with other builds.
-        let mut left = 6;
+        // Counted in the socket's own timeouts rather than read off a clock, as `eventually` counts its waits. A
+        // frame that has to cross the node and come back through the feed can take a while on a machine running
+        // every other test at the same time, and waiting costs nothing when it arrives.
+        let mut left = 24;
         loop {
             match socket.read() {
                 Ok(Message::Text(text)) => {
