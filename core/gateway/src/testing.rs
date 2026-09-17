@@ -77,7 +77,7 @@ fn start_node(name: &str) -> (String, String) {
         let config = Config {
             listen: ingress.parse().expect("an ingress address"),
             feed: feed.parse().expect("a feed address"),
-            data_dir,
+            data_dir: data_dir.clone(),
             group: 1,
             node_id: 1,
             tick: Duration::from_millis(100),
@@ -89,17 +89,23 @@ fn start_node(name: &str) -> (String, String) {
             let outcome = node::serve(&config).map_err(|e| e.to_string());
             let _ = stopped.send(outcome);
         });
-        // Up to a minute, counted in waits rather than read off a clock. The ingress accepting once is not enough: the
-        // node binds its feed just after its ingress, and a feed port another test took meanwhile stops it with its
-        // ingress briefly accepting. A node still running a wait after its ingress accepted has bound both.
-        let mut accepted = false;
+        // Up to a minute, counted in waits rather than read off a clock. A connection to the ingress port is not enough
+        // on its own: free ports are found by binding and letting go, so until this node has bound its ports another
+        // test's node, or the client end of another test's connection, may hold them. The node creates its journal
+        // only once its engine is built, a moment before it binds its ingress and then its feed; a node that has done
+        // that, whose ingress accepts, and that is still running some waits later has bound both, since one that could
+        // not bind stops at once.
+        let journal = data_dir.join("journal.sbe");
+        let mut settled = None;
         for _ in 0..3000 {
             match stop.recv_timeout(Duration::from_millis(20)) {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if accepted {
-                        return (ingress, feed);
-                    }
-                    accepted = TcpStream::connect(&ingress).is_ok();
+                    settled = match settled {
+                        Some(0) => return (ingress, feed),
+                        Some(n) => Some(n - 1),
+                        None if journal.exists() && TcpStream::connect(&ingress).is_ok() => Some(10),
+                        None => None,
+                    };
                 }
                 Ok(Err(e)) => {
                     eprintln!("test node for {name} could not start, trying other ports: {e}");
