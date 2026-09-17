@@ -48,6 +48,7 @@ pub fn encode(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
         Some("SetFeeSchedule") => encode_set_fee_schedule(v, buf),
         Some("SetFeeOverride") => encode_set_fee_override(v, buf),
         Some("RemoveFeeOverride") => encode_remove_fee_override(v, buf),
+        Some("SetListingParameters") => encode_set_listing_parameters(v, buf),
         Some("OrderAccepted") => encode_order_accepted(v, buf),
         Some("OrderRejected") => encode_order_rejected(v, buf),
         Some("Fill") => encode_fill(v, buf),
@@ -61,6 +62,7 @@ pub fn encode(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
         Some("MarketStateChanged") => encode_market_state_changed(v, buf),
         Some("SettlementPayout") => encode_settlement_payout(v, buf),
         Some("OrderGroupUpdated") => encode_order_group_updated(v, buf),
+        Some("EventReleased") => encode_event_released(v, buf),
         Some("CommandApplied") => encode_command_applied(v, buf),
         other => Err(format!("unknown message {other:?}")),
     }
@@ -102,6 +104,7 @@ pub fn decode(buf: &[u8]) -> Result<Value, String> {
         set_fee_schedule_codec::SBE_TEMPLATE_ID => decode_set_fee_schedule(header, buf),
         set_fee_override_codec::SBE_TEMPLATE_ID => decode_set_fee_override(header, buf),
         remove_fee_override_codec::SBE_TEMPLATE_ID => decode_remove_fee_override(header, buf),
+        set_listing_parameters_codec::SBE_TEMPLATE_ID => decode_set_listing_parameters(header, buf),
         order_accepted_codec::SBE_TEMPLATE_ID => decode_order_accepted(header, buf),
         order_rejected_codec::SBE_TEMPLATE_ID => decode_order_rejected(header, buf),
         fill_codec::SBE_TEMPLATE_ID => decode_fill(header, buf),
@@ -115,6 +118,7 @@ pub fn decode(buf: &[u8]) -> Result<Value, String> {
         market_state_changed_codec::SBE_TEMPLATE_ID => decode_market_state_changed(header, buf),
         settlement_payout_codec::SBE_TEMPLATE_ID => decode_settlement_payout(header, buf),
         order_group_updated_codec::SBE_TEMPLATE_ID => decode_order_group_updated(header, buf),
+        event_released_codec::SBE_TEMPLATE_ID => decode_event_released(header, buf),
         command_applied_codec::SBE_TEMPLATE_ID => decode_command_applied(header, buf),
         other => Err(format!("unknown template {other}")),
     }
@@ -323,6 +327,7 @@ fn enum_reject_reason(v: &Value, k: &str) -> Result<reject_reason::RejectReason,
         "PROTOCOL_VERSION" => Ok(reject_reason::RejectReason::PROTOCOL_VERSION),
         "INVALID_COMMAND" => Ok(reject_reason::RejectReason::INVALID_COMMAND),
         "ORDER_GROUP_TRIGGERED" => Ok(reject_reason::RejectReason::ORDER_GROUP_TRIGGERED),
+        "LISTING_CAPACITY" => Ok(reject_reason::RejectReason::LISTING_CAPACITY),
         other => Err(format!("{k}: {other} is not a RejectReason")),
     }
 }
@@ -1548,6 +1553,43 @@ fn decode_remove_fee_override<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf
     Ok(Value::Object(m))
 }
 
+fn encode_set_listing_parameters(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
+    let mut enc = set_listing_parameters_codec::SetListingParametersEncoder::default().wrap(WriteBuf::new(buf), message_header_codec::ENCODED_LENGTH);
+    enc = enc.header(0).parent().map_err(sbe_err)?;
+    let cv = &v["record"];
+    let mut c = enc.record_encoder();
+    c.sequence(ju(cv, "sequence") as u64);
+    c.sequenced_at(ju(cv, "sequencedAt") as u64);
+    c.sequencer_group(ju(cv, "sequencerGroup") as u16);
+    enc = c.parent().map_err(sbe_err)?;
+    enc.command_id_zero_padded(js(v, "commandId").as_bytes());
+    enc.settled_retention_seconds(ju(v, "settledRetentionSeconds") as u32);
+    enc.max_events(ju(v, "maxEvents") as u32);
+    enc.max_instruments(ju(v, "maxInstruments") as u32);
+    enc.max_price_levels(ju(v, "maxPriceLevels") as u32);
+    Ok(enc.get_limit())
+}
+
+fn decode_set_listing_parameters<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: &'a [u8]) -> Result<Value, String> {
+    let mut m = Map::new();
+    m.insert("msg".into(), json!("SetListingParameters"));
+    let mut dec = set_listing_parameters_codec::SetListingParametersDecoder::default().header(header, 0);
+    let mut c = dec.record_decoder();
+    let mut cm = Map::new();
+    cm.insert("sequence".into(), json!(c.sequence()));
+    cm.insert("sequencedAt".into(), json!(c.sequenced_at()));
+    cm.insert("sequencerGroup".into(), json!(c.sequencer_group()));
+    dec = c.parent().map_err(sbe_err)?;
+    m.insert("record".into(), Value::Object(cm));
+    m.insert("commandId".into(), json!(bytes_str(&dec.command_id())));
+    m.insert("settledRetentionSeconds".into(), json!(dec.settled_retention_seconds()));
+    m.insert("maxEvents".into(), json!(dec.max_events()));
+    m.insert("maxInstruments".into(), json!(dec.max_instruments()));
+    m.insert("maxPriceLevels".into(), json!(dec.max_price_levels()));
+    let _ = &mut dec;
+    Ok(Value::Object(m))
+}
+
 fn encode_order_accepted(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
     let mut enc = order_accepted_codec::OrderAcceptedEncoder::default().wrap(WriteBuf::new(buf), message_header_codec::ENCODED_LENGTH);
     enc = enc.header(0).parent().map_err(sbe_err)?;
@@ -2071,6 +2113,37 @@ fn decode_order_group_updated<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf
     m.insert("maxContractsFilledPerWindow".into(), json!(dec.max_contracts_filled_per_window()));
     m.insert("windowMillis".into(), json!(dec.window_millis()));
     m.insert("triggered".into(), json!(dec.triggered().to_string()));
+    let _ = &mut dec;
+    Ok(Value::Object(m))
+}
+
+fn encode_event_released(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
+    let mut enc = event_released_codec::EventReleasedEncoder::default().wrap(WriteBuf::new(buf), message_header_codec::ENCODED_LENGTH);
+    enc = enc.header(0).parent().map_err(sbe_err)?;
+    let cv = &v["result"];
+    let mut c = enc.result_encoder();
+    c.input_sequence(ju(cv, "inputSequence") as u64);
+    c.result_index(ju(cv, "resultIndex") as u32);
+    c.sequenced_at(ju(cv, "sequencedAt") as u64);
+    c.sequencer_group(ju(cv, "sequencerGroup") as u16);
+    enc = c.parent().map_err(sbe_err)?;
+    enc.event_id(ju(v, "eventId") as u64);
+    Ok(enc.get_limit())
+}
+
+fn decode_event_released<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: &'a [u8]) -> Result<Value, String> {
+    let mut m = Map::new();
+    m.insert("msg".into(), json!("EventReleased"));
+    let mut dec = event_released_codec::EventReleasedDecoder::default().header(header, 0);
+    let mut c = dec.result_decoder();
+    let mut cm = Map::new();
+    cm.insert("inputSequence".into(), json!(c.input_sequence()));
+    cm.insert("resultIndex".into(), json!(c.result_index()));
+    cm.insert("sequencedAt".into(), json!(c.sequenced_at()));
+    cm.insert("sequencerGroup".into(), json!(c.sequencer_group()));
+    dec = c.parent().map_err(sbe_err)?;
+    m.insert("result".into(), Value::Object(cm));
+    m.insert("eventId".into(), json!(dec.event_id()));
     let _ = &mut dec;
     Ok(Value::Object(m))
 }

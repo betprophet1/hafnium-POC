@@ -24,12 +24,13 @@ COMMANDS = {
     "ActivateProtocol", "SleeveAdjust", "DefineTickTable", "DefineEvent", "ListInstrument", "SetEventPhase",
     "SetMarketState", "SetVenueMode", "ResolveEvent", "ExpireParlay", "SetRuleLimits", "SetGroupParameters",
     "SetAccountControls", "SetMakerProtection", "SetFeeSchedule", "SetFeeOverride", "RemoveFeeOverride",
-    "TransferOut", "TransferIn",
+    "SetListingParameters", "TransferOut", "TransferIn",
 }
 SEQUENCER_EVENTS = {"TimeTick", "EngineStarted", "SeedSet"}
 COMMAND_ID_WINDOW_SECONDS = 604_800                                  # D-25
 FEE_RATE_LIMIT = 1_000_000                                           # E-7.9: rates are millionths, at most 100%
 FEE_ACCOUNT = 0                                                      # D-21
+SETTLED_RETENTION_SECONDS = 604_800                                  # D-29: the default retention
 
 CANCEL_CAUSE_REASON = {
     "CLIENT_REQUEST": "MASS_CANCEL",
@@ -71,6 +72,7 @@ class Event:
     suspended: bool = False
     ended: bool = False
     resolved: bool = False
+    resolved_at: object = None                              # E-15.6, E-8.4
     collateral: int = 0
     instruments: list = field(default_factory=list)
 
@@ -166,6 +168,11 @@ class Engine:
         self.venue_mode = "NORMAL"
         self.active_order_limit = 0
         self.client_order_id_window_seconds = 7_200           # D-12
+        self.settled_retention_seconds = SETTLED_RETENTION_SECONDS  # E-7.12 (D-29)
+        self.max_events = 0                                    # E-7.12 (D-30): 0 is none
+        self.max_instruments = 0
+        self.max_price_levels = 0
+        self.releases = []                                     # E-8.4: resolved event IDs, in resolution order
         self.tick_tables = {}
         self.events = {}
         self.instruments = {}
@@ -399,7 +406,30 @@ class Engine:
                      key=lambda o: (o.expires_at, o.order_id))
         for o in due:
             self.remove(o, "EXPIRED")
+        self.release_due()                                               # E-8.4
         self.end_unit()
+
+    def release_due(self):                                               # E-8.4, E-8.5
+        """Releases the earliest-resolved event if its retention has passed: at most one a tick (D-29)."""
+        if not self.releases:
+            return
+        ev = self.events[self.releases[0]]
+        if ev.resolved_at + self.settled_retention_seconds * NS_PER_SECOND > self.now:
+            return
+        self.releases.pop(0)
+        for i in sorted(ev.instruments):
+            del self.instruments[i]
+            for acc in self.accounts.values():                          # all 0 since settlement (E-15.5)
+                for table in (acc.positions, acc.yes_locked, acc.no_locked):
+                    if table.pop(i, 0):
+                        raise FailStop(f"released instrument {i} still held")
+        for key in [k for k in self.maker_counters if k[1] == ev.event_id]:
+            del self.maker_counters[key]
+        del self.events[ev.event_id]
+        self.emit_event("EventReleased", eventId=ev.event_id)
+
+    def carried_price_levels(self):                                      # E-6.5
+        return sum(2 * len(self.tick_tables[i.tick_table_id]) for i in self.instruments.values())
 
     def on_EngineStarted(self, inp):
         pass
@@ -456,6 +486,8 @@ class Engine:
         def body(inp, cid):
             if inp["eventId"] in self.events or not (2 <= inp["stateCount"] <= 64):
                 raise Reject("INVALID_COMMAND")
+            if self.max_events and len(self.events) >= self.max_events:          # E-6.2 (D-30)
+                raise Reject("LISTING_CAPACITY")
             self.events[inp["eventId"]] = Event(inp["eventId"], inp["stateCount"], inp["scheduledStart"])
             self.applied(cid)
         self.command(inp, body)
@@ -479,6 +511,10 @@ class Engine:
                 raise Reject("INVALID_COMMAND")
             if cls == "PARLAY" and (ev.state_count != 2 or not legs):
                 raise Reject("INVALID_COMMAND")
+            if (self.max_instruments and len(self.instruments) >= self.max_instruments) or (   # E-6.3 (D-30)
+                    self.max_price_levels
+                    and self.carried_price_levels() + 2 * len(table) > self.max_price_levels):
+                raise Reject("LISTING_CAPACITY")
             inst = Instrument(inp["instrumentId"], inp["eventId"], cls, inp["tickTableId"], inp["lotStep"],
                               inp["allocationPolicy"], mask, inp.get("positionLimit", 0), legs)
             self.instruments[inst.instrument_id] = inst
@@ -527,6 +563,17 @@ class Engine:
                 raise Reject("INVALID_COMMAND")
             self.active_order_limit = inp["activeOrderLimit"]
             self.client_order_id_window_seconds = inp["clientOrderIdWindowSeconds"]
+            self.applied(cid)
+        self.command(inp, body)
+
+    def on_SetListingParameters(self, inp):                              # E-7.12
+        def body(inp, cid):
+            if inp["settledRetentionSeconds"] <= 0:
+                raise Reject("INVALID_COMMAND")
+            self.settled_retention_seconds = inp["settledRetentionSeconds"]
+            self.max_events = inp["maxEvents"]
+            self.max_instruments = inp["maxInstruments"]
+            self.max_price_levels = inp["maxPriceLevels"]
             self.applied(cid)
         self.command(inp, body)
 
@@ -719,6 +766,8 @@ class Engine:
             raise FailStop(f"payouts {paid} do not equal collateral {ev.collateral} (E-15.6)")
         ev.collateral = 0
         ev.resolved = True
+        ev.resolved_at = self.now                                        # E-15.6, E-8.4 (D-29)
+        self.releases.append(ev.event_id)
 
     # ============================================================ order book mechanics
 

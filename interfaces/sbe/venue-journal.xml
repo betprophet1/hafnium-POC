@@ -231,6 +231,7 @@
       <validValue name="PROTOCOL_VERSION">20</validValue>
       <validValue name="INVALID_COMMAND">21</validValue>
       <validValue name="ORDER_GROUP_TRIGGERED">22</validValue>
+      <validValue name="LISTING_CAPACITY" description="A DefineEvent or ListInstrument past maxEvents, maxInstruments or maxPriceLevels (spec E-6.2, E-6.3)">23</validValue>
     </enum>
     <enum name="CancelReason" encodingType="uint8">
       <validValue name="CLIENT_REQUEST">0</validValue>
@@ -533,6 +534,15 @@
     <field name="overrideId" id="3" type="FeeOverrideId"/>
   </sbe:message>
 
+  <sbe:message name="SetListingParameters" id="99" description="How long a resolved event is kept, and how many events, instruments and price levels the group carries at once; each limit uses 0 for none (spec E-7.12)">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="settledRetentionSeconds" id="3" type="Count" description="Sequencer seconds from an event's resolution to its release; at least 1 (spec E-8.4)"/>
+    <field name="maxEvents" id="4" type="Count" description="Events defined and not released"/>
+    <field name="maxInstruments" id="5" type="Count" description="Instruments listed and not released"/>
+    <field name="maxPriceLevels" id="6" type="Count" description="Twice the tick-table rows of every instrument listed and not released"/>
+  </sbe:message>
+
   <!-- ===== Results (interface 20), read by every reader (interface 12) ===== -->
 
   <sbe:message name="OrderAccepted" id="100">
@@ -660,6 +670,11 @@
     <field name="maxContractsFilledPerWindow" id="4" type="Count"/>
     <field name="windowMillis" id="5" type="Millis"/>
     <field name="triggered" id="6" type="BooleanType"/>
+  </sbe:message>
+
+  <sbe:message name="EventReleased" id="115" description="The retention after the event's resolution has passed: the event and every instrument listed under it no longer exist, and their IDs may be listed again (spec E-8.4)">
+    <field name="result" id="1" type="ResultHeader"/>
+    <field name="eventId" id="2" type="EventId"/>
   </sbe:message>
 
   <sbe:message name="CommandApplied" id="112" description="The outbox relay marks a command done only on seeing this for its command ID">

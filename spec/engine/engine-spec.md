@@ -86,8 +86,9 @@ orders and for trades within the group *(D-13)*.
 |---|---|
 | Clock | `now` [0], `lastSequence` [0], `protocolVersion` [1] |
 | Venue | `venueMode` [`NORMAL`], `activeOrderLimit` [0 = none], `clientOrderIdWindowSeconds` [7 200] *(D-12)* |
+| Listing | `settledRetentionSeconds` [604 800] *(D-29)*; `maxEvents`, `maxInstruments`, `maxPriceLevels` [all 0 = none] *(D-30)* |
 | Tick tables | by `tickTableId`: ordered rows of `numerator`, `denominator`, `complement` |
-| Events | by `eventId`: `stateCount`, `scheduledStart`, `started`, `suspended`, `ended` [all false], `resolved` [false], `collateralCents` [0] |
+| Events | by `eventId`: `stateCount`, `scheduledStart`, `started`, `suspended`, `ended` [all false], `resolved` [false], `resolvedAt` [none], `collateralCents` [0] |
 | Instruments | by `instrumentId`: `eventId`, `instrumentClass`, `tickTableId`, `lotStep`, `allocationPolicy`, `stateMask`, `positionLimit`, `legs`, `marketState` [`LISTED`] |
 | Books | per instrument, per side, per tick: a FIFO of order IDs |
 | Orders | by `orderId`: `accountId`, `sessionId`, `clientOrderId`, `instrumentId`, `side`, `enteredContract`, `tick` (effective limit), `remaining`, `timeInForce`, `expiresAt`, `atEventStart`, `postOnly`, `reduceOnly`, `spendCapRemaining` (or none), `clientOrderGroup` (or none), `lock`, `reserved`, `acceptedAt` (input sequence) |
@@ -98,6 +99,7 @@ orders and for trades within the group *(D-13)*.
 | Order groups | by `(accountId, clientOrderGroup)`: threshold, window, counter, window start, `triggered` |
 | Duplicates | by `(accountId, clientOrderId)`: expiry, and the order ID it created or none |
 | Commands | by `commandId`: expiry, seven days after the command was processed *(D-25)* |
+| Releases | the resolved events not yet released, in the order they were resolved (E-8.4) |
 | Counters | next order number and next trade number [1] |
 
 **E-3.2** An account exists from its first mention; until then every field has its initial value. Account 0
@@ -142,7 +144,7 @@ that input's results, counting from 0 across all units of the input.
    `OrderAmended`, `OrderGroupUpdated` (for `SetOrderGroup` and `ResetOrderGroup`) or
    `CommandApplied`. `MassCancel`, `TimeTick`, `EngineStarted` and `SeedSet` have no outcome result.
 2. **Events** in the order they occur: `Fill`, `OrderCancelled`, `OrderReduced`, `OrderGroupUpdated`
-   (triggers), `CollateralReleased`, `MarketStateChanged`, `SettlementPayout`.
+   (triggers), `CollateralReleased`, `MarketStateChanged`, `SettlementPayout`, `EventReleased`.
 3. **Positions** — one `PositionChanged` for each `(accountId, instrumentId)` whose position differs from its
    value at the start of the unit, ascending by `accountId` then `instrumentId`, carrying the final value.
 4. **Sleeves** — one `SleeveChanged` for each account whose `balance` or `reserved` differs from its value
@@ -170,13 +172,16 @@ rows are not ordinals 0, 1, 2 … in order, if any row has `numerator == 0` or `
 probabilities are not strictly increasing, or if any row's `complement` `c` fails `P(t) + P(c) = 1` exactly
 or `complement(c) = t`. Otherwise stored.
 
-**E-6.2 `DefineEvent`.** Rejected if the event ID exists or `stateCount` is not between 2 and 64. Otherwise
-stored with every flag false and `collateralCents` 0.
+**E-6.2 `DefineEvent`.** Rejected if the event ID exists or `stateCount` is not between 2 and 64; then rejected
+`LISTING_CAPACITY` if `maxEvents` is not 0 and the group carries `maxEvents` events (E-6.5). Otherwise stored with every
+flag false and `collateralCents` 0.
 
 **E-6.3 `ListInstrument`.** Rejected if the instrument ID exists; the event does not exist or is resolved;
 the tick table does not exist; `lotStep` is 0; for any row of the tick table, `100 · lotStep · numerator`
 is not divisible by `denominator`; `stateMask` is 0, has a bit at or above `stateCount`, or has every
-state's bit set; or the class constraint fails:
+state's bit set; or the class constraint fails (below). It is then rejected `LISTING_CAPACITY` if `maxInstruments`
+is not 0 and the group carries `maxInstruments` instruments, or if `maxPriceLevels` is not 0 and the price levels the
+group carries plus the listing's own exceed `maxPriceLevels` (E-6.5) *(D-30)*. The class constraints:
 
 | Class | Constraint |
 |---|---|
@@ -191,6 +196,11 @@ Otherwise stored with `marketState` `LISTED` and empty books; outcome `CommandAp
 **E-6.4** An event is a **partition event** while it has at least two instruments, their state masks are
 pairwise disjoint, and together they cover every state. The property is re-evaluated whenever an instrument
 is listed.
+
+**E-6.5 Carried reference data.** The group **carries** every event that has been defined and not released
+(E-8.4), and every instrument that has been listed and not released. An instrument's **price levels** are twice the
+number of rows in its tick table, and the price levels the group carries are the sum over the instruments it carries.
+Tick tables are never released and are not counted.
 
 ---
 
@@ -233,6 +243,11 @@ later than `now`. Otherwise stores the override under `overrideId`, replacing an
 
 **E-7.11 `RemoveFeeOverride`.** Rejected if no active override (E-10.12) has `overrideId`. Otherwise removes it.
 
+**E-7.12 `SetListingParameters`.** Rejected if `settledRetentionSeconds` is 0. Otherwise replaces
+`settledRetentionSeconds`, `maxEvents`, `maxInstruments` and `maxPriceLevels`. A retention applies from the next
+`TimeTick` to every resolved event not yet released, whenever it was resolved (E-8.4). A limit applies to later
+listings only: nothing the group already carries is released or changed by a limit below it *(D-29, D-30)*.
+
 ---
 
 ## 8. Time
@@ -248,6 +263,24 @@ an expired override never wins (E-10.12), E-7.11 treats it as absent, and E-7.10
 
 **E-8.3 `EngineStarted`, `SeedSet`.** No state change visible in results. `SeedSet` seeds the keyed hash
 or PRNG; no rule in v0 draws randomness.
+
+**E-8.4 Release.** On a `TimeTick`, after E-8.1: if the resolved event resolved earliest among those the group still
+carries has `resolvedAt + settledRetentionSeconds · 10⁹ <= now`, under the retention in force at this tick, that event
+is released. At most one event is released per tick, so a tick's work is bounded by one event's instruments; a
+backlog, after the retention is shortened, is released one event a tick in the order the events were resolved
+*(D-29)*. Releasing an event, in order: each of its instruments, ascending ID, ceases to exist; every maker protection
+counter for `(accountId, eventId)` is discarded (E-13.2); the event ceases to exist; `EventReleased` is emitted with
+its `eventId`. The event's positions are 0 and its books empty (E-15.5), so a release changes no position, sleeve or
+book level and emits nothing else.
+
+**E-8.5 After a release.** A released event or instrument is as if it had never been defined or listed. Every rule
+that looks one up finds nothing: an order on a released instrument is rejected `UNKNOWN_INSTRUMENT` (E-9.3 check 4), a
+cancel or amendment of an order on it `UNKNOWN_ORDER` (E-12.2, E-12.3), a mass cancel naming it removes nothing, and a
+command naming it, a resolution or parlay expiry included, `INVALID_COMMAND`. Its ID may be defined or listed again,
+and is then a new event or instrument. Nothing that is not the listing's own is released: accounts, sleeves, the
+duplicate table and command set, rule limits, order groups, maker protection settings and fee overrides are keyed by
+account, client order ID, command, group or override, so they stay, and a setting or override naming a released ID
+applies again to a listing that reuses it *(D-29)*.
 
 ---
 
@@ -569,7 +602,9 @@ Every account's `eventCash` for the event is then discarded.
 **E-15.6 Conservation at settlement.** The payouts sum to the event's `collateralCents` exactly: for `RESOLVED`
 by E-15.2, and for `VOID` because every change to `eventCash` either moved `collateralCents` by its negation or,
 for a fee, was matched by the opposite change to account 0's `eventCash` (E-10.11). Anything
-else is a fail-stop. The event is marked resolved and its `collateralCents` set to 0 *(D-1, D-21)*.
+else is a fail-stop. The event is marked resolved with `resolvedAt` = `now`, its `collateralCents` set to 0, and it
+joins the end of the releases (E-8.4) *(D-1, D-21, D-29)*. A resolution is final: E-15.3 rejects any later
+resolution of the event, so nothing moves `resolvedAt`, and once the event is released no input can name it.
 
 **E-15.7 `ExpireParlay`.** Rejected `INVALID_COMMAND` unless the instrument exists, is a `PARLAY` and its
 event is unresolved. Then processed as `ResolveEvent` `RESOLVED` on the instrument's event with the
@@ -625,6 +660,13 @@ E-3.3; a crossed book (E-10.10); a conservation violation (E-15.2, E-15.6); an u
 
 **E-18.2** Stopping is deterministic: every replica stops at the same input. Recovery is an operator
 decision — a fixed engine replaying the journal, or the quarantine path of blueprint §5.
+
+**E-18.3** An implementation holds its tables in storage sized when it starts. Filling one is a fail-stop, not a
+rejection: storage is not in the journal, so a rejection that depended on it could differ between replicas, where a
+fail-stop only stops them. The sequenced limits are what reject: `activeOrderLimit` (E-9.3 check 17), and
+`maxEvents`, `maxInstruments` and `maxPriceLevels` (E-6.2, E-6.3). An operator sets them no higher than the storage
+every replica has; an implementation must then never fail-stop for want of room for the events, instruments and price
+levels they admit, so storage a release frees (E-8.4) must be reusable by any later listing *(D-30)*.
 
 ---
 
