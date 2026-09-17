@@ -5,3 +5,7 @@
 blueprint
 spec
 interfaces/generated
+# The FIX adapter's toolchain (1 GiB of JDK and Gradle), Gradle state and build output: the image builds its own.
+adapters/fix/.toolchain
+adapters/fix/.gradle
+adapters/fix/build
