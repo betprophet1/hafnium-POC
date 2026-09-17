@@ -5,17 +5,17 @@
 //! arrive in, so a run can be repeated exactly and a failure found in one can be found again.
 //!
 //! `Bank` is the bank's side of the story: the transfers it received, what it decided and when, and the FBO omnibus
-//! balance that follows. It keeps its own book, apart from the treasury's, because it stands for another company's
-//! system: the treasury learns what the bank did only from its notices, which can go missing (`faults`), and checks
+//! balance that follows. It keeps its own book (tables of its own in the treasury's records), apart from the
+//! treasury's, because it stands for another company's system: the treasury learns what the bank did only from its notices, which can go missing (`faults`), and checks
 //! its ledger against the bank's statement (`recon`).
 
-use crate::book::Book;
 use crate::clock;
 use crate::faults::Faults;
+use crate::records::Records;
 use crate::transfer::{Kind, Method, Transfer};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
 pub struct FakeBank {
@@ -120,34 +120,6 @@ impl Receipt {
             _ => 0,
         }
     }
-
-    fn to_json(&self) -> Value {
-        json!({
-            "transfer": self.transfer, "account": self.account, "kind": self.kind.name(), "amountCents": self.amount,
-            "received": self.received, "decided": self.decided, "settles": self.settles, "cancelled": self.cancelled,
-            "arrivals": self.arrivals
-        })
-    }
-
-    fn from_json(v: &Value) -> Result<Self, String> {
-        let number = |name: &str| v[name].as_u64().ok_or_else(|| format!("a bank receipt needs {name}: {v}"));
-        Ok(Self {
-            transfer: number("transfer")?,
-            account: number("account")?,
-            kind: v["kind"].as_str().and_then(Kind::parse).ok_or("a bank receipt needs kind")?,
-            amount: number("amountCents")?,
-            received: number("received")?,
-            decided: number("decided")?,
-            settles: v["settles"].as_bool().ok_or("a bank receipt needs settles")?,
-            cancelled: v["cancelled"].as_u64(),
-            arrivals: v["arrivals"]
-                .as_array()
-                .ok_or("a bank receipt needs arrivals")?
-                .iter()
-                .map(|a| a.as_u64().ok_or("an arrival is a time"))
-                .collect::<Result<_, _>>()?,
-        })
-    }
 }
 
 /// The bank telling the treasury what it decided about a transfer.
@@ -196,7 +168,7 @@ impl Statement {
 pub struct Bank {
     pub fake: FakeBank,
     faults: Faults,
-    book: Book,
+    records: Arc<dyn Records>,
     /// The omnibus balance when the bank's book was opened: whatever the treasury's ledger said the bank held then.
     opening: i64,
     receipts: BTreeMap<u64, Receipt>,
@@ -207,49 +179,39 @@ pub struct Bank {
 }
 
 impl Bank {
-    /// The bank whose book is the file at `path`, replayed if it exists. A new book opens with `opening` in the
-    /// omnibus, for the treasury book named by `nonce`; an existing one must be that book's. Says whether it is new.
+    /// The bank whose book is in `records`, as it was left. A new book opens with `opening` in the omnibus, for the
+    /// treasury book named by `nonce`; an existing one must be that book's. Says whether it is new.
     pub fn open(
         fake: FakeBank,
         faults: Faults,
-        path: &Path,
-        fsync: bool,
+        records: Arc<dyn Records>,
         nonce: u32,
         opening: i64,
         now: u64,
     ) -> Result<(Self, bool), String> {
-        let (book, records) = Book::open(path, fsync)?;
-        let fresh = records.is_empty();
+        let loaded = records.load_bank()?;
+        let fresh = loaded.is_none();
         let mut bank = Self {
             fake,
             faults,
-            book,
+            records,
             opening,
             receipts: BTreeMap::new(),
             outbox: BTreeSet::new(),
             sent: BTreeMap::new(),
         };
-        if fresh {
-            bank.book.append(&json!({"bank": {"openingCents": opening, "opened": now, "treasuryBook": nonce}}))?;
-        }
-        for r in records {
-            if let Some(o) = r["bank"]["openingCents"].as_i64() {
-                if r["bank"]["treasuryBook"].as_u64() != Some(u64::from(nonce)) {
+        match loaded {
+            None => bank.records.open_bank(opening, now, nonce)?,
+            Some(book) => {
+                if book.treasury_book != nonce {
                     return Err(format!(
-                        "{} belongs to another treasury book: remove it with the book it belongs to",
-                        path.display()
+                        "the bank's book belongs to treasury book {}, not this one ({nonce})",
+                        book.treasury_book
                     ));
                 }
-                bank.opening = o;
-            } else if !r["receipt"].is_null() {
-                let receipt = Receipt::from_json(&r["receipt"])?;
-                bank.receipts.insert(receipt.transfer, receipt);
-            } else if let Some(id) = r["cancelled"].as_u64() {
-                if let Some(receipt) = bank.receipts.get_mut(&id) {
-                    receipt.cancelled = r["at"].as_u64();
-                }
-            } else if let Some(id) = r["sent"].as_u64() {
-                bank.sent.insert(id, u8::try_from(r["copies"].as_u64().unwrap_or(0)).unwrap_or(u8::MAX));
+                bank.opening = book.opening;
+                bank.receipts = book.receipts.into_iter().map(|r| (r.transfer, r)).collect();
+                bank.sent = book.sent;
             }
         }
         let ids: Vec<u64> = bank.receipts.keys().copied().collect();
@@ -257,6 +219,20 @@ impl Bank {
             bank.queue(id);
         }
         Ok((bank, fresh))
+    }
+
+    /// Reads the book again from the records, after a write whose outcome is not known.
+    pub fn reload(&mut self) -> Result<(), String> {
+        let book = self.records.load_bank()?.ok_or("the bank's book has gone from the records")?;
+        self.opening = book.opening;
+        self.receipts = book.receipts.into_iter().map(|r| (r.transfer, r)).collect();
+        self.sent = book.sent;
+        self.outbox.clear();
+        let ids: Vec<u64> = self.receipts.keys().copied().collect();
+        for id in ids {
+            self.queue(id);
+        }
+        Ok(())
     }
 
     fn queue(&mut self, id: u64) {
@@ -291,7 +267,8 @@ impl Bank {
             cancelled: None,
             arrivals: self.faults.arrivals(self.fake.seed, t.id, now.saturating_add(decision.delay_ms)),
         };
-        self.book.append(&json!({"receipt": receipt.to_json()}))?;
+        // The records keep the first receipt, should a write whose acknowledgement was lost be repeated.
+        let receipt = self.records.receive(&receipt)?;
         self.receipts.insert(t.id, receipt.clone());
         self.queue(t.id);
         Ok(receipt)
@@ -303,7 +280,7 @@ impl Bank {
             Some(r) if r.outcome(now) == Outcome::Pending => {}
             _ => return Ok(false),
         }
-        self.book.append(&json!({"cancelled": id, "at": now}))?;
+        self.records.cancel(id, now)?;
         if let Some(r) = self.receipts.get_mut(&id) {
             r.cancelled = Some(now);
         }
@@ -318,7 +295,7 @@ impl Bank {
             if at > now {
                 break;
             }
-            self.book.append(&json!({"sent": id, "copies": copy + 1}))?;
+            self.records.sent(id, copy, now)?;
             self.outbox.pop_first();
             self.sent.insert(id, copy + 1);
             if let Some(r) = self.receipts.get(&id) {
@@ -369,6 +346,7 @@ impl Bank {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::records::Memory;
 
     fn bank(seed: u64) -> FakeBank {
         FakeBank { seed, min_delay_ms: 1000, max_delay_ms: 3000, failure_per_mille: 100 }
@@ -421,16 +399,15 @@ mod tests {
         }
     }
 
-    fn open(path: &Path, faults: Faults) -> Bank {
+    fn open(records: &Memory, faults: Faults) -> Bank {
         let fake = FakeBank { seed: 1, min_delay_ms: 1000, max_delay_ms: 1000, failure_per_mille: 0 };
-        Bank::open(fake, faults, path, false, 7, 10_000, 0).expect("a bank").0
+        Bank::open(fake, faults, Arc::new(records.clone()), 7, 10_000, 0).expect("a bank").0
     }
 
     #[test]
     fn the_bank_takes_a_transfer_once_and_its_statement_follows_its_decisions() {
-        let path = std::env::temp_dir().join(format!("venue-treasury-bank-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let mut b = open(&path, Faults::NONE);
+        let records = Memory::default();
+        let mut b = open(&records, Faults::NONE);
         let first = b.receive(&transfer(1, Kind::Deposit, 500, Method::DummyBank), 100).expect("received");
         assert_eq!(b.receive(&transfer(1, Kind::Deposit, 500, Method::DummyBank), 900).expect("again"), first);
         b.receive(&transfer(2, Kind::Withdrawal, 200, Method::DummyBank), 100).expect("received");
@@ -451,35 +428,31 @@ mod tests {
 
         // Reopened, it holds the same and sends nothing twice.
         drop(b);
-        let mut b = open(&path, Faults::NONE);
+        let mut b = open(&records, Faults::NONE);
         assert_eq!(b.balance(2_000), 10_300);
         assert_eq!(b.deliver(5_000).expect("nothing"), vec![]);
         assert!(b.receipt(3).is_some_and(|r| r.cancelled == Some(500)));
         let fake = b.fake;
         drop(b);
-        let other = Bank::open(fake, Faults::NONE, &path, false, 8, 10_000, 0).map(|_| ());
+        let other = Bank::open(fake, Faults::NONE, Arc::new(records), 8, 10_000, 0).map(|_| ());
         assert!(other.is_err(), "a bank's book opened for another treasury book");
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn a_lost_notice_never_comes_and_a_duplicate_comes_twice() {
-        let path = std::env::temp_dir().join(format!("venue-treasury-bank-lost-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let mut b = open(&path, Faults { lost_notice_per_mille: 1000, ..Faults::NONE });
+        let records = Memory::default();
+        let mut b = open(&records, Faults { lost_notice_per_mille: 1000, ..Faults::NONE });
         b.receive(&transfer(1, Kind::Deposit, 500, Method::DummyInstant), 100).expect("received");
         assert_eq!(b.deliver(u64::MAX).expect("nothing"), vec![]);
         assert_eq!(b.balance(100), 10_500, "the bank settled it all the same");
         drop(b);
-        let mut b = open(&path, Faults::NONE);
+        let mut b = open(&records, Faults::NONE);
         assert_eq!(b.deliver(u64::MAX).expect("still nothing"), vec![], "a lost notice came back after a restart");
         drop(b);
-        let _ = std::fs::remove_file(&path);
-        let mut b = open(&path, Faults { duplicate_notice_per_mille: 1000, ..Faults::NONE });
+        let mut b = open(&Memory::default(), Faults { duplicate_notice_per_mille: 1000, ..Faults::NONE });
         b.receive(&transfer(1, Kind::Deposit, 500, Method::DummyInstant), 100).expect("received");
         assert_eq!(b.deliver(100).expect("the first").len(), 1);
         assert_eq!(b.next_delivery(), Some(100 + crate::faults::DUPLICATE_GAP_MS));
         assert_eq!(b.deliver(100 + crate::faults::DUPLICATE_GAP_MS).expect("the second").len(), 1);
-        let _ = std::fs::remove_file(&path);
     }
 }

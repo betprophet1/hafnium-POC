@@ -20,7 +20,8 @@ agent needs to build its core, and the core itself. Read this before changing an
 | `core/node/` | The single-member node for laptops and test environments: simulated sequencer, journal, result log, TCP ingress and feed. Never on the production path. |
 | `core/link/` | Talking to a node from outside the engine: ingress client, feed follower, a projection of the feed, the demo catalogue. |
 | `core/gateway/` | Interface 1, the REST and WebSocket gateway (`interfaces/gateway/`): the only client-facing component that writes to a sequencer group. Its public half (market data) and private half (orders, accounts, transfers, requests for quote) can run in one process or apart (`--serve`). |
-| `core/treasury/` | The dummy treasury: deposits and withdrawals behind the gateway's `/v4/transfers`, a double-entry ledger and a fake bank. Test environments only. |
+| `core/treasury/` | The dummy treasury: deposits and withdrawals behind the gateway's `/v4/transfers`, a double-entry ledger in PostgreSQL and a fake bank. Test environments only. |
+| `core/store/` | How the services keep their records in PostgreSQL: connecting by URL, a pool, migrations (plain SQL files per service, run by each service's `migrate`), transactions, and a schema per test. Its decisions are `core/store/decisions.md`. |
 | `core/identity/` | The identity service of test environments: API keys with permissions behind the gateway's `/v4/keys`, kept hashed in an append-only store, and verified for the gateways. Its decisions are `interfaces/gateway/decisions.md`. Test environments only. |
 | `core/parlays/` | The parlay service: lists parlays, keeps the approved responders, routes requests for quote to those that subscribe, and settles each parlay from its legs. Test environments only. |
 | `core/sim/` | The mini venue's actors: synthetic makers (which also answer requests for quote) and takers, the dummy oracle and its calendar, demo markets and the web page. Test environments only. |

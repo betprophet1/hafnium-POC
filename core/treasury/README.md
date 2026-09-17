@@ -38,9 +38,55 @@ omnibus always equals the customers' cash plus what is in transit (§11's invari
 sequencer group, which this ledger does not follow yet: it is the treasury's account of
 what crossed the venue's edge, not of what each account now holds.
 
-The book is an append-only file of JSON lines. Its first line names the book's nonce; each later line is a transfer
-as it now stands with the postings that took it there, written before anything that depends on it is done. On start the
-treasury replays it, drops a last line cut short by a stop mid-write, and carries on from where each transfer was.
+## Records in PostgreSQL
+
+The ledger, transfers, the fake bank's book and reconciliation are kept in PostgreSQL (`migrations/`, through
+`core/store`), in the database and schema `treasury`; the decisions are S-6 to S-12 of `core/store/decisions.md`.
+
+| Table | Holds | Changes |
+|---|---|---|
+| `book` | the book's nonce, which prefixes its command IDs | never |
+| `ledger_accounts` | each ledger account, its kind, and the venue account a customer's belongs to | never |
+| `postings`, `entries` | each posting (memo, transfer, idempotency key) and its lines, `bigint` cents | never |
+| `transfers` | each transfer as it now stands; `(account_id, client_transfer_id)` unique | where it stands, never its terms |
+| `transfer_events` | every state each transfer has been in, numbered | never |
+| `bank_book`, `bank_receipts`, `bank_cancellations`, `bank_notices` | the fake bank's own book | never |
+| `recon_runs`, `recon_breaks`, `recon_resolutions` | each run's report, each break as found, each resolution | never |
+
+What the database itself enforces, whatever writes to it:
+
+- **Double entry.** A deferred constraint trigger checks, when a transaction commits, that every posting written in
+  it has at least two lines and that they sum to zero; a transaction that breaks this is rolled back whole.
+- **Append-only.** Statement triggers refuse `UPDATE`, `DELETE` and `TRUNCATE` on every table of record; a row trigger
+  refuses a change to a transfer's terms, or a version that does not follow the last. A correction is a compensating
+  posting, never an edit. `PUBLIC` holds no such privileges either; the owning role keeps them only because
+  PostgreSQL's foreign-key checks need them, and the triggers bind it.
+- **Idempotency.** A posting's key is its transfer and the accounts it moves money between (`transfer:7:bank:fbo_omnibus>transit:deposits`), a step that happens once per transfer; an opening balance's is `opening:` and its accounts. A write
+  repeated after a lost acknowledgement finds the posting already there with the same lines and posts nothing; the same
+  key with other lines is refused. A transfer's state already recorded is not recorded again.
+- **Integer cents** in `bigint` throughout, and views `trial_balance` (per account) and `ledger_check` (total, number
+  of postings, whether it balances).
+
+Every change is written in one transaction before anything that depends on it is done. The treasury keeps a working
+copy in memory for reads and reconciliation, rebuilt from the records at start, and read again whenever a write failed
+(its outcome unknown) before anything else is written. The invariant `ledger_sums_to_zero` sums the ledger of record
+in the database, after the run's own fixes, and also checks that the working copy agrees with it.
+
+Earlier versions kept the book in JSON-lines files; `venue-treasury import --ledger FILE` moves one (and the bank's
+`FILE.bank.jsonl` beside it) into empty records, each line becoming the rows it would have been, and checks that the
+result balances. The treasury no longer reads or writes the files.
+
+### When the database cannot be reached
+
+- **At start** the treasury tries again with backoff (1 s doubling to 30 s), saying on stderr what it cannot reach and
+  why, and does not listen until it can; then it waits the same way for its schema to be at this build's migration,
+  which `venue-treasury migrate` applies (the chart's migrate job). A schema newer than the build, or an edited
+  migration, stops it.
+- **While running**, a new transfer, a cancellation or an operator's resolution is refused with `503 UNAVAILABLE` and
+  nothing is done. Transfers already under way wait where they are: a bank decision or a sleeve answer is taken up once
+  it can be written. Reads are answered from the working copy. Reconciliation runs are postponed and tried again every
+  five seconds. `/healthz` answers 503, so the pod is taken out of its Service and the gateway answers transfers with
+  503 until the database is back; nothing needs restarting.
 
 ## The fake bank
 
@@ -48,13 +94,13 @@ treasury replays it, drops a last line cut short by a stop mid-write, and carrie
 `--failure-per-mille` of transfers; `dummy_instant` settles at once; `dummy_failing` always fails. Each decision is a
 function of `--seed` and the transfer alone, so a run can be repeated.
 
-The bank stands for another company's system, so it keeps a book of its own beside the treasury's (the ledger's path
-with the extension `bank.jsonl`): each transfer it received, when and which way it decides, whether it was cancelled,
+The bank stands for another company's system, so it keeps a book of its own beside the treasury's (tables of its own,
+`bank_*`, sharing no keys with the treasury's): each transfer it received, when and which way it decides, whether it was cancelled,
 and which of its notices it has sent. The treasury learns a decision only from the bank's notice, and the bank's
 statement (`GET /v1/bank/statement`) gives the omnibus's opening and closing balance for a period and a line for each
 transfer received, decided or cancelled in it. A bank book opened beside an older treasury book opens with the
 ledger's omnibus balance and takes over the transfers the ledger has at the bank; a bank book that belongs to another
-treasury book is refused, so delete the two together.
+treasury book is refused.
 
 ## Losing messages on purpose
 
@@ -104,13 +150,13 @@ what it did; the rest stays open for an operator.
 A finding that matches an open break (same kind, transfer and account) is that break, still open, not a new one; an
 open break a run no longer finds is closed with the note `not found again by run N`. Every fix checks first that the
 transfer is still where the break found it, so a run repeated, or a late notice after a booking, never moves money
-twice. Breaks and runs are lines in the treasury's book, so they survive a restart, and run numbers never repeat.
+twice. Breaks and runs are in the records, so they survive a restart, and run numbers never repeat.
 
 ### Invariants
 
 Checked at the end of every run, after its fixes:
 
-- **`ledger_sums_to_zero`**: every posting balanced.
+- **`ledger_sums_to_zero`**: the ledger of record, summed in the database, is zero, and the working copy agrees.
 - **`omnibus_covers_customer_cash`**: the bank's own omnibus balance, less the decisions it has made that are still
   within the grace period and not booked, equals the customers' cash plus money in transit in the ledger. This is
   §11's "sum of customer cash equals the FBO balance minus in-flight transfers", with the balance taken from the bank
@@ -162,8 +208,10 @@ under `/treasury` for the account tab's reconciliation section, and nothing else
 ## Running it
 
 ```sh
+export VENUE_DATABASE_URL='postgres://postgres:dev@127.0.0.1:5432/postgres?sslmode=disable'
+target/release/venue-treasury migrate
 target/release/venue-treasury --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 \
-  --catalogue ../deploy/charts/venue-mini/files/markets.json --ledger /tmp/venue/treasury.jsonl
+  --catalogue ../deploy/charts/venue-mini/files/markets.json
 target/release/venue-gateway --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 \
   --catalogue ../deploy/charts/venue-mini/files/markets.json --treasury 127.0.0.1:8083
 ```
@@ -172,7 +220,7 @@ With messages lost and a run every five seconds, to watch reconciliation at work
 
 ```sh
 target/release/venue-treasury --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 \
-  --catalogue ../deploy/charts/venue-mini/files/markets.json --ledger /tmp/venue/treasury.jsonl \
+  --catalogue ../deploy/charts/venue-mini/files/markets.json \
   --faults demo --reconcile-every-ms 5000 --reconcile-grace-ms 3000
 curl -s 127.0.0.1:8083/v1/reconciliation
 curl -s -X POST 127.0.0.1:8083/v1/reconciliation/breaks/7/resolve -d '{"note": "checked with the bank"}'
@@ -183,7 +231,12 @@ curl -s -X POST 127.0.0.1:8083/v1/reconciliation/breaks/7/resolve -d '{"note": "
 - **Reconciliation covers the treasury's edge only.** The journal check matches the treasury's own sleeve grants and
   reclaims; fills, fees and payouts move cash inside the sequencer group and are not in this ledger, so an account's
   cash in the ledger is not its available cash in the engine, and nothing compares the two.
-- **Breaks and runs live in the book.** No separate case store: a busy schedule grows the book by a line a run.
+- **Breaks and runs live beside the ledger.** No separate case store: a busy schedule adds a row a run.
+- **One writer.** The working copy assumes this treasury is the only one writing its records (the chart runs one pod,
+  replaced rather than rolled); a second would find its writes refused on transfer IDs and idempotency keys rather than
+  doubling money, but would not serve correctly.
+- **The records are the outbox.** A reclaim or grant to send is a transfer's stage in `transfers`, written before it
+  is sent and done when its answer or the journal says so (blueprint §18); there is no separate outbox table.
 - **The journal comes from the feed**, read from the start each time the treasury starts. Until the feed has passed a
   transfer's sequence a missing command is not reported, and a command in doubt the feed has not reached yet is sent
   again, which is safe but reads as `engine_command_lost` rather than `engine_answer_lost`.

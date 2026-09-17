@@ -23,7 +23,7 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use postgres;
 
@@ -430,13 +430,11 @@ impl Database {
     }
 
     /// Brings the schema up to the last of `migrations`, and returns the versions it applied. Idempotent, and safe to
-    /// run from several processes at once: they queue on an advisory lock and later ones find nothing to do.
+    /// run from several processes at once: they queue on an advisory lock and later ones find nothing to do. This is
+    /// what a service's `migrate` subcommand runs; a service itself only checks (`wait_for_schema`), unless told to
+    /// migrate at start.
     pub fn migrate(&self, migrations: &[Migration]) -> Result<Vec<i32>, Error> {
-        for (i, m) in migrations.iter().enumerate() {
-            if usize::try_from(m.version).ok() != Some(i + 1) {
-                return Err(Error::refused(format!("migration {} ({}) is out of order", m.version, m.name)));
-            }
-        }
+        in_order(migrations)?;
         let schema = self.schema().to_string();
         self.transaction(|tx| {
             tx.execute("SELECT pg_advisory_xact_lock(hashtext('venue-store migrate ' || $1::text))", &[&schema])?;
@@ -452,30 +450,9 @@ impl Database {
                    applied_at timestamptz NOT NULL DEFAULT now()
                  )",
             )?;
-            let applied: Vec<(i32, String, String)> = tx
-                .query("SELECT version, name, checksum FROM schema_migrations ORDER BY version", &[])?
-                .iter()
-                .map(|r| (r.get(0), r.get(1), r.get(2)))
-                .collect();
-            for (version, name, sum) in &applied {
-                let known =
-                    usize::try_from(*version).ok().and_then(|v| v.checked_sub(1)).and_then(|i| migrations.get(i));
-                let Some(m) = known else {
-                    return Err(Error::refused(format!(
-                        "schema {schema} is at migration {version} ({name}), newer than this build knows ({}): run a \
-                         build that has it",
-                        migrations.len()
-                    )));
-                };
-                if *sum != checksum(m.sql) || name != m.name {
-                    return Err(Error::refused(format!(
-                        "migration {version} ({name}) of schema {schema} differs from the one applied: a released \
-                         migration must never be edited"
-                    )));
-                }
-            }
+            let applied = applied(tx, &schema, migrations)?;
             let mut done = Vec::new();
-            for m in migrations.iter().skip(applied.len()) {
+            for m in migrations.iter().skip(applied) {
                 tx.batch_execute(m.sql).map_err(|e| Error::from(e).in_migration(m))?;
                 tx.execute(
                     "INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)",
@@ -486,6 +463,101 @@ impl Database {
             Ok(done)
         })
     }
+
+    /// How many of `migrations` the schema has had applied: all of them is the schema this build expects. An error if
+    /// the schema has a migration this build does not know, or one that differs from this build's.
+    pub fn schema_version(&self, migrations: &[Migration]) -> Result<usize, Error> {
+        in_order(migrations)?;
+        let schema = self.schema().to_string();
+        self.transaction(|tx| {
+            let table = format!("{schema}.schema_migrations");
+            if tx.query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])?.get::<_, bool>(0) {
+                applied(tx, &schema, migrations)
+            } else {
+                Ok(0)
+            }
+        })
+    }
+
+    /// Waits until the schema is at the last of `migrations`, as a service does at start: while it is behind, or the
+    /// database cannot be reached, it says why on stderr (prefixed with `who`) and tries again with backoff. A schema
+    /// ahead of this build, or with an edited migration, is an error at once: waiting cannot mend it.
+    pub fn wait_for_schema(&self, migrations: &[Migration], who: &str) -> Result<(), String> {
+        let mut wait = Duration::from_secs(1);
+        loop {
+            match self.schema_version(migrations) {
+                Ok(at) if at == migrations.len() => return Ok(()),
+                Ok(at) => eprintln!(
+                    "{who}: schema {} is at migration {at} and this build needs {}: waiting for `{who} migrate` (the \
+                     chart's migrate job) to apply the rest; trying again in {} s",
+                    self.schema(),
+                    migrations.len(),
+                    wait.as_secs()
+                ),
+                Err(Error::Unavailable(e)) => {
+                    eprintln!("{who}: cannot read schema {}: {e}; trying again in {} s", self.schema(), wait.as_secs());
+                }
+                Err(Error::Refused(e)) => return Err(e),
+            }
+            thread::sleep(wait);
+            wait = (wait * 2).min(Duration::from_secs(30));
+        }
+    }
+}
+
+/// Versions from 1, each one more than the last.
+fn in_order(migrations: &[Migration]) -> Result<(), Error> {
+    for (i, m) in migrations.iter().enumerate() {
+        if usize::try_from(m.version).ok() != Some(i + 1) {
+            return Err(Error::refused(format!("migration {} ({}) is out of order", m.version, m.name)));
+        }
+    }
+    Ok(())
+}
+
+/// How many migrations `schema_migrations` records, each checked against this build's.
+fn applied(tx: &mut Transaction<'_>, schema: &str, migrations: &[Migration]) -> Result<usize, Error> {
+    let rows = tx.query("SELECT version, name, checksum FROM schema_migrations ORDER BY version", &[])?;
+    for row in &rows {
+        let (version, name, sum): (i32, String, String) = (row.get(0), row.get(1), row.get(2));
+        let known = usize::try_from(version).ok().and_then(|v| v.checked_sub(1)).and_then(|i| migrations.get(i));
+        let Some(m) = known else {
+            return Err(Error::refused(format!(
+                "schema {schema} is at migration {version} ({name}), newer than this build knows ({}): run a build \
+                 that has it",
+                migrations.len()
+            )));
+        };
+        if sum != checksum(m.sql) || name != m.name {
+            return Err(Error::refused(format!(
+                "migration {version} ({name}) of schema {schema} differs from the one applied: a released migration \
+                 must never be edited"
+            )));
+        }
+    }
+    Ok(rows.len())
+}
+
+/// Checks that `dir` holds exactly `migrations` as files named `V<version, three digits>__<name>.sql` with the same
+/// SQL, so the files a DevOps tool would run and the ones the binary embeds are the same. For each service's tests.
+pub fn check_files(dir: &std::path::Path, migrations: &[Migration]) -> Result<(), String> {
+    in_order(migrations).map_err(String::from)?;
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    names.sort();
+    let expected: Vec<String> = migrations.iter().map(|m| format!("V{:03}__{}.sql", m.version, m.name)).collect();
+    if names != expected {
+        return Err(format!("{} holds {names:?}, and the build embeds {expected:?}", dir.display()));
+    }
+    for (m, name) in migrations.iter().zip(&expected) {
+        let text = std::fs::read_to_string(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
+        if text != m.sql {
+            return Err(format!("{name} differs from the migration the build embeds"));
+        }
+    }
+    Ok(())
 }
 
 impl Error {
@@ -505,6 +577,19 @@ pub fn big(n: u64) -> Result<i64, Error> {
 /// A `bigint` column as the services' unsigned numbers; a negative value is a record something else wrote.
 pub fn unsigned(n: i64) -> Result<u64, Error> {
     u64::try_from(n).map_err(|_| Error::refused(format!("a negative value {n} where a count or time belongs")))
+}
+
+/// The latest time a `timestamptz` column is given: the end of the year 9999, well inside PostgreSQL's range.
+const LATEST_MS: u64 = 253_402_300_799_999;
+
+/// Wall-clock milliseconds since the Unix epoch, the services' own clock readings, as a `timestamptz` value.
+pub fn time(ms: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(ms.min(LATEST_MS))
+}
+
+/// A `timestamptz` column as milliseconds since the Unix epoch; a time before the epoch reads as 0.
+pub fn millis(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Databases for tests: each test gets a schema of its own on the server `VENUE_TEST_DATABASE_URL` names, so tests
@@ -533,6 +618,32 @@ pub mod testing {
             .collect();
         let schema = format!("t_{tag}_{}_{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
         Some(Config { url, schema, pool_size: 4, tls: None, ca_file: None, application: format!("test {name}") })
+    }
+
+    /// A configuration for a fresh schema owned by a role of its own that is not a superuser, as a deployed service's
+    /// is, so that privileges and triggers are tested the way they apply there. `None` if skipped.
+    pub fn owned_config(name: &str) -> Option<Config> {
+        let config = config(name)?;
+        let admin = Database::connect(&Config { schema: "public".into(), ..config.clone() })
+            .unwrap_or_else(|e| panic!("the test database: {e}"));
+        let role = config.schema.clone();
+        let mut bytes = [0u8; 12];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes))
+            .unwrap_or_else(|e| panic!("a password for {role}: {e}"));
+        let password: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        admin
+            .get()
+            .and_then(|mut c| {
+                c.batch_execute(&format!(
+                    "CREATE ROLE {role} LOGIN PASSWORD '{password}'; CREATE SCHEMA {role} AUTHORIZATION {role}"
+                ))?;
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("a role for {role}: {e}"));
+        let (scheme, rest) = config.url.split_once("://").unwrap_or_else(|| panic!("a URL with a scheme"));
+        let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+        Some(Config { url: format!("{scheme}://{role}:{password}@{host}"), ..config })
     }
 
     /// A pool on a fresh schema with `migrations` applied, or `None` (skipped, and said so).
@@ -598,12 +709,19 @@ mod tests {
     fn migrations_apply_once_in_order_and_refuse_an_edited_or_newer_history() {
         let Some(config) = testing::config("store_migrations") else { return };
         let db = Database::connect(&config).expect("a database");
+        assert_eq!(db.schema_version(&MIGRATIONS).expect("readable"), 0, "nothing applied yet");
         assert_eq!(db.migrate(&MIGRATIONS[..1]).expect("first"), vec![1]);
+        assert_eq!(db.schema_version(&MIGRATIONS).expect("readable"), 1, "behind");
         assert_eq!(db.migrate(&MIGRATIONS).expect("second"), vec![2]);
+        db.wait_for_schema(&MIGRATIONS, "test").expect("current");
         assert_eq!(db.migrate(&MIGRATIONS).expect("again"), Vec::<i32>::new(), "idempotent");
         let edited = [MIGRATIONS[0], Migration { sql: "ALTER TABLE notes ADD COLUMN at2 bigint", ..MIGRATIONS[1] }];
         assert!(matches!(db.migrate(&edited), Err(Error::Refused(e)) if e.contains("never be edited")));
         assert!(matches!(db.migrate(&MIGRATIONS[..1]), Err(Error::Refused(e)) if e.contains("newer than this build")));
+        assert!(
+            db.wait_for_schema(&MIGRATIONS[..1], "test").is_err(),
+            "an older build does not wait for a newer schema"
+        );
         let gap = [MIGRATIONS[1]];
         assert!(db.migrate(&gap).is_err(), "out of order");
 

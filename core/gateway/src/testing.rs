@@ -241,23 +241,27 @@ fn start_identity(name: &str) -> String {
     address
 }
 
-/// Starts a treasury of the test's own on the node, with a fresh book, and returns where it listens.
+/// Starts a treasury of the test's own on the node, with a fresh book, and returns where it listens. Its records are
+/// in PostgreSQL, in a schema of the test's own, when `VENUE_TEST_DATABASE_URL` names a server, and in memory
+/// otherwise.
 fn start_treasury(name: &str, ingress: &str, feed: &str) -> String {
-    let ledger = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}.treasury", std::process::id()));
-    let _ = std::fs::remove_file(&ledger);
     let settings = venue_treasury::Settings {
         ingress: ingress.to_string(),
         feed: feed.to_string(),
         catalogue: CATALOGUE.to_string(),
-        ledger,
-        fsync: false,
         bank: venue_treasury::bank::FakeBank { seed: 1, min_delay_ms: 200, max_delay_ms: 500, failure_per_mille: 0 },
         max_cents: 100_000_000,
         recon: venue_treasury::recon::Options::default(),
     };
+    let storage =
+        match venue_store::testing::url().and_then(|_| venue_store::testing::config(&format!("gw_treasury_{name}"))) {
+            Some(config) => venue_treasury::Storage::Postgres { config, migrate: true },
+            None => venue_treasury::Storage::Memory(venue_treasury::records::Memory::default()),
+        };
+    let records = venue_treasury::records(&storage).expect("the treasury's records");
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the treasury");
     let address = listener.local_addr().expect("its address").to_string();
-    venue_treasury::start(&settings, listener).expect("a treasury");
+    venue_treasury::start(&settings, records, listener).expect("a treasury");
     address
 }
 

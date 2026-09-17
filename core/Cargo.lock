@@ -866,6 +866,7 @@ dependencies = [
  "venue-link",
  "venue-node",
  "venue-parlays",
+ "venue-store",
  "venue-treasury",
 ]
 
@@ -942,6 +943,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "venue-link",
+ "venue-store",
 ]
 
 [[package]]

@@ -25,17 +25,21 @@ service's schema first on its `search_path`.
 
 ## Migrations
 
-Each service lists its migrations in code (`Migration { version, name, sql }`), versions from 1 with no gaps. At
-start, and in the service's `migrate` subcommand, `Database::migrate`:
+Each service keeps its migrations as plain SQL files, `migrations/V001__<name>.sql`, `V002__...`, forward-only, and
+embeds them in its binary (`Migration { version, name, sql: include_str!(...) }`); a test checks that the files and
+the embedded list agree (`check_files`), so DevOps can also run the files with another tool. `Database::migrate`:
 
-1. takes a transaction-scoped advisory lock for the schema, so services starting together queue rather than race;
+1. takes a transaction-scoped advisory lock for the schema, so two runs at once queue rather than collide;
 2. creates the schema if it does not exist (when the role may) and the `schema_migrations` table;
 3. refuses to go on if a migration already applied has a different name or checksum (a released migration was
-   edited) or the schema is at a version this build does not know (an older build started against a newer database);
+   edited) or the schema is at a version this build does not know (an older build against a newer database);
 4. applies the rest in order and records each, all in that one transaction: a failure leaves the schema as it was.
 
-Running it again does nothing. DDL rights can be kept from the running service by running `migrate` as a separate job
-with a role that has them, and starting the service with a role that does not; the startup run then finds nothing to do.
+Migrations run explicitly, through each service's `migrate` subcommand (the chart runs it as a Helm hook job). A
+service at start calls `Database::wait_for_schema`: it carries on once its schema is at the last migration it knows,
+waits with backoff while the schema is behind (saying so), and refuses to start if the schema is ahead or edited. For
+laptops and tests, `--migrate-on-start true` (`VENUE_MIGRATE_ON_START`) applies the migrations at start under the same
+lock. A mistake is fixed by a new migration, never by editing or undoing one.
 
 ## Pool and transactions
 

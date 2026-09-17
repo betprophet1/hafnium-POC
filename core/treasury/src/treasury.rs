@@ -3,8 +3,8 @@
 //! A deposit is sent to the bank and, once the bank settles it, granted to the account's sleeve in the sequencer group.
 //! A withdrawal is reclaimed from the sleeve first — the sequencer group decides whether the account has the cash — and
 //! only then sent to the bank; if the bank cannot pay it out, or the client cancels it while it waits, it is granted
-//! back. Every movement is a balanced posting in the ledger, written down with the transfer's new stage in one line of
-//! the book before anything is done that depends on it.
+//! back. Every movement is a balanced posting in the ledger, written down with the transfer's new stage in one write
+//! to the records (`records.rs`) before anything is done that depends on it.
 //!
 //! Nothing here waits on the network while holding the lock: `step` takes one piece of work out, does it, and puts
 //! the outcome back.
@@ -13,14 +13,13 @@
 //! and when an operator asks (`recon`), against the bank's statement and what the sequencer group applied.
 
 use crate::bank::{Bank, FakeBank, Notice};
-use crate::book::Book;
 use crate::ledger::{self, Ledger, Posting};
 use crate::recon;
+use crate::records::{Loaded, Records};
 use crate::transfer::{Kind, Method, Reason, Stage, State, Transfer};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, VecDeque};
-use std::path::Path;
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// Transfers a client may list at once.
@@ -35,8 +34,9 @@ const UPDATES: usize = 10_000;
 /// settled. A sequencer group that is slower than this is answered `pending`.
 pub const QUICK: Duration = Duration::from_secs(5);
 
-/// How soon work that could not be done — a sequencer group that did not answer — is tried again.
-const RETRY_MS: u64 = 1000;
+/// How soon work that could not be done — a sequencer group that did not answer, records that could not be written —
+/// is tried again.
+pub(crate) const RETRY_MS: u64 = 1000;
 
 /// Transfer IDs fit in the six hex digits a command ID leaves them (`command_id`).
 const MAX_TRANSFERS: u64 = 0xff_ffff;
@@ -128,8 +128,10 @@ pub(crate) struct Inner {
     pub(crate) transfers: BTreeMap<u64, Transfer>,
     by_client: BTreeMap<(u64, String), u64>,
     pub(crate) ledger: Ledger,
-    book: Book,
     pub(crate) bank: Bank,
+    /// A write to the records failed, so they may hold something this working copy does not: it is read again from
+    /// them before anything else is written.
+    pub(crate) stale: bool,
     /// The bank's notices that have arrived and are not yet acted on.
     inbox: VecDeque<Notice>,
     /// How much each transfer's postings have moved the FBO omnibus, to match against the bank's statement line by
@@ -147,6 +149,7 @@ pub(crate) struct Inner {
 
 pub struct Treasury {
     pub(crate) config: Config,
+    pub(crate) records: Arc<dyn Records>,
     pub(crate) inner: Mutex<Inner>,
     /// Signalled whenever anything changes: a new transfer for `step`, a new stage for a request waiting on one, a new
     /// update for a stream.
@@ -180,6 +183,9 @@ impl Command {
     }
 }
 
+/// The ledger, transfers by ID and by client transfer ID, and each transfer's omnibus movement.
+type WorkingCopy = (Ledger, BTreeMap<u64, Transfer>, BTreeMap<(u64, String), u64>, BTreeMap<u64, i64>);
+
 pub(crate) fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -191,63 +197,6 @@ fn nonce() -> Result<u32, String> {
         .and_then(|mut f| f.read_exact(&mut bytes))
         .map_err(|e| format!("drawing a nonce: {e}"))?;
     Ok(u32::from_le_bytes(bytes))
-}
-
-fn stage_json(stage: Stage) -> Value {
-    match stage {
-        Stage::Reclaiming => json!({"at": "reclaiming"}),
-        Stage::ToBank => json!({"at": "to_bank"}),
-        Stage::AtBank { due } => json!({"at": "at_bank", "due": due}),
-        Stage::Granting { then, reason } => {
-            json!({"at": "granting", "then": then.name(), "reason": reason.map(Reason::name)})
-        }
-        Stage::Done => json!({"at": "done"}),
-    }
-}
-
-fn stage_from(v: &Value) -> Result<Stage, String> {
-    Ok(match v["at"].as_str().unwrap_or("") {
-        "reclaiming" => Stage::Reclaiming,
-        "to_bank" => Stage::ToBank,
-        // A book from before the bank kept its own record also says which way the bank will decide; the bank's
-        // record is what counts now.
-        "at_bank" => Stage::AtBank { due: v["due"].as_u64().ok_or("an at_bank stage needs due")? },
-        "granting" => Stage::Granting {
-            then: v["then"].as_str().and_then(State::parse).ok_or("a granting stage needs then")?,
-            reason: v["reason"].as_str().and_then(Reason::parse),
-        },
-        "done" => Stage::Done,
-        other => return Err(format!("unknown stage {other:?}")),
-    })
-}
-
-/// A transfer as the book records it: everything, including the stage a client never sees.
-fn record(t: &Transfer) -> Value {
-    json!({
-        "id": t.id, "account": t.account, "clientTransferId": t.client_id, "kind": t.kind.name(),
-        "amountCents": t.amount, "method": t.method.name(), "state": t.state.name(),
-        "reason": t.reason.map(Reason::name), "sequence": t.sequence, "created": t.created, "updated": t.updated,
-        "stage": stage_json(t.stage), "inDoubt": t.in_doubt
-    })
-}
-
-fn from_record(v: &Value) -> Result<Transfer, String> {
-    let number = |name: &str| v[name].as_u64().ok_or_else(|| format!("a transfer record needs {name}: {v}"));
-    Ok(Transfer {
-        id: number("id")?,
-        account: number("account")?,
-        client_id: v["clientTransferId"].as_str().ok_or("a transfer record needs clientTransferId")?.to_string(),
-        kind: v["kind"].as_str().and_then(Kind::parse).ok_or("a transfer record needs kind")?,
-        amount: number("amountCents")?,
-        method: v["method"].as_str().and_then(Method::parse).ok_or("a transfer record needs method")?,
-        state: v["state"].as_str().and_then(State::parse).ok_or("a transfer record needs state")?,
-        reason: v["reason"].as_str().and_then(Reason::parse),
-        sequence: v["sequence"].as_u64(),
-        created: number("created")?,
-        updated: number("updated")?,
-        stage: stage_from(&v["stage"])?,
-        in_doubt: v["inDoubt"].as_u64(),
-    })
 }
 
 /// The command ID of a transfer's reclaim (`r`) or grant (`g`): fixed by the transfer, so that sending it again after
@@ -264,72 +213,41 @@ const fn in_transit(kind: Kind) -> &'static str {
     }
 }
 
-fn posting_json(memo: &str, posting: &Posting) -> Value {
-    json!({"memo": memo, "entries": posting.to_json()})
-}
-
 fn text<'a>(fields: &'a Map<String, Value>, name: &str) -> Result<&'a str, Refusal> {
     fields.get(name).and_then(Value::as_str).ok_or_else(|| Refusal::bad(format!("{name} is required, as a string")))
 }
 
 impl Treasury {
-    /// A treasury whose book is the file at `path`, replayed if it exists. A new book records the seed's grants as
-    /// opening balances held at the fake bank, so the ledger starts where the sequencer group does and the omnibus
-    /// covers every customer's cash from the first posting (blueprint §11): a withdrawal of seeded money is paid out
-    /// of money the bank holds, not out of nothing.
-    pub fn open(config: Config, path: &Path, fsync: bool, now: u64) -> Result<Self, String> {
-        let (mut book, records) = Book::open(path, fsync)?;
-        let mut ledger = Ledger::default();
-        let mut transfers = BTreeMap::new();
-        let mut by_client = BTreeMap::new();
-        let mut fbo: BTreeMap<u64, i64> = BTreeMap::new();
-        let mut recon = recon::State::new(&config.recon, now);
-        let mut records = records.into_iter();
-        let nonce = match records.next() {
-            Some(first) => {
-                let nonce = first["book"]["nonce"].as_u64().ok_or("the ledger's first line must name its book")?;
-                u32::try_from(nonce).map_err(|_| "a book nonce out of range")?
-            }
-            None => nonce()?,
-        };
-        for r in records {
-            let mut moved = 0i64;
-            for p in r["postings"].as_array().into_iter().flatten() {
-                let posting = Posting::from_json(&p["entries"])?;
-                ledger.post(&posting)?;
-                moved = moved.saturating_add(posting.cents(ledger::FBO));
-            }
-            if !r["transfer"].is_null() {
-                let t = from_record(&r["transfer"])?;
-                if moved != 0 {
-                    *fbo.entry(t.id).or_default() += moved;
-                }
-                by_client.insert((t.account, t.client_id.clone()), t.id);
-                transfers.insert(t.id, t);
-            }
-            recon.replay(&r)?;
-        }
-        let fresh = transfers.is_empty() && ledger.trial_balance()["postings"] == 0;
-        if fresh {
-            book.append(&json!({"book": {"nonce": nonce, "created": now}}))?;
-            let mut postings = Vec::new();
-            for (&account, &cents) in config.accounts.iter().filter(|(_, c)| **c > 0) {
-                postings.push(Posting::moving(cents, ledger::FBO, &ledger::customer(account))?);
-            }
-            if !postings.is_empty() {
+    /// A treasury whose book is in `records`, as it was left. A new book records the seed's grants as opening balances
+    /// held at the fake bank, so the ledger starts where the sequencer group does and the omnibus covers every
+    /// customer's cash from the first posting (blueprint §11): a withdrawal of seeded money is paid out of money the
+    /// bank holds, not out of nothing.
+    pub fn open(config: Config, records: Arc<dyn Records>, now: u64) -> Result<Self, String> {
+        let loaded = match records.load(recon::RUNS)? {
+            Some(loaded) => loaded,
+            None => {
                 let memo = "opening balance: the environment's seed grant, held at the fake bank";
-                let written: Vec<Value> = postings.iter().map(|p| posting_json(memo, p)).collect();
-                book.append(&json!({"postings": written}))?;
-                for posting in &postings {
-                    ledger.post(posting)?;
+                let mut opening = Vec::new();
+                for (&account, &cents) in config.accounts.iter().filter(|(_, c)| **c > 0) {
+                    opening.push((memo, Posting::moving(cents, ledger::FBO, &ledger::customer(account))?));
                 }
+                records.create(nonce()?, now, &opening)?;
+                records.load(recon::RUNS)?.ok_or("the book just created is not in the records")?
             }
-        }
+        };
+        let nonce = loaded.nonce;
+        let mut recon = recon::State::new(&config.recon, now);
+        let (ledger, transfers, by_client, fbo) = Self::working_copy(loaded, &mut recon)?;
         // The bank opens holding what the ledger says it holds, so a bank added beside an older book starts level
         // with it rather than with nothing.
-        let bank_path = path.with_extension("bank.jsonl");
-        let (mut bank, bank_fresh) =
-            Bank::open(config.bank, config.recon.faults, &bank_path, fsync, nonce, ledger.balance(ledger::FBO), now)?;
+        let (mut bank, bank_fresh) = Bank::open(
+            config.bank,
+            config.recon.faults,
+            Arc::clone(&records),
+            nonce,
+            ledger.balance(ledger::FBO),
+            now,
+        )?;
         if bank_fresh {
             for t in transfers.values().filter(|t| matches!(t.stage, Stage::AtBank { .. })) {
                 bank.receive(t, now)?;
@@ -340,8 +258,8 @@ impl Treasury {
             transfers,
             by_client,
             ledger,
-            book,
             bank,
+            stale: false,
             inbox: VecDeque::new(),
             fbo,
             recon,
@@ -350,11 +268,61 @@ impl Treasury {
             retry_at: BTreeMap::new(),
             generation: 0,
         };
-        Ok(Self { config, inner: Mutex::new(inner), changed: Condvar::new() })
+        Ok(Self { config, records, inner: Mutex::new(inner), changed: Condvar::new() })
     }
 
-    pub(crate) fn write(inner: &mut Inner, record: &Value) -> Result<(), String> {
-        inner.book.append(record)
+    /// The working copy of what the records hold: the ledger, transfers by ID and by client transfer ID, and the
+    /// omnibus movement of each transfer; breaks and runs go into `recon`.
+    fn working_copy(loaded: Loaded, recon: &mut recon::State) -> Result<WorkingCopy, String> {
+        let total: i128 = loaded.balances.values().map(|b| i128::from(*b)).sum();
+        if total != 0 {
+            return Err(format!("the ledger of record sums to {total} cents, not 0"));
+        }
+        let ledger = Ledger::restore(loaded.balances, loaded.postings);
+        let by_client = loaded.transfers.iter().map(|t| ((t.account, t.client_id.clone()), t.id)).collect();
+        let transfers = loaded.transfers.into_iter().map(|t| (t.id, t)).collect();
+        recon.restore(loaded.breaks, loaded.runs, loaded.next_run);
+        Ok((ledger, transfers, by_client, loaded.fbo))
+    }
+
+    /// Reads the working copy again from the records, after a write whose outcome is not known: whatever did reach
+    /// them is taken up, and streams are told of every transfer that looks different.
+    pub(crate) fn resync(&self, inner: &mut Inner) -> Result<(), String> {
+        let loaded = self.records.load(recon::RUNS)?.ok_or("the book has gone from the records")?;
+        if loaded.nonce != inner.nonce {
+            return Err(format!("the records now hold another book ({:08x})", loaded.nonce));
+        }
+        inner.bank.reload()?;
+        let (ledger, transfers, by_client, fbo) = Self::working_copy(loaded, &mut inner.recon)?;
+        for t in transfers.values() {
+            if inner.transfers.get(&t.id).map(Transfer::visible) != Some(t.visible()) {
+                let n = inner.next_update;
+                inner.next_update += 1;
+                inner.updates.push_back((n, t.account, t.to_json()));
+            }
+        }
+        while inner.updates.len() > UPDATES {
+            inner.updates.pop_front();
+        }
+        (inner.ledger, inner.transfers, inner.by_client, inner.fbo) = (ledger, transfers, by_client, fbo);
+        inner.stale = false;
+        inner.generation += 1;
+        self.changed.notify_all();
+        eprintln!("treasury: the working copy was read again from the records");
+        Ok(())
+    }
+
+    /// Reads the working copy again if a write failed since it was last read; an error if the records cannot be read.
+    pub(crate) fn fresh(&self, inner: &mut Inner) -> Result<(), String> {
+        if inner.stale {
+            self.resync(inner)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the records answer, for health checks.
+    pub fn health(&self) -> Result<(), String> {
+        self.records.ping().map_err(String::from)
     }
 
     /// Writes a transfer's new stage, with the postings that go with it, and only then applies them: a line that
@@ -370,8 +338,11 @@ impl Treasury {
         if before.is_some_and(|b| b != next.visible()) {
             next.updated = now;
         }
-        let written: Vec<Value> = postings.iter().map(|(memo, p)| posting_json(memo, p)).collect();
-        Self::write(inner, &json!({"transfer": record(&next), "postings": written}))?;
+        self.fresh(inner)?;
+        if let Err(e) = self.records.commit(&next, postings, now) {
+            inner.stale = true;
+            return Err(e.into());
+        }
         for (_, posting) in postings {
             inner.ledger.post(posting)?;
             let moved = posting.cents(ledger::FBO);
@@ -426,6 +397,10 @@ impl Treasury {
             .filter(|a| (1..=max).contains(a))
             .ok_or_else(|| Refusal::bad(format!("amountCents must be an integer from 1 to {max}")))?;
         let mut inner = locked(&self.inner);
+        self.fresh(&mut inner).map_err(|e| {
+            eprintln!("treasury: {e}");
+            Refusal::unavailable("the treasury's records are unavailable; nothing was done")
+        })?;
         if let Some(&id) = inner.by_client.get(&(account, client_id.to_string())) {
             let t = &inner.transfers[&id];
             return if (t.kind, t.amount, t.method) == (kind, amount, method) {
@@ -470,6 +445,10 @@ impl Treasury {
     /// DELETE: cancels a transfer still waiting on the bank. A withdrawal is granted back by `step`.
     pub fn cancel(&self, account: u64, id: u64, now: u64) -> Result<u64, Refusal> {
         let mut inner = locked(&self.inner);
+        self.fresh(&mut inner).map_err(|e| {
+            eprintln!("treasury: {e}");
+            Refusal::unavailable("the treasury's records are unavailable; nothing was done")
+        })?;
         let mut t = inner
             .transfers
             .get(&id)
@@ -487,6 +466,7 @@ impl Treasury {
         // its notice has arrived.
         if matches!(t.stage, Stage::AtBank { .. }) {
             let cancelled = inner.bank.cancel(id, now).map_err(|e| {
+                inner.stale = true;
                 eprintln!("treasury: {e}");
                 Refusal::unavailable("the bank could not record the cancellation; nothing was done")
             })?;
@@ -596,14 +576,20 @@ impl Treasury {
     /// most that long for a change.
     pub fn step(&self, sequencer: &mut dyn Sequencer, now: u64) -> Duration {
         loop {
+            if let Err(e) = self.fresh(&mut locked(&self.inner)) {
+                eprintln!("treasury: the records: {e}");
+                return Duration::from_millis(RETRY_MS);
+            }
             let due = locked(&self.inner).recon.due(now);
             if let Some(trigger) = due {
                 // The journal is read before the lock is taken, so it is never newer than the transfers it is matched
                 // against: a command the treasury has seen answered is on the feed or the feed is behind it.
                 let journal = sequencer.journal();
                 let mut inner = locked(&self.inner);
-                self.reconcile(&mut inner, &journal, trigger, now);
-                continue;
+                if self.reconcile(&mut inner, &journal, trigger, now) {
+                    continue;
+                }
+                return Duration::from_millis(RETRY_MS);
             }
             let command = {
                 let mut inner = locked(&self.inner);
@@ -611,6 +597,7 @@ impl Treasury {
                     Ok(true) => continue,
                     Ok(false) => {}
                     Err(e) => {
+                        inner.stale = true;
                         eprintln!("treasury: {e}");
                         return Duration::from_millis(RETRY_MS);
                     }
@@ -763,6 +750,7 @@ impl Treasury {
 pub(crate) mod tests {
     use super::*;
     use crate::ledger::{customer, DEPOSITS_IN_TRANSIT, FBO, WITHDRAWALS_IN_TRANSIT};
+    use crate::records::Memory;
 
     /// A sequencer group that keeps sleeves and remembers command IDs as E-7.1 and E-7.2 say, and can be told to
     /// stop answering.
@@ -814,25 +802,22 @@ pub(crate) mod tests {
 
     pub(crate) const ACCOUNT: u64 = 2;
 
-    pub(crate) fn path(name: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("venue-treasury-{name}-{}.jsonl", std::process::id()));
-        let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_file(p.with_extension("bank.jsonl"));
-        p
+    pub(crate) fn open(records: &Memory) -> Treasury {
+        open_with(records, recon::Options { every_ms: 0, ..recon::Options::default() })
     }
 
-    pub(crate) fn open(path: &Path) -> Treasury {
-        open_with(path, recon::Options { every_ms: 0, ..recon::Options::default() })
+    pub(crate) fn open_with(records: &Memory, recon: recon::Options) -> Treasury {
+        open_on(Arc::new(records.clone()), recon)
     }
 
-    pub(crate) fn open_with(path: &Path, recon: recon::Options) -> Treasury {
+    pub(crate) fn open_on(records: Arc<dyn Records>, recon: recon::Options) -> Treasury {
         let config = Config {
             bank: FakeBank { seed: 5, min_delay_ms: 100, max_delay_ms: 200, failure_per_mille: 0 },
             max_cents: 1_000_000,
             accounts: [(1, 0), (ACCOUNT, 50_000)].into_iter().collect(),
             recon,
         };
-        Treasury::open(config, path, false, 1_000).expect("a treasury")
+        Treasury::open(config, records, 1_000).expect("a treasury")
     }
 
     pub(crate) fn body(client: &str, kind: &str, cents: u64, method: &str) -> Value {
@@ -863,7 +848,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_settled_deposit_is_granted_once_and_the_ledger_balances() {
-        let p = path("deposit");
+        let p = Memory::default();
         let treasury = open(&p);
         let mut group = Group::default();
         assert_eq!(treasury.balance(&customer(ACCOUNT)), -50_000, "the seed's opening balance");
@@ -879,12 +864,11 @@ pub(crate) mod tests {
         assert_eq!(treasury.balance(DEPOSITS_IN_TRANSIT), 0);
         assert!(treasury.get(ACCOUNT, id).expect("the transfer")["sequence"].is_string());
         balanced(&treasury);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn a_withdrawal_beyond_available_cash_is_refused_and_moves_nothing() {
-        let p = path("refused");
+        let p = Memory::default();
         let treasury = open(&p);
         let mut group = Group::default();
         group.sleeves.insert(ACCOUNT, 300);
@@ -896,12 +880,11 @@ pub(crate) mod tests {
         assert_eq!(treasury.balance(WITHDRAWALS_IN_TRANSIT), 0);
         assert!(treasury.get(ACCOUNT, id).expect("the transfer")["sequence"].is_null());
         balanced(&treasury);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn a_withdrawal_is_reclaimed_before_the_bank_and_paid_out_after() {
-        let p = path("withdrawal");
+        let p = Memory::default();
         let treasury = open(&p);
         let mut group = Group::default();
         group.sleeves.insert(ACCOUNT, 1_000);
@@ -914,12 +897,11 @@ pub(crate) mod tests {
         assert_eq!(group.sleeves[&ACCOUNT], 600);
         assert_eq!((treasury.balance(FBO), treasury.balance(WITHDRAWALS_IN_TRANSIT)), (49_600, 0));
         balanced(&treasury);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn what_the_bank_fails_is_never_granted_or_is_granted_back() {
-        let p = path("bank-fails");
+        let p = Memory::default();
         let treasury = open(&p);
         let mut group = Group::default();
         group.sleeves.insert(ACCOUNT, 1_000);
@@ -933,12 +915,11 @@ pub(crate) mod tests {
         assert_eq!(treasury.balance(&customer(ACCOUNT)), -50_000);
         assert_eq!((treasury.balance(FBO), treasury.balance(WITHDRAWALS_IN_TRANSIT)), (50_000, 0));
         balanced(&treasury);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn a_client_transfer_id_makes_one_transfer_however_often_it_is_sent() {
-        let p = path("idempotent");
+        let p = Memory::default();
         let mut group = Group::default();
         let id = {
             let treasury = open(&p);
@@ -960,12 +941,11 @@ pub(crate) mod tests {
         assert_eq!(group.sleeves[&ACCOUNT], 250);
         assert_eq!(treasury.list(ACCOUNT, 10).expect("a list")["transfers"].as_array().map(Vec::len), Some(1));
         balanced(&treasury);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn a_grant_sent_again_after_a_restart_moves_the_money_once() {
-        let p = path("restart");
+        let p = Memory::default();
         let mut group = Group::default();
         {
             let treasury = open(&p);
@@ -981,7 +961,6 @@ pub(crate) mod tests {
         assert_eq!(group.sleeves[&ACCOUNT], 800, "granted twice");
         assert_eq!(treasury.balance(&customer(ACCOUNT)), -50_800, "posted twice");
         balanced(&treasury);
-        let _ = std::fs::remove_file(&p);
     }
 
     /// Passes each command on and then loses the answer, as a treasury that stops at that moment would.
@@ -1000,7 +979,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_sequencer_group_that_does_not_answer_leaves_the_transfer_to_be_tried_again() {
-        let p = path("down");
+        let p = Memory::default();
         let treasury = open(&p);
         let mut group = Group { down: true, ..Group::default() };
         group.sleeves.insert(ACCOUNT, 1_000);
@@ -1014,12 +993,11 @@ pub(crate) mod tests {
         treasury.step(&mut group, 2_000);
         assert_eq!(state(&treasury, id).0, "settled");
         assert_eq!(group.sleeves[&ACCOUNT], 900);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn only_a_transfer_waiting_on_the_bank_can_be_cancelled() {
-        let p = path("cancel");
+        let p = Memory::default();
         let treasury = open(&p);
         let mut group = Group::default();
         group.sleeves.insert(ACCOUNT, 1_000);
@@ -1038,12 +1016,11 @@ pub(crate) mod tests {
         let again = treasury.cancel(ACCOUNT, withdrawal, 1_600).map_err(|r| (r.status, r.code));
         assert_eq!(again, Err((409, "TRANSFER_NOT_CANCELLABLE")));
         balanced(&treasury);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn malformed_requests_create_nothing() {
-        let p = path("malformed");
+        let p = Memory::default();
         let treasury = open(&p);
         let refused = |b: Value| treasury.request(ACCOUNT, &b, 1_000).map_err(|r| r.status);
         assert_eq!(refused(json!([])), Err(400));
@@ -1057,7 +1034,38 @@ pub(crate) mod tests {
         assert_eq!(refused(extra), Err(400));
         assert_eq!(treasury.request(99, &body("x", "deposit", 1, "dummy_bank"), 1_000).map_err(|r| r.status), Err(404));
         assert_eq!(treasury.list(ACCOUNT, 10).expect("a list")["transfers"], json!([]));
-        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn records_that_cannot_be_reached_refuse_new_transfers_and_nothing_is_lost_when_they_return() {
+        let p = Memory::default();
+        let treasury = open(&p);
+        let mut group = Group::default();
+        group.sleeves.insert(ACCOUNT, 1_000);
+        let before =
+            treasury.request(ACCOUNT, &body("before", "deposit", 300, "dummy_bank"), 1_000).expect("requested");
+        treasury.step(&mut group, 1_000);
+        p.set_down(true);
+        let refused = treasury.request(ACCOUNT, &body("during", "deposit", 100, "dummy_instant"), 1_010);
+        assert_eq!(refused.map_err(|r| (r.status, r.code)), Err((503, "UNAVAILABLE")));
+        assert!(treasury.health().is_err());
+        // Reads are answered from the working copy; the bank's decision waits, and so does reconciliation.
+        assert_eq!(state(&treasury, before).0, "pending");
+        run(&treasury, &mut group, 1_500);
+        assert_eq!(state(&treasury, before).0, "pending", "moved on while its records could not be written");
+        locked(&treasury.inner).recon.requested = true;
+        treasury.step(&mut group, 1_600);
+        assert!(locked(&treasury.inner).recon.runs.is_empty(), "a run while the records were down");
+        p.set_down(false);
+        for now in (6_700..=7_500).step_by(50) {
+            treasury.step(&mut group, now);
+        }
+        assert_eq!(state(&treasury, before), ("settled".into(), Value::Null));
+        assert_eq!(locked(&treasury.inner).recon.runs.len(), 1, "the postponed run ran once the records were back");
+        treasury.request(ACCOUNT, &body("after", "deposit", 100, "dummy_instant"), 7_600).expect("accepted again");
+        balanced(&treasury);
+        let reopened = open(&p);
+        assert_eq!(state(&reopened, before).0, "settled");
     }
 
     #[test]

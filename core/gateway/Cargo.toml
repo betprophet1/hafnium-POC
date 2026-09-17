@@ -24,7 +24,8 @@ mio = { version = "1", default-features = false, features = ["os-poll", "net"] }
 [dev-dependencies]
 # The request-path tests run order entry against a real node rather than a stub of one.
 venue-node = { path = "../node" }
-# And deposits and withdrawals against a real treasury.
+# And deposits and withdrawals against a real treasury, in PostgreSQL when a test database is given.
 venue-treasury = { path = "../treasury" }
+venue-store = { path = "../store" }
 # Requests for quote are tested against the parlay service itself, beside the node.
 venue-parlays = { path = "../parlays" }
