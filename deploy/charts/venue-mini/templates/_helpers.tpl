@@ -117,6 +117,11 @@ containers:
       - name: VENUE_TRUSTED_PROXIES
         value: {{ $.Values.ingress.trustedProxies | quote }}
       {{- end }}
+      {{- with $.Values.gateway.allowedOrigins }}
+      # Pages served from somewhere else — a front end in development — may call the API from these origins only.
+      - name: VENUE_ALLOWED_ORIGINS
+        value: {{ . | quote }}
+      {{- end }}
     ports:
       - name: http
         containerPort: 8081

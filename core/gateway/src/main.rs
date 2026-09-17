@@ -49,6 +49,7 @@ const USAGE: &str = "usage:
   venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--treasury ADDR] [--parlays ADDR]
                 [--identity ADDR] [--dev-tokens true] [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
                 [--audit-dir ./gateway-audit] [--audit-instance HOSTNAME] [--audit-fsync true] [--trusted-proxies ADDRS]
+                [--allowed-origins ORIGINS]
                 [--metrics ADDR]
 
 --serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
@@ -60,6 +61,9 @@ as unavailable. --identity is the identity service (venue-identity) the private 
 /v4/keys to; without it keys are refused as unavailable. --dev-tokens false refuses the catalogue's dev tokens, which
 otherwise act as their accounts with every permission. Every request and what it was answered is written to the audit log in --audit-dir
 (interfaces/audit/README.md); a gateway that cannot write it does not start, and one that stops being able to exits.
+--allowed-origins is a comma-separated list of the origins a browser page may call this gateway from, such as
+https://app.example.com or http://127.0.0.1:8081 for a front end in development. None by default, which serves a page
+from the gateway's own origin and refuses every other, since a browser asks before it sends.
 --trusted-proxies is a comma-separated list of addresses and networks (such as 10.42.0.0/16) of proxies in front of
 the gateway, an ingress: on a connection from one, the audit log also records the client its X-Forwarded-For or
 Forwarded header names. None by default, and those headers are never believed from any other address.
@@ -202,6 +206,18 @@ fn run(args: &Args) -> Result<(), Error> {
     };
     let proxies = TrustedProxies::parse(&args.get("trusted-proxies", Some(""))?)
         .map_err(|e| format!("--trusted-proxies: {e}"))?;
+    let origins: Vec<String> = args
+        .get("allowed-origins", Some(""))?
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .map(String::from)
+        .collect();
+    for origin in &origins {
+        if !origin.starts_with("http://") && !origin.starts_with("https://") {
+            return Err(format!("--allowed-origins: {origin} is not an origin (scheme://host[:port])").into());
+        }
+    }
     let mut registry = Registry::default();
     venue_telemetry::build_info(&mut registry, "venue_gateway", env!("CARGO_PKG_VERSION"), &[]);
     let metrics = Metrics::register(&mut registry);
@@ -228,6 +244,7 @@ fn run(args: &Args) -> Result<(), Error> {
                 other => return Err(format!("--dev-tokens must be true or false, not {other}").into()),
             };
             let mut gateway = Gateway::private(Hub::new(catalogue), ingress, limits)
+                .with_origins(origins.clone())
                 .with_metrics(half_metrics)
                 .with_audit(audit.clone())
                 .with_trusted_proxies(proxies)

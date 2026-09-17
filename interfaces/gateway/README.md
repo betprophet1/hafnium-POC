@@ -411,6 +411,30 @@ responder's session stays subscribed across a service restart without doing anyt
 (its gateway restarted, or it reconnected) subscribes on its new session. While the service is unreachable,
 `subscribeRfqs`, `requestQuote`, `attachQuote` and `GET /v4/rfqs` are refused with `UNAVAILABLE`.
 
+## Browsers
+
+A page the venue serves itself calls the API from the same origin and needs nothing here. A page served from anywhere
+else — a front end in development, or a web app on its own host — is subject to the browser's same-origin rule, and
+the gateway answers it only from origins it has been given (`--allowed-origins`, `VENUE_ALLOWED_ORIGINS`,
+comma-separated, none by default).
+
+- A request that names an allowed `Origin` is answered with `Access-Control-Allow-Origin` echoing that origin,
+  `Access-Control-Expose-Headers: Retry-After` so a client can read how long a flood limit lasts, and `Vary: Origin`
+  so a cache never answers one origin with another's response. The origin is echoed rather than `*` because a client
+  sends its token in a header and an allow-list of exact origins is easier to reason about than a wildcard.
+- A request that names any other origin, or none, is answered exactly as it always was: the answer carries no such
+  headers, and a browser refuses to let the page read it.
+- `OPTIONS` from an allowed origin is the browser asking what it may send, and is answered 204 with
+  `Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS`,
+  `Access-Control-Allow-Headers: authorization, content-type` and `Access-Control-Max-Age: 600`. From anywhere else it
+  is a route that does not exist, 404.
+- **The WebSockets are not origin-checked**, and do not need to be: a session carries no ambient credential. Nothing
+  is authenticated by a cookie the browser would attach on its own; a session is only an account's once it has sent
+  `login` with a token, which a page from another site does not have. The audit log records the origin a request
+  came from either way (`headers`).
+
+Credentials in the browser's sense (cookies) are not used, so `Access-Control-Allow-Credentials` is never sent.
+
 ## Not in this draft
 
 The binary market-maker gateway (interface 2); keys scoped to markets, IP allow-lists and signed requests; real

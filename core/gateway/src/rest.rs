@@ -210,6 +210,52 @@ mod tests {
         (status, serde_json::from_str(json).unwrap_or(Value::Null))
     }
 
+    /// The whole response, headers included, for a request that names an origin as a browser page does.
+    fn from_origin(address: &str, method: &str, path: &str, origin: Option<&str>) -> String {
+        let mut stream = TcpStream::connect(address).expect("the gateway accepts a connection");
+        stream.set_read_timeout(Some(Duration::from_secs(30))).expect("a read timeout");
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {address}\r\n");
+        if let Some(origin) = origin {
+            head.push_str(&format!("Origin: {origin}\r\n"));
+        }
+        if method == "OPTIONS" {
+            head.push_str("Access-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: authorization\r\n");
+        }
+        head.push_str("Content-Length: 0\r\n\r\n");
+        stream.write_all(head.as_bytes()).expect("the request is sent");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("a whole response before the timeout");
+        response
+    }
+
+    #[test]
+    fn a_browser_page_is_answered_only_from_an_origin_the_gateway_allows() {
+        let venue = testing::venue("cors");
+        // The origin the test venue allows (testing.rs); a page there may read the answer.
+        let allowed = from_origin(&venue.address, "GET", "/v4/markets", Some("http://app.test"));
+        assert!(allowed.contains("Access-Control-Allow-Origin: http://app.test"), "{allowed}");
+        assert!(allowed.contains("Vary: Origin"), "{allowed}");
+
+        // Any other page is answered as it always was: the answer carries nothing that lets it be read.
+        let refused = from_origin(&venue.address, "GET", "/v4/markets", Some("http://elsewhere.test"));
+        assert!(refused.starts_with("HTTP/1.1 200"), "the request itself is served: {refused}");
+        assert!(!refused.contains("Access-Control-Allow-Origin"), "{refused}");
+
+        // And a request from anything but a browser is untouched.
+        let plain = from_origin(&venue.address, "GET", "/v4/markets", None);
+        assert!(!plain.contains("Access-Control-Allow-Origin"), "{plain}");
+
+        // Before sending an order, a browser asks what it may send.
+        let asked = from_origin(&venue.address, "OPTIONS", "/v4/orders", Some("http://app.test"));
+        assert!(asked.starts_with("HTTP/1.1 204"), "{asked}");
+        assert!(asked.contains("Access-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS"), "{asked}");
+        assert!(asked.contains("Access-Control-Allow-Headers: authorization, content-type"), "{asked}");
+
+        // Asked from anywhere else, it is a route that does not exist.
+        let unasked = from_origin(&venue.address, "OPTIONS", "/v4/orders", Some("http://elsewhere.test"));
+        assert!(unasked.starts_with("HTTP/1.1 404"), "{unasked}");
+    }
+
     /// POST /v4/rfqs as the retail customer. A parlay service refuses requests as unavailable while it is catching up
     /// with the feed, which on a loaded machine it can fall behind for a moment: that is asked again.
     fn ask_for_quotes(address: &str, body: &str) -> (u16, Value) {

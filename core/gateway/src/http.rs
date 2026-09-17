@@ -78,6 +78,37 @@ pub fn parse(buf: &[u8]) -> Result<Option<Request>, String> {
     Ok(Some(Request { method, path: path.to_string(), query, headers, body: body.to_vec() }))
 }
 
+/// The methods and headers a browser is told it may use, which is what the API takes (interface 1 README, browsers).
+const ALLOW_METHODS: &str = "GET, POST, PATCH, DELETE, OPTIONS";
+const ALLOW_HEADERS: &str = "authorization, content-type";
+/// How long a browser may keep a preflight answer: ten minutes, so a session costs one of them.
+const PREFLIGHT_MAX_AGE: u64 = 600;
+
+/// A response with the headers that let `origin` read it. The origin is echoed rather than `*` because a client
+/// sends its token in a header, and an allow-list of one is easier to reason about than a wildcard; `Vary` keeps a
+/// cache from answering one origin with another's response.
+pub fn with_cors(response: Vec<u8>, origin: &str) -> Vec<u8> {
+    let headers = format!(
+        "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Expose-Headers: Retry-After\r\nVary: Origin\r\n"
+    );
+    let Some(end) = response.windows(2).position(|w| w == b"\r\n") else { return response };
+    let mut out = Vec::with_capacity(response.len() + headers.len());
+    out.extend_from_slice(&response[..end + 2]);
+    out.extend_from_slice(headers.as_bytes());
+    out.extend_from_slice(&response[end + 2..]);
+    out
+}
+
+/// The answer to a browser's preflight: what it may send, and for how long it need not ask again.
+pub fn preflight(origin: &str) -> Vec<u8> {
+    let head = format!(
+        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Methods: \
+         {ALLOW_METHODS}\r\nAccess-Control-Allow-Headers: {ALLOW_HEADERS}\r\nAccess-Control-Max-Age: \
+         {PREFLIGHT_MAX_AGE}\r\nVary: Origin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    head.into_bytes()
+}
+
 /// A whole response, ready to write.
 pub fn response(status: u16, body: &Value, headers: &[(&str, String)]) -> Vec<u8> {
     let reason = match status {

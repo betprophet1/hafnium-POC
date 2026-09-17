@@ -154,6 +154,7 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool, proxies: 
     let mut private_half = Gateway::private(hub(), Submit::spawn(&ingress), limits)
         .with_audit(audit.clone())
         .with_trusted_proxies(proxies.clone())
+        .with_origins(vec!["http://app.test".into()])
         .with_identity(Some(start_identity(name)), true);
     let treasury = treasury.then(|| start_treasury(name, &ingress, &feed));
     if let Some(address) = &treasury {
@@ -165,8 +166,13 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool, proxies: 
     }
     let (service, parlays) = start_parlays(&ingress, &feed);
     Gateway::connect_parlays(&gateway, &parlays);
-    let public_half =
-        crate::start_half(Gateway::public(hub(), limits).with_audit(audit).with_trusted_proxies(proxies), &feed);
+    let public_half = crate::start_half(
+        Gateway::public(hub(), limits)
+            .with_audit(audit)
+            .with_trusted_proxies(proxies)
+            .with_origins(vec!["http://app.test".into()]),
+        &feed,
+    );
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
     let address = listener.local_addr().expect("its address").to_string();
     let halves = crate::Halves {

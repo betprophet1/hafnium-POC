@@ -139,6 +139,10 @@ migrations:
 # minute per account (blueprint §12). Set well above what the page and bots need: a maker requoting every market can
 # send a few dozen requests in one pass.
 gateway:
+  # The origins a browser page may call the API from, comma-separated (https://app.example.com), for a front end
+  # served from somewhere other than this ingress — a development server, say. Empty allows only a page the venue
+  # serves itself, which is what the demo page is.
+  allowedOrigins: ""
   perSecond: 200
   burst: 400
   logonsPerMinute: 30
@@ -178,6 +182,12 @@ ingress:
   # Empty answers any host name.
   host: ""
   annotations: {}
+  # A certificate for the host above, as a Secret of type kubernetes.io/tls already in the namespace: the venue is then
+  # served over https and wss. Phones need it — iOS refuses cleartext by default, and Android has since 9 — so a demo
+  # that is to be opened from a phone or a simulator wants one, self-signed and trusted on the device for a test
+  # (deploy/README.md, from a phone). Empty serves plain http, which is what a laptop browser is happy with.
+  tls:
+    secretName: ""
   # /oracle and /treasury, the dummy oracle's control API and the treasury's reconciliation summary, reach the page's
   # server and through it those services, as they do under deploy/laptop.sh web. They are unauthenticated operator
   # APIs: true only for a demo on a private network; false routes only the page itself (/ and /api), so they are not

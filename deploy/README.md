@@ -199,6 +199,35 @@ restricted. Its network policy lets anything reach its FIX port (a Logon's crede
 adapter reach only the gateway pods and cluster DNS. `fix.service.type` is `LoadBalancer` for k3d (published on the
 node, then mapped by `expose`), `ClusterIP` to keep FIX inside the cluster; `fix.service.port` is its port.
 
+## From a phone, a simulator or a front end in development
+
+The demo is served over plain HTTP, which a laptop browser is happy with and a phone is not: iOS refuses cleartext by
+default and Android has since 9. Two things make a device work.
+
+**A certificate.** `ingress.tls.secretName` names a Secret of type `kubernetes.io/tls` already in the namespace, and
+the venue is then served over `https` and `wss`. For a test, a self-signed certificate for the host name the device
+will use, trusted on the device (iOS: install the profile, then Settings → General → About → Certificate Trust
+Settings; Android: install as a CA and add a `network_security_config` that trusts user CAs in the debug build):
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=venue.local" \
+  -addext "subjectAltName=DNS:venue.local,IP:<private-address>" -keyout tls.key -out tls.crt
+kubectl create secret tls venue-tls --cert=tls.crt --key=tls.key
+helm upgrade --install venue deploy/charts/venue-mini --set ingress.enabled=true \
+  --set ingress.host=venue.local --set ingress.tls.secretName=venue-tls
+```
+
+**An origin the gateway answers.** A front end served from its own development server is another origin, and the
+browser refuses to let it read the answer unless the gateway says so (interfaces/gateway/README.md, browsers):
+
+```sh
+helm upgrade --install venue deploy/charts/venue-mini --set gateway.allowedOrigins="http://127.0.0.1:8081"
+```
+
+Where the device looks for the venue: a real phone and an iOS simulator use the machine's own address on the network
+they share; an Android emulator reaches its host as `10.0.2.2`. Neither can use `127.0.0.1`, which is the device
+itself.
+
 ## Databases
 
 The treasury, identity, parlay and oracle services keep their records in PostgreSQL (`core/store/README.md`; the

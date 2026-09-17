@@ -161,6 +161,9 @@ struct Http {
     whole: Option<Instant>,
     /// Whether the response has been recorded in the audit log.
     recorded: bool,
+    /// The origin this answer may be read from, when the request came from a browser page the gateway allows
+    /// (interface 1 README, browsers); `None` answers as it always did.
+    cors: Option<String>,
 }
 
 enum Socket {
@@ -403,6 +406,7 @@ fn decide(gateway: &Gateway, conn: &mut Conn, max_behind: usize, registry: &Regi
             route: metrics::route(path),
             whole: None,
             recorded: false,
+            cors: None,
         })
     });
     Decided::Here
@@ -427,6 +431,7 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, origin: &mut 
             Ok(None) => return true,
             Ok(Some(request)) => {
                 http.whole = Some(monotonic());
+                http.cors = gateway.allowed_origin(request.headers.get("origin").map(String::as_str));
                 http.who = request
                     .headers
                     .get("authorization")
@@ -438,10 +443,17 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, origin: &mut 
                 };
                 origin.client = gateway.proxies.client(origin.ip, &forwarding);
                 record_request(gateway, origin, http, &request);
-                match rest::route(gateway, &request, notify) {
-                    rest::Routed::Now(answer) => http.response = rest::response(answer),
-                    rest::Routed::Later(pending) => http.pending = Some(pending),
-                    rest::Routed::Service(call) => http.call = Some(call),
+                // A browser asks what it may send before it sends it. Nothing else answers that question, and a
+                // request from anywhere else is routed as it always was — where no route takes OPTIONS, it is a 404.
+                if request.method == "OPTIONS" && http.cors.is_some() {
+                    let allowed = http.cors.take().unwrap_or_default();
+                    http.response = http::preflight(&allowed);
+                } else {
+                    match rest::route(gateway, &request, notify) {
+                        rest::Routed::Now(answer) => http.response = rest::response(answer),
+                        rest::Routed::Later(pending) => http.pending = Some(pending),
+                        rest::Routed::Service(call) => http.call = Some(call),
+                    }
                 }
             }
             Err(reason) => {
@@ -468,6 +480,9 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, origin: &mut 
     }
     if !http.recorded {
         http.recorded = true;
+        if let Some(allowed) = http.cors.take() {
+            http.response = http::with_cors(std::mem::take(&mut http.response), &allowed);
+        }
         record_response(gateway, origin, http);
     }
     while http.written < http.response.len() {

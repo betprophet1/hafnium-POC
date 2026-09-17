@@ -327,6 +327,9 @@ pub struct Gateway {
     pub identity: Identity,
     /// The proxies whose forwarding headers name the client a record is about (`forwarded.rs`); none by default.
     pub proxies: TrustedProxies,
+    /// The origins a browser page may call this gateway from (interface 1 README, browsers). Empty by default, which
+    /// answers without the headers and so allows a page served from the gateway's own origin and nothing else.
+    origins: Vec<String>,
     /// What this half counts (`metrics.rs`); registered nowhere unless `with_metrics` gave it a registry's.
     pub metrics: Arc<HalfMetrics>,
 }
@@ -356,6 +359,7 @@ impl Gateway {
             audit: Audit::disabled(),
             identity: Identity::new(None, true, Arc::clone(&metrics)),
             proxies: TrustedProxies::default(),
+            origins: Vec::new(),
             metrics,
         }
     }
@@ -377,6 +381,19 @@ impl Gateway {
     pub fn with_trusted_proxies(mut self, proxies: TrustedProxies) -> Self {
         self.proxies = proxies;
         self
+    }
+
+    /// The same half, letting pages from `origins` call it.
+    pub fn with_origins(mut self, origins: Vec<String>) -> Self {
+        self.origins = origins;
+        self
+    }
+
+    /// The origin to answer with, for a request that came from one: `None` when the request names no origin or names
+    /// one that was not allowed, and the answer then carries no headers for it.
+    pub fn allowed_origin(&self, asked: Option<&str>) -> Option<String> {
+        let asked = asked?.trim();
+        self.origins.iter().find(|allowed| allowed.eq_ignore_ascii_case(asked)).cloned()
     }
 
     /// The same half, passing deposits and withdrawals to the treasury at `address`.
