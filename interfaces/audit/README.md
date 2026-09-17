@@ -26,7 +26,9 @@ edge.
   the host name) with anything but letters, digits, `-` and `_` replaced by `-`. A process that starts again on the same
   day opens the next segment (`0001`, ...) rather than appending to a file another process wrote.
 - **Rotation.** At the first record of a new UTC day, or within a second of midnight when nothing is being recorded,
-  the file is closed with a `close` record and the next day's file is opened. A clean shutdown closes the file too.
+  the file is closed with a `close` record and the next day's file is opened. A clean shutdown closes the file too
+  (the FIX adapter's). The gateway has no clean shutdown: stopped by a signal, it leaves its file open, and the next
+  gateway of the same instance seals it.
   A record's day is the day of its `ts`; a record taken just before midnight and written just after it goes in the
   file that is open, so a file can end with a moment of the next day and never begins with one of the previous.
 - **Sealing after a crash.** A process that stops without closing its file leaves it without a `close` record. The

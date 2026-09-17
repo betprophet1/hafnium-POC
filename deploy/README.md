@@ -9,6 +9,7 @@ through ArgoCD. There is no compose file; the laptop runs the same chart.
 | `charts/venue-mini/` | The chart: the core, the gateway, the dummy treasury, the parlay service, a seed job for the demo markets, the dummy oracle, synthetic maker and taker, the web page, network policies and a `helm test` smoke test |
 | `charts/venue-mini/files/markets.json` | The demo catalogue: accounts with their dev tokens, tabs and whether they respond to requests for quote, markets and their outcome names |
 | `charts/venue-mini/files/calendar.json` | The dummy oracle's calendar: how often each market lists a new round, its timings, and the resolution timers (`core/sim/README.md`) |
+| `charts/venue-mini/templates/gateway.yaml` | Also the gateway's audit log volume (`/var/lib/gateway-audit`, `gateway.audit` in values): every request and answer, in the format of `interfaces/audit/`. Nothing ships it to retained storage yet |
 | `laptop.sh` | `up`, `web`, `restart` and `down` for a local k3d cluster |
 
 ## On a laptop

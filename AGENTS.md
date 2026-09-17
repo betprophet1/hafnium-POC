@@ -9,6 +9,7 @@ agent needs to build its core, and the core itself. Read this before changing an
 |---|---|
 | `blueprint/prediction-exchange.html` | The architecture blueprint. Explains why; not an implementation contract. |
 | `interfaces/` | One specification per interface between components, and the catalogue of all of them. The journal schema is `interfaces/sbe/venue-journal.xml`. |
+| `interfaces/audit/README.md` | The edge audit log format: what the FIX adapter and the gateway record of every message a client sent and was sent, hash-chained per file; `interfaces/tools/audit_verify.py` checks a file. |
 | `spec/engine/engine-spec.md` | The normative behaviour of one sequencer group's engine, in numbered rules (`E-10.6`). |
 | `spec/engine/decisions.md` | Defaults chosen to complete the specification, some awaiting review. |
 | `spec/engine/scenarios/` | Acceptance tests: inputs and exact expected results, computed by hand from the specification. |
