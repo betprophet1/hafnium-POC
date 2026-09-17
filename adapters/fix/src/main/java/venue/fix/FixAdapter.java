@@ -87,8 +87,9 @@ public final class FixAdapter implements AutoCloseable
             return;
         }
         final FixAdapter adapter = start(config);
-        System.err.printf("fix adapter: FIX 4.4 on %s:%d as %s, gateway %s, audit log %s%n",
-            config.listenHost(), config.listenPort(), config.compId(), config.gateway(), adapter.audit.currentFile());
+        System.err.printf("fix adapter: FIX 4.4 on %s:%d as %s, gateway %s, public gateway %s, audit log %s%n",
+            config.listenHost(), config.listenPort(), config.compId(), config.gateway(), config.publicGateway(),
+            adapter.audit.currentFile());
         try (ShutdownSignalBarrier barrier = new ShutdownSignalBarrier())
         {
             barrier.await();
@@ -190,8 +191,8 @@ public final class FixAdapter implements AutoCloseable
 
     private SessionHandler onAcquired(final Session session)
     {
-        final VenueSession venueSession =
-            new VenueSession(session, authenticator.take(session.connectionId()), http, config.gateway(), memories);
+        final VenueSession venueSession = new VenueSession(session, authenticator.take(session.connectionId()), http,
+            config.gateway(), config.publicGateway(), memories);
         sessions.add(venueSession);
         System.err.println("fix adapter: " + session.compositeKey() + " logged on");
         return venueSession;

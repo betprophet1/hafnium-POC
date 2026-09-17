@@ -163,6 +163,8 @@ final class VenueSession implements SessionHandler
     private final GatewayLink link;
     private final HttpClient http;
     private final String gateway;
+    /** Where the security list is read: the public half's gateway. */
+    private final String publicGateway;
     private final String accountId;
     private final long heartbeatNanos;
     private final SessionMemory.Store memories;
@@ -223,12 +225,14 @@ final class VenueSession implements SessionHandler
         final GatewayLink link,
         final HttpClient http,
         final String gateway,
+        final String publicGateway,
         final SessionMemory.Store memories)
     {
         this.session = session;
         this.link = link;
         this.http = http;
         this.gateway = gateway;
+        this.publicGateway = publicGateway;
         this.memories = memories;
         final JsonNode welcome = link != null ? link.welcome() : null;
         this.accountId = welcome != null ? welcome.path("accountId").asText() : "";
@@ -640,7 +644,7 @@ final class VenueSession implements SessionHandler
         final String reqId = securityListRequest.securityReqIDAsString();
         final int type = securityListRequest.securityListRequestType();
         final String symbol = securityListRequest.hasSymbol() ? securityListRequest.symbolAsString() : null;
-        final HttpRequest get = HttpRequest.newBuilder(URI.create("http://" + gateway + "/v4/markets?resolved=false"))
+        final HttpRequest get = HttpRequest.newBuilder(URI.create("http://" + publicGateway + "/v4/markets?resolved=false"))
             .timeout(Duration.ofSeconds(10))
             .GET()
             .build();

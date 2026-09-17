@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # A throwaway local venue for the FIX adapter: a node, seeded with the mini venue's catalogue, an identity service for
-# API keys, a gateway serving both halves, and a second gateway serving the private half beside it, as a venue with
-# several gateways has, all on 127.0.0.1. Built binaries are taken from core/target/release
+# API keys, a gateway serving both halves, a second gateway serving the private half beside it, as a venue with
+# several gateways has, and a third serving the public half, all on 127.0.0.1. Built binaries are taken from core/target/release
 # (build them with `cargo build --release -p venue-node -p venue-gateway -p venue-sim -p venue-identity` in core/).
 #
-#   scripts/venue.sh start DIR   starts in DIR (wiped first), writes DIR/pids, DIR/gateway.address and
-#                                DIR/second-gateway.address, waits until seeded
+#   scripts/venue.sh start DIR   starts in DIR (wiped first), writes DIR/pids, DIR/gateway.address,
+#                                DIR/second-gateway.address and DIR/public-gateway.address, waits until seeded
 #   scripts/venue.sh stop DIR    stops exactly the processes recorded in DIR/pids
 #
 # Ports come from VENUE_FIX_PORTS_BASE (default 17410): base is the node's ingress, base+1 its feed, base+2 the gateway,
-# base+3 the identity service, base+4 the second gateway.
+# base+3 the identity service, base+4 the second gateway, base+5 the public gateway.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 BIN="$ROOT/core/target/release"
@@ -59,7 +59,14 @@ case "${1:-}" in
     echo $! >>"$dir/pids"
     wait_port "$((BASE + 4))" "the second gateway"
     echo "$second" >"$dir/second-gateway.address"
-    echo "venue up: gateway $gateway, second gateway $second (logs in $dir)"
+    public="127.0.0.1:$((BASE + 5))"
+    "$BIN/venue-gateway" --serve public --feed "$feed" --catalogue "$CATALOGUE" --listen "$public" \
+      --audit-instance public-gateway --per-second 10000 --burst 10000 --logons-per-minute 10000 \
+      --audit-dir "$dir/public-gateway-audit" --audit-fsync false >"$dir/public-gateway.log" 2>&1 &
+    echo $! >>"$dir/pids"
+    wait_port "$((BASE + 5))" "the public gateway"
+    echo "$public" >"$dir/public-gateway.address"
+    echo "venue up: gateway $gateway, second gateway $second, public gateway $public (logs in $dir)"
     ;;
   stop)
     dir="${2:?usage: venue.sh stop DIR}"

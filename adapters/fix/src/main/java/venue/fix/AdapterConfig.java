@@ -13,7 +13,9 @@ import java.util.Set;
  * @param listenPort          the FIX acceptor's port
  * @param compId              the venue's CompID: clients send it as TargetCompID
  * @param gateway             the gateway's {@code host:port}; the adapter uses {@code /v4/ws_private} and
- *                            {@code GET /v4/markets} on it
+ *                            {@code GET /v4/account} on it
+ * @param publicGateway       where the adapter reads {@code GET /v4/markets}, the public half's: the gateway itself
+ *                            unless that one serves only the private half (interfaces/gateway/README.md)
  * @param dataDir             Artio's session state and message archive, and the embedded Aeron directory
  * @param cancelOnDisconnect  whether sessions log in to the gateway with {@code cancelOnDisconnect}
  * @param keepOrdersFor       SenderCompIDs whose orders outlive their session, whatever the default
@@ -26,6 +28,7 @@ public record AdapterConfig(
     int listenPort,
     String compId,
     String gateway,
+    String publicGateway,
     Path dataDir,
     boolean cancelOnDisconnect,
     Set<String> keepOrdersFor,
@@ -36,10 +39,12 @@ public record AdapterConfig(
     static final String USAGE = """
         usage:
           venue-fix-adapter [--listen 127.0.0.1:17420] [--comp-id VENUE] [--gateway 127.0.0.1:8081]
-                            [--data ./fix-data] [--cancel-on-disconnect true] [--keep-orders-for COMPID,...]
+                            [--public-gateway GATEWAY] [--data ./fix-data] [--cancel-on-disconnect true]
+                            [--keep-orders-for COMPID,...]
                             [--audit-dir DATA/audit] [--audit-instance HOSTNAME] [--audit-fsync true]
 
-        FIX 4.4 on --listen, translated to the gateway's private WebSocket. A session logs on with its dev token in
+        FIX 4.4 on --listen, translated to the gateway's private WebSocket. The security list comes from
+        GET /v4/markets on --public-gateway, which defaults to --gateway. A session logs on with its dev token in
         Password (554). Every FIX message in and out is written to the audit log in --audit-dir, by default the audit
         directory inside --data. Every flag can also be given as VENUE_FIX_<FLAG>, for example VENUE_FIX_GATEWAY.""";
 
@@ -69,11 +74,13 @@ public record AdapterConfig(
         final String keep = value(flags, "keep-orders-for", "");
         final Path data = Path.of(value(flags, "data", "./fix-data"));
         final String hostname = System.getenv("HOSTNAME");
+        final String gateway = value(flags, "gateway", "127.0.0.1:8081");
         final AdapterConfig config = new AdapterConfig(
             listen.substring(0, colon),
             Integer.parseInt(listen.substring(colon + 1)),
             value(flags, "comp-id", "VENUE"),
-            value(flags, "gateway", "127.0.0.1:8081"),
+            gateway,
+            value(flags, "public-gateway", gateway),
             data,
             Boolean.parseBoolean(value(flags, "cancel-on-disconnect", "true")),
             keep.isBlank() ? Set.of() : Set.of(keep.split(",")),

@@ -54,14 +54,17 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 final class FixAdapterTest
 {
     /**
-     * Ports: the venue takes 17430-17434 (node ingress, feed, gateway, identity service, a second gateway), the adapter
-     * 17440.
+     * Ports: the venue takes 17430-17435 (node ingress, feed, gateway, identity service, a second gateway serving the
+     * private half, a third serving the public half), the adapter 17440, and an adapter on the split halves 17441.
      */
     private static final int VENUE_PORTS_BASE = 17430;
     private static final int ADAPTER_PORT = 17440;
     private static final String GATEWAY = "127.0.0.1:" + (VENUE_PORTS_BASE + 2);
     /** Another gateway process on the same venue, serving the private half, which the adapter does not use. */
     private static final String SECOND_GATEWAY = "127.0.0.1:" + (VENUE_PORTS_BASE + 4);
+    /** A gateway process serving only the public half. */
+    private static final String PUBLIC_GATEWAY = "127.0.0.1:" + (VENUE_PORTS_BASE + 5);
+    private static final int SPLIT_ADAPTER_PORT = 17441;
     /** Two binary markets the mini venue's catalogue lists and opens, and one categorical market. */
     private static final String RAIN = "100000100";
     private static final String BITCOIN = "300000100";
@@ -73,7 +76,7 @@ final class FixAdapterTest
      * orders outlive its sessions.
      */
     private static final AdapterConfig ADAPTER = new AdapterConfig(
-        "127.0.0.1", ADAPTER_PORT, "VENUE", GATEWAY, ADAPTER_DATA, true, Set.of("KEEPER1"),
+        "127.0.0.1", ADAPTER_PORT, "VENUE", GATEWAY, GATEWAY, ADAPTER_DATA, true, Set.of("KEEPER1"),
         ADAPTER_DATA.resolve("audit"), "test", false);
 
     private static Path root;
@@ -806,6 +809,36 @@ final class FixAdapterTest
         assertEquals(g2, report(desk, "g2-c", '4').get(37));
         client.pollUntil("the other gateway no longer shows g2",
             () -> !restingOrdersOn(SECOND_GATEWAY, "dev-market-maker").contains(g2));
+
+        desk.logoutAndDisconnect();
+        client.pollUntil("the desk is disconnected", () -> client.isDisconnected(desk));
+        adapter.close();
+        adapter = null;
+    }
+
+    @Test
+    @Order(16)
+    void anAdapterOnAPrivateOnlyGatewayListsMarketsFromThePublicHalf() throws Exception
+    {
+        // As in a venue whose halves are served apart: the private gateway does not answer GET /v4/markets, so the
+        // security list comes from the public one.
+        final Path data = scratch.resolve("split-adapter");
+        deleteRecursively(data);
+        adapter = FixAdapter.start(new AdapterConfig("127.0.0.1", SPLIT_ADAPTER_PORT, "VENUE", SECOND_GATEWAY,
+            PUBLIC_GATEWAY, data, true, Set.of(), data.resolve("audit"), "split", false));
+        final Session desk = client.logon("SPLIT2", "dev-market-maker", SPLIT_ADAPTER_PORT, false);
+        assertNotNull(desk, "the desk logs on through the private gateway");
+        client.send(desk, new SecurityListRequestEncoder().securityReqID("split-markets").securityListRequestType(4));
+        final FixClient.Message list = client.expect(desk, "a security list",
+            m -> "y".equals(m.type()) && "split-markets".equals(m.get(320)));
+        assertEquals("0", list.get(560), list.toString());
+        assertTrue(list.all(55).containsAll(List.of(RAIN, BITCOIN, ARSENAL)), list.toString());
+
+        // And it trades on the private gateway.
+        client.send(desk, order("s1", RAIN, '1', 2, "11"));
+        final String s1 = report(desk, "s1", '0').get(37);
+        client.send(desk, cancel("s1-c", "s1", RAIN, '1'));
+        assertEquals(s1, report(desk, "s1-c", '4').get(37));
 
         desk.logoutAndDisconnect();
         client.pollUntil("the desk is disconnected", () -> client.isDisconnected(desk));

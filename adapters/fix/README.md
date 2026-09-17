@@ -46,7 +46,8 @@ build/install/venue-fix-adapter/bin/venue-fix-adapter \
 |---|---|---|
 | `--listen` | `127.0.0.1:17420` | where FIX clients connect |
 | `--comp-id` | `VENUE` | the venue's CompID; clients send it as TargetCompID |
-| `--gateway` | `127.0.0.1:8081` | the gateway's host and port (`/v4/ws_private`, `GET /v4/markets`) |
+| `--gateway` | `127.0.0.1:8081` | the gateway's host and port (`/v4/ws_private`, `GET /v4/account`) |
+| `--public-gateway` | `--gateway` | where the security list is read (`GET /v4/markets`): a gateway serving the public half, when `--gateway` serves only the private one |
 | `--data` | `./fix-data` | Artio's session state and message archive, the embedded Aeron directory, and what each SenderCompID's sessions know (`sessions/`) |
 | `--cancel-on-disconnect` | `true` | whether sessions' orders are cancelled when they end |
 | `--keep-orders-for` | none | SenderCompIDs, comma-separated, whose orders outlive their sessions |
