@@ -161,6 +161,54 @@ map one to one onto `NewOrder` (spec §9). `expiresAt` is converted to nanosecon
 Amending needs no instrument: the gateway knows each resting order's instrument. A new price is in YES terms unless
 `outcome` says otherwise.
 
+## Fees
+
+Each party to a fill, the maker (the resting order's account) and the taker (the incoming order's), pays a fee on
+that fill of
+
+```
+rate × contracts × P × (1 − P)   dollars
+```
+
+where `P` is the fill's YES price as a fraction (`29/100` at 29¢), rounded up to the next whole cent, per fill (spec
+E-10.11, decisions D-2). An order that fills in several pieces pays on each piece, so it can pay up to a cent a fill
+more than the formula on its whole quantity. The fee is largest at 50¢ and shrinks toward 0¢ and 100¢. Exactly, in
+the spec's integers, with the rate `r` in millionths and `yesCost` and `noCost` the fill's YES and NO cost in cents
+(E-2.4):
+
+```
+fee = ⌈ r · yesCost · noCost / (100 000 000 · contracts) ⌉   cents
+```
+
+Rounding is always toward positive infinity, for both signs. A negative rate, which only a maker rate may be, is a
+rebate, and rounding up takes it toward zero: a rebate is never larger than the formula (`⌈−0.8⌉ = 0`, `⌈−8.3⌉ = −8`).
+
+Maker and taker rates are separate. They come from a default schedule (E-7.9), which overrides replace for the
+parties they match (E-7.10, E-10.12, D-27). An override names an account, a market and an event, each or all of them
+"any", with both rates, a priority and optionally an expiry. For each party separately, of the unexpired overrides
+that match its account, the fill's market and that market's event, the lowest priority number wins, and a tie goes
+to the lower override ID; with none, the default schedule applies. Which fields an override names does not matter,
+only its priority. Rates are set by the operator; this draft has no endpoint that lists them.
+
+Fees are charged when the fill happens. They are not reserved when an order is accepted or amended, no order is
+refused for a fee it would pay, and a spend cap counts the price without fees, so a fee can leave available cash
+below zero; the account can then receive cash but spend none until it is funded (E-3.3, D-26). A void refunds the
+event's fees, and takes back its rebates, with the rest of the event's cash (D-1, D-28).
+
+Every `fill` execution, on REST and WebSocket alike, carries `feeCents`: what this account paid at its own maker or
+taker rate, negative for a rebate, taken from cash on top of `cashCents`, which excludes it.
+
+A worked example. A taker buys 10 contracts at 21¢ at the 7% taker rate: `0.07 × 10 × 0.21 × 0.79 = 0.11613`
+dollars, 11.613¢, so it pays 12¢. In integers, `yesCost = 210`, `noCost = 790` and
+`⌈70 000 · 210 · 790 / (100 000 000 · 10)⌉ = ⌈11.613⌉ = 12` cents. A maker on the other side at 1.75% pays
+`⌈2.903⌉ = 3` cents.
+
+The demo venue's seed (`core/link`, `Catalogue::fees`) sets a default schedule of 7% taker and 1.75% maker, and one
+override for the synthetic maker's account (account 10: override 1, priority 10, any market and event, no expiry):
+a maker rebate of 0.5% and no taker fee, as a market maker on a programme would have. At 0.5% a small fill can round
+to no rebate at all: the synthetic maker selling 10 contracts at 21¢ gets `⌈−0.8295⌉ = 0`, and 100 contracts at 21¢
+earn it `⌈−8.295⌉ = −8`, an 8¢ rebate.
+
 ## Sessions: cancel-on-disconnect and heartbeats
 
 These are private sessions, on `/v4/ws_private`. `cancelOnDisconnect` in `login` makes the end of the session, a

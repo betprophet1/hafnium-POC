@@ -193,6 +193,10 @@ venue's order ID, a decimal string; a rejected order has `NONE`.
 ExecID is made from the venue's sequence number, order ID and trade ID, so it is unique and says which venue event
 the report is of. A status report (150=I) is of no venue event: its ExecID starts `I-`.
 
+Reports carry no fee: there is no Commission (12) or CommType (13) on a fill. Each fill does charge one, at the
+account's maker or taker rate (interface 1 README, fees), and interface 1 reports it as `feeCents` on the fill's
+execution: in the answer to the order and on the account's private WebSocket session.
+
 Executions of orders a session neither placed nor asked the status of (the same account's other sessions, the web
 page) are not reported on it. A drop copy (interface 5) is where every execution of an account is found.
 
