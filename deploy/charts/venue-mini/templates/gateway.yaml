@@ -102,6 +102,11 @@ spec:
   serviceName: {{ $name }}-gateway-{{ $half }}
   replicas: {{ $replicas }}
   podManagementPolicy: Parallel
+  # Scaling down keeps the audit volumes of the pods it removes: the audit log is kept, not a cache. A pod of the same
+  # name, when the half scales up again, takes its volume back and seals the file its predecessor left open.
+  persistentVolumeClaimRetentionPolicy:
+    whenScaled: Retain
+    whenDeleted: Retain
   selector:
     matchLabels:
       {{- include "venue-mini.selector" (dict "ctx" $ "component" "gateway") | nindent 6 }}

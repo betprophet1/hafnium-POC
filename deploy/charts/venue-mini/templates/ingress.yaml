@@ -1,0 +1,87 @@
+{{- if .Values.ingress.enabled }}
+{{- $name := include "venue-mini.fullname" . }}
+{{- $public := printf "%s-gateway" $name }}
+{{- $private := printf "%s-gateway" $name }}
+{{- if .Values.gateway.split.enabled }}
+{{- $public = printf "%s-gateway-public" $name }}
+{{- $private = printf "%s-gateway-private" $name }}
+{{- end }}
+# The venue under one host name, routed by path as the gateway tells its halves apart (interfaces/gateway/README.md,
+# public and private; Half::of in core/gateway/src/api.rs): /v4/ws_public and /v4/markets with everything under it
+# to the public half, the rest of /v4 to the private half, everything else to the web page. The most specific path
+# wins. A path cannot say GET, so every method on /v4/markets reaches the public half, which answers only GET, as the
+# gateway itself would. Each rule names a Service, never a pod: the ingress follows its endpoints as either half
+# scales. WebSockets are upgraded through as they are, and the page's and bots' sessions heartbeat every 15 s.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+    {{- if .Values.ingress.host }}
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+    {{- else }}
+    - http:
+    {{- end }}
+        paths:
+          - path: /v4/ws_public
+            pathType: Exact
+            backend:
+              service:
+                name: {{ $public }}
+                port:
+                  name: http
+          - path: /v4/markets
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $public }}
+                port:
+                  name: http
+          - path: /v4
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $private }}
+                port:
+                  name: http
+          {{- if .Values.web.enabled }}
+          {{- if .Values.ingress.operatorApis }}
+          # The page and its /api, and the operator APIs it passes through: /oracle to the dummy oracle and the
+          # treasury's reconciliation summary under /treasury. A demo on a private network only.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $name }}-web
+                port:
+                  name: http
+          {{- else }}
+          # The page and its /api only: /oracle and /treasury match no rule and are not served.
+          - path: /
+            pathType: Exact
+            backend:
+              service:
+                name: {{ $name }}-web
+                port:
+                  name: http
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $name }}-web
+                port:
+                  name: http
+          {{- end }}
+          {{- end }}
+{{- end }}

@@ -101,10 +101,66 @@ gateway:
   # account may reach replicas times them.
   split:
     enabled: false
+    # Each half scales on its own: helm upgrade --reuse-values --set gateway.split.public.replicas=N (or private).
+    # A pod scaled away leaves its audit volume, and its last file unsealed, until a pod of its name returns
+    # (deploy/README.md, several gateways).
     public:
       replicas: 2
     private:
       replicas: 2
+  # Seconds a stopping gateway pod keeps serving after it has been taken out of its Service's endpoints, so the
+  # ingress and kube-proxy stop sending it new connections before its sessions are closed.
+  drainSeconds: 5
+
+# One host name for the page and the gateway, routed by path (deploy/README.md, one host name): /v4/ws_public and
+# /v4/markets with everything under it to the public half, the rest of /v4 to the private half (or both to the one
+# gateway when the halves are not split), and everything else to the web page. WebSockets pass through as they are.
+ingress:
+  enabled: false
+  # k3s and k3d ship Traefik, whose IngressClass is traefik.
+  className: traefik
+  # Empty answers any host name.
+  host: ""
+  annotations: {}
+  # /oracle and /treasury, the dummy oracle's control API and the treasury's reconciliation summary, reach the page's
+  # server and through it those services, as they do under deploy/laptop.sh web. They are unauthenticated operator
+  # APIs: true only for a demo on a private network; false routes only the page itself (/ and /api), so they are not
+  # served, and the page's settlement tab and reconciliation section stop working.
+  operatorApis: true
+
+# The FIX 4.4 adapter (adapters/fix, interface 4) in front of the gateway's private half: a StatefulSet of one, since
+# Artio's session state is one writer's, with its data (sequence numbers and the message archive) and its audit log
+# on volumes of their own. The archive holds every Logon's Password (554), API key secrets included, in clear: the
+# adapter creates everything private to its user, no other pod mounts the volumes, and they belong on encrypted
+# storage wherever real keys are used. Built as the image venue-fix (deploy/images/venue-fix.Dockerfile).
+fix:
+  enabled: false
+  image:
+    repository: venue-fix
+    # Empty: image.tag.
+    tag: ""
+  # The venue's CompID; clients send it as TargetCompID (56).
+  compId: VENUE
+  cancelOnDisconnect: true
+  # SenderCompIDs, comma-separated, whose orders outlive their sessions.
+  keepOrdersFor: ""
+  auditFsync: true
+  service:
+    # LoadBalancer publishes the port on the cluster's nodes (k3s ServiceLB), which k3d's load balancer can map to a
+    # host address (deploy/README.md); ClusterIP keeps FIX inside the cluster.
+    type: LoadBalancer
+    port: 9879
+  storage:
+    data: 1Gi
+    audit: 1Gi
+    # Empty uses the cluster's default class (k3d: local-path).
+    className: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 384Mi
+    limits:
+      memory: 1Gi
 
 # The parlay service: parlays listed on request, requests for quote routed to approved responders that subscribe, and
 # settlement from the legs. Responders start from the catalogue's "responder": true accounts and are approved and

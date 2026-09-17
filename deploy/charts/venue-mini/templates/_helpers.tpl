@@ -51,6 +51,9 @@ forwards to; a public one only follows the feed. Each pod of a split gateway wri
 {{- $core := printf "%s-core" $name -}}
 securityContext:
   {{- include "venue-mini.podSecurity" $ | nindent 2 }}
+# A stopping gateway first drains (preStop), then gets SIGTERM, which ends it at once: its sessions close, and their
+# clients reconnect through the Service to another pod.
+terminationGracePeriodSeconds: {{ add $.Values.gateway.drainSeconds 10 }}
 containers:
   - name: gateway
     image: {{ include "venue-mini.image" $ | quote }}
@@ -106,6 +109,12 @@ containers:
     ports:
       - name: http
         containerPort: 8081
+    # Taken out of the Service's endpoints as soon as it is stopping; the ingress and kube-proxy stop picking it while
+    # it still answers.
+    lifecycle:
+      preStop:
+        sleep:
+          seconds: {{ $.Values.gateway.drainSeconds }}
     # Ready once the gateway has caught up with the core's feed.
     readinessProbe:
       httpGet:

@@ -1,0 +1,160 @@
+{{- if .Values.fix.enabled }}
+{{- $name := include "venue-mini.fullname" . }}
+{{- $gateway := printf "%s-gateway" $name }}
+{{- $publicGateway := $gateway }}
+{{- if .Values.gateway.split.enabled }}
+{{- $gateway = printf "%s-gateway-private" $name }}
+{{- $publicGateway = printf "%s-gateway-public" $name }}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-fix
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: fix
+spec:
+  type: {{ .Values.fix.service.type }}
+  selector:
+    {{- include "venue-mini.selector" (dict "ctx" . "component" "fix") | nindent 4 }}
+  ports:
+    - name: fix
+      port: {{ .Values.fix.service.port }}
+      targetPort: fix
+---
+# The FIX 4.4 adapter (adapters/fix): Artio's sessions translated to the gateway's private WebSocket, one gateway
+# session per FIX session, through the private half's Service, so a session lands on whichever private gateway the
+# Service picks and a FIX client whose gateway went away logs on again to another. The security list comes from the
+# public half. One pod, since Artio's session state and archive have one writer: a replacement starts only once the
+# old pod has stopped, and carries on its sessions' sequence numbers from the data volume.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}-fix
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: fix
+spec:
+  serviceName: {{ $name }}-fix
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "fix") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" . | nindent 8 }}
+        app.kubernetes.io/component: fix
+    spec:
+      # Nothing in the adapter talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "venue-mini.podSecurity" . | nindent 8 }}
+        # The volumes' roots are given the pod's group once; their contents are not opened up to the group again at
+        # every start, so what the adapter creates stays readable by its user alone.
+        fsGroupChangePolicy: OnRootMismatch
+      # The JVM's shutdown handler stops Artio (Logouts to the sessions) and closes the audit file.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: fix
+          image: "{{ .Values.fix.image.repository }}:{{ .Values.fix.image.tag | default .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: VENUE_FIX_LISTEN
+              value: "0.0.0.0:9878"
+            - name: VENUE_FIX_COMP_ID
+              value: {{ .Values.fix.compId | quote }}
+            - name: VENUE_FIX_GATEWAY
+              value: "{{ $gateway }}:8081"
+            - name: VENUE_FIX_PUBLIC_GATEWAY
+              value: "{{ $publicGateway }}:8081"
+            - name: VENUE_FIX_CANCEL_ON_DISCONNECT
+              value: {{ .Values.fix.cancelOnDisconnect | quote }}
+            - name: VENUE_FIX_KEEP_ORDERS_FOR
+              value: {{ .Values.fix.keepOrdersFor | quote }}
+            # Subdirectories the adapter creates private to its user (the image's umask 077), inside volumes whose
+            # own roots the storage provisioner may leave open.
+            - name: VENUE_FIX_DATA
+              value: /var/lib/venue-fix/state/data
+            - name: VENUE_FIX_AUDIT_DIR
+              value: /var/lib/venue-fix/audit-log/audit
+            # The audit instance is the pod's name ($HOSTNAME), the same for its replacement, which seals a file
+            # the old pod left open.
+            - name: VENUE_FIX_AUDIT_FSYNC
+              value: {{ .Values.fix.auditFsync | quote }}
+            - name: JAVA_OPTS
+              value: "-XX:+ExitOnOutOfMemoryError -XX:-UsePerfData -Djava.io.tmpdir=/tmp"
+          ports:
+            - name: fix
+              containerPort: 9878
+          readinessProbe:
+            tcpSocket:
+              port: fix
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.fix.resources | nindent 12 }}
+          securityContext:
+            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/venue-fix/state
+            - name: audit
+              mountPath: /var/lib/venue-fix/audit-log
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+  volumeClaimTemplates:
+    {{- range $volume := list "data" "audit" }}
+    - metadata:
+        name: {{ $volume }}
+        labels:
+          {{- include "venue-mini.labels" $ | nindent 10 }}
+          app.kubernetes.io/component: fix
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $.Values.fix.storage.className }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ index $.Values.fix.storage $volume }}
+    {{- end }}
+---
+# FIX clients reach the adapter's port from outside the cluster; a Logon's credential is what admits them. The
+# adapter itself reaches only the gateway (the private half, and the public half for the security list) and cluster
+# DNS: not the core, the treasury, the identity or parlay services, nor anything outside the cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-fix
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "fix") | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - port: 9878
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "venue-mini.selector" (dict "ctx" . "component" "gateway") | nindent 14 }}
+      ports:
+        - port: 8081
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+{{- end }}
