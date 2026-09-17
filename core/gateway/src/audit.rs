@@ -1081,7 +1081,9 @@ mod recorded {
     /// the bytes that were actually sent. The socket's read timeout is short, and a loaded machine can take longer
     /// than that to answer, so a timeout is waited through rather than failed on, as `eventually` does.
     fn streamed(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>, kind: &str) -> String {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        // Counted in the socket's own timeouts rather than read off a clock, as `eventually` counts its waits: six
+        // of them is half a minute, which is what a test may wait on a machine shared with other builds.
+        let mut left = 6;
         loop {
             match socket.read() {
                 Ok(Message::Text(text)) => {
@@ -1093,7 +1095,10 @@ mod recorded {
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(e))
                     if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
-                        && std::time::Instant::now() < deadline => {}
+                        && left > 0 =>
+                {
+                    left -= 1;
+                }
                 Err(e) => panic!("no {kind} frame arrived: {e}"),
             }
         }
