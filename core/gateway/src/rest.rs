@@ -449,6 +449,8 @@ mod tests {
         assert_ne!(first["requestId"], again["requestId"]);
         let parlay = first["instrumentId"].as_str().expect("an instrument").to_string();
 
+        // The public half learns of the listing from its own feed, which can be a moment behind the parlay service's.
+        testing::eventually("the public half lists the parlay", || listed(a, &parlay).is_some());
         let (event, market) = listed(a, &parlay).expect("the parlay is listed");
         assert_eq!(
             (market["class"].as_str(), market["state"].as_str(), market["lotStep"].as_u64()),
