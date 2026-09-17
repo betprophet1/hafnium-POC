@@ -50,6 +50,9 @@ build/install/venue-fix-adapter/bin/venue-fix-adapter \
 | `--data` | `./fix-data` | Artio's session state and message archive, and the embedded Aeron directory |
 | `--cancel-on-disconnect` | `true` | whether sessions' orders are cancelled when they end |
 | `--keep-orders-for` | none | SenderCompIDs, comma-separated, whose orders outlive their sessions |
+| `--audit-dir` | `<data>/audit` | the audit log of every FIX message (below) |
+| `--audit-instance` | `$HOSTNAME`, else `fix-adapter` | this adapter's name in the audit log's file names |
+| `--audit-fsync` | `true` | whether the audit log syncs what it writes; `false` only for tests |
 
 A firm then logs on with its SenderCompID, `TargetCompID=VENUE` and its dev token in `Password (554)`.
 
@@ -73,8 +76,12 @@ logs on two Artio initiators as a market maker and a retail customer. It checks:
 the security list; place, replace, cancel, a cancel too late and one of an unknown order; a price off the ladder, a
 duplicate ClOrdID, a malformed OrdType and a GTD without ExpireTime; a mass cancel by market and of everything; a
 fill between the two sessions reported to both, with maker and taker, partial and full fills and AvgPx, and no
-report twice; cancel-on-disconnect after Logout; and an adapter restart after which the market maker logs on
-without resetting sequence numbers and has its first session's messages resent from the archive.
+report twice; cancel-on-disconnect after Logout; an adapter restart after which the market maker logs on
+without resetting sequence numbers and has its first session's messages resent from the archive; and the audit log:
+one closed file per run of the adapter whose chain verifies and which holds no token in clear, with a Logon both ways
+(Password masked), an order and the report that answered it, a TestRequest and the Heartbeat Artio answered it with, a
+ResendRequest and its gap fill, Logouts, and the refused logons with their Logouts and the gateway's reasons.
+`test.sh` then checks the same files with `interfaces/tools/audit_verify.py`.
 
 `./check` runs `test.sh` as its last step when the toolchain has been bootstrapped (`bootstrap.sh --check`), and
 skips it with a note otherwise, so a machine without Java still passes every other gate.
@@ -110,8 +117,34 @@ firm ── FIX 4.4 / TCP ──► Artio engine (session layer, archive) ──
   Idle loops sleep a millisecond rather than spin: the machine is shared, and the gateway round trip dominates.
 - **Gateway JSON.** Read as trees, so fields the gateway adds (fees on executions, treasury fields) pass unnoticed.
 
+## The audit log
+
+Every FIX message of every session, in and out, is written to `--audit-dir` in the format of
+[`interfaces/audit/`](../../interfaces/audit/README.md): one file per UTC day per adapter instance, hash-chained lines,
+Password (554) masked. That includes what the adapter's own code never sees, because Artio's engine does it: Logon
+and its answer, Heartbeat, TestRequest, ResendRequest, SequenceReset, Reject, Logout, replays from the archive, and
+the Logon and Logout of a connection whose token was refused.
+
+- **How.** `FixAuditor` runs Artio's `FixMessageLogger`, which subscribes to the Aeron streams between the engine and
+  its libraries (inbound, outbound, and the engine's replay stream) and hands every FIX message over in timestamp
+  order. Artio's archive holds the same messages, but its archive printer could not be made to read them back, and a
+  record of what was said should not depend on a store kept for resends. `GatewayAuthenticator` adds a
+  `gateway-login` record for each Logon (the account and the gateway session it opened, or why it was refused, and
+  the firm's address) and a `disconnect` record for each connection.
+- **Tying FIX to the gateway.** The adapter does not log its JSON. The gateway's own audit log holds every frame of
+  the WebSocket behind each FIX session, and `gatewaySession` in the `gateway-login` record is the `session` the
+  gateway's records carry.
+- **Off the polling thread.** The subscriber has its own thread and the writer another; the polling thread never waits
+  on either. A disk slow enough to fill the writer's queue (65 536 records) makes the subscriber wait, which Aeron
+  turns into back-pressure on Artio's engine: sessions slow down rather than a message going unrecorded. A queue full
+  for 10 seconds, or any failure to write, stops the adapter with status 74; so does an audit directory it cannot
+  write at start.
+- **Where.** `<data>/audit` unless `--audit-dir` says otherwise; in the chart, a volume of its own.
+
 ## Across adapter restarts
 
+- **Kept**: the audit log. A restart closes the file it was writing and opens the next segment of the day; after a
+  crash, the next start seals the file left open (interfaces/audit/README.md, files).
 - **Kept** in `--data`: each session's sequence numbers and every message sent and received (Artio's archive). A firm
   that logs on again without ResetSeqNumFlag carries on where it was and can ask for any of it to be resent, as the
   test does.
@@ -153,6 +186,8 @@ To get there:
 | `src/main/java/venue/fix/GatewayAuthenticator.java` | Logon: the token checked by logging in to the gateway |
 | `src/main/java/venue/fix/GatewayLink.java` | One gateway WebSocket session |
 | `src/main/java/venue/fix/VenueSession.java` | The translation, both ways, for one FIX session |
+| `src/main/java/venue/fix/FixAuditor.java` | Every FIX message, both ways, off Artio's internal streams into the audit log |
+| `src/main/java/venue/fix/AuditLog.java` | The audit log's writer: queue, chain, rotation, sealing, masking, verification |
 | `src/main/java/venue/fix/OrderState.java` | What a session knows about one of its orders |
 | `src/main/java/venue/fix/Translate.java` | Fixed mappings: prices, quantities, reject reasons |
 | `src/test/java/venue/fix/` | The integration test and its Artio initiator |

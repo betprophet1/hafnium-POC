@@ -19,3 +19,5 @@ fi
 cd "$HERE"
 # --rerun: the test depends on the venue binaries too, which Gradle does not see change.
 ./gradlew --console=plain --warning-mode=summary test --rerun
+# The test checks the audit log's chains in Java; the format's own verifier checks the same files independently.
+python3 "$ROOT/interfaces/tools/audit_verify.py" --closed "$HERE"/build/it/adapter/audit/*.jsonl

@@ -38,6 +38,10 @@ import java.util.concurrent.TimeUnit;
  * connections and the session layer: logon, heartbeats, sequence numbers, resend and gap fill. One Artio library,
  * polled by a single thread here, receives the application messages and holds the translation state; one thread
  * means no locks anywhere in the translation.
+ *
+ * <p>Beside them, the audit log (interfaces/audit/README.md): {@link FixAuditor} reads every FIX message off Artio's
+ * internal streams, session-level messages and refused logons included, and {@link AuditLog} writes them on a thread
+ * of its own.
  */
 public final class FixAdapter implements AutoCloseable
 {
@@ -47,12 +51,14 @@ public final class FixAdapter implements AutoCloseable
 
     private final AdapterConfig config;
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+    private final AuditLog audit;
     private final GatewayAuthenticator authenticator;
     private final List<VenueSession> sessions = new ArrayList<>();
     private final CountDownLatch stopped = new CountDownLatch(1);
     private volatile boolean running = true;
 
     private ArchivingMediaDriver driver;
+    private FixAuditor auditor;
     private FixEngine engine;
     private FixLibrary library;
     private Thread poller;
@@ -60,7 +66,9 @@ public final class FixAdapter implements AutoCloseable
     private FixAdapter(final AdapterConfig config)
     {
         this.config = config;
-        this.authenticator = new GatewayAuthenticator(config, http);
+        // First, so that an adapter that cannot keep its audit log never takes a connection.
+        this.audit = AuditLog.open(config.auditDir(), "fix-adapter", config.auditInstance(), config.auditFsync());
+        this.authenticator = new GatewayAuthenticator(config, http, audit);
     }
 
     public static void main(final String[] args)
@@ -77,8 +85,8 @@ public final class FixAdapter implements AutoCloseable
             return;
         }
         final FixAdapter adapter = start(config);
-        System.err.printf("fix adapter: FIX 4.4 on %s:%d as %s, gateway %s%n",
-            config.listenHost(), config.listenPort(), config.compId(), config.gateway());
+        System.err.printf("fix adapter: FIX 4.4 on %s:%d as %s, gateway %s, audit log %s%n",
+            config.listenHost(), config.listenPort(), config.compId(), config.gateway(), adapter.audit.currentFile());
         try (ShutdownSignalBarrier barrier = new ShutdownSignalBarrier())
         {
             barrier.await();
@@ -131,6 +139,8 @@ public final class FixAdapter implements AutoCloseable
             .replicationChannel("aeron:udp?endpoint=127.0.0.1:0")
             .deleteArchiveOnStart(false);
         driver = ArchivingMediaDriver.launch(driverContext, archiveContext);
+        // Subscribed before the engine starts, so its streams are read from their first message.
+        auditor = new FixAuditor(audit, aeronDir, LIBRARY_CHANNEL);
 
         final EngineConfiguration engineConfiguration = new EngineConfiguration()
             .bindTo(config.listenHost(), config.listenPort())
@@ -236,6 +246,9 @@ public final class FixAdapter implements AutoCloseable
                 Thread.currentThread().interrupt();
             }
         }
-        CloseHelper.closeAll(library, engine, driver);
+        CloseHelper.closeAll(library, engine);
+        // After the engine, whose last messages (the Logouts it sends as it closes) are still on the streams, and
+        // before the media driver that holds them.
+        CloseHelper.closeAll(auditor, audit, driver);
     }
 }

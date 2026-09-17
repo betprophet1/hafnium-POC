@@ -42,7 +42,7 @@ Every record has these fields; key order carries no meaning.
 
 | Field | |
 |---|---|
-| `ts` | UTC wall-clock time, `YYYY-MM-DDTHH:MM:SS.ffffffZ` (microseconds). Read from the host's clock when the record is taken (for FIX, Artio's timestamp of the message). It is not the sequencer's time, orders nothing and is used for no logic; it is ordered within a file only as well as the host's clock is. |
+| `ts` | UTC wall-clock time, `YYYY-MM-DDTHH:MM:SS.ffffffZ` (microseconds). Read from the host's clock when the record is taken (for a FIX message, Artio's timestamp of it). It is not the sequencer's time and is used for no logic. Lines are in the order they were written, which for records taken on different threads can differ by milliseconds from the order of their `ts`. |
 | `n` | The record's number in its file, from 0. |
 | `component`, `instance` | Which process wrote it. The same on every line of a file. |
 | `kind` | What the record is (below). |
@@ -66,9 +66,9 @@ connections whose Logon was refused.
 
 | `kind` | Fields |
 |---|---|
-| `fix` | `dir`; `conn` (Artio's connection ID), `session` (Artio's session ID, 0 before logon), `sender` and `target` (SenderCompID 49 and TargetCompID 56 as the message carries them), `msgType` (35), `seq` (34), `msg` (the whole message, SOH shown as `\|`, secrets masked), and `status` when Artio did not mark the message OK (for example a replayed message). |
-| `gateway-login` | The adapter's login to the gateway for a FIX Logon: `conn`, `sender`, `peer` (the firm's address), and either `accountId` and `gatewaySession` (the `sessionId` of the gateway's `welcome`), or `refused` with the reason. `gatewaySession` is what ties a FIX session to the gateway's own audit records of the WebSocket the adapter holds for it. |
-| `disconnect` | A FIX session's TCP connection ended: `conn`, `session`, `sender`, `target`, `reason` (Artio's). |
+| `fix` | `dir`; `conn` (Artio's connection ID), `session` (Artio's session ID), `sender` and `target` (SenderCompID 49 and TargetCompID 56 as the message carries them), `msgType` (35), `seq` (34), `msg` (the whole message, SOH shown as `\|`, secrets masked), and `status` when Artio did not mark the message OK (`AUTH_REJECT` on the Logon of a refused connection). `session` is -1 on a connection that never logged on. |
+| `gateway-login` | The adapter's login to the gateway for a FIX Logon: `conn`, `sender`, `peer` (the firm's `address:port`), and either `accountId` and `gatewaySession` (the `sessionId` of the gateway's `welcome`), or `refused` with the reason. `gatewaySession` is what ties a FIX session to the gateway's own audit records of the WebSocket the adapter holds for it. |
+| `disconnect` | A connection ended, whether or not it logged on: `conn`, `session`, `reason` (Artio's, such as `REMOTE_DISCONNECT` or `FAILED_AUTHENTICATION`). |
 
 The adapter does not log the JSON it exchanges with the gateway: the gateway's audit log has every frame of that
 WebSocket, under the `gatewaySession` above.

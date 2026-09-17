@@ -17,6 +17,7 @@ import venue.fix.codecs.builder.OrderCancelRequestEncoder;
 import venue.fix.codecs.builder.OrderMassCancelRequestEncoder;
 import venue.fix.codecs.builder.ResendRequestEncoder;
 import venue.fix.codecs.builder.SecurityListRequestEncoder;
+import venue.fix.codecs.builder.TestRequestEncoder;
 
 import java.io.IOException;
 import java.net.URI;
@@ -26,6 +27,8 @@ import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -54,9 +57,11 @@ final class FixAdapterTest
     private static final String BITCOIN = "300000100";
     private static final String ARSENAL = "200000100";
 
+    private static final Path ADAPTER_DATA = Path.of(System.getProperty("venue.scratch"), "adapter");
+    /** The audit log where it is by default, inside the data directory; unsynced, as a test can afford. */
     private static final AdapterConfig ADAPTER = new AdapterConfig(
-        "127.0.0.1", ADAPTER_PORT, "VENUE", GATEWAY, Path.of(System.getProperty("venue.scratch"), "adapter"), true,
-        Set.of());
+        "127.0.0.1", ADAPTER_PORT, "VENUE", GATEWAY, ADAPTER_DATA, true, Set.of(), ADAPTER_DATA.resolve("audit"),
+        "test", false);
 
     private static Path root;
     private static Path scratch;
@@ -324,6 +329,98 @@ final class FixAdapterTest
 
         maker.logoutAndDisconnect();
         client.pollUntil("the maker is disconnected", () -> client.isDisconnected(maker));
+    }
+
+    @Test
+    @Order(10)
+    void theAuditLogHoldsEveryMessageOfEverySessionBothWays() throws Exception
+    {
+        // A TestRequest, which the adapter's own code never sees: Artio answers it with a Heartbeat.
+        taker = client.logon("TAKER1", "dev-retail-customer", ADAPTER_PORT, false);
+        assertNotNull(taker, "the retail customer logs on again");
+        client.send(taker, new TestRequestEncoder().testReqID("audit-probe"));
+        client.expect(taker, "the heartbeat answering the test request",
+            m -> "0".equals(m.type()) && "audit-probe".equals(m.get(112)));
+        taker.logoutAndDisconnect();
+        client.pollUntil("the taker is disconnected", () -> client.isDisconnected(taker));
+
+        // Closing the adapter closes its audit file, as a restart did before.
+        adapter.close();
+        adapter = null;
+
+        final Path dir = ADAPTER.auditDir();
+        final List<Path> files;
+        try (var paths = Files.list(dir))
+        {
+            files = paths.sorted().toList();
+        }
+        assertEquals(2, files.size(), "one file for each run of the adapter: " + files);
+        final List<JsonNode> records = new ArrayList<>();
+        for (final Path file : files)
+        {
+            assertTrue(file.getFileName().toString().startsWith("fix-adapter.test."), file.toString());
+            assertNull(AuditLog.verify(file), "the chain of " + file + " verifies");
+            final List<String> lines = Files.readAllLines(file);
+            assertEquals("close", GatewayLink.JSON.readTree(lines.get(lines.size() - 1)).path("kind").asText(),
+                "closed: " + file);
+            assertTrue(lines.stream().noneMatch(l -> l.contains("dev-market-maker") || l.contains("dev-retail")),
+                "no token is written in clear in " + file);
+            for (final String line : lines)
+            {
+                records.add(GatewayLink.JSON.readTree(line));
+            }
+        }
+        assertEquals(files.get(0).getFileName().toString(), records.stream()
+            .filter(r -> "open".equals(r.path("kind").asText()) && r.has("after")).findFirst()
+            .map(r -> r.path("after").path("file").asText()).orElse(""), "the second file follows the first");
+
+        // A logon both ways, its token masked; an order and the report that answered it.
+        final JsonNode logon = fix(records, "in", "MAKER1", "A");
+        assertTrue(logon.path("msg").asText().contains("|554=***|"), logon.toString());
+        assertTrue(logon.path("msg").asText().startsWith("8=FIX.4.4|"), logon.toString());
+        fix(records, "out", "VENUE", "A", "|56=MAKER1|");
+        final JsonNode order = fix(records, "in", "MAKER1", "D", "|11=m1|");
+        final JsonNode report = fix(records, "out", "VENUE", "8", "|11=m1|", "|150=0|");
+        assertEquals(order.path("conn").asLong(), report.path("conn").asLong(), "one connection");
+        assertTrue(order.path("n").asLong() < report.path("n").asLong(), "the report is recorded after the order");
+
+        // Session-level messages Artio generates: the heartbeat answering a test request, a gap fill answering a
+        // resend request, and logouts.
+        fix(records, "in", "TAKER1", "1", "|112=audit-probe|");
+        fix(records, "out", "VENUE", "0", "|112=audit-probe|");
+        fix(records, "in", "MAKER1", "2");
+        fix(records, "out", "VENUE", "4", "|123=Y|", "|56=MAKER1|");
+        fix(records, "in", "MAKER1", "5");
+        fix(records, "out", "VENUE", "5", "|56=MAKER1|");
+
+        // Refused logons: the Logon, the Logout that refused it, and what the gateway said.
+        final JsonNode refused = fix(records, "in", "BADTOKEN", "A", "|554=***|");
+        assertEquals("AUTH_REJECT", refused.path("status").asText(), refused.toString());
+        final JsonNode logout = fix(records, "out", "VENUE", "5", "|56=BADTOKEN|");
+        assertTrue(logout.path("msg").asText().contains("58=token refused"), logout.toString());
+        assertEquals(refused.path("conn").asLong(), logout.path("conn").asLong());
+        assertTrue(records.stream().anyMatch(r -> "gateway-login".equals(r.path("kind").asText()) &&
+            "BADTOKEN".equals(r.path("sender").asText()) && r.path("refused").asText().contains("UNAUTHORIZED")),
+            "the gateway's refusal is recorded");
+        fix(records, "in", "NOTOKEN", "A");
+        assertTrue(records.stream().anyMatch(r -> "gateway-login".equals(r.path("kind").asText()) &&
+            "MAKER1".equals(r.path("sender").asText()) && !r.path("gatewaySession").asText().isEmpty()),
+            "an accepted logon names the gateway session it opened");
+        assertTrue(records.stream().anyMatch(r -> "disconnect".equals(r.path("kind").asText())));
+    }
+
+    /** The first FIX record going that way, from that SenderCompID, of that MsgType, whose message has all of those. */
+    private static JsonNode fix(
+        final List<JsonNode> records, final String dir, final String sender, final String msgType,
+        final String... contains)
+    {
+        return records.stream()
+            .filter(r -> "fix".equals(r.path("kind").asText()) && dir.equals(r.path("dir").asText()) &&
+                sender.equals(r.path("sender").asText()) && msgType.equals(r.path("msgType").asText()) &&
+                Arrays.stream(contains).allMatch(r.path("msg").asText()::contains))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("no " + dir + " " + msgType + " from " + sender + " containing " +
+                Arrays.toString(contains) + " in the audit log"));
     }
 
     // -------------------------------------------------------------------------------------------------------------

@@ -1,8 +1,10 @@
 package venue.fix;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import uk.co.real_logic.artio.decoder.AbstractLogonDecoder;
 import uk.co.real_logic.artio.messages.DisconnectReason;
+import uk.co.real_logic.artio.validation.AbstractAuthenticationProxy;
 import uk.co.real_logic.artio.validation.AuthenticationProxy;
 import uk.co.real_logic.artio.validation.AuthenticationStrategy;
 import venue.fix.codecs.builder.LogoutEncoder;
@@ -22,6 +24,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * the WebSocket client's threads and answers Artio through the {@link AuthenticationProxy} when the gateway has. A
  * session that is accepted already has its gateway session open; the polling thread collects it by connection ID when
  * Artio hands the FIX session over ({@link #take}).
+ *
+ * <p>Each decision is recorded in the audit log as a {@code gateway-login} record, and every connection's end as a
+ * {@code disconnect} record (interfaces/audit/README.md): the FIX messages themselves are recorded by
+ * {@link FixAuditor}, but only this sees what the gateway said and the firm's address.
  */
 final class GatewayAuthenticator implements AuthenticationStrategy
 {
@@ -32,12 +38,14 @@ final class GatewayAuthenticator implements AuthenticationStrategy
 
     private final AdapterConfig config;
     private final HttpClient http;
+    private final AuditLog audit;
     private final Map<Long, GatewayLink> accepted = new ConcurrentHashMap<>();
 
-    GatewayAuthenticator(final AdapterConfig config, final HttpClient http)
+    GatewayAuthenticator(final AdapterConfig config, final HttpClient http, final AuditLog audit)
     {
         this.config = config;
         this.http = http;
+        this.audit = audit;
     }
 
     @Override
@@ -52,12 +60,13 @@ final class GatewayAuthenticator implements AuthenticationStrategy
     {
         // The token travels in Password (554). Username (553) is free for the firm's own use and ignored.
         final String token = logon.hasPassword() ? logon.passwordAsString() : "";
+        final String sender = logon.header().senderCompIDAsString();
         if (token.isEmpty())
         {
+            recordLogin(proxy, sender, audit.fields().put("refused", "no token in Password (554)"));
             reject(proxy, "Password (554) must carry the account's token");
             return;
         }
-        final String sender = logon.header().senderCompIDAsString();
         final ObjectNode login = GatewayLink.JSON.createObjectNode()
             .put("op", "login")
             .put("token", token)
@@ -75,6 +84,10 @@ final class GatewayAuthenticator implements AuthenticationStrategy
         {
             if (failure == null)
             {
+                final JsonNode welcome = link.welcome();
+                recordLogin(proxy, sender, audit.fields()
+                    .put("accountId", welcome.path("accountId").asText())
+                    .put("gatewaySession", welcome.path("sessionId").asText()));
                 accepted.put(proxy.connectionId(), link);
                 try
                 {
@@ -90,6 +103,8 @@ final class GatewayAuthenticator implements AuthenticationStrategy
             }
             final Throwable cause = failure instanceof CompletionException && failure.getCause() != null ?
                 failure.getCause() : failure;
+            recordLogin(proxy, sender, audit.fields().put("refused", cause instanceof GatewayLink.Refused refusedBy ?
+                refusedBy.getMessage() : "gateway unavailable: " + cause));
             if (cause instanceof GatewayLink.Refused refused)
             {
                 reject(proxy, "UNAUTHORIZED".equals(refused.code) ? "token refused" : refused.getMessage());
@@ -100,6 +115,23 @@ final class GatewayAuthenticator implements AuthenticationStrategy
                 reject(proxy, "venue gateway unavailable");
             }
         });
+    }
+
+    /** Records what became of one Logon: {@code outcome} is the gateway's welcome or the reason it was refused. */
+    private void recordLogin(final AbstractAuthenticationProxy proxy, final String sender, final ObjectNode outcome)
+    {
+        final ObjectNode fields = audit.fields()
+            .put("conn", proxy.connectionId())
+            .put("sender", sender)
+            .put("peer", peer(proxy.remoteAddress()));
+        fields.setAll(outcome);
+        audit.record(AuditLog.nowMicros(), "gateway-login", fields);
+    }
+
+    /** The firm's address as {@code host:port}: Artio gives it the way InetSocketAddress prints, with a leading '/'. */
+    private static String peer(final String remoteAddress)
+    {
+        return remoteAddress != null && remoteAddress.startsWith("/") ? remoteAddress.substring(1) : remoteAddress;
     }
 
     private static void reject(final AuthenticationProxy proxy, final String text)
@@ -124,6 +156,8 @@ final class GatewayAuthenticator implements AuthenticationStrategy
     @Override
     public void onDisconnect(final long sessionId, final long connectionId, final DisconnectReason reason)
     {
+        audit.record(AuditLog.nowMicros(), "disconnect", audit.fields()
+            .put("conn", connectionId).put("session", sessionId).put("reason", String.valueOf(reason)));
         // A connection that went away between being accepted and being handed to the library still has a gateway
         // session open; closing it is what cancels anything it could have left behind.
         final GatewayLink orphan = accepted.remove(connectionId);
