@@ -158,7 +158,8 @@ pub fn timestamp(micros: u64) -> String {
     format!("{}T{:02}:{:02}:{:02}.{:06}Z", date(day), seconds / 3600, seconds / 60 % 60, seconds % 60, rest % 1_000_000)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// The SHA-256 of `bytes`, in lower-case hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -782,6 +783,11 @@ mod recorded {
     }
 
     fn request(address: &str, method: &str, path: &str, token: Option<&str>, body: &str) -> u16 {
+        exchange(address, method, path, token, body).0
+    }
+
+    /// A request's status and the body of its response, as sent.
+    fn exchange(address: &str, method: &str, path: &str, token: Option<&str>, body: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(address).expect("the gateway accepts a connection");
         stream.set_read_timeout(Some(Duration::from_secs(5))).expect("a read timeout");
         let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
@@ -790,7 +796,9 @@ mod recorded {
         stream.write_all(format!("{head}{body}").as_bytes()).expect("sent");
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("a response");
-        response.split_whitespace().nth(1).and_then(|s| s.parse().ok()).expect("a status")
+        let status = response.split_whitespace().nth(1).and_then(|s| s.parse().ok()).expect("a status");
+        let body = response.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+        (status, body.to_string())
     }
 
     fn connect(url: &str) -> WebSocket<MaybeTlsStream<TcpStream>> {
@@ -849,6 +857,52 @@ mod recorded {
 
         assert_eq!(request(&venue.address, "GET", "/v4/nowhere", None, ""), 404);
         find(dir, "a route that does not exist", |r| is(r, "http-response", "out") && r["status"] == 404);
+    }
+
+    #[test]
+    fn the_public_half_records_what_it_answered_by_length_and_hash_and_a_refusal_in_full() {
+        let venue = testing::venue("audit-public-rest");
+        let dir = &venue.audit_dir;
+        let (status, markets) = exchange(&venue.address, "GET", "/v4/markets", None, "");
+        assert_eq!(status, 200);
+        let (status, book) = exchange(&venue.address, "GET", &format!("/v4/markets/{MARKET}/book"), None, "");
+        assert_eq!(status, 200);
+        for (path, sent) in [("/v4/markets".to_string(), &markets), (format!("/v4/markets/{MARKET}/book"), &book)] {
+            let asked = find(dir, &format!("the request for {path}"), |r| {
+                is(r, "http-request", "in") && r["line"] == format!("GET {path} HTTP/1.1")
+            });
+            assert_eq!(asked["half"], "public", "{asked}");
+            assert!(asked["headers"]["host"].is_string(), "the request is recorded with its headers: {asked}");
+            let answered = find(dir, "its answer", |r| is(r, "http-response", "out") && r["conn"] == asked["conn"]);
+            assert_eq!(answered["status"], 200, "{answered}");
+            assert!(answered.get("body").is_none(), "a public answer's body was recorded: {answered}");
+            assert_eq!(answered["length"], sent.len(), "{answered}");
+            assert_eq!(answered["sha256"], super::sha256_hex(sent.as_bytes()), "{answered}");
+        }
+
+        // Refusals and errors on the public half keep their bodies.
+        let (status, missing) = exchange(&venue.address, "GET", "/v4/markets/99999/book", None, "");
+        assert_eq!(status, 404);
+        let refused =
+            find(dir, "the refusal", |r| is(r, "http-response", "out") && r["half"] == "public" && r["status"] == 404);
+        assert_eq!(refused["body"], missing, "{refused}");
+        assert!(refused.get("sha256").is_none(), "{refused}");
+
+        // The private half keeps every body.
+        let (status, account) = exchange(&venue.address, "GET", "/v4/account", Some(MAKER_TOKEN), "");
+        assert_eq!(status, 200);
+        let private = find(dir, "the account's answer", |r| {
+            is(r, "http-response", "out") && r["half"] == "private" && r["status"] == 200
+        });
+        assert_eq!(private["body"], account, "{private}");
+
+        let file = std::fs::read_dir(dir)
+            .expect("listed")
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .expect("a log file");
+        assert_eq!(verify(&file), Ok(false), "the chain verifies");
     }
 
     #[test]

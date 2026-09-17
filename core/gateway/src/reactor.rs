@@ -643,8 +643,16 @@ fn record_response(gateway: &Gateway, id: u64, peer: &str, http: &Http) {
     let mut fields = about(gateway, id, peer, who.map(|c| c.account), who.and_then(|c| c.key.as_deref()), None);
     fields.insert("dir".into(), json!("out"));
     fields.insert("status".into(), json!(status));
-    // Masked too: the answer that creates an API key carries its secret.
-    fields.insert("body".into(), json!(audit::mask_tokens(&String::from_utf8_lossy(body))));
+    if gateway.half == Half::Public && status.is_some_and(|s| s < 400) {
+        // What the public half answers is market data: the same for every client, reconstructable from the journal,
+        // and polled all day, so its bytes would fill the log. The length and hash of what was sent still say what the
+        // answer was; a refusal or an error keeps its body.
+        fields.insert("length".into(), json!(body.len()));
+        fields.insert("sha256".into(), json!(audit::sha256_hex(body)));
+    } else {
+        // Masked too: the answer that creates an API key carries its secret.
+        fields.insert("body".into(), json!(audit::mask_tokens(&String::from_utf8_lossy(body))));
+    }
     gateway.audit.record("http-response", fields);
 }
 

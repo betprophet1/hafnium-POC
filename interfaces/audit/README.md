@@ -89,7 +89,7 @@ WebSocket once it has one, `session` (the engine session ID the gateway gave it)
 | `kind` | Fields |
 |---|---|
 | `http-request` | `dir: in`. `line` (the request line), `headers` (every header, names in lower case, secrets masked), `body` (as text). Or, for bytes that can never be a request, `line` (what could be read of it) and `unreadable` (why). |
-| `http-response` | `dir: out`. `status` and `body`. |
+| `http-response` | `dir: out`. `status`, and `body` (as text, secrets masked); on the public half, for a status below 400, `length` (the body's length in bytes as sent) and `sha256` (the SHA-256 of those bytes, lower-case hex) instead of `body`. |
 | `ws-open` | A WebSocket upgrade completed: `path`. |
 | `ws-refused` | A WebSocket upgrade that failed its handshake: `path`. |
 | `ws-frame` | `dir`, and `msg`, the text frame (secrets masked); for a binary frame from a client, `binary` (its length) instead. |
@@ -99,11 +99,18 @@ What is recorded on each half:
 
 | | Private half | Public half |
 |---|---|---|
-| REST | every request and its response | every request and its response |
+| REST request | line, headers (masked), body | line, headers (masked), body |
+| REST response | status and body | a refusal or error (4xx, 5xx): status and body; any other: status, `length` and `sha256` of the body, not the body |
 | WebSocket | open, close; every frame from the client; every frame to it (replies, errors, executions, account updates, quotes, transfers) | open, close; every frame from the client except `heartbeat`; every `error` sent to it |
 
-Market data (book, trade and market messages) is not recorded: it is the same for every viewer, high in volume, and
-reconstructable from the journal. Neither are heartbeats on the public half, which viewers send all day. A connection
+The private half is recorded in full: what an account asked for and was told is what a dispute turns on, and much of
+it (a refused order, a transfer's answer, a quote) is in no journal. The public half serves market data, which is the
+same for every viewer, high in volume, and reconstructable from the journal, so it is not stored: book, trade and market
+messages on its WebSocket are not recorded, nor the bodies of its successful REST answers (`GET /v4/markets`,
+`GET /v4/markets/{id}/book` and the rest of its routes), which clients poll all day. What a client asked for is still
+recorded, and the length and hash of its answer show what it was sent, which a client holding the answer can check. A
+public answer's hash cannot be recomputed from the journal alone, since the bytes depend on the moment of the answer.
+Heartbeats on the public half, which viewers send all day, are not recorded either. A connection
 that never completes a request line, a whole request or a WebSocket handshake within the gateway's arrival time has
 said nothing to record, and is not recorded. Refusals are always recorded: every 4xx and 5xx response, and every `error` frame,
 including flood limits and failed logins.

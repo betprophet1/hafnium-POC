@@ -68,7 +68,8 @@ engine and does not use up its ID.
 A refusal at the edge is never journaled, so the gateway keeps the record of it: every REST request and its
 response, and every WebSocket's upgrade, frames and end, in the audit log format of `interfaces/audit/` (blueprint
 §12, flood protection). On the private half every frame both ways is recorded; on the public half the client's frames
-except heartbeats and the errors sent back, but not market data. Credentials are masked: the `Authorization` value
+except heartbeats and the errors sent back, but not market data, and each REST request with its answer's status, length
+and hash, the body only of a refusal or an error. Credentials are masked: the `Authorization` value
 becomes `Bearer ***`, the `token` of a `login` becomes `***`, and so do the `secret` and `credential` of a key just
 created. Every record of a request or session authenticated with an API key names the key (`key`), so an auditor can
 tell which key did what; its secret never appears.
