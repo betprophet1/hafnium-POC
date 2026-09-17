@@ -7,8 +7,9 @@
 //! loop that cannot queue a record for `STALL` takes the disk to have hung, and a record that cannot be written stops
 //! the process (the format document says why).
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -49,10 +50,43 @@ fn exit_on_failure() -> Failure {
     })
 }
 
+/// What a field holds: JSON the loop already had, or text from the wire, which the writer masks and escapes. Masking
+/// is a scan of the whole message, so it belongs on the writer's thread and not on an event loop.
+enum Field {
+    Json(Value),
+    Wire(String),
+}
+
+/// A record's fields, in the order they were put there. Field names are static and the record is written straight
+/// into the writer's buffer, so a record about a message costs one allocation: the copy of the message itself.
+pub struct Fields(Vec<(&'static str, Field)>);
+
+impl Fields {
+    /// Room for the fields a record has, taken once.
+    pub fn new() -> Self {
+        Self(Vec::with_capacity(8))
+    }
+
+    pub fn put(&mut self, name: &'static str, value: impl Into<Value>) {
+        self.0.push((name, Field::Json(value.into())));
+    }
+
+    /// Text a client sent or was sent, kept as it arrived: the writer masks credentials out of it (`push_masked`).
+    pub fn wire(&mut self, name: &'static str, text: &str) {
+        self.0.push((name, Field::Wire(text.to_string())));
+    }
+}
+
+impl Default for Fields {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct Record {
     micros: u64,
     kind: &'static str,
-    fields: Map<String, Value>,
+    fields: Fields,
 }
 
 /// Where records are taken. Cheap to clone; every clone feeds the same writer.
@@ -95,7 +129,7 @@ impl Audit {
     }
 
     /// Takes a record of `kind` now. Waits while the queue is full, and fails the log if it stays full.
-    pub fn record(&self, kind: &'static str, fields: Map<String, Value>) {
+    pub fn record(&self, kind: &'static str, fields: Fields) {
         let Some(queue) = &self.queue else { return };
         let mut record = Record { micros: wall_micros(), kind, fields };
         for _ in 0..STALL_WAITS {
@@ -151,45 +185,167 @@ fn civil(day: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
-/// `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
-pub fn timestamp(micros: u64) -> String {
+/// `YYYY-MM-DDTHH:MM:SS.ffffffZ`. Records go straight into the writer's buffer, so only the tests of the format
+/// build one of these as a string.
+#[cfg(test)]
+fn timestamp(micros: u64) -> String {
+    let mut out = Vec::new();
+    push_timestamp(&mut out, micros);
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.ffffffZ`, appended.
+fn push_timestamp(out: &mut Vec<u8>, micros: u64) {
     let (day, rest) = (micros / MICROS_PER_DAY, micros % MICROS_PER_DAY);
+    let (y, m, d) = civil(day);
     let seconds = rest / 1_000_000;
-    format!("{}T{:02}:{:02}:{:02}.{:06}Z", date(day), seconds / 3600, seconds / 60 % 60, seconds % 60, rest % 1_000_000)
+    let _ = write!(
+        out,
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:06}Z",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60,
+        rest % 1_000_000
+    );
 }
 
 /// The SHA-256 of `bytes`, in lower-case hex.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    let mut out = String::new();
+    push_hex(&mut out, Sha256::digest(bytes).as_slice());
+    out
 }
 
-/// One record as its line, without the newline.
-fn line(
+/// `bytes` as lower-case hex, replacing what `out` held: the chain's previous hash is kept in one string.
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    out.clear();
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+}
+
+/// `text` as a JSON string: quoted, and escaped where JSON requires it.
+fn push_quoted(out: &mut Vec<u8>, text: &str) {
+    out.push(b'"');
+    push_escaped(out, text);
+    out.push(b'"');
+}
+
+/// The body of a JSON string. Bytes above ASCII are UTF-8 and go as they are; only what JSON forbids is escaped.
+fn push_escaped(out: &mut Vec<u8>, text: &str) {
+    let bytes = text.as_bytes();
+    let mut copied = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let escape: &[u8] = match b {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            0x08 => b"\\b",
+            0x0c => b"\\f",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            0x00..=0x1f => b"",
+            _ => continue,
+        };
+        out.extend_from_slice(&bytes[copied..i]);
+        if escape.is_empty() {
+            let _ = write!(out, "\\u{b:04x}");
+        } else {
+            out.extend_from_slice(escape);
+        }
+        copied = i + 1;
+    }
+    out.extend_from_slice(&bytes[copied..]);
+}
+
+/// Member names whose value is a credential, lower-case. Matched whatever their case, so a client that writes
+/// `Token` — which the gateway refuses, and refusals are logged in full — still keeps its token out of the log.
+const CREDENTIALS: [&str; 7] = ["token", "secret", "credential", "password", "passphrase", "apikey", "api_key"];
+
+/// `text` as a JSON string, with the value of every credential member replaced by `***`. Found textually rather than
+/// by parsing, so a frame that is not JSON at all is masked too.
+fn push_masked(out: &mut Vec<u8>, text: &str) {
+    out.push(b'"');
+    let bytes = text.as_bytes();
+    let (mut i, mut copied) = (0, 0);
+    while let Some(found) = bytes[i..].iter().position(|&b| b == b'"') {
+        let at = i + found;
+        match credential_value(bytes, at) {
+            Some((start, end)) => {
+                push_escaped(out, &text[copied..start]);
+                out.extend_from_slice(b"***");
+                (i, copied) = (end, end);
+            }
+            None => i = at + 1,
+        }
+    }
+    push_escaped(out, &text[copied..]);
+    out.push(b'"');
+}
+
+/// Where the value of a credential member starts and ends, given the quote at `at` that may open the member's name.
+fn credential_value(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
+    let name_end = at + 1 + bytes[at + 1..].iter().position(|&b| b == b'"')?;
+    let name = std::str::from_utf8(bytes.get(at + 1..name_end)?).ok()?;
+    if !CREDENTIALS.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+        return None;
+    }
+    let mut i = name_end + 1;
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    let start = i + 1;
+    let mut end = start;
+    while end < bytes.len() && bytes[end] != b'"' {
+        end += if bytes[end] == b'\\' { 2 } else { 1 };
+    }
+    Some((start, end.min(bytes.len())))
+}
+
+/// What every line carries besides its own fields: where it sits in its file, and what it chains to.
+struct Head<'a> {
     micros: u64,
     n: u64,
-    component: &str,
-    instance: &str,
-    kind: &str,
-    fields: &Map<String, Value>,
-    prev: &str,
-) -> String {
-    let mut out = format!(
-        "{{\"ts\":\"{}\",\"n\":{n},\"component\":{},\"instance\":{},\"kind\":{}",
-        timestamp(micros),
-        Value::from(component),
-        Value::from(instance),
-        Value::from(kind)
-    );
-    for (key, value) in fields {
-        out.push(',');
-        out.push_str(&Value::from(key.as_str()).to_string());
-        out.push(':');
-        out.push_str(&value.to_string());
+    component: &'a str,
+    instance: &'a str,
+    kind: &'a str,
+    prev: &'a str,
+}
+
+/// One record as its line, without the newline, appended to `out`: the writer keeps one buffer for every line it
+/// ever writes, so a record of any size is written without taking memory for it.
+fn push_line(out: &mut Vec<u8>, head: &Head<'_>, fields: &Fields) {
+    let (n, prev) = (head.n, head.prev);
+    out.extend_from_slice(b"{\"ts\":\"");
+    push_timestamp(out, head.micros);
+    let _ = write!(out, "\",\"n\":{n},\"component\":");
+    push_quoted(out, head.component);
+    out.extend_from_slice(b",\"instance\":");
+    push_quoted(out, head.instance);
+    out.extend_from_slice(b",\"kind\":");
+    push_quoted(out, head.kind);
+    for (name, field) in &fields.0 {
+        out.push(b',');
+        push_quoted(out, name);
+        out.push(b':');
+        match field {
+            Field::Json(value) => serde_json::to_writer(&mut *out, value).expect("a buffer never fails a write"),
+            Field::Wire(text) => push_masked(out, text),
+        }
     }
-    out.push_str(",\"prev\":\"");
-    out.push_str(prev);
-    out.push_str("\"}");
-    out
+    out.extend_from_slice(b",\"prev\":\"");
+    out.extend_from_slice(prev.as_bytes());
+    out.extend_from_slice(b"\"}");
 }
 
 /// The file being written, and what the next line chains to.
@@ -203,6 +359,8 @@ struct Writer {
     day: u64,
     next: u64,
     prev: String,
+    /// The line being written, kept from record to record so no record allocates for its own bytes.
+    line: Vec<u8>,
     /// The instance's lock, held for as long as this writer lives (`lock_instance`).
     _lock: File,
 }
@@ -248,6 +406,7 @@ impl Writer {
             day: micros / MICROS_PER_DAY,
             next: 0,
             prev: ZEROS.to_string(),
+            line: Vec::new(),
             _lock: lock,
         };
         writer.begin(micros, after)?;
@@ -278,18 +437,26 @@ impl Writer {
     }
 
     /// Appends one record, first rotating if it belongs to a later day than the file.
-    fn append(&mut self, micros: u64, kind: &str, fields: &Map<String, Value>) -> io::Result<()> {
+    fn append(&mut self, micros: u64, kind: &str, fields: &Fields) -> io::Result<()> {
         self.rotate_if_past_midnight(micros)?;
         self.write_line(micros, kind, fields)
     }
 
-    fn write_line(&mut self, micros: u64, kind: &str, fields: &Map<String, Value>) -> io::Result<()> {
-        let text = line(micros, self.next, &self.component, &self.instance, kind, fields, &self.prev);
-        let mut bytes = Vec::with_capacity(text.len() + 1);
-        bytes.extend_from_slice(text.as_bytes());
-        bytes.push(b'\n');
-        self.file.write_all(&bytes)?;
-        self.prev = sha256_hex(text.as_bytes());
+    /// One record, built in the buffer this writer keeps and written with one write. The write is per record and not
+    /// per batch on purpose: a record already written survives a gateway that is killed, and only the machine going
+    /// down loses what has not been synced.
+    fn write_line(&mut self, micros: u64, kind: &str, fields: &Fields) -> io::Result<()> {
+        let mut line = std::mem::take(&mut self.line);
+        line.clear();
+        let head =
+            Head { micros, n: self.next, component: &self.component, instance: &self.instance, kind, prev: &self.prev };
+        push_line(&mut line, &head, fields);
+        let digest = Sha256::digest(&line);
+        line.push(b'\n');
+        let written = self.file.write_all(&line);
+        self.line = line;
+        written?;
+        push_hex(&mut self.prev, digest.as_slice());
         self.next += 1;
         Ok(())
     }
@@ -322,12 +489,12 @@ impl Writer {
 
     /// Writes a new file's open record, and makes the file durable.
     fn begin(&mut self, micros: u64, after: Option<Value>) -> io::Result<()> {
-        let mut open = Map::new();
-        open.insert("format".into(), json!(FORMAT));
-        open.insert("file".into(), json!(self.name));
-        open.insert("pid".into(), json!(std::process::id()));
+        let mut open = Fields::new();
+        open.put("format", FORMAT);
+        open.put("file", self.name.clone());
+        open.put("pid", std::process::id());
         if let Some(after) = after {
-            open.insert("after".into(), after);
+            open.put("after", after);
         }
         self.write_line(micros, "open", &open)?;
         self.sync()?;
@@ -340,9 +507,9 @@ impl Writer {
 
     /// Ends the file with its close record.
     fn close(&mut self, micros: u64, reason: &str) -> io::Result<()> {
-        let mut close = Map::new();
-        close.insert("reason".into(), json!(reason));
-        close.insert("records".into(), json!(self.next));
+        let mut close = Fields::new();
+        close.put("reason", reason);
+        close.put("records", self.next);
         self.write_line(micros, "close", &close)?;
         self.sync()
     }
@@ -435,17 +602,21 @@ fn seal_earlier_files(
             after = Some(json!({"file": name, "last": sha256_hex(&last)}));
             continue;
         }
-        let mut close = Map::new();
-        close.insert("reason".into(), json!("recovered"));
-        close.insert("records".into(), json!(n + 1));
-        let text = line(micros, n + 1, component, instance, "close", &close, &sha256_hex(&last));
+        let mut close = Fields::new();
+        close.put("reason", "recovered");
+        close.put("records", n + 1);
+        let mut text = Vec::new();
+        let head = Head { micros, n: n + 1, component, instance, kind: "close", prev: &sha256_hex(&last) };
+        push_line(&mut text, &head, &close);
+        let sealed = sha256_hex(&text);
+        text.push(b'\n');
         let mut file = OpenOptions::new().append(true).open(&path)?;
-        file.write_all(format!("{text}\n").as_bytes())?;
+        file.write_all(&text)?;
         if fsync {
             file.sync_data()?;
         }
         eprintln!("venue-gateway: sealed audit file {}, left open by an earlier process", path.display());
-        after = Some(json!({"file": name, "last": sha256_hex(text.as_bytes())}));
+        after = Some(json!({"file": name, "last": sealed}));
     }
     Ok(after)
 }
@@ -504,52 +675,6 @@ pub fn header_value(name: &str, value: &str) -> String {
     }
 }
 
-/// JSON text as it is recorded: the string value of every member named `token`, `secret` or `credential` becomes `***`.
-/// Found textually, so a frame that is not valid JSON is masked too.
-pub fn mask_tokens(text: &str) -> String {
-    ["\"token\"", "\"secret\"", "\"credential\""]
-        .into_iter()
-        .fold(text.to_string(), |text, key| mask_member(&text, key))
-}
-
-/// `text` with the string value of every member named `key` (quotes included) masked.
-fn mask_member(text: &str, key: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut copied = 0;
-    let mut from = 0;
-    while let Some(found) = text[from..].find(key) {
-        let key_end = from + found + key.len();
-        from = key_end;
-        let mut i = key_end;
-        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
-            i += 1;
-        }
-        if bytes.get(i) != Some(&b':') {
-            continue;
-        }
-        i += 1;
-        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
-            i += 1;
-        }
-        if bytes.get(i) != Some(&b'"') {
-            continue;
-        }
-        let start = i + 1;
-        let mut end = start;
-        while end < bytes.len() && bytes[end] != b'"' {
-            end += if bytes[end] == b'\\' { 2 } else { 1 };
-        }
-        let end = end.min(bytes.len());
-        out.push_str(&text[copied..start]);
-        out.push_str("***");
-        copied = end;
-        from = end;
-    }
-    out.push_str(&text[copied..]);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,11 +690,24 @@ mod tests {
         dir
     }
 
-    fn fields(text: &str) -> Map<String, Value> {
-        let mut fields = Map::new();
-        fields.insert("dir".into(), json!("in"));
-        fields.insert("msg".into(), json!(text));
+    fn fields(text: &str) -> Fields {
+        let mut fields = Fields::new();
+        fields.put("dir", "in");
+        fields.wire("msg", text);
         fields
+    }
+
+    /// The text of a record's wire field, for tests that read records off the queue rather than out of a file.
+    fn wire_of(record: &Record) -> String {
+        record
+            .fields
+            .0
+            .iter()
+            .find_map(|(_, field)| match field {
+                Field::Wire(text) => Some(text.clone()),
+                Field::Json(_) => None,
+            })
+            .unwrap_or_default()
     }
 
     fn files(dir: &Path) -> Vec<PathBuf> {
@@ -672,26 +810,53 @@ mod tests {
         assert!(Writer::open(&dir, COMPONENT, "test", false, LATE - 6).is_ok(), "the instance stayed locked");
     }
 
+    /// What a wire field holds in the file: masked and escaped as the writer does it, read back as JSON, so these
+    /// tests check the escaping as well as the masking.
+    fn masked(text: &str) -> String {
+        let mut out = Vec::new();
+        push_masked(&mut out, text);
+        serde_json::from_slice::<String>(&out).expect("a JSON string")
+    }
+
     #[test]
     fn secrets_are_masked() {
         assert_eq!(header_value("authorization", "Bearer dev-market-maker"), "Bearer ***");
         assert_eq!(header_value("cookie", "session=abc; x=y"), "***");
         assert_eq!(header_value("content-type", "application/json"), "application/json");
         assert_eq!(
-            mask_tokens(r#"{"op":"login","token":"dev-market-maker","id":"l"}"#),
+            masked(r#"{"op":"login","token":"dev-market-maker","id":"l"}"#),
             r#"{"op":"login","token":"***","id":"l"}"#
         );
+        assert_eq!(masked(r#"{"token" : "a\"b", "x": {"token":"c"}}"#), r#"{"token" : "***", "x": {"token":"***"}}"#);
         assert_eq!(
-            mask_tokens(r#"{"token" : "a\"b", "x": {"token":"c"}}"#),
-            r#"{"token" : "***", "x": {"token":"***"}}"#
-        );
-        assert_eq!(
-            mask_tokens(r#"{"keyId":"ak_0123456789abcdef","secret":"00ff","credential":"ak_0123456789abcdef.00ff"}"#),
+            masked(r#"{"keyId":"ak_0123456789abcdef","secret":"00ff","credential":"ak_0123456789abcdef.00ff"}"#),
             r#"{"keyId":"ak_0123456789abcdef","secret":"***","credential":"***"}"#
         );
         // Not JSON, and still masked; and a value that happens to be the word token is not a member.
-        assert_eq!(mask_tokens(r#"{"op":"login","token":"secret"#), r#"{"op":"login","token":"***"#);
-        assert_eq!(mask_tokens(r#"{"op":"token","x":1}"#), r#"{"op":"token","x":1}"#);
+        assert_eq!(masked(r#"{"op":"login","token":"secret"#), r#"{"op":"login","token":"***"#);
+        assert_eq!(masked(r#"{"op":"token","x":1}"#), r#"{"op":"token","x":1}"#);
+    }
+
+    #[test]
+    fn a_credential_is_masked_whatever_it_is_called() {
+        // A login the gateway refuses for its field name is recorded in full, so the name it used must be masked too.
+        assert_eq!(masked(r#"{"op":"login","Token":"ak_1.ff"}"#), r#"{"op":"login","Token":"***"}"#);
+        assert_eq!(masked(r#"{"PASSWORD":"hunter2"}"#), r#"{"PASSWORD":"***"}"#);
+        for name in ["password", "passphrase", "apiKey", "api_key"] {
+            let frame = format!(r#"{{"{name}":"s3cret"}}"#);
+            assert_eq!(masked(&frame), format!(r#"{{"{name}":"***"}}"#), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_frame_is_escaped_as_json_requires() {
+        // A line break in a frame must not become a line break in the file: one record is one line.
+        const FRAME: &str = "a\"b\\c\nd\te\u{1}f\u{20ac}";
+        let mut out = Vec::new();
+        push_masked(&mut out, FRAME);
+        let written = String::from_utf8(out).expect("UTF-8");
+        assert_eq!(written, serde_json::to_string(FRAME).expect("JSON"), "not escaped as serde_json escapes");
+        assert_eq!(masked(FRAME), FRAME, "a frame does not come back as it went in");
     }
 
     #[test]
@@ -711,10 +876,10 @@ mod tests {
             let _ = sent.send(());
         });
         assert!(done.recv_timeout(Duration::from_millis(200)).is_err(), "a record was queued past a full queue");
-        assert_eq!(records.recv().map(|r| r.fields["msg"].clone()).ok(), Some(json!("1")));
+        assert_eq!(records.recv().as_ref().map(wire_of).ok(), Some("1".to_string()));
         assert!(done.recv_timeout(Duration::from_secs(5)).is_ok(), "the waiting record was never queued");
-        let rest: Vec<Value> = records.try_iter().map(|r| r.fields["msg"].clone()).collect();
-        assert_eq!(rest, [json!("2"), json!("3")]);
+        let rest: Vec<String> = records.try_iter().map(|r| wire_of(&r)).collect();
+        assert_eq!(rest, ["2", "3"]);
         assert_eq!(failures.load(Ordering::SeqCst), 0);
     }
 

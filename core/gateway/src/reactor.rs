@@ -22,7 +22,7 @@
 //! record only queues it; nothing here waits on the disk.
 
 use crate::api::{Gateway, Half, Pending};
-use crate::audit;
+use crate::audit::{self, Fields};
 use crate::forwarded::Forwarding;
 use crate::hub::Outbox;
 use crate::identity::Credential;
@@ -425,9 +425,9 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, origin: &mut 
             }
             Err(reason) => {
                 let mut fields = about(gateway, origin, None, None, None);
-                fields.insert("dir".into(), json!("in"));
-                fields.insert("line".into(), json!(request_line(&http.request)));
-                fields.insert("unreadable".into(), json!(reason));
+                fields.put("dir", "in");
+                fields.put("line", request_line(&http.request));
+                fields.put("unreadable", reason.clone());
                 gateway.audit.record("http-request", fields);
                 http.response = rest::unreadable(&reason);
             }
@@ -483,7 +483,7 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
         if let Some(session) = &conn.session {
             forwarded_client(gateway, &mut conn.origin, conn.upgrade.take());
             let mut fields = about(gateway, &conn.origin, None, None, Some(session.id()));
-            fields.insert("path".into(), json!(conn.path));
+            fields.put("path", conn.path.clone());
             gateway.audit.record("ws-open", fields);
         }
     }
@@ -506,8 +506,8 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
                 }
                 Ok(Message::Binary(data)) => {
                     let mut fields = about(gateway, origin, session.account(), session.api_key(), Some(session.id()));
-                    fields.insert("dir".into(), json!("in"));
-                    fields.insert("binary".into(), json!(data.len()));
+                    fields.put("dir", "in");
+                    fields.put("binary", data.len());
                     gateway.audit.record("ws-frame", fields);
                     let refused = ws::binary_refused();
                     record_to_client(gateway, origin, session, &refused, true);
@@ -596,7 +596,7 @@ fn close_slot(
     if let Some(conn) = conns[token].take() {
         if let Some(session) = &conn.session {
             let mut fields = about(gateway, &conn.origin, session.account(), session.api_key(), Some(session.id()));
-            fields.insert("reason".into(), json!(reason.unwrap_or(conn.ending)));
+            fields.put("reason", reason.unwrap_or(conn.ending));
             gateway.audit.record("ws-close", fields);
             ws::end(gateway, session);
         }
@@ -644,30 +644,24 @@ fn forwarded_client(gateway: &Gateway, origin: &mut Origin, upgrade: Option<Arc<
 }
 
 /// The fields that say which connection a record is about.
-fn about(
-    gateway: &Gateway,
-    origin: &Origin,
-    account: Option<u64>,
-    key: Option<&str>,
-    session: Option<u64>,
-) -> Map<String, Value> {
-    let mut fields = Map::new();
-    fields.insert("conn".into(), json!(origin.id));
-    fields.insert("peer".into(), json!(origin.peer));
+fn about(gateway: &Gateway, origin: &Origin, account: Option<u64>, key: Option<&str>, session: Option<u64>) -> Fields {
+    let mut fields = Fields::new();
+    fields.put("conn", origin.id);
+    fields.put("peer", origin.peer.clone());
     // Only when a trusted proxy named one: otherwise the peer is the client.
     if let Some(client) = &origin.client {
-        fields.insert("client".into(), json!(client));
+        fields.put("client", client.clone());
     }
-    fields.insert("half".into(), json!(gateway.half.name()));
+    fields.put("half", gateway.half.name());
     if let Some(account) = account {
-        fields.insert("account".into(), json!(account.to_string()));
+        fields.put("account", account.to_string());
     }
     // The key's ID, never its secret, so an auditor can tell which of an account's keys did something.
     if let Some(key) = key {
-        fields.insert("key".into(), json!(key));
+        fields.put("key", key);
     }
     if let Some(session) = session {
-        fields.insert("session".into(), json!(session.to_string()));
+        fields.put("session", session.to_string());
     }
     fields
 }
@@ -682,12 +676,12 @@ fn request_line(request: &[u8]) -> String {
 fn record_request(gateway: &Gateway, origin: &Origin, http: &Http, request: &http::Request) {
     let who = http.who.as_ref();
     let mut fields = about(gateway, origin, who.map(|c| c.account), who.and_then(|c| c.key.as_deref()), None);
-    fields.insert("dir".into(), json!("in"));
-    fields.insert("line".into(), json!(request_line(&http.request)));
+    fields.put("dir", "in");
+    fields.put("line", request_line(&http.request));
     let headers: Map<String, Value> =
         request.headers.iter().map(|(name, value)| (name.clone(), json!(audit::header_value(name, value)))).collect();
-    fields.insert("headers".into(), Value::Object(headers));
-    fields.insert("body".into(), json!(audit::mask_tokens(&String::from_utf8_lossy(&request.body))));
+    fields.put("headers", Value::Object(headers));
+    fields.wire("body", &String::from_utf8_lossy(&request.body));
     gateway.audit.record("http-request", fields);
 }
 
@@ -697,17 +691,17 @@ fn record_response(gateway: &Gateway, origin: &Origin, http: &Http) {
     let body = response.windows(4).position(|w| w == b"\r\n\r\n").map_or(&response[..0], |i| &response[i + 4..]);
     let who = http.who.as_ref();
     let mut fields = about(gateway, origin, who.map(|c| c.account), who.and_then(|c| c.key.as_deref()), None);
-    fields.insert("dir".into(), json!("out"));
-    fields.insert("status".into(), json!(status));
+    fields.put("dir", "out");
+    fields.put("status", status);
     if gateway.half == Half::Public && status.is_some_and(|s| s < 400) {
         // What the public half answers is market data: the same for every client, reconstructable from the journal,
         // and polled all day, so its bytes would fill the log. The length and hash of what was sent still say what the
         // answer was; a refusal or an error keeps its body.
-        fields.insert("length".into(), json!(body.len()));
-        fields.insert("sha256".into(), json!(audit::sha256_hex(body)));
+        fields.put("length", body.len());
+        fields.put("sha256", audit::sha256_hex(body));
     } else {
         // Masked too: the answer that creates an API key carries its secret.
-        fields.insert("body".into(), json!(audit::mask_tokens(&String::from_utf8_lossy(body))));
+        fields.wire("body", &String::from_utf8_lossy(body));
     }
     gateway.audit.record("http-response", fields);
 }
@@ -715,7 +709,7 @@ fn record_response(gateway: &Gateway, origin: &Origin, http: &Http) {
 fn record_refused_upgrade(gateway: &Gateway, conn: &mut Conn) {
     forwarded_client(gateway, &mut conn.origin, conn.upgrade.take());
     let mut fields = about(gateway, &conn.origin, None, None, None);
-    fields.insert("path".into(), json!(conn.path));
+    fields.put("path", conn.path.clone());
     gateway.audit.record("ws-refused", fields);
 }
 
@@ -728,8 +722,8 @@ fn record_from_client(gateway: &Gateway, origin: &Origin, session: &Session, tex
         return;
     }
     let mut fields = about(gateway, origin, session.account(), session.api_key(), Some(session.id()));
-    fields.insert("dir".into(), json!("in"));
-    fields.insert("msg".into(), json!(audit::mask_tokens(text)));
+    fields.put("dir", "in");
+    fields.wire("msg", text);
     gateway.audit.record("ws-frame", fields);
 }
 
@@ -742,8 +736,10 @@ fn record_to_client(gateway: &Gateway, origin: &Origin, session: &Session, text:
         return;
     }
     let mut fields = about(gateway, origin, session.account(), session.api_key(), Some(session.id()));
-    fields.insert("dir".into(), json!("out"));
-    fields.insert("msg".into(), json!(text));
+    fields.put("dir", "out");
+    // Masked like anything else now that masking costs the loop nothing: no answer carries a credential today, and
+    // one added later should not have to remember this.
+    fields.wire("msg", text);
     gateway.audit.record("ws-frame", fields);
 }
 
