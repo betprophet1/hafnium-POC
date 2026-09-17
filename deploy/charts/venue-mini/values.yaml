@@ -61,6 +61,16 @@ treasury:
     size: 256Mi
     # Empty uses the cluster's default class (k3d: local-path).
     className: ""
+# The identity service of test environments (core/identity): API keys with permissions, made, listed and revoked on
+# the gateway's private half (/v4/keys) and kept in a store on a volume of its own. Without it the gateway refuses keys
+# and only the catalogue's dev tokens work. Test environments only: production identity is interface 6.
+identity:
+  enabled: true
+  fsync: true
+  storage:
+    size: 64Mi
+    # Empty uses the cluster's default class (k3d: local-path).
+    className: ""
 # The dummy oracle: lists a new round of each demo market on the calendar in files/calendar.json, runs it (start,
 # sometimes a suspension, end, close) and settles it through proposal, auto-approval and a dispute window, voiding one
 # now and then. The settlement tab drives it. Off, the markets the seed lists stay open until someone settles them.

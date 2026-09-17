@@ -5,8 +5,8 @@ through ArgoCD. There is no compose file; the laptop runs the same chart.
 
 | Path | What it is |
 |---|---|
-| `images/venue-node.Dockerfile` | The image `venue`: `venue-node`, `venue-gateway`, `venue-parlays`, `venue-sim` and `venue-treasury`, built from the repository root |
-| `charts/venue-mini/` | The chart: the core, the gateway, the dummy treasury, the parlay service, a seed job for the demo markets, the dummy oracle, synthetic maker and taker, the web page, network policies and a `helm test` smoke test |
+| `images/venue-node.Dockerfile` | The image `venue`: `venue-node`, `venue-gateway`, `venue-parlays`, `venue-sim`, `venue-treasury` and `venue-identity`, built from the repository root |
+| `charts/venue-mini/` | The chart: the core, the gateway, the identity service, the dummy treasury, the parlay service, a seed job for the demo markets, the dummy oracle, synthetic maker and taker, the web page, network policies and a `helm test` smoke test |
 | `charts/venue-mini/files/markets.json` | The demo catalogue: accounts with their dev tokens, tabs and whether they respond to requests for quote, markets and their outcome names |
 | `charts/venue-mini/files/calendar.json` | The dummy oracle's calendar: how often each market lists a new round, its timings, and the resolution timers (`core/sim/README.md`) |
 | `charts/venue-mini/templates/gateway.yaml` | Also the gateway's audit log volume (`/var/lib/gateway-audit`, `gateway.audit` in values): every request and answer, in the format of `interfaces/audit/`. Nothing ships it to retained storage yet |
@@ -24,7 +24,7 @@ deploy/laptop.sh web    # then open http://127.0.0.1:8080
 The page has an order book and five tabs. The market maker and retail customer tabs are private WebSocket sessions on
 the gateway (`/v4/ws_private`), each logged in with its account's dev token, and the book comes from a public one
 (`/v4/ws_public`); the account tab deposits and withdraws for either account through the dummy treasury and shows its
-cash, positions and transfers; the parlays tab builds a parlay from open markets and requests quotes for it as the
+cash, positions and transfers, and makes, lists and revokes the account's API keys; the parlays tab builds a parlay from open markets and requests quotes for it as the
 retail customer, shows the quotes as they arrive and lapse, takes one, and lists every parlay with its legs and how it
 settled. Markets run on their own: the dummy oracle (`oracle.enabled`, on by default) lists a new round of each market
 every few minutes (the S&P 500 market once a day, trading for 22 hours, so something stays put while you test) and starts, ends, closes and settles it through two dummy sources, an auto-approver and a 30 s
@@ -43,6 +43,8 @@ curl -s localhost:8080/oracle/schedule
 curl -s -H 'Authorization: Bearer dev-retail-customer' localhost:8080/v4/account
 curl -s -H 'Authorization: Bearer dev-retail-customer' localhost:8080/v4/transfers \
   -d '{"clientTransferId": "d1", "kind": "deposit", "amountCents": 10000, "method": "dummy_bank"}'
+curl -s -H 'Authorization: Bearer dev-retail-customer' localhost:8080/v4/keys \
+  -d '{"label": "my bot", "permissions": ["read", "trade"]}'   # then use its credential as the bearer token
 ```
 
 `up` is safe to repeat. After rebuilding, it replaces every pod, the core included, which replays its journal before
@@ -62,6 +64,9 @@ it is ready. `down` deletes the cluster and the journal with it.
   the journal every `treasury.reconciliation.everyMs`; `treasury.faults: demo` loses a few percent of the bank's
   notices and of sleeve-adjustment answers on purpose, so the account tab's reconciliation section has breaks to show.
   The seed's grants are still how accounts start.
+- **API keys through the identity service.** With `identity.enabled` (the default) the gateway verifies API keys with
+  the identity service and passes `/v4/keys` to it; the key store is on a volume of its own and only the gateway may
+  reach it. Dev tokens keep working beside keys. Test-environment identity only (`core/identity/README.md`).
 - **Seeding is idempotent.** The seed job runs after every install and upgrade; its commands have fixed IDs.
 - **Not production.** Production runs the core on dedicated hosts behind Aeron Cluster (blueprint §5, §9). Tokens are
   fixed dev tokens, and the page and operator actions are unauthenticated; never expose them outside the cluster.

@@ -103,6 +103,8 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
 @media (max-width: 520px) { .money { grid-template-columns: 1fr; } }
 .money form { border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin: 0; }
 .money h4 { width: 100%; margin: 0; font-size: 13px; }
+.secret { border: 1px solid var(--accent); border-radius: 8px; padding: 10px; margin: 8px 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.secret code { word-break: break-all; font-size: 12px; flex: 1 1 20em; }
 .legpick { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 6px 10px; padding: 6px 0; border-top: 1px solid var(--line); }
 .legpick .title { font-size: 12px; color: var(--muted); }
 .yn { display: flex; gap: 4px; }
@@ -213,6 +215,22 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
       <h3>Transfers</h3><div id="acctTransfers"></div>
       <h3>Positions</h3><div id="acctPositions"></div>
       <h3>Reconciliation <button class="link small" id="reconRun">Run now</button></h3><div id="recon"></div>
+      <h3>API keys</h3>
+      <div class="money">
+        <form id="keyForm" style="grid-column: 1 / -1">
+          <h4>New key</h4>
+          <label>Label<input id="keyLabel" maxlength="64" value="my bot"></label>
+          <label class="check"><input type="checkbox" checked disabled> read</label>
+          <label class="check"><input type="checkbox" id="keyTrade" checked> trade</label>
+          <label class="check"><input type="checkbox" id="keyTransfers"> transfers</label>
+          <label class="check"><input type="checkbox" id="keyKeys"> keys</label>
+          <label>Expires<select id="keyExpiry"><option value="">never</option><option value="1">in an hour</option><option value="24">in a day</option><option value="720">in 30 days</option></select></label>
+          <button class="primary">Create</button>
+        </form>
+      </div>
+      <div id="keySecret"></div>
+      <p class="note">A key acts for this account with only the permissions it was given: send <code>keyId.secret</code> as the bearer token, in a WebSocket login, or in FIX Password. The secret is shown once. Revoking stops a key within 10 seconds, sessions included.</p>
+      <div id="acctKeys"></div>
     </div>
 
     <div id="tab-parlays" hidden>
@@ -778,6 +796,7 @@ function renderAccount() {
   setHTML($('#acctPositions'), positionsHtml(s));
   for (const id of ['#depMethod', '#wdMethod']) if (!$(id).options.length) setHTML($(id), METHODS.map(([v, l]) => `<option value="${v}">${l}</option>`).join(''));
   if (!s) return setHTML($('#acctTransfers'), '');
+  renderKeys(s);
   if (s.transfersError) return setHTML($('#acctTransfers'), `<p class="muted">${esc(s.transfersError)}</p>`);
   const list = [...(s.transfers || new Map()).values()].sort((a, b) => Number(BigInt(b.transferId) - BigInt(a.transferId)));
   setHTML($('#acctTransfers'), list.length ? '<table><thead><tr><th>When</th><th>Kind</th><th class="r">Amount</th><th>Method</th><th>State</th><th></th></tr></thead><tbody>'
@@ -832,6 +851,64 @@ document.addEventListener('click', async ev => {
 });
 loadRecon();
 setInterval(() => { if (tab === 'account') loadRecon(); }, 3000);
+// ------------------------------------------------------------------------------------------ API keys
+
+// Keys are managed with the account's dev token, which holds the keys permission. The list is read when an account is
+// first shown and after each change; nothing streams key changes.
+async function loadKeys(s) {
+  s.keys = null;
+  try {
+    const r = await fetch('/v4/keys', {headers: {Authorization: 'Bearer ' + s.token}});
+    const j = await r.json();
+    s.keys = r.ok ? j.keys : {error: j.error ? j.error.message : r.statusText};
+  } catch (e) { s.keys = {error: String(e)}; }
+  renderKeys(s);
+}
+
+async function keyCall(s, method, path, body) {
+  try {
+    const r = await fetch(path, {method, headers: {Authorization: 'Bearer ' + s.token, 'Content-Type': 'application/json'}, body: body && JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) { toast(`${words(j.error.code)}: ${j.error.message}`, 'bad'); return null; }
+    return j;
+  } catch (e) { toast(String(e), 'bad'); return null; }
+}
+
+async function createKey() {
+  const s = sessions[acctName];
+  if (!s) return;
+  const permissions = ['read'].concat([['#keyTrade', 'trade'], ['#keyTransfers', 'transfers'], ['#keyKeys', 'keys']].filter(([id]) => $(id).checked).map(([, p]) => p));
+  const body = {label: $('#keyLabel').value.trim(), permissions};
+  const hours = +$('#keyExpiry').value;
+  if (hours) body.expiresAt = new Date(Date.now() + hours * 3600e3).toISOString();
+  const made = await keyCall(s, 'POST', '/v4/keys', body);
+  if (!made) return;
+  s.secretShown = {keyId: made.keyId, credential: made.credential};
+  toast(`${s.label}: key ${made.keyId} created`, 'ok');
+  loadKeys(s);
+}
+
+async function revokeKey(keyId) {
+  const s = sessions[acctName];
+  if (!s || !confirm(`Revoke ${keyId}? Anything using it stops working within 10 seconds.`)) return;
+  if (await keyCall(s, 'DELETE', '/v4/keys/' + keyId)) { toast(`${s.label}: key ${keyId} revoked`, 'ok'); loadKeys(s); }
+}
+
+function renderKeys(s) {
+  if (!s) return setHTML($('#acctKeys'), '');
+  if (s.keys === undefined) { loadKeys(s); return; }
+  const shown = s.secretShown;
+  setHTML($('#keySecret'), shown ? `<div class="secret"><span class="small">Credential for <b>${esc(shown.keyId)}</b>, shown this once:</span><code id="keyCredential">${esc(shown.credential)}</code>`
+    + `<button data-copy-key="1">Copy</button><button class="ghost" data-hide-key="1">Done</button></div>` : '');
+  if (s.keys === null) return setHTML($('#acctKeys'), '<p class="muted">Loading…</p>');
+  if (s.keys.error) return setHTML($('#acctKeys'), `<p class="muted">${esc(s.keys.error)}</p>`);
+  const when = t => t ? new Date(t).toLocaleString() : '—';
+  const state = k => k.revokedAt ? '<span class="state failed">revoked</span>' : k.expiresAt && new Date(k.expiresAt) <= new Date() ? '<span class="state cancelled">expired</span>' : '<span class="state settled">active</span>';
+  setHTML($('#acctKeys'), s.keys.length ? '<table><thead><tr><th>Key</th><th>Label</th><th>Permissions</th><th>Created</th><th>Expires</th><th>Last used</th><th>State</th><th></th></tr></thead><tbody>'
+    + s.keys.map(k => `<tr><td><code>${esc(k.keyId)}</code></td><td>${esc(k.label)}</td><td>${k.permissions.map(esc).join(', ')}</td><td class="muted">${when(k.createdAt)}</td><td class="muted">${when(k.expiresAt)}</td><td class="muted">${when(k.lastUsedAt)}</td><td>${state(k)}</td>`
+      + `<td class="r">${k.revokedAt ? '' : `<button class="link" data-revoke-key="${esc(k.keyId)}">Revoke</button>`}</td></tr>`).join('')
+    + '</tbody></table>' : '<p class="muted">No keys yet.</p>');
+}
 
 // The dummy oracle's schedule (venue-sim oracle, passed through under /oracle). Times are the sequencer's, in ms; the
 // page keeps its offset from this browser's clock so countdowns tick between polls.
@@ -1013,6 +1090,9 @@ document.addEventListener('click', ev => {
   if (t.dataset.pick) { selInst = t.dataset.pick; subscribeMarket(); return render(); }
   if (t.dataset.cancel) return send(t.dataset.session, 'cancel', {orderId: t.dataset.cancel});
   if (t.dataset.acct) { acctName = t.dataset.acct; return renderAccount(); }
+  if (t.dataset.revokeKey) return revokeKey(t.dataset.revokeKey);
+  if (t.dataset.copyKey) return navigator.clipboard.writeText($('#keyCredential').textContent).then(() => toast('Copied', 'ok'), () => toast('Copy it by hand: the browser refused', 'bad'));
+  if (t.dataset.hideKey) { sessions[acctName].secretShown = null; return renderKeys(sessions[acctName]); }
   if (t.dataset.cancelTransfer) return transferCall(sessions[acctName], 'DELETE', '/v4/transfers/' + t.dataset.cancelTransfer);
   if (t.dataset.list) return oracle(`templates/${t.dataset.list}/list`);
   if (t.dataset.oracle) {
@@ -1057,6 +1137,7 @@ document.addEventListener('submit', ev => {
   ev.preventDefault();
   if (ev.target.id === 'depositForm') requestTransfer('deposit');
   else if (ev.target.id === 'withdrawForm') requestTransfer('withdrawal');
+  else if (ev.target.id === 'keyForm') createKey();
 });
 
 document.addEventListener('change', ev => {

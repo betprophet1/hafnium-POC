@@ -8,7 +8,7 @@ The mini venue's actors (blueprint §16), for laptops and test clusters only.
 | `maker` | Quotes several levels on both sides of every open market (three by default, each a tick further out and larger) around a seeded random-walk fair value, rescaled to sum to 100¢ across an event's outcomes, with a doubled spread once the event starts. Pulls its quotes when an event ends or is suspended. It follows its own executions on a private session with cancel-on-disconnect and a 10 s heartbeat, and books on a public one, so a maker that dies or hangs has its quotes pulled by the gateway; it logs in again, cancels anything an earlier session left (orders a dead gateway could not cancel), and reads `/v4/account` to start afresh. As a registered responder (`"responder": true` in the catalogue), answers each request for quote on a parlay: it prices the parlay as the product of its legs' mid prices, read from their books, adds `--margin` thousandths and 0.1¢, rests a GTD sell of the whole size until the request's window closes, and attaches it with `attachQuote`. It never quotes parlays otherwise. | the gateway's two WebSocket endpoints, `/v4/ws_private` with its dev token and `/v4/ws_public` for books (REST only for the market list, account snapshots and the books of a parlay's legs) |
 | `taker` | Leaves parlays to their requesters. Sends immediate-or-cancel orders at the touch at random: buying YES, buying NO or selling YES, with prices as ticks or cents and buys often as stakes, and an occasional sweep three ticks through. | the gateway's REST API, with its dev token |
 | `oracle` | The dummy oracle: lists a new round of each demo market on a calendar, starts it, sometimes suspends it, ends it, closes its markets and settles it through two dummy sources, a referee, the auto-approver and a dispute window, voiding one now and then. Serves a control API for the page and for people. See [The dummy oracle](#the-dummy-oracle). | the core's ingress and feed, as an operator |
-| `web` | The web page: an order book, a market maker tab and a retail customer tab that trade over the gateway's private WebSocket (the book comes from its public one), an account tab, a parlays tab, and a settlement tab that shows the oracle's schedule and cases and drives it. The account tab shows either account's available and reserved cash and positions, deposits and withdraws through `/v4/transfers`, and lists its transfers as their states change. The parlays tab builds a parlay from open markets (one leg per event, yes or no, in lots of 10), requests quotes as the retail customer, shows each quote's price and remaining validity as it arrives, buys at a quote with an immediate-or-cancel order, and lists every parlay with its legs' states and its own: open, closed, settled as won, expired as lost, or voided. A parlay's book trades from the other tabs like any market's. It passes `/v4` through to the gateway and `/oracle` to the dummy oracle, so one address serves the page and both APIs. | the gateway for trading, transfers and requests for quote; the dummy oracle for settlement; the core's feed for the event list |
+| `web` | The web page: an order book, a market maker tab and a retail customer tab that trade over the gateway's private WebSocket (the book comes from its public one), an account tab, a parlays tab, and a settlement tab that shows the oracle's schedule and cases and drives it. The account tab shows either account's available and reserved cash and positions, deposits and withdraws through `/v4/transfers`, and lists its transfers as their states change; its API keys section creates a key with a label, permissions and an expiry (showing the secret once, with a copy button), lists the account's keys and revokes them through `/v4/keys`. The parlays tab builds a parlay from open markets (one leg per event, yes or no, in lots of 10), requests quotes as the retail customer, shows each quote's price and remaining validity as it arrives, buys at a quote with an immediate-or-cancel order, and lists every parlay with its legs' states and its own: open, closed, settled as won, expired as lost, or voided. A parlay's book trades from the other tabs like any market's. It passes `/v4` through to the gateway and `/oracle` to the dummy oracle, so one address serves the page and both APIs. | the gateway for trading, transfers and requests for quote; the dummy oracle for settlement; the core's feed for the event list |
 
 Parlays themselves are the parlay service's (`core/parlays`, `venue-parlays`), not an actor here: it lists them on
 request, routes requests for quote, and settles them from their legs.
@@ -91,14 +91,15 @@ alone: they are not on its schedule, and its control API refuses to act on them.
 ## Running it without a cluster
 
 ```sh
-cargo build --release -p venue-node -p venue-gateway -p venue-parlays -p venue-sim -p venue-treasury
+cargo build --release -p venue-node -p venue-gateway -p venue-parlays -p venue-sim -p venue-treasury -p venue-identity
 CAT=../deploy/charts/venue-mini/files/markets.json
 target/release/venue-node serve --data /tmp/venue --tick-ms 100 &
 target/release/venue-sim seed --ingress 127.0.0.1:7101 --catalogue $CAT
 target/release/venue-treasury --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT --ledger /tmp/venue/treasury.jsonl &
 target/release/venue-parlays --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT &
+target/release/venue-identity --catalogue $CAT --store /tmp/venue/identity.jsonl &
 target/release/venue-gateway --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT --treasury 127.0.0.1:8083 \
-  --parlays 127.0.0.1:7103 --audit-dir /tmp/venue/gateway-audit &
+  --parlays 127.0.0.1:7103 --identity 127.0.0.1:8084 --audit-dir /tmp/venue/gateway-audit &
 target/release/venue-sim oracle --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT \
   --calendar ../deploy/charts/venue-mini/files/calendar.json &
 target/release/venue-sim maker --gateway 127.0.0.1:8081 &
@@ -123,6 +124,8 @@ treasury's own API (`core/treasury/README.md`).
 ## Known shortcuts
 
 - **Dev tokens.** Tokens are fixed per account in the catalogue, and the page is handed them. Test environments only.
+  The account tab's API keys section makes, lists and revokes keys with them (`core/identity`); the page, the bots
+  and the tests still act with the dev tokens rather than keys.
 - **No resolution console.** Proposals, sign-offs and disputes live inside the oracle process rather than behind
   interface 24, and are lost if it restarts: a case still open is opened again from the sources, which report the
   same outcomes. Postponements and suspensions by hand are lost the same way. The auto-approver's two credentials are

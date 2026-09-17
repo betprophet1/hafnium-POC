@@ -76,6 +76,10 @@ spec:
             - name: VENUE_TREASURY
               value: "{{ $name }}-treasury:8083"
             {{- end }}
+            {{- if .Values.identity.enabled }}
+            - name: VENUE_IDENTITY
+              value: "{{ $name }}-identity:8084"
+            {{- end }}
             {{- if .Values.parlays.enabled }}
             - name: VENUE_PARLAYS
               value: "{{ $name }}-parlays:7103"

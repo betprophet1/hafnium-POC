@@ -1,0 +1,121 @@
+{{- if .Values.identity.enabled }}
+{{- $name := include "venue-mini.fullname" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-identity
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: identity
+spec:
+  selector:
+    {{- include "venue-mini.selector" (dict "ctx" . "component" "identity") | nindent 4 }}
+  ports:
+    - name: http
+      port: 8084
+      targetPort: http
+---
+# The key store outlives the pod: a service that forgot its keys would lock every firm out, and one that forgot a
+# revocation would let a leaked key back in.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-identity
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: identity
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.identity.storage.className }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.identity.storage.size }}
+---
+# The identity service of test environments (core/identity): API keys, their permissions, and their verification for
+# the gateway. One writer to its store, so an old pod stops before a new one starts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-identity
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: identity
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "identity") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "venue-mini.labels" . | nindent 8 }}
+        app.kubernetes.io/component: identity
+    spec:
+      securityContext:
+        {{- include "venue-mini.podSecurity" . | nindent 8 }}
+      containers:
+        - name: identity
+          image: {{ include "venue-mini.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["tini", "--", "venue-identity"]
+          env:
+            - name: VENUE_LISTEN
+              value: "0.0.0.0:8084"
+            - name: VENUE_CATALOGUE
+              value: /catalogue/markets.json
+            - name: VENUE_STORE
+              value: /var/lib/identity/keys.jsonl
+            - name: VENUE_FSYNC
+              value: {{ .Values.identity.fsync | quote }}
+          ports:
+            - name: http
+              containerPort: 8084
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          securityContext:
+            {{- include "venue-mini.containerSecurity" . | nindent 12 }}
+          volumeMounts:
+            - name: catalogue
+              mountPath: /catalogue
+            - name: store
+              mountPath: /var/lib/identity
+      volumes:
+        - name: catalogue
+          configMap:
+            name: {{ $name }}-catalogue
+        - name: store
+          persistentVolumeClaim:
+            claimName: {{ $name }}-identity
+---
+# The identity service trusts the account a request names and answers whether a secret is right, so only the
+# gateway, which authenticated the account and checked what it may do, may reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-identity
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "venue-mini.selector" (dict "ctx" . "component" "identity") | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "venue-mini.selector" (dict "ctx" $ "component" "gateway") | nindent 14 }}
+      ports:
+        - port: 8084
+{{- end }}
