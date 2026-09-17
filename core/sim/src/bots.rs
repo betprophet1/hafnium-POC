@@ -100,13 +100,37 @@ fn markets(api: &Api) -> Result<Vec<Market>, Error> {
 }
 
 /// A book's levels as `(tick, quantity)`, best first.
-#[derive(Clone)]
+#[derive(Clone, Default, Debug, PartialEq)]
 struct Book {
     bids: Vec<(u64, u64)>,
     asks: Vec<(u64, u64)>,
 }
 
-/// A book from a REST book or a WebSocket `book` message, which share the schema.
+impl Book {
+    /// Applies a WebSocket `book` message (interfaces/gateway/asyncapi.yaml, `book`): a snapshot replaces every level,
+    /// and each change sets its level's quantity, a quantity of zero removing the level. Mirrors the web page's
+    /// `applyBook`.
+    fn apply(&mut self, message: &Value) {
+        if message["snapshot"] == true {
+            self.bids.clear();
+            self.asks.clear();
+        }
+        for change in message["changes"].as_array().into_iter().flatten() {
+            let tick = change["price"]["tick"].as_u64().unwrap_or(0);
+            let quantity = change["quantity"].as_u64().unwrap_or(0);
+            let levels = if change["side"] == "buy" { &mut self.bids } else { &mut self.asks };
+            levels.retain(|&(t, _)| t != tick);
+            if quantity > 0 {
+                levels.push((tick, quantity));
+            }
+        }
+        // Best first: the highest bid, the lowest ask.
+        self.bids.sort_by_key(|b| std::cmp::Reverse(b.0));
+        self.asks.sort_by_key(|a| a.0);
+    }
+}
+
+/// A whole book from REST `GET /v4/markets/{id}/book`, which lists `bids` and `asks` best first.
 fn book_of(body: &Value) -> Book {
     let levels = |side: &str| -> Vec<(u64, u64)> {
         body[side]
@@ -363,7 +387,7 @@ impl Stream {
                 }
             }
             "book" => {
-                self.books.insert(id(&message["instrumentId"]), book_of(message));
+                self.books.entry(id(&message["instrumentId"])).or_default().apply(message);
             }
             "market" => self.markets_changed = true,
             "resync" => self.resync = true,
@@ -454,7 +478,7 @@ fn session_pass(
             if !markets.iter().any(|m| m.id == id(&rfq["instrumentId"])) {
                 markets = crate::bots::markets(api)?;
             }
-            // The legs' whole books, from REST: the public session's book messages carry only what changed.
+            // The legs' whole books, from REST, as they stand at the request.
             let books = |instrument: u64| book(api, instrument).ok();
             match respond(&markets, &books, &rfq) {
                 Some(order) => answer_rfq(&mut session, who, &rfq, order)?,
@@ -783,6 +807,44 @@ mod tests {
         assert_eq!(parlay[tick as usize], 2_800);
         // Without a book on a leg there is no price to quote.
         assert_eq!(parlay_tick(&markets, &|_| None, &rfq, 100), None);
+    }
+
+    fn level(side: &str, tick: u64, quantity: u64) -> Value {
+        json!({"side": side, "price": {"tick": tick, "cents": "0"}, "quantity": quantity, "orders": 1})
+    }
+
+    #[test]
+    fn a_session_book_starts_from_its_snapshot_and_follows_the_changes() {
+        let mut stream = Stream::default();
+        let book = |changes: Vec<Value>, snapshot: bool| json!({"type": "book", "instrumentId": "7", "sequence": "5", "snapshot": snapshot, "changes": changes});
+        stream.apply(&book(
+            vec![level("buy", 40, 5), level("sell", 45, 3), level("buy", 42, 2), level("sell", 44, 1)],
+            true,
+        ));
+        assert_eq!(stream.books[&7], Book { bids: vec![(42, 2), (40, 5)], asks: vec![(44, 1), (45, 3)] });
+        // A new level on each side, a changed one, and a removed one.
+        stream.apply(&book(
+            vec![level("buy", 43, 4), level("buy", 40, 9), level("sell", 44, 0), level("sell", 50, 6)],
+            false,
+        ));
+        assert_eq!(stream.books[&7], Book { bids: vec![(43, 4), (42, 2), (40, 9)], asks: vec![(45, 3), (50, 6)] });
+        stream.apply(&book(vec![level("buy", 42, 0), level("sell", 45, 7)], false));
+        assert_eq!(stream.books[&7], Book { bids: vec![(43, 4), (40, 9)], asks: vec![(45, 7), (50, 6)] });
+        // A later snapshot replaces every level, including an empty one.
+        stream.apply(&book(vec![level("sell", 60, 1)], true));
+        assert_eq!(stream.books[&7], Book { bids: vec![], asks: vec![(60, 1)] });
+        stream.apply(&book(vec![], true));
+        assert_eq!(stream.books[&7], Book::default());
+    }
+
+    #[test]
+    fn a_rest_book_is_read_from_its_bids_and_asks() {
+        let body = json!({
+            "instrumentId": "7",
+            "bids": [{"price": {"tick": 42}, "quantity": 2}, {"price": {"tick": 40}, "quantity": 5}],
+            "asks": [{"price": {"tick": 44}, "quantity": 1}]
+        });
+        assert_eq!(book_of(&body), Book { bids: vec![(42, 2), (40, 5)], asks: vec![(44, 1)] });
     }
 
     #[test]
