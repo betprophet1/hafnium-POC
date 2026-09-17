@@ -138,13 +138,16 @@ The client address is recorded only. Flood and logon limits are kept per account
 
 ### Masking
 
-Secrets are replaced by `***` before a record is taken; nothing unmasked is ever queued or written.
+Secrets are replaced by `***` before a record is written; nothing unmasked ever reaches a file. The gateway queues a
+frame as it arrived and masks it as it writes it, because masking reads the whole message and its event loops are not
+where that work belongs; an unmasked secret therefore lives in the gateway's memory, as it already does in the socket
+it was read from, and nowhere else.
 
 | Where | What |
 |---|---|
 | FIX | the values of Password (554), NewPassword (925), EncryptedPassword (1402) and EncryptedNewPassword (1404). Username (553) is an identity, not a secret, and is kept. A masked message's BodyLength (9) and CheckSum (10) are left as they were sent, so they no longer match. |
 | HTTP headers | `authorization`, `proxy-authorization` and `cookie`: the value becomes its scheme and `***` (`Bearer ***`), or `***` when it has no scheme. |
-| JSON, in HTTP bodies and WebSocket frames | the string value of every member named `token`, `secret` or `credential`, wherever it appears, found textually so that a frame that is not valid JSON is masked too. The last two are how a new API key's secret is answered. |
+| JSON, in HTTP bodies and WebSocket frames | the string value of every member named `token`, `secret`, `credential`, `password`, `passphrase`, `apiKey` or `api_key`, whatever its case, wherever it appears, found textually so that a frame that is not valid JSON is masked too. `secret` and `credential` are how a new API key's secret is answered; the rest are names a client may reach for, and a frame the venue refuses for using one is still recorded in full. Frames sent to a client are masked like frames from one. |
 
 ## Writing
 
