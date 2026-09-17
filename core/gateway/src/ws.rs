@@ -682,6 +682,8 @@ mod tests {
         let heard = responder.streamed_message(|m| m["type"] == "rfq");
         assert_eq!((heard["requestId"].as_str(), &heard["instrumentId"]), (Some(request), &parlay), "{heard}");
         assert!(!heard.to_string().contains("accountId"), "the requester was named: {heard}");
+        let listed: u64 = parlay.as_str().and_then(|p| p.parse().ok()).expect("a numeric instrument ID");
+        eventually("the private half lists the parlay", || venue.gateway.hub().market(listed).is_some());
         let sell = json!({"op": "order", "id": "sell", "clientOrderId": "quote-1", "instrumentId": parlay,
                           "action": "sell", "outcome": "yes", "price": {"cents": "0.8"}, "quantity": 20,
                           "timeInForce": "GTD", "expiresAt": expires});
