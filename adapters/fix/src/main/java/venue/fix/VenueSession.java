@@ -1187,6 +1187,7 @@ final class VenueSession implements SessionHandler
             final StatusQuery query = statusQueries.poll();
             finished++;
             JsonNode account = null;
+            boolean refused = false;
             try
             {
                 final HttpResponse<String> response = query.response.join();
@@ -1196,13 +1197,30 @@ final class VenueSession implements SessionHandler
                 }
                 else
                 {
+                    // The gateway's answer names no credential; the request's own header is never printed.
                     System.err.println("fix adapter: GET /v4/account answered " + response.statusCode() + " for " +
                         session.compositeKey() + ": " + response.body());
+                    refused = response.statusCode() == 401;
                 }
             }
             catch (final Exception e)
             {
                 System.err.println("fix adapter: GET /v4/account failed: " + e);
+            }
+            if (refused)
+            {
+                // The session's credential is no longer good: an API key revoked or expired since the logon. The
+                // gateway ends the session within its bound anyway; ending it now keeps status out of reach
+                // meanwhile, and the firm is told why rather than to try again.
+                businessReject(query.refSeqNum, query.msgType,
+                    "H".equals(query.msgType) ?
+                        (query.ordStatusReqId != null ? query.ordStatusReqId : query.clOrdId) : query.massStatusReqId,
+                    6, "UNAUTHORIZED: the session's credential is no longer accepted (revoked or expired)");
+                if (!link.isClosed())
+                {
+                    link.close("credential refused");
+                }
+                continue;
             }
             if (account != null)
             {

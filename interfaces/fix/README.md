@@ -18,7 +18,7 @@ and nothing past the adapter knows it came from FIX.
 | Credentials | An API key on Logon (interface 1 README, API keys and permissions): the key ID in **Username (553)** and its secret in **Password (554)**, or the whole credential, `<keyId>.<secret>`, in Password with Username free. Test environments also take an account's dev token in Password, such as `dev-market-maker` from `deploy/charts/venue-mini/files/markets.json`. Username is read as a key ID only when it is one (`ak_` and 16 hex digits); otherwise it is the firm's own and ignored. |
 | Logon refused | A missing or refused credential is answered with a Logout (5) whose Text (58) says why (`token refused`, also for a revoked or expired key), and the connection is closed. |
 | Account | The credential decides the account. Account (1) is optional; on a NewOrderSingle it must equal the logged-on account ID when given. |
-| Permissions | Logging on needs `read`, which every key holds, so a key without `trade` can log on and list securities. Its NewOrderSingle is rejected (ExecutionReport 150=8, OrdRejReason 103 = 99, Text `FORBIDDEN: ...` naming the permission), its OrderCancelReplaceRequest and OrderCancelRequest are refused with OrderCancelReject (102 = 99), and its OrderMassCancelRequest with 531=0 and 532=99. A session whose key is revoked or expires is logged out within 10 seconds, which cancels its orders as any disconnect does. |
+| Permissions | Logging on needs `read`, which every key holds, so a key without `trade` can log on and list securities. Its NewOrderSingle is rejected (ExecutionReport 150=8, OrdRejReason 103 = 99, Text `FORBIDDEN: ...` naming the permission), its OrderCancelReplaceRequest and OrderCancelRequest are refused with OrderCancelReject (102 = 99), and its OrderMassCancelRequest with 531=0 and 532=99. OrderStatusRequest and OrderMassStatusRequest need only `read`, so every key can ask for status; the adapter asks the gateway with the session's own credential and never shows or writes its secret. A session whose key is revoked or expires is logged out within 10 seconds, which cancels its orders as any disconnect does; a status request that meets the revoked key first is refused with BusinessMessageReject 380=6 and the session is logged out at once. |
 | EncryptMethod | 0 only. |
 | HeartBtInt | Chosen by the firm on Logon, and honoured by the venue both ways (TestRequest, then Logout on silence). |
 | Sequence numbers | Persistent: they carry on across logons and across restarts of the adapter, until the firm logs on with ResetSeqNumFlag (141) = Y. |
@@ -224,6 +224,8 @@ OrdStatus is the order's status, or 8 when there is no such order.
 - 380=4, with BusinessRejectRefID = the OrdStatusReqID, ClOrdID or MassStatusReqID: a status request could not be
   answered because the venue's account view did not answer; send it again.
 - 380=5: an OrderMassStatusRequest without the Symbol or UnderlyingSymbol its type needs.
+- 380=6, Text `UNAUTHORIZED: ...`, with BusinessRejectRefID = the OrdStatusReqID, ClOrdID or MassStatusReqID: a status
+  request whose session's API key has been revoked or has expired; the session is logged out.
 - 380=0: a status request whose Account (1) is not the logged-on account.
 - 380=4, with BusinessRejectRefID = the ClOrdID: **the venue did not answer in time and the outcome is unknown**. The
   order may or may not exist. If it was taken, its ExecutionReport (150=0) still follows when the venue reports it.

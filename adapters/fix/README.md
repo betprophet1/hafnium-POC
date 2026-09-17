@@ -88,8 +88,12 @@ one closed file per run of the adapter whose chain verifies and which holds no t
 (Password masked), an order and the report that answered it, a TestRequest and the Heartbeat Artio answered it with, a
 ResendRequest and its gap fill, Logouts, the status requests and their reports, and the refused logons with their Logouts and the gateway's reasons. Last,
 API keys: a read-only key logs on with Username and Password and its order is rejected `FORBIDDEN`, a trading key
-logs on with the whole credential in Password and trades, and once revoked its session is logged out and it is refused;
-the logon's audit record names the key and no secret is written.
+logs on with the whole credential in Password and trades; both ask for order status and mass status with their keys,
+the read-only one seeing the trading key's order on the same account, and the gateway's audit log names the key the
+adapter's `GET /v4/account` came with; once revoked, the trading key's session is logged out while it keeps asking for
+status (each answered, or refused with 380=6 once the gateway no longer takes the key), the key reads no status over
+REST, and it is refused at logon; the logon's audit record names the key and no secret is written in either audit log
+or in the sessions' memory.
 `test.sh` then checks the same files with `interfaces/tools/audit_verify.py`.
 
 `./check` runs `test.sh` as its last step when the toolchain has been bootstrapped (`bootstrap.sh --check`), and
@@ -168,7 +172,12 @@ the Logon and Logout of a connection whose token was refused.
   crash, the next start seals the file left open (interfaces/audit/README.md, files).
 - **Kept** in `--data`: each session's sequence numbers and every message sent and received (Artio's archive). A firm
   that logs on again without ResetSeqNumFlag carries on where it was and can ask for any of it to be resent, as the
-  test does.
+  test does. Artio needs inbound messages archived to keep sequence numbers (`logInboundMessages(false)` refuses
+  persistent sessions), so the archive holds each Logon as received, **Password (554) in clear**: a dev token, or an
+  API key's secret or whole credential. `--data` must be protected like the identity service's key store, and
+  revoking a key is the remedy if it leaks. Nothing else the adapter writes holds a secret: the audit log masks
+  Password, `sessions/` holds no credential, and the gateway credential kept in memory for status requests
+  (`GatewayLink.token`) is sent only in the `Authorization` header of `GET /v4/account` and never printed.
 - **Kept** in `--data/sessions`: each SenderCompID's memory (the live orders its sessions know, their ClOrdIDs and
   totals, the gateway sequence it has been reported up to, the reports it could not deliver), written when a session
   ends and when the adapter stops. On the next logon the gateway replays what happened since, so orders kept past a

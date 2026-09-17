@@ -607,7 +607,24 @@ final class FixAdapterTest
             client.logon("KEYTRADE", "desk-7", trader.path("credential").asText(), ADAPTER_PORT, false);
         assertNotNull(trading, "a trading key logs on");
         client.send(trading, order("k2", RAIN, '1', 10, "5"));
-        report(trading, "k2", '0');
+        final String k2 = report(trading, "k2", '0').get(37);
+
+        // Status with keys: each session asks the gateway as its own key, which holds read whatever else it holds.
+        // The read-only key, from Username and Password, sees the order the trading key placed on the same account.
+        client.send(readOnly, massStatus("key-ms", 1, RAIN, null));
+        final List<FixClient.Message> seen = massStatusReports(readOnly, "key-ms");
+        assertTrue(seen.stream().anyMatch(m -> k2.equals(m.get(37)) && "0".equals(m.get(39))), seen.toString());
+        client.send(trading, status("key-s", null, "k2", RAIN, '1'));
+        final FixClient.Message known = client.expect(trading, "the status of k2",
+            m -> "8".equals(m.type()) && "key-s".equals(m.get(790)));
+        assertEquals(k2, known.get(37), known.toString());
+        client.send(trading, massStatus("key-ms2", 7, null, null));
+        assertTrue(clOrdIds(massStatusReports(trading, "key-ms2")).contains("k2"));
+        final Path gatewayAudit = scratch.resolve("venue").resolve("gateway-audit");
+        client.pollUntil("the gateway records the status calls under the reading key", () ->
+            gatewayRecords(gatewayAudit).stream().anyMatch(r -> "http-request".equals(r.path("kind").asText()) &&
+                r.path("line").asText().startsWith("GET /v4/account") &&
+                reader.path("keyId").asText().equals(r.path("key").asText())));
 
         // Revoked: the session is logged out within the gateway's bound, and the key logs on no more.
         final HttpResponse<String> revoked = HttpClient.newHttpClient().send(
@@ -615,7 +632,34 @@ final class FixAdapterTest
                 .header("Authorization", "Bearer dev-retail-customer").DELETE().build(),
             HttpResponse.BodyHandlers.ofString());
         assertEquals(200, revoked.statusCode(), revoked.body());
-        client.pollUntil("the revoked key's session ends", () -> client.isDisconnected(trading));
+        // Status requests until the session ends: each is answered as before while the gateway still remembers the
+        // key, or refused as unauthorized once it does not, and the session ends either way.
+        final long[] next = {0};
+        final int[] asked = {0};
+        client.pollUntil("the revoked key's session ends", () ->
+        {
+            if (client.isDisconnected(trading))
+            {
+                return true;
+            }
+            if (System.nanoTime() > next[0] &&
+                trading.trySend(massStatus("rv-" + asked[0], 7, null, null)) > 0)
+            {
+                asked[0]++;
+                next[0] = System.nanoTime() + 250_000_000L;
+            }
+            return false;
+        });
+        for (final FixClient.Message reject : client.drain(trading, Duration.ofMillis(10), m -> "j".equals(m.type())))
+        {
+            assertEquals("6", reject.get(380), reject.toString());
+            assertTrue(reject.get(58).startsWith("UNAUTHORIZED"), reject.toString());
+        }
+        final HttpResponse<String> statusAfter = HttpClient.newHttpClient().send(
+            HttpRequest.newBuilder(URI.create("http://" + GATEWAY + "/v4/account"))
+                .header("Authorization", "Bearer " + trader.path("credential").asText()).GET().build(),
+            HttpResponse.BodyHandlers.ofString());
+        assertEquals(401, statusAfter.statusCode(), "the revoked key reads no status: " + statusAfter.body());
         assertNull(client.logon("KEYGONE", "desk-7", trader.path("credential").asText(), ADAPTER_PORT, false),
             "a revoked key is refused");
 
@@ -643,6 +687,51 @@ final class FixAdapterTest
         }
         assertTrue(logins.stream().anyMatch(r -> "KEYREAD".equals(r.path("sender").asText()) &&
             reader.path("keyId").asText().equals(r.path("key").asText())), "an accepted logon names its key");
+        for (final JsonNode record : gatewayRecords(gatewayAudit))
+        {
+            final String text = record.toString();
+            assertTrue(!text.contains(reader.path("secret").asText()) && !text.contains(trader.path("secret").asText()),
+                "a key's secret is written in the gateway's audit log: " + text);
+        }
+        // Nothing the adapter keeps about its sessions holds a secret either.
+        assertTrue(Files.isDirectory(ADAPTER_DATA.resolve("sessions")), "the adapter keeps its sessions' memory");
+        try (var paths = Files.walk(ADAPTER_DATA.resolve("sessions")))
+        {
+            for (final Path file : paths.filter(Files::isRegularFile).toList())
+            {
+                final String text = Files.readString(file);
+                assertTrue(!text.contains(reader.path("secret").asText()) &&
+                    !text.contains(trader.path("secret").asText()), "a key's secret is kept in " + file);
+            }
+        }
+    }
+
+    /** Every record of the gateway's audit log so far; a record being written is skipped. */
+    private static List<JsonNode> gatewayRecords(final Path dir)
+    {
+        final List<JsonNode> records = new ArrayList<>();
+        try (var paths = Files.list(dir))
+        {
+            for (final Path file : paths.sorted().toList())
+            {
+                for (final String line : Files.readAllLines(file))
+                {
+                    try
+                    {
+                        records.add(GatewayLink.JSON.readTree(line));
+                    }
+                    catch (final IOException e)
+                    {
+                        // A record cut off where the writer is.
+                    }
+                }
+            }
+        }
+        catch (final IOException e)
+        {
+            throw new java.io.UncheckedIOException(e);
+        }
+        return records;
     }
 
     /** Makes an API key for the account of the dev token, through the gateway, and returns it with its secret. */
