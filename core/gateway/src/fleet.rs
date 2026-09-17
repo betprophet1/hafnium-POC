@@ -331,9 +331,12 @@ fn a_session_ending_on_one_gateway_cancels_only_its_own_orders() {
     }
     let taken: Vec<&Value> = watching.streamed.iter().filter(|m| m["execution"]["type"] == "cancelled").collect();
     assert_eq!(taken.len(), 1, "more than the ended session's order was cancelled: {taken:?}");
+    // Each gateway's account is as of its own feed, which on a loaded machine can be a moment behind, or replaying.
     for gateway in [a, b] {
-        let orders = resting(&gateway.address, MAKER_TOKEN);
-        assert!(orders.contains(&kept) && orders.contains(&rest) && !orders.contains(&doomed), "{orders:?}");
+        eventually("the gateway's account shows exactly the ended session's order gone", || {
+            let orders = resting(&gateway.address, MAKER_TOKEN);
+            orders.contains(&kept) && orders.contains(&rest) && !orders.contains(&doomed)
+        });
     }
     assert_eq!(staying.ask(&json!({"op": "heartbeat", "id": "still"}))["id"], "still");
 }
@@ -403,7 +406,9 @@ fn a_missed_heartbeat_on_one_gateway_leaves_sessions_on_another_alone() {
         "the beating session's order was cancelled"
     );
     for gateway in [a, b] {
-        assert!(resting(&gateway.address, MAKER_TOKEN).contains(&beating_order));
+        eventually("the beating session's order rests", || {
+            resting(&gateway.address, MAKER_TOKEN).contains(&beating_order)
+        });
     }
 }
 
