@@ -75,11 +75,15 @@ load balancer maps a host address to them; `expose` adds both mappings, bound to
 
 ```sh
 deploy/laptop.sh expose 127.0.0.1                    # page and /v4 on 127.0.0.1:8088, FIX on 127.0.0.1:9878
-deploy/laptop.sh expose 100.101.132.94 8091 9879     # a private (tailnet) address of the machine
+deploy/laptop.sh expose <private-address> 8091 9879  # a private address of this machine (LAN, VPN or tailnet)
 # which is:
-k3d cluster edit venue --port-add 100.101.132.94:8091:80@loadbalancer --port-add 100.101.132.94:9879:9879@loadbalancer
+k3d cluster edit venue --port-add <private-address>:8091:80@loadbalancer --port-add <private-address>:9879:9879@loadbalancer
 ss -tln | grep -E ':(8091|9879) '                   # listening on that address only, not 0.0.0.0
 ```
+
+`<private-address>` stands for an address this machine holds on a private network that only the people meant to
+use the demo can reach, such as its address on a LAN, a VPN or a tailnet (`ip -brief address` lists them). It is
+never `0.0.0.0` or any other wildcard, and never an address the public internet can reach.
 
 k3d recreates its load balancer container with the ports; the cluster keeps running, and the mappings persist.
 A cluster can also be created with them, so that deleting and recreating it is one command (`VENUE_EXPOSE` is read
@@ -87,8 +91,8 @@ only when `up` creates the cluster; on an existing one, use `expose`):
 
 ```sh
 deploy/laptop.sh down                                # the journal goes with it
-VENUE_SPLIT=1 VENUE_EXPOSE=100.101.132.94 VENUE_EXPOSE_HTTP_PORT=8091 VENUE_EXPOSE_FIX_PORT=9879 deploy/laptop.sh up
-ss -tln | grep -E ':(6550|8091|9879) '               # 127.0.0.1:6550, and the two ports on 100.101.132.94 only
+VENUE_SPLIT=1 VENUE_EXPOSE=<private-address> VENUE_EXPOSE_HTTP_PORT=8091 VENUE_EXPOSE_FIX_PORT=9879 deploy/laptop.sh up
+ss -tln | grep -E ':(6550|8091|9879) '               # 127.0.0.1:6550, and the two ports on <private-address> only
 ```
 
 `VENUE_FIX_SERVICE_PORT` (default 9879) must match `fix.service.port` if that is changed.
@@ -213,7 +217,7 @@ node, then mapped by `expose`), `ClusterIP` to keep FIX inside the cluster; `fix
 - **Seeding is idempotent.** The seed job runs after every install and upgrade; its commands have fixed IDs.
 - **Not production.** Production runs the core on dedicated hosts behind Aeron Cluster (blueprint §5, §9). Tokens are
   fixed dev tokens, and the page and operator actions are unauthenticated; never expose them beyond a private network
-  (a loopback or tailnet address, above).
+  (a loopback or private address, above).
 - **One oracle, bounded by the core's capacity.** The oracle is `replicas: 1` with `Recreate`, so two never act on a
   round. The engine releases a settled round half an hour after it resolves (the seed's retention), so the calendar
   runs indefinitely on the `small` profile.

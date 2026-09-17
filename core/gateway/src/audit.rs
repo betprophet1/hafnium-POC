@@ -888,15 +888,15 @@ mod recorded {
         // The test's connections come from 127.0.0.1, which plays the ingress.
         let venue = testing::venue_trusting("audit-proxy", "127.0.0.1, 10.42.0.0/16");
         let dir = &venue.audit_dir;
-        let hops = "X-Forwarded-For: 203.0.113.9, 100.101.132.94\r\nX-Forwarded-For: 10.42.0.3\r\n";
+        let hops = "X-Forwarded-For: 203.0.113.9, 198.51.100.77\r\nX-Forwarded-For: 10.42.0.3\r\n";
         assert_eq!(exchange_with(&venue.address, "GET", "/v4/markets", None, hops, "").0, 200);
         let asked = find(dir, "the public request", |r| {
             is(r, "http-request", "in") && r["half"] == "public" && r["line"] == "GET /v4/markets HTTP/1.1"
         });
-        assert_eq!(asked["client"], "100.101.132.94", "the right-most entry no trusted proxy wrote: {asked}");
+        assert_eq!(asked["client"], "198.51.100.77", "the right-most entry no trusted proxy wrote: {asked}");
         assert!(asked["peer"].as_str().is_some_and(|p| p.starts_with("127.0.0.1:")), "the peer is the proxy: {asked}");
         let answered = find(dir, "its answer", |r| is(r, "http-response", "out") && r["conn"] == asked["conn"]);
-        assert_eq!(answered["client"], "100.101.132.94", "{answered}");
+        assert_eq!(answered["client"], "198.51.100.77", "{answered}");
 
         let forwarded = "Forwarded: for=192.0.2.60;proto=http\r\n";
         assert_eq!(exchange_with(&venue.address, "GET", "/v4/account", Some(MAKER_TOKEN), forwarded, "").0, 200);

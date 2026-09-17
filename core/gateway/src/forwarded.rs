@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn a_trusted_proxy_names_the_client() {
         let trusted = TrustedProxies::parse("10.42.0.0/16").expect("parsed");
-        assert_eq!(trusted.client(ip("10.42.0.9"), &xff("100.101.132.94")).as_deref(), Some("100.101.132.94"));
+        assert_eq!(trusted.client(ip("10.42.0.9"), &xff("198.51.100.77")).as_deref(), Some("198.51.100.77"));
         assert_eq!(trusted.client(ip("10.42.0.9"), &Forwarding::default()), None, "no header names no client");
         let forwarded =
             Forwarding { x_forwarded_for: None, forwarded: Some(r#"for="[2001:db8::7]:4711";proto=http"#.into()) };
@@ -198,13 +198,10 @@ mod tests {
         let trusted = TrustedProxies::parse("10.42.0.0/16, 172.18.0.2").expect("parsed");
         let peer = ip("10.42.0.9");
         // What the client wrote comes first; each trusted proxy appended the address it was reached from.
+        assert_eq!(trusted.client(peer, &xff("1.2.3.4, 198.51.100.77, 172.18.0.2")).as_deref(), Some("198.51.100.77"));
         assert_eq!(
-            trusted.client(peer, &xff("1.2.3.4, 100.101.132.94, 172.18.0.2")).as_deref(),
-            Some("100.101.132.94")
-        );
-        assert_eq!(
-            trusted.client(peer, &xff("1.2.3.4,100.101.132.94:5123,10.42.0.3")).as_deref(),
-            Some("100.101.132.94")
+            trusted.client(peer, &xff("1.2.3.4,198.51.100.77:5123,10.42.0.3")).as_deref(),
+            Some("198.51.100.77")
         );
         assert_eq!(
             trusted.client(peer, &xff("10.42.0.1, 172.18.0.2")).as_deref(),
