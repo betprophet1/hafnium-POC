@@ -25,7 +25,8 @@ pub const MAKER_TOKEN: &str = "dev-market-maker";
 /// Its retail customer, funded with 50 000 cents; its dev token.
 pub const RETAIL: u64 = 2;
 pub const RETAIL_TOKEN: &str = "dev-retail-customer";
-/// The synthetic maker, the catalogue's registered responder to requests for quote; its dev token.
+/// The synthetic maker, the catalogue's responder, approved to answer requests for quote; its dev token.
+pub const RESPONDER: u64 = 10;
 pub const RESPONDER_TOKEN: &str = "dev-synthetic-maker";
 
 /// The first market of round 1 of a catalogue template: 1 is rain, 2 the football (Arsenal, Draw, Chelsea), 3
@@ -128,8 +129,14 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
     let seeder = Submit::spawn(&ingress);
     let catalogue = Catalogue::load(CATALOGUE).expect("the mini venue's catalogue");
     let profile = catalogue::capacity_profile("small").expect("a known profile");
+    // The seed's commands have fixed IDs, so one resent after its connection ended under load is sequenced once.
     for input in catalogue.seed(&profile).expect("the seed") {
-        seeder.send(input).expect("seeded");
+        let mut attempt = 0;
+        while let Err(e) = seeder.send(input.clone()) {
+            attempt += 1;
+            assert!(attempt < 5, "seeding {name} failed five times: {e}");
+            thread::sleep(Duration::from_millis(200));
+        }
     }
     let limits = Limits { per_second: 1_000_000, burst: 1_000_000, logons_per_minute: 1_000_000 };
     let audit_dir = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}.audit", std::process::id()));
@@ -162,8 +169,11 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
                 levels: profile.levels,
             }
         },
+        responders: None,
+        min_quantity: venue_parlays::rules::LOT_STEP,
     };
-    venue_parlays::service::start(Catalogue::load(CATALOGUE).expect("the catalogue"), &config).expect("parlay service");
+    let service = venue_parlays::service::start(Catalogue::load(CATALOGUE).expect("the catalogue"), &config)
+        .expect("parlay service");
     Gateway::connect_parlays(&gateway, &parlays);
     let public_half = crate::start_half(Gateway::public(hub(), limits).with_audit(audit), &feed);
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
@@ -179,9 +189,15 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
         if gateway.hub().market(MARKET).is_some() && public_half.hub().market(MARKET).is_some() {
             break;
         }
-        assert!(wait < 500, "the feed never listed market {MARKET}");
+        assert!(wait < 1_500, "the feed never listed market {MARKET}");
         thread::sleep(Duration::from_millis(20));
     }
+    // Requests for quote are served once the parlay service has caught up with the feed and the private half has
+    // reached it; a test that asked sooner would be refused as unavailable.
+    eventually("the parlay service catches up with the feed", || service.ready());
+    eventually("the private half reaches the parlay service", || {
+        gateway.open_rfqs_pending(RESPONDER, None).is_ok_and(|pending| gateway.wait_for(pending).is_ok())
+    });
     let (ws_public, ws_private) = (format!("ws://{address}/v4/ws_public"), format!("ws://{address}/v4/ws_private"));
     Venue { gateway, address, ws_public, ws_private, ingress, audit_dir }
 }
@@ -217,13 +233,14 @@ fn start_treasury(name: &str, ingress: &str, feed: &str) -> String {
     address
 }
 
-/// Waits up to five seconds, in 20 ms steps, for `ready` to hold.
+/// Waits up to thirty seconds, in 20 ms steps, for `ready` to hold. Generous, because tests share a machine with
+/// other builds: the wait costs time only when something is wrong.
 pub fn eventually(what: &str, mut ready: impl FnMut() -> bool) {
     for wait in 0.. {
         if ready() {
             return;
         }
-        assert!(wait < 250, "never happened: {what}");
+        assert!(wait < 1_500, "never happened: {what}");
         thread::sleep(Duration::from_millis(20));
     }
 }

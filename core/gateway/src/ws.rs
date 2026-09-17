@@ -37,8 +37,9 @@ pub struct Session {
     notify: Notify,
     /// Requests given to the node and not yet answered, oldest first, each with the id to answer it under. A node
     /// answers a connection in commit order, so the oldest is always the first to be ready and replies leave in
-    /// the order they were asked for.
-    in_flight: VecDeque<(Value, Pending)>,
+    /// the order they were asked for. A `subscribeRfqs` is marked: the requests its answer catches up with are sent
+    /// as `rfq` messages ahead of its reply.
+    in_flight: VecDeque<(Value, Pending, bool)>,
 }
 
 impl Session {
@@ -135,6 +136,7 @@ pub fn heartbeat_expired(gateway: &Arc<Gateway>, session: &mut Session) {
 /// The connection has gone: the session leaves the hub and, if it asked at logon, its orders are cancelled.
 pub fn end(gateway: &Arc<Gateway>, session: &Session) {
     gateway.hub().remove_session(session.key);
+    gateway.end_rfq_subscription(session.key);
     if session.cancel_on_disconnect {
         cancel_session_orders(gateway, session, "SESSION_DISCONNECT");
     }
@@ -156,8 +158,19 @@ pub fn key_withdrawn_error() -> String {
 pub fn ready_replies(gateway: &Gateway, session: &mut Session) -> Vec<String> {
     let mut out = Vec::new();
     // The result is taken before the request leaves the queue, so nothing is dropped between the two.
-    while let Some(result) = session.in_flight.front().and_then(|(_, pending)| gateway.finish(pending)) {
-        if let Some((id, _)) = session.in_flight.pop_front() {
+    while let Some(result) = session.in_flight.front().and_then(|(_, pending, _)| gateway.finish(pending)) {
+        if let Some((id, _, catch_up)) = session.in_flight.pop_front() {
+            let result = match result {
+                Ok(mut value) if catch_up => {
+                    let requests = value.as_object_mut().and_then(|v| v.remove("requests"));
+                    for mut rfq in requests.and_then(|r| r.as_array().cloned()).unwrap_or_default() {
+                        rfq["type"] = json!("rfq");
+                        out.push(rfq.to_string());
+                    }
+                    Ok(value)
+                }
+                other => other,
+            };
             out.push(answer(&id, result));
         }
     }
@@ -240,7 +253,8 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
     // Market data and order entry are separate endpoints, possibly separate gateways (README, public and private).
     let belongs = match op {
         "subscribe" | "unsubscribe" => Some(Half::Public),
-        "login" | "order" | "amend" | "cancel" | "cancelAll" | "requestQuote" | "attachQuote" => Some(Half::Private),
+        "login" | "order" | "amend" | "cancel" | "cancelAll" | "requestQuote" | "attachQuote" | "subscribeRfqs"
+        | "unsubscribeRfqs" => Some(Half::Private),
         _ => None,
     };
     if let Some(half) = belongs.filter(|half| *half != gateway.half) {
@@ -295,7 +309,20 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
                     }
                 }
             };
-            session.in_flight.push_back((request_id, pending));
+            session.in_flight.push_back((request_id, pending, false));
+            Ok(Vec::new())
+        }
+        "subscribeRfqs" | "unsubscribeRfqs" => {
+            let account = session.allowed(Permissions::READ)?;
+            let notify = Some(Arc::clone(&session.notify));
+            let body = body_of(message);
+            let subscribe = op == "subscribeRfqs";
+            let pending = if subscribe {
+                gateway.subscribe_rfqs_pending(account, session.key, &body, notify)?
+            } else {
+                gateway.unsubscribe_rfqs_pending(account, session.key, &body, notify)?
+            };
+            session.in_flight.push_back((request_id, pending, subscribe));
             Ok(Vec::new())
         }
         "requestQuote" | "attachQuote" => {
@@ -309,7 +336,7 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
             } else {
                 gateway.attach_quote_pending(account, &body, notify)?
             };
-            session.in_flight.push_back((request_id, pending));
+            session.in_flight.push_back((request_id, pending, false));
             Ok(Vec::new())
         }
         _ => Err(ApiError::bad(format!("unknown op {op}"))),
@@ -398,8 +425,9 @@ mod tests {
     impl Client {
         fn connect(url: &str) -> Self {
             let (socket, _) = tungstenite::connect(url).expect("the gateway accepts a WebSocket");
+            // Long, because tests share a machine with other builds; it costs time only when an answer never comes.
             if let MaybeTlsStream::Plain(stream) = socket.get_ref() {
-                stream.set_read_timeout(Some(Duration::from_secs(5))).expect("a read timeout");
+                stream.set_read_timeout(Some(Duration::from_secs(30))).expect("a read timeout");
             }
             Self { socket, streamed: Vec::new() }
         }
@@ -460,6 +488,21 @@ mod tests {
                     return m;
                 }
             }
+        }
+
+        /// Sends a call for the parlay service and returns its answer, asking again while the answer is that the service
+        /// is unavailable: it refuses requests while catching up with the feed, which on a loaded machine it can fall
+        /// behind for a moment.
+        fn ask_parlays(&mut self, message: Value) -> Value {
+            for _ in 0..300 {
+                self.send(message.clone());
+                let answer = self.next_answer();
+                if answer["error"]["code"] != "UNAVAILABLE" {
+                    return answer;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!("the parlay service stayed unavailable for {message}");
         }
 
         /// Logs in as the account whose dev token this is.
@@ -713,16 +756,17 @@ mod tests {
         let venue = testing::venue("ws-rfq");
         let mut responder = Client::connect(&venue.ws_private);
         responder.login_as(RESPONDER_TOKEN);
+        let subscribed = responder.ask_parlays(json!({"op": "subscribeRfqs", "id": "sub"}));
+        assert_eq!((subscribed["id"].as_str(), &subscribed["result"]["subscribed"]), (Some("sub"), &json!(true)));
         let mut requester = Client::connect(&venue.ws_private);
         requester.login_as(RETAIL_TOKEN);
         let bitcoin = testing::market(3, 0).to_string();
         let legs =
             json!([{"instrumentId": bitcoin, "outcome": "yes"}, {"instrumentId": MARKET.to_string(), "outcome": "no"}]);
-        requester.send(json!({"op": "requestQuote", "id": "rq", "legs": legs, "quantity": 20}));
-        let opened = requester.next_answer();
+        let opened = requester.ask_parlays(json!({"op": "requestQuote", "id": "rq", "legs": legs, "quantity": 20}));
         assert_eq!((opened["type"].as_str(), opened["id"].as_str()), (Some("reply"), Some("rq")), "{opened}");
         let rfq = &opened["result"];
-        assert_eq!(rfq["listed"], true, "{rfq}");
+        assert_eq!((&rfq["listed"], &rfq["responders"]), (&json!(true), &json!(1)), "{rfq}");
         // Canonical order is by event: rain (template 1) before bitcoin (template 3).
         assert_eq!(rfq["legs"][0]["instrumentId"], MARKET.to_string(), "{rfq}");
         assert_eq!((rfq["legs"][0]["outcome"].as_str(), rfq["lotStep"].as_u64()), (Some("no"), Some(10)));
@@ -741,8 +785,8 @@ mod tests {
         let placed = responder.next_answer();
         assert_eq!(placed["result"]["status"], "accepted", "{placed}");
         let order = order_id(&placed);
-        responder.send(json!({"op": "attachQuote", "id": "attach", "requestId": request, "orderId": order}));
-        let attached = responder.next_answer();
+        let attached =
+            responder.ask_parlays(json!({"op": "attachQuote", "id": "attach", "requestId": request, "orderId": order}));
         assert_eq!((attached["id"].as_str(), attached["result"]["state"].as_str()), (Some("attach"), Some("open")));
         assert_eq!(attached["result"]["price"]["cents"], "0.8", "{attached}");
 
@@ -785,31 +829,150 @@ mod tests {
         requester.login_as(RETAIL_TOKEN);
         let legs = json!([{"instrumentId": MARKET.to_string(), "outcome": "yes"},
                           {"instrumentId": testing::market(2, 1).to_string(), "outcome": "yes"}]);
-        requester.send(json!({"op": "requestQuote", "id": "rq", "legs": legs, "quantity": 10}));
-        let rfq = requester.next_answer()["result"].clone();
+        let rfq = requester.ask_parlays(json!({"op": "requestQuote", "id": "rq", "legs": legs, "quantity": 10}))
+            ["result"]
+            .clone();
         let (request, parlay) = (rfq["requestId"].clone(), rfq["instrumentId"].clone());
+        // Orders on the parlay are validated against the private half's view, which learns of it from the feed.
+        let listed: u64 = parlay.as_str().and_then(|p| p.parse().ok()).expect("a numeric instrument ID");
+        eventually("the private half lists the parlay", || venue.gateway.hub().market(listed).is_some());
         // The requester is no responder, whatever it rests.
         requester.send(json!({"op": "order", "id": "own", "clientOrderId": "own-1", "instrumentId": parlay,
                               "action": "sell", "outcome": "yes", "price": {"cents": "50"}, "quantity": 10}));
         let own = order_id(&requester.next_answer());
-        requester.send(json!({"op": "attachQuote", "id": "a1", "requestId": request, "orderId": own}));
-        assert_eq!(requester.next_answer()["error"]["code"], "BAD_REQUEST");
+        let refused =
+            requester.ask_parlays(json!({"op": "attachQuote", "id": "a1", "requestId": request, "orderId": own}));
+        assert_eq!(refused["error"]["code"], "FORBIDDEN");
         let mut responder = Client::connect(&venue.ws_private);
         responder.login_as(RESPONDER_TOKEN);
         // Someone else's order, a buy, and an order on another market are all refused.
-        responder.send(json!({"op": "attachQuote", "id": "a2", "requestId": request, "orderId": own}));
-        assert_eq!(responder.next_answer()["error"]["code"], "NOT_FOUND");
+        assert_eq!(
+            responder.ask_parlays(json!({"op": "attachQuote", "id": "a2", "requestId": request, "orderId": own}))
+                ["error"]["code"],
+            "NOT_FOUND"
+        );
         responder.send(json!({"op": "order", "id": "buy", "clientOrderId": "buy-1", "instrumentId": parlay,
                               "action": "buy", "outcome": "yes", "price": {"cents": "1"}, "quantity": 10}));
         let buy = order_id(&responder.next_answer());
-        responder.send(json!({"op": "attachQuote", "id": "a3", "requestId": request, "orderId": buy}));
-        assert_eq!(responder.next_answer()["error"]["code"], "BAD_REQUEST");
+        assert_eq!(
+            responder.ask_parlays(json!({"op": "attachQuote", "id": "a3", "requestId": request, "orderId": buy}))
+                ["error"]["code"],
+            "BAD_REQUEST"
+        );
         responder.send(order("elsewhere", 4));
         let elsewhere = order_id(&responder.next_answer());
-        responder.send(json!({"op": "attachQuote", "id": "a4", "requestId": request, "orderId": elsewhere}));
-        assert_eq!(responder.next_answer()["error"]["code"], "BAD_REQUEST");
-        responder.send(json!({"op": "attachQuote", "id": "a5", "requestId": "nosuchrequest", "orderId": buy}));
-        assert_eq!(responder.next_answer()["error"]["code"], "NOT_FOUND");
+        assert_eq!(
+            responder.ask_parlays(json!({"op": "attachQuote", "id": "a4", "requestId": request, "orderId": elsewhere}))
+                ["error"]["code"],
+            "BAD_REQUEST"
+        );
+        assert_eq!(
+            responder
+                .ask_parlays(json!({"op": "attachQuote", "id": "a5", "requestId": "nosuchrequest", "orderId": buy}))
+                ["error"]["code"],
+            "NOT_FOUND"
+        );
+    }
+
+    fn request_quote(client: &mut Client, id: &str, legs: &[(u64, &str)], quantity: u64) -> Value {
+        let legs: Vec<Value> =
+            legs.iter().map(|(m, outcome)| json!({"instrumentId": m.to_string(), "outcome": outcome})).collect();
+        let opened = client.ask_parlays(json!({"op": "requestQuote", "id": id, "legs": legs, "quantity": quantity}));
+        assert_eq!(opened["type"], "reply", "{opened}");
+        opened["result"].clone()
+    }
+
+    /// Nothing `wanted` accepts has reached the client, of what was on its way before this was called. Two round trips:
+    /// the gateway answers a heartbeat as it reads it, possibly ahead of messages already waiting for the session, but
+    /// sends whatever was waiting before it reads the next.
+    fn none_streamed(client: &mut Client, id: &str, wanted: impl Fn(&Value) -> bool) {
+        for round in ["a", "b"] {
+            let id = format!("{id}{round}");
+            client.send(json!({"op": "heartbeat", "id": id}));
+            assert_eq!(client.next_answer()["id"], id.as_str());
+        }
+        let seen: Vec<&Value> = client.streamed.iter().filter(|m| wanted(m)).collect();
+        assert!(seen.is_empty(), "sent {seen:?}");
+    }
+
+    /// A responder hears requests only once it subscribes: first those still open, ahead of the reply, then each new
+    /// one its filters select, until it unsubscribes. Its own requests are never sent to it.
+    #[test]
+    fn a_subscribed_responder_catches_up_then_hears_what_its_filters_select() {
+        let venue = testing::venue("ws-rfq-subscribe");
+        let (arsenal, bitcoin) = (testing::market(2, 0), testing::market(3, 0));
+        let mut requester = Client::connect(&venue.ws_private);
+        requester.login_as(RETAIL_TOKEN);
+        let mut responder = Client::connect(&venue.ws_private);
+        responder.login_as(RESPONDER_TOKEN);
+        let early = request_quote(&mut requester, "early", &[(MARKET, "yes"), (bitcoin, "no")], 10);
+        assert_eq!(early["responders"], 0, "nobody had subscribed: {early}");
+        // Logged in but not subscribed: nothing arrives.
+        none_streamed(&mut responder, "h0", |m| m["type"] == "rfq");
+
+        responder.send(json!({"op": "subscribeRfqs", "id": "sub"}));
+        // The request is open, so only the parlay service being unreachable could refuse this, and the venue has
+        // reached it; nothing else is sent to this session meanwhile.
+        let caught_up = responder.next();
+        assert_eq!((caught_up["type"].as_str(), &caught_up["requestId"]), (Some("rfq"), &early["requestId"]));
+        assert!(caught_up["expiresAt"].as_str().is_some_and(|t| t.ends_with('Z')), "{caught_up}");
+        assert!(!caught_up.to_string().contains("accountId"), "the requester was named: {caught_up}");
+        let reply = responder.next();
+        assert_eq!((reply["type"].as_str(), reply["id"].as_str()), (Some("reply"), Some("sub")), "{reply}");
+        assert_eq!(reply["result"]["openRequests"], 1, "{reply}");
+        assert_eq!(reply["result"]["filters"]["minLegs"], 2, "{reply}");
+        assert!(reply["result"].get("requests").is_none(), "{reply}");
+
+        // A second session of the same responder, choosier: three legs or more.
+        let mut choosy = Client::connect(&venue.ws_private);
+        choosy.login_as(RESPONDER_TOKEN);
+        let sub3 = choosy.ask_parlays(json!({"op": "subscribeRfqs", "id": "sub3", "filters": {"minLegs": 3}}));
+        assert_eq!(sub3["result"]["openRequests"], 0, "{sub3}");
+        let two = request_quote(&mut requester, "two", &[(arsenal, "yes"), (bitcoin, "yes")], 20);
+        assert_eq!(two["responders"], 1, "two sessions of one account are one responder: {two}");
+        responder.streamed_message(|m| m["type"] == "rfq" && m["requestId"] == two["requestId"]);
+        let three = request_quote(&mut requester, "three", &[(MARKET, "no"), (arsenal, "yes"), (bitcoin, "yes")], 10);
+        choosy.streamed_message(|m| m["type"] == "rfq" && m["requestId"] == three["requestId"]);
+        none_streamed(&mut choosy, "h1", |m| m["requestId"] == two["requestId"]);
+
+        let unsubscribed = responder.ask_parlays(json!({"op": "unsubscribeRfqs", "id": "unsub"}));
+        assert_eq!(unsubscribed["result"]["subscribed"], false, "{unsubscribed}");
+        responder.streamed.clear();
+        let late = request_quote(&mut requester, "late", &[(MARKET, "yes"), (arsenal, "no")], 10);
+        assert_eq!(late["responders"], 0, "{late}");
+        none_streamed(&mut responder, "h2", |m| m["type"] == "rfq");
+
+        // An approved responder that requests is not sent its own request.
+        let own = request_quote(&mut choosy, "own", &[(MARKET, "yes"), (arsenal, "yes"), (bitcoin, "no")], 10);
+        assert_eq!(own["responders"], 0, "{own}");
+        none_streamed(&mut choosy, "h3", |m| m["requestId"] == own["requestId"]);
+    }
+
+    #[test]
+    fn an_account_that_is_not_an_approved_responder_cannot_subscribe() {
+        let venue = testing::venue("ws-rfq-refused");
+        let mut client = Client::connect(&venue.ws_private);
+        client.send(json!({"op": "subscribeRfqs", "id": "anonymous"}));
+        assert_eq!(client.next_answer()["error"]["code"], "UNAUTHORIZED");
+        client.login_as(RETAIL_TOKEN);
+        let refused = client.ask_parlays(json!({"op": "subscribeRfqs", "id": "retail"}));
+        assert_eq!((refused["id"].as_str(), refused["error"]["code"].as_str()), (Some("retail"), Some("FORBIDDEN")));
+        assert!(refused["error"]["message"].as_str().is_some_and(|m| m.contains("approved")), "{refused}");
+        let mut responder = Client::connect(&venue.ws_private);
+        responder.login_as(RESPONDER_TOKEN);
+        for (filters, why) in [
+            (json!({"minLegs": 7}), "too many legs"),
+            (json!({"minLegs": 4, "maxLegs": 3}), "an empty range"),
+            (json!({"eventIds": [5]}), "an ID that is not a string"),
+            (json!({"colour": "red"}), "an unknown filter"),
+        ] {
+            let refused = responder.ask_parlays(json!({"op": "subscribeRfqs", "id": why, "filters": filters}));
+            assert_eq!(refused["error"]["code"], "BAD_REQUEST", "{why}: {refused}");
+        }
+        let mut public = Client::connect(&venue.ws_public);
+        public.send(json!({"op": "subscribeRfqs", "id": "public"}));
+        let wrong_half = public.next_answer();
+        assert!(wrong_half["error"]["message"].as_str().is_some_and(|m| m.contains("/v4/ws_private")), "{wrong_half}");
     }
 
     #[test]

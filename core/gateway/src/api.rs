@@ -138,6 +138,35 @@ fn request_id(text: &str) -> Result<&str, ApiError> {
     ok.then_some(text).ok_or_else(|| ApiError::bad("requestId must be 1 to 32 digits and lower-case letters"))
 }
 
+/// A `subscribeRfqs` filter, checked whole and with its IDs as numbers, as the parlay service takes it.
+fn rfq_filters(filters: &Value) -> Result<Value, ApiError> {
+    let fields = only(filters, &["minLegs", "maxLegs", "eventIds", "instrumentIds", "minQuantity"])?;
+    let mut out = Map::new();
+    for name in ["minLegs", "maxLegs"] {
+        if let Some(n) = integer(fields, name, 2, 6)? {
+            out.insert(name.into(), json!(n));
+        }
+    }
+    if let (Some(min), Some(max)) = (out.get("minLegs"), out.get("maxLegs")) {
+        if min.as_u64() > max.as_u64() {
+            return Err(ApiError::bad("minLegs must not be more than maxLegs"));
+        }
+    }
+    for name in ["eventIds", "instrumentIds"] {
+        let Some(list) = fields.get(name) else { continue };
+        let list = list
+            .as_array()
+            .filter(|l| l.len() <= 100)
+            .ok_or_else(|| ApiError::bad(format!("{name} must be a list of at most 100 IDs")))?;
+        let ids = list.iter().map(|v| parse_id(v.as_str().unwrap_or(""), name)).collect::<Result<Vec<u64>, _>>()?;
+        out.insert(name.into(), json!(ids));
+    }
+    if let Some(n) = integer(fields, "minQuantity", 0, u64::from(u32::MAX))? {
+        out.insert("minQuantity".into(), json!(n));
+    }
+    Ok(Value::Object(out))
+}
+
 pub fn parse_id(text: &str, name: &str) -> Result<u64, ApiError> {
     let ok = !text.is_empty() && text.len() <= 20 && text.bytes().all(|b| b.is_ascii_digit());
     ok.then(|| text.parse().ok()).flatten().ok_or_else(|| ApiError::bad(format!("{name} must be a decimal string")))
@@ -426,21 +455,37 @@ impl Gateway {
     /// account's sessions is delivered to them. A half without one refuses requests for quote as unavailable.
     pub fn connect_parlays(gateway: &Arc<Self>, addr: &str) {
         let half = Arc::downgrade(gateway);
-        let deliver: parlays::Deliver = Arc::new(move |accounts, message| {
+        let deliver: parlays::Deliver = Arc::new(move |target, message| {
             if let Some(gateway) = half.upgrade() {
-                gateway.hub().deliver(accounts, message);
+                match target {
+                    parlays::Target::Accounts(accounts) => gateway.hub().deliver(accounts, message),
+                    parlays::Target::Sessions(sessions) => gateway.hub().deliver_to_sessions(sessions, message),
+                }
             }
         });
         let _ = gateway.parlays.set(Parlays::spawn(addr, deliver));
     }
 
-    /// Gives a call to the parlay service for `account`, without waiting for its answer.
-    fn ask_parlays(&self, account: u64, mut call: Value, notify: Option<Notify>) -> Result<Pending, ApiError> {
-        let service = self.parlays.get().ok_or_else(|| {
+    fn parlay_service(&self) -> Result<&Parlays, ApiError> {
+        self.parlays.get().ok_or_else(|| {
             ApiError::unavailable("requests for quote are not served here: this gateway has no parlay service")
-        })?;
+        })
+    }
+
+    /// Gives a call to the parlay service for `account`, without waiting for its answer.
+    fn ask_parlays(&self, account: u64, call: Value, notify: Option<Notify>) -> Result<Pending, ApiError> {
+        self.ask_parlays_with(account, call, |service, call| service.call(call, notify))
+    }
+
+    fn ask_parlays_with(
+        &self,
+        account: u64,
+        mut call: Value,
+        send: impl FnOnce(&Parlays, Value) -> Result<parlays::Pending, wire::Error>,
+    ) -> Result<Pending, ApiError> {
+        let service = self.parlay_service()?;
         call["accountId"] = json!(account);
-        let inner = service.call(call, notify).map_err(|e| {
+        let inner = send(service, call).map_err(|e| {
             eprintln!("gateway: parlay service: {e}");
             ApiError::unavailable("the parlay service is not taking requests; nothing was requested")
         })?;
@@ -454,6 +499,7 @@ impl Gateway {
             Err((status, code, message)) => {
                 let code = match code.as_str() {
                     "BAD_REQUEST" => "BAD_REQUEST",
+                    "FORBIDDEN" => "FORBIDDEN",
                     "NOT_FOUND" => "NOT_FOUND",
                     _ => "UNAVAILABLE",
                 };
@@ -506,10 +552,63 @@ impl Gateway {
         body: &Value,
         notify: Option<Notify>,
     ) -> Result<Pending, ApiError> {
+        self.may_respond(account)?;
         let fields = only(body, &["requestId", "orderId"])?;
         let request = request_id(fields.get("requestId").and_then(Value::as_str).unwrap_or(""))?;
         let order = id_field(fields, "orderId")?;
         self.ask_parlays(account, json!({"op": "quote", "requestId": request, "orderId": order}), notify)
+    }
+
+    /// The credential may answer requests for quote. Every dev token may; an API key will only if it was issued with
+    /// the permission to respond, and this is where that permission is read. Whether the account is an approved
+    /// responder is the parlay service's to say.
+    const fn may_respond(&self, _account: u64) -> Result<(), ApiError> {
+        Ok(())
+    }
+
+    /// The WebSocket `subscribeRfqs` op for the session with hub key `session`: requests from now on, and those open
+    /// now in the answer (`requests`), which the session is sent as `rfq` messages before the reply.
+    pub fn subscribe_rfqs_pending(
+        &self,
+        account: u64,
+        session: u64,
+        body: &Value,
+        notify: Option<Notify>,
+    ) -> Result<Pending, ApiError> {
+        self.may_respond(account)?;
+        let fields = only(body, &["filters"])?;
+        let filters = match fields.get("filters") {
+            None => Value::Null,
+            Some(f) => rfq_filters(f)?,
+        };
+        let call = json!({"op": "subscribe", "session": session, "filters": filters});
+        self.ask_parlays_with(account, call, |service, call| service.subscribe(session, call, notify))
+    }
+
+    /// The WebSocket `unsubscribeRfqs` op.
+    pub fn unsubscribe_rfqs_pending(
+        &self,
+        account: u64,
+        session: u64,
+        body: &Value,
+        notify: Option<Notify>,
+    ) -> Result<Pending, ApiError> {
+        only(body, &[])?;
+        let call = json!({"op": "unsubscribe", "session": session});
+        self.ask_parlays_with(account, call, |service, call| service.unsubscribe(session, call, notify))
+    }
+
+    /// A session has ended: its subscription to requests, if it had one, ends with it.
+    pub fn end_rfq_subscription(&self, session: u64) {
+        if let Some(service) = self.parlays.get() {
+            service.forget(session);
+        }
+    }
+
+    /// GET /v4/rfqs: the requests open now that an approved responder may quote.
+    pub fn open_rfqs_pending(&self, account: u64, notify: Option<Notify>) -> Result<Pending, ApiError> {
+        self.may_respond(account)?;
+        self.ask_parlays(account, json!({"op": "open"}), notify)
     }
 
     /// The input for a new order, once it has passed every check the gateway makes.

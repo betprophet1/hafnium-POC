@@ -467,6 +467,17 @@ impl Hub {
         }
     }
 
+    /// A message from the parlay service for some sessions, by their keys, presented as everything else is. Not kept
+    /// for resuming either.
+    pub fn deliver_to_sessions(&self, keys: &[u64], message: &Value) {
+        let text = self.present(message.clone()).to_string();
+        for key in keys {
+            if let Some(s) = self.sessions.get(key) {
+                let _ = s.tx.send(text.clone());
+            }
+        }
+    }
+
     /// What the parlay service says, in interface 1's terms: a price it gives as a tick on an instrument becomes a
     /// price quote from that instrument's ladder, and a time in nanoseconds a timestamp. The service leaves both to
     /// the gateway, which owns how prices and times are shown.
@@ -482,9 +493,11 @@ impl Hub {
                 object.insert(key.into(), json!(price::format_timestamp(ns)));
             }
         }
-        if let Some(quotes) = object.get_mut("quotes").and_then(Value::as_array_mut) {
-            for quote in quotes.iter_mut() {
-                *quote = self.present(quote.take());
+        for list in ["quotes", "requests"] {
+            if let Some(items) = object.get_mut(list).and_then(Value::as_array_mut) {
+                for item in items.iter_mut() {
+                    *item = self.present(item.take());
+                }
             }
         }
         value

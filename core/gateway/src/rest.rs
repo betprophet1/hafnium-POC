@@ -151,6 +151,10 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Res
             let account = account(gateway, request, Permissions::TRADE)?;
             Ok(Routed::Later(gateway.request_quote_pending(account, &body(request)?, later())?))
         }
+        ("GET", ["v4", "rfqs"]) => {
+            let account = account(gateway, request, Permissions::READ)?;
+            Ok(Routed::Later(gateway.open_rfqs_pending(account, later())?))
+        }
         ("GET", ["v4", "rfqs", rfq]) => {
             let account = account(gateway, request, Permissions::READ)?;
             Ok(Routed::Later(gateway.rfq_pending(account, rfq, later())?))
@@ -187,7 +191,7 @@ mod tests {
     /// Sends one request and returns the status and the JSON body. The gateway answers once and closes.
     fn request(address: &str, method: &str, path: &str, token: Option<&str>, body: Option<&str>) -> (u16, Value) {
         let mut stream = TcpStream::connect(address).expect("the gateway accepts a connection");
-        stream.set_read_timeout(Some(Duration::from_secs(5))).expect("a read timeout");
+        stream.set_read_timeout(Some(Duration::from_secs(30))).expect("a read timeout");
         let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {address}\r\n");
         if let Some(token) = token {
             head.push_str(&format!("Authorization: Bearer {token}\r\n"));
@@ -200,6 +204,20 @@ mod tests {
         let status = response.split_whitespace().nth(1).and_then(|s| s.parse().ok()).expect("a status line");
         let json = response.split_once("\r\n\r\n").map_or("", |(_, b)| b);
         (status, serde_json::from_str(json).unwrap_or(Value::Null))
+    }
+
+    /// POST /v4/rfqs as the retail customer. A parlay service refuses requests as unavailable while it is catching up
+    /// with the feed, which on a loaded machine it can fall behind for a moment: that is asked again.
+    fn ask_for_quotes(address: &str, body: &str) -> (u16, Value) {
+        let mut answer = request(address, "POST", "/v4/rfqs", Some(RETAIL_TOKEN), Some(body));
+        for _ in 0..300 {
+            if answer.0 != 503 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            answer = request(address, "POST", "/v4/rfqs", Some(RETAIL_TOKEN), Some(body));
+        }
+        answer
     }
 
     fn order(client_order_id: &str) -> String {
@@ -406,7 +424,7 @@ mod tests {
         let venue = testing::venue("rest-rfq");
         let a = &venue.address;
         let (arsenal, draw, bitcoin) = (testing::market(2, 0), testing::market(2, 1), testing::market(3, 0));
-        let ask = |body: &str| request(a, "POST", "/v4/rfqs", Some(RETAIL_TOKEN), Some(body));
+        let ask = |body: &str| ask_for_quotes(a, body);
         for (why, body, status) in [
             ("two legs on one event", legs(&[(arsenal, "yes"), (draw, "no")], 10), 400),
             ("one leg", legs(&[(arsenal, "yes")], 10), 400),
@@ -448,7 +466,14 @@ mod tests {
             Some(MAKER_TOKEN),
             Some(r#"{"orderId": "5"}"#),
         );
-        assert_eq!(attach.0, 400, "the market maker tab's account is not a responder: {}", attach.1);
+        assert_eq!(attach.0, 403, "the market maker tab's account is not a responder: {}", attach.1);
+        // Only an approved responder lists the open requests, and never sees its own among them.
+        assert_eq!(request(a, "GET", "/v4/rfqs", Some(MAKER_TOKEN), None).0, 403);
+        let (status, open) = request(a, "GET", "/v4/rfqs", Some(testing::RESPONDER_TOKEN), None);
+        assert_eq!(status, 200, "{open}");
+        let ids: Vec<&Value> = open["requests"].as_array().into_iter().flatten().map(|r| &r["requestId"]).collect();
+        assert_eq!(ids, vec![&first["requestId"], &again["requestId"]], "{open}");
+        assert!(open["requests"][0]["expiresAt"].as_str().is_some(), "{open}");
     }
 
     /// Each settlement rule against a real node: a lost leg expires a parlay, a voided leg voids one, and a parlay
@@ -459,7 +484,7 @@ mod tests {
         let a = &venue.address;
         let (arsenal, bitcoin) = (testing::market(2, 0), testing::market(3, 0));
         let parlay = |legs_asked: &[(u64, &str)]| {
-            let (status, rfq) = request(a, "POST", "/v4/rfqs", Some(RETAIL_TOKEN), Some(&legs(legs_asked, 10)));
+            let (status, rfq) = ask_for_quotes(a, &legs(legs_asked, 10));
             assert_eq!(status, 200, "{rfq}");
             rfq["instrumentId"].as_str().expect("an instrument").to_string()
         };

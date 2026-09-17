@@ -2,23 +2,35 @@
 //! open requests for quote and the quotes attached to them, and sequences what the legs call for.
 //!
 //! Gateways connect to it over TCP and speak JSON, one object per line. A gateway sends a call,
-//! `{"ref": 7, "op": "request" | "quote" | "status", "accountId": 2, ...}`, and is answered
-//! `{"ref": 7, "result": {...}}` or `{"ref": 7, "error": {"status": 400, "code": "BAD_REQUEST", "message": "..."}}`,
-//! in whatever order the answers are ready. Unasked, the service sends every gateway `{"to": [10], "message": {...}}`:
-//! a message for the private sessions of those accounts, which the gateway delivers as it is, apart from turning a
-//! `price` tick into a price quote and nanosecond times into timestamps, as it does for everything it presents.
+//! `{"ref": 7, "op": "request" | "quote" | "status" | "open" | "subscribe" | "unsubscribe", "accountId": 2, ...}`,
+//! and is answered `{"ref": 7, "result": {...}}` or
+//! `{"ref": 7, "error": {"status": 400, "code": "BAD_REQUEST", "message": "..."}}`, in whatever order the answers are
+//! ready, except that `subscribe` and `unsubscribe` are answered in the order they were sent, before anything the
+//! gateway sent after them. Unasked, the service sends every gateway `{"to": [10], "message": {...}}`, a message for
+//! the private sessions of those accounts, and one gateway `{"toSessions": [3, 8], "message": {...}}`, a message for
+//! those of its sessions, named by the key the gateway gave them in `subscribe`. The gateway delivers either as it
+//! is, apart from turning a `price` tick into a price quote and nanosecond times into timestamps, as it does for
+//! everything it presents.
+//!
+//! A responder's session subscribes with `{"op": "subscribe", "accountId", "session", "filters"}` and is answered
+//! with its filters and the requests open now that match (`requests`), so a session that subscribes mid-window can
+//! still quote. Subscriptions belong to the gateway connection they came through and end with it: a gateway that
+//! reconnects, to this service or to a restarted one, subscribes its sessions again.
 //!
 //! Requests are here rather than in a gateway because a gateway must hold nothing a failover could lose (interface 1
 //! README), and because a requester and the responders are rarely on one gateway. They are not in the journal: the
 //! engine has no RFQ state machine (spec §19), and the quotes that matter, the orders, are journaled already. A
-//! restarted service forgets open requests and relearns everything else from the feed.
+//! restarted service forgets open requests and subscriptions, rereads its approved responders from their file, and
+//! relearns everything else (parlays, their legs and how they stand) from the feed.
 
+use crate::responders::{Approvals, Filter, Subscriptions};
 use crate::rules::{self, Action, Refusal, Wanted, LOT_STEP};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -49,6 +61,11 @@ pub struct Config {
     pub max_parlays: usize,
     /// The node's capacity profile: no parlay is listed that would take the venue past 95% of it (`rules::no_room`).
     pub capacity: rules::Capacity,
+    /// The file the approved responders are kept in (`responders::Approvals`); `None` keeps them in memory, seeded
+    /// from the catalogue, for tests.
+    pub responders: Option<PathBuf>,
+    /// The fewest contracts a request may ask for: a multiple of the parlay lot step, and at least one lot.
+    pub min_quantity: u64,
 }
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -79,6 +96,14 @@ fn bad(message: impl Into<String>) -> Failure {
 
 fn not_found(message: impl Into<String>) -> Failure {
     Failure { status: 404, code: "NOT_FOUND", message: message.into() }
+}
+
+fn forbidden(account: u64) -> Failure {
+    Failure {
+        status: 403,
+        code: "FORBIDDEN",
+        message: format!("account {account} is not an approved parlay responder; an operator approves responders"),
+    }
 }
 
 fn unavailable(message: impl Into<String>) -> Failure {
@@ -115,6 +140,8 @@ struct State {
     /// The request each open quote's order answers.
     by_order: BTreeMap<u64, String>,
     count: u64,
+    /// The sessions listening for requests.
+    subscriptions: Subscriptions,
     /// Parlays with a command sequenced that the view has not reached yet, with that command's sequence. Nothing more
     /// is decided for them until it has, or the service would send the same move again on every tick in between.
     in_flight: BTreeMap<u64, u64>,
@@ -125,6 +152,18 @@ struct State {
 type Update = (u64, Option<u64>, Option<u64>, Option<&'static str>, u64);
 
 impl State {
+    /// The requests still open that `account` may answer and `filter` selects, oldest first: never the account's own.
+    fn open_for(&self, account: u64, filter: &Filter) -> Vec<(&String, &Request)> {
+        let mut open: Vec<(&String, &Request)> = self
+            .requests
+            .iter()
+            .filter(|(_, r)| self.view.now < r.expires_at && r.requester != account)
+            .filter(|(_, r)| filter.matches(&r.legs, r.quantity))
+            .collect();
+        open.sort_by_key(|(name, r)| (r.opened_at, name.as_str()));
+        open
+    }
+
     /// Follows the orders that are quotes through one unit's results, and returns the requester's news.
     fn track_quotes(&mut self, results: &[Value]) -> Vec<(u64, Value)> {
         let mut changed: Vec<u64> = Vec::new();
@@ -190,8 +229,10 @@ fn quote_json(request: &str, parlay: u64, order: u64, quote: &Quote) -> Value {
 
 pub struct Service {
     catalogue: Catalogue,
-    responders: BTreeSet<u64>,
+    /// Taken only after `state` when both are held.
+    approvals: Mutex<Approvals>,
     window: u64,
+    min_quantity: u64,
     max_parlays: usize,
     capacity: rules::Capacity,
     nonce: String,
@@ -211,12 +252,17 @@ fn nonce() -> Result<String, Error> {
 
 /// Starts the service: follows the feed, accepts gateways on `config.listen`, and returns once it is listening.
 pub fn start(catalogue: Catalogue, config: &Config) -> Result<Arc<Service>, Error> {
-    let responders =
-        catalogue.accounts().iter().filter(|a| a["responder"] == true).filter_map(|a| a["id"].as_u64()).collect();
+    let seed = catalogue.accounts().iter().filter(|a| a["responder"] == true).filter_map(|a| a["id"].as_u64());
+    let approvals = Approvals::load(config.responders.as_deref(), seed.collect::<Vec<u64>>())?;
+    if config.min_quantity < LOT_STEP || !config.min_quantity.is_multiple_of(LOT_STEP) {
+        return Err(format!("the minimum request must be a positive multiple of the lot step, {LOT_STEP}").into());
+    }
+    eprintln!("parlay service: approved responders {:?}", approvals.accounts());
     let service = Arc::new(Service {
         catalogue,
-        responders,
+        approvals: Mutex::new(approvals),
         window: config.window_seconds.max(1) * 1_000_000_000,
+        min_quantity: config.min_quantity,
         max_parlays: config.max_parlays,
         capacity: config.capacity,
         nonce: nonce()?,
@@ -320,8 +366,20 @@ impl Service {
         locked(&self.gateways).retain(|_, gateway| gateway.send(line.clone()).is_ok());
     }
 
+    /// Sends a message for some of one gateway's sessions to that gateway.
+    fn push_sessions(&self, gateway: u64, sessions: &[u64], message: &Value) {
+        if sessions.is_empty() {
+            return;
+        }
+        let line = json!({"toSessions": sessions, "message": message}).to_string();
+        let mut gateways = locked(&self.gateways);
+        if gateways.get(&gateway).is_some_and(|g| g.send(line).is_err()) {
+            gateways.remove(&gateway);
+        }
+    }
+
     /// Serves one gateway until it disconnects: its calls are answered on threads of their own, so a call waiting for
-    /// the feed holds up nothing else.
+    /// the feed holds up nothing else. Subscribing and unsubscribing never wait, and are answered here, in order.
     fn gateway(self: &Arc<Self>, stream: TcpStream) -> Result<(), Error> {
         stream.set_nodelay(true)?;
         let (tx, rx) = channel::<String>();
@@ -349,6 +407,16 @@ impl Service {
                     continue;
                 }
             };
+            if let Some(answer) = self.subscription_call(key, &call) {
+                let answer = match answer {
+                    Ok(result) => json!({"ref": call["ref"], "result": result}),
+                    Err(f) => {
+                        json!({"ref": call["ref"], "error": {"status": f.status, "code": f.code, "message": f.message}})
+                    }
+                };
+                let _ = tx.send(answer.to_string());
+                continue;
+            }
             let (service, tx) = (Arc::clone(self), tx.clone());
             thread::spawn(move || {
                 let answer = match service.call(&call) {
@@ -361,7 +429,133 @@ impl Service {
             });
         }
         locked(&self.gateways).remove(&key);
+        locked(&self.state).subscriptions.drop_gateway(key);
         Ok(())
+    }
+
+    /// The answer to a `subscribe` or `unsubscribe` from gateway connection `gateway`, or `None` for any other call.
+    fn subscription_call(&self, gateway: u64, call: &Value) -> Option<Result<Value, Failure>> {
+        let op = call["op"].as_str()?;
+        if op != "subscribe" && op != "unsubscribe" {
+            return None;
+        }
+        Some(self.subscription(gateway, op == "subscribe", call))
+    }
+
+    fn subscription(&self, gateway: u64, subscribe: bool, call: &Value) -> Result<Value, Failure> {
+        let account = call["accountId"].as_u64().ok_or_else(|| bad("a call names its account"))?;
+        let session = call["session"].as_u64().ok_or_else(|| bad("a subscription names its session"))?;
+        if !subscribe {
+            locked(&self.state).subscriptions.unsubscribe((gateway, session));
+            return Ok(json!({"subscribed": false}));
+        }
+        self.subscribe(gateway, session, account, &call["filters"])
+    }
+
+    /// Subscribes a session of an approved responder, and answers with the requests open now that it would have been
+    /// sent. Both happen under one lock with the requests, so a request opened meanwhile is in the answer or sent to
+    /// the session afterwards, never both and never neither. A refusal leaves any subscription the session had as it
+    /// was.
+    fn subscribe(&self, gateway: u64, session: u64, account: u64, filters: &Value) -> Result<Value, Failure> {
+        let filter = Filter::parse(filters).map_err(bad)?;
+        let mut state = locked(&self.state);
+        if !locked(&self.approvals).contains(account) {
+            return Err(forbidden(account));
+        }
+        let requests: Vec<Value> = state
+            .open_for(account, &filter)
+            .into_iter()
+            .map(|(name, request)| {
+                let mut rfq = self.rfq_json(name, request);
+                rfq["type"] = json!("rfq");
+                rfq
+            })
+            .collect();
+        let shown = filter.to_json();
+        state.subscriptions.subscribe((gateway, session), account, filter);
+        drop(state);
+        eprintln!("parlay service: account {account} subscribed, {} requests open for it", requests.len());
+        Ok(json!({"subscribed": true, "filters": shown, "openRequests": requests.len(), "requests": requests}))
+    }
+
+    /// The requests open now that an approved responder may quote.
+    fn open(&self, account: u64) -> Result<Value, Failure> {
+        let state = locked(&self.state);
+        if !locked(&self.approvals).contains(account) {
+            return Err(forbidden(account));
+        }
+        let requests: Vec<Value> = state
+            .open_for(account, &Filter::default())
+            .into_iter()
+            .map(|(name, request)| self.rfq_json(name, request))
+            .collect();
+        Ok(json!({"requests": requests}))
+    }
+
+    /// Approves an account as a responder, for an operator. Only a catalogue account can be approved.
+    pub fn approve(&self, account: u64) -> Result<Value, Failure> {
+        if !self.catalogue.accounts().iter().any(|a| a["id"].as_u64() == Some(account)) {
+            return Err(not_found(format!("no account {account}")));
+        }
+        let changed = locked(&self.approvals)
+            .approve(account)
+            .map_err(|e| unavailable(format!("the responder list could not be written: {e}")))?;
+        if changed {
+            eprintln!("parlay service: account {account} approved as a responder");
+        }
+        Ok(json!({"accountId": id(account), "approved": true, "changed": changed}))
+    }
+
+    /// Revokes an account's approval, for an operator: its subscriptions end at once, each session told, and it can
+    /// attach no more quotes. Quotes it attached already are orders on the book, and stay there.
+    pub fn revoke(&self, account: u64) -> Result<Value, Failure> {
+        let (changed, ended) = {
+            let mut state = locked(&self.state);
+            let changed = locked(&self.approvals)
+                .revoke(account)
+                .map_err(|e| unavailable(format!("the responder list could not be written: {e}")))?;
+            (changed, state.subscriptions.drop_account(account))
+        };
+        let message = json!({
+            "type": "rfqSubscription", "subscribed": false,
+            "reason": "this account's approval as a parlay responder was revoked"
+        });
+        let mut by_gateway: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for (gateway, session) in &ended {
+            by_gateway.entry(*gateway).or_default().push(*session);
+        }
+        for (gateway, sessions) in by_gateway {
+            self.push_sessions(gateway, &sessions, &message);
+        }
+        if changed {
+            eprintln!("parlay service: account {account} revoked as a responder, {} subscriptions ended", ended.len());
+        }
+        Ok(json!({"accountId": id(account), "approved": false, "changed": changed, "subscriptionsEnded": ended.len()}))
+    }
+
+    /// The approved responders, each with its name and how many sessions it has subscribed, for an operator.
+    pub fn responders(&self) -> Value {
+        let state = locked(&self.state);
+        let approvals = locked(&self.approvals);
+        let list: Vec<Value> = approvals
+            .accounts()
+            .iter()
+            .map(|&account| {
+                let name = self
+                    .catalogue
+                    .accounts()
+                    .iter()
+                    .find(|a| a["id"].as_u64() == Some(account))
+                    .map_or(Value::Null, |a| a["name"].clone());
+                json!({"accountId": id(account), "name": name, "subscriptions": state.subscriptions.count(account)})
+            })
+            .collect();
+        json!({"responders": list})
+    }
+
+    /// Whether the service has caught up with the feed and can open requests.
+    pub fn ready(&self) -> bool {
+        locked(&self.state).caught_up
     }
 
     fn call(&self, call: &Value) -> Result<Value, Failure> {
@@ -370,6 +564,7 @@ impl Service {
             "request" => self.request(account, call),
             "quote" => self.quote(account, call),
             "status" => self.status(account, call),
+            "open" => self.open(account),
             other => Err(bad(format!("no call {other}"))),
         }
     }
@@ -402,12 +597,15 @@ impl Service {
         })
     }
 
-    /// Opens a request: canonical legs, the parlay listed if it is new, and the request sent to every responder but
-    /// the requester, who is not named.
+    /// Opens a request: canonical legs, the parlay listed if it is new, and the request sent to every subscribed
+    /// session of an approved responder whose filters match, except the requester's own, without naming the requester.
     fn request(&self, account: u64, call: &Value) -> Result<Value, Failure> {
         let quantity = call["quantity"].as_u64().unwrap_or(0);
         if quantity < LOT_STEP || !quantity.is_multiple_of(LOT_STEP) {
             return Err(bad(format!("quantity must be a positive multiple of the parlay lot step, {LOT_STEP}")));
+        }
+        if quantity < self.min_quantity {
+            return Err(bad(format!("a request is for at least {} contracts", self.min_quantity)));
         }
         let wanted: Vec<Wanted> = call["legs"]
             .as_array()
@@ -461,7 +659,7 @@ impl Service {
         }
         self.when(|s| s.view.instruments.get(&parlay).filter(|i| i.state == "OPEN").map(|_| ()))
             .ok_or_else(|| unavailable("the parlay was listed but the feed has not shown it open yet; ask again"))?;
-        let (name, rfq) = {
+        let (name, rfq, targets, reached) = {
             let mut state = locked(&self.state);
             state.count += 1;
             let name = format!("{}{}", self.nonce, rules::command_id('r', state.count).split_off(1));
@@ -477,23 +675,30 @@ impl Service {
                 quotes: BTreeMap::new(),
             };
             let rfq = self.rfq_json(&name, &request);
+            // Chosen while the request is inserted, under the same lock a subscription takes to read what is open.
+            let (targets, reached) =
+                state.subscriptions.targets(&locked(&self.approvals), account, &request.legs, quantity);
             state.requests.insert(name.clone(), request);
-            (name, rfq)
+            (name, rfq, targets, reached)
         };
-        let responders: Vec<u64> = self.responders.iter().copied().filter(|r| *r != account).collect();
         let mut message = rfq.clone();
         message["type"] = json!("rfq");
-        self.push(&responders, &message);
-        eprintln!("parlay service: request {name} for parlay {parlay}, {quantity} contracts");
+        for (gateway, sessions) in &targets {
+            self.push_sessions(*gateway, sessions, &message);
+        }
+        eprintln!(
+            "parlay service: request {name} for parlay {parlay}, {quantity} contracts, sent to {reached} responders"
+        );
         let mut result = rfq;
         result["listed"] = json!(listed);
+        result["responders"] = json!(reached);
         Ok(result)
     }
 
     /// Attaches a responder's resting sell to a request.
     fn quote(&self, account: u64, call: &Value) -> Result<Value, Failure> {
-        if !self.responders.contains(&account) {
-            return Err(bad("only registered responders can quote"));
+        if !locked(&self.approvals).contains(account) {
+            return Err(forbidden(account));
         }
         let name = call["requestId"].as_str().unwrap_or("").to_string();
         let order = call["orderId"].as_u64().unwrap_or(0);
@@ -502,6 +707,9 @@ impl Service {
             let request = state.requests.get(&name).ok_or_else(|| not_found("no such request"))?;
             if state.view.now >= request.expires_at {
                 return Err(bad("the request's window has closed"));
+            }
+            if request.requester == account {
+                return Err(bad("a responder cannot quote its own request"));
             }
         }
         // The order was accepted moments ago, and the feed can be a little behind the gateway's answer.
@@ -563,5 +771,52 @@ impl Service {
             .collect::<Vec<_>>()
             .into();
         Ok(status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leg(event: u64) -> Leg {
+        Leg { event, instrument: event * 100, yes: true }
+    }
+
+    fn request(requester: u64, legs: &[u64], quantity: u64, opened_at: u64, expires_at: u64) -> Request {
+        Request {
+            requester,
+            parlay: rules::ID_BASE + opened_at,
+            legs: legs.iter().map(|&e| leg(e)).collect(),
+            quantity,
+            listed: true,
+            opened_at,
+            expires_at,
+            quotes: BTreeMap::new(),
+        }
+    }
+
+    /// What a responder subscribing now is caught up with: requests still open, oldest first, that its filter selects
+    /// and that it did not make itself.
+    #[test]
+    fn a_subscriber_catches_up_with_the_open_requests_it_would_have_been_sent() {
+        let mut state = State::default();
+        state.view.now = 1_000;
+        state.requests.insert("b".into(), request(2, &[1, 2], 10, 900, 2_000));
+        state.requests.insert("a".into(), request(2, &[1, 2, 3], 50, 950, 2_000));
+        state.requests.insert("closed".into(), request(2, &[1, 2], 10, 100, 1_000));
+        state.requests.insert("own".into(), request(10, &[1, 2], 10, 990, 2_000));
+        let names = |open: Vec<(&String, &Request)>| open.into_iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+        assert_eq!(names(state.open_for(10, &Filter::default())), vec!["b", "a"]);
+        let three = Filter { min_legs: 3, ..Filter::default() };
+        assert_eq!(names(state.open_for(10, &three)), vec!["a"]);
+        let large = Filter { min_quantity: 20, ..Filter::default() };
+        assert_eq!(names(state.open_for(10, &large)), vec!["a"]);
+        assert_eq!(
+            names(state.open_for(2, &Filter::default())),
+            vec!["own"],
+            "the requester sees only others' requests"
+        );
+        // A restarted service has forgotten every request: nothing to catch up with, and nothing wrongly offered.
+        assert!(State::default().open_for(10, &Filter::default()).is_empty());
     }
 }
