@@ -1,6 +1,15 @@
 The mini venue {{ .Release.Name }} is installed: the core, the gateway (interface 1), {{ if .Values.treasury.enabled }}the dummy treasury, {{ end }}{{ if .Values.identity.enabled }}the identity service for API keys, {{ end }}{{ if .Values.parlays.enabled }}the parlay service, {{ end }}the demo markets{{ if .Values.oracle.enabled }} on the dummy oracle's calendar{{ end }}{{ if .Values.web.enabled }}, the web page{{ end }} and synthetic traders.
 
   deploy/laptop.sh web                      then open http://127.0.0.1:8080 (the page, and the gateway under /v4)
+{{- if .Values.ingress.enabled }}
+  deploy/laptop.sh expose ADDRESS PORT      the ingress (page and /v4{{ if .Values.fix.enabled }}) and FIX{{ else }}){{ end }} on ADDRESS of this machine through k3d
+{{- end }}
+{{- if .Values.gateway.split.enabled }}
+  deploy/laptop.sh scale public|private N   scale one half ({{ .Values.gateway.split.public.replicas }} public, {{ .Values.gateway.split.private.replicas }} private now)
+{{- end }}
+{{- if .Values.fix.enabled }}
+  kubectl logs statefulset/{{ include "venue-mini.fullname" . }}-fix          FIX logons, and what the adapter refuses
+{{- end }}
   helm test {{ .Release.Name }} --logs                 smoke test through the core's ingress
 {{- if .Values.gateway.split.enabled }}
   kubectl logs statefulset/{{ include "venue-mini.fullname" . }}-gateway-private     what a private gateway refuses, and why

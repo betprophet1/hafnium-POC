@@ -6,20 +6,27 @@ through ArgoCD. There is no compose file; the laptop runs the same chart.
 | Path | What it is |
 |---|---|
 | `images/venue-node.Dockerfile` | The image `venue`: `venue-node`, `venue-gateway`, `venue-parlays`, `venue-sim`, `venue-treasury` and `venue-identity`, built from the repository root |
+| `images/venue-fix.Dockerfile` | The image `venue-fix`: the FIX 4.4 adapter (`adapters/fix`), built with Gradle from the repository root |
 | `charts/venue-mini/` | The chart: the core, the gateway, the identity service, the dummy treasury, the parlay service, a seed job for the demo markets, the dummy oracle, synthetic maker and taker, the web page, network policies and a `helm test` smoke test |
 | `charts/venue-mini/files/markets.json` | The demo catalogue: accounts with their dev tokens, tabs and whether they respond to requests for quote, markets and their outcome names |
 | `charts/venue-mini/files/calendar.json` | The dummy oracle's calendar: how often each market lists a new round, its timings, and the resolution timers (`core/sim/README.md`) |
 | `charts/venue-mini/templates/gateway.yaml` | Also the gateway's audit log volume (`/var/lib/gateway-audit`, `gateway.audit` in values): every request and answer, in the format of `interfaces/audit/`. Nothing ships it to retained storage yet. With `gateway.split.enabled`, the public and private halves as StatefulSets of their own (several gateways, below) |
-| `laptop.sh` | `up`, `web`, `restart` and `down` for a local k3d cluster |
+| `charts/venue-mini/templates/ingress.yaml` | With `ingress.enabled`, the page and the gateway under one host name, routed by path to the halves (below) |
+| `charts/venue-mini/templates/fix.yaml` | With `fix.enabled`, the FIX adapter in front of the gateway's private half, its data and audit volumes, its Service and network policy (below) |
+| `laptop.sh` | `up`, `web`, `expose`, `scale`, `restart` and `down` for a local k3d cluster |
 
 ## On a laptop
 
 Needs Docker, [k3d](https://k3d.io) 5.9, Helm 4.3 and kubectl 1.37.
 
 ```sh
-deploy/laptop.sh up     # build, install, seed, smoke test
-deploy/laptop.sh web    # then open http://127.0.0.1:8080
+deploy/laptop.sh up     # build both images, install, seed, smoke test
+deploy/laptop.sh web    # then open http://127.0.0.1:8080 (deploy/laptop.sh web 18080 if 8080 is taken)
 ```
+
+`up --split` (or `VENUE_SPLIT=1`) serves the gateway's halves from StatefulSets of their own (several gateways,
+below); `--no-fix` (or `VENUE_FIX=0`) leaves out the FIX adapter and its image; other flags, such as
+`--set gateway.split.public.replicas=3`, pass through to `helm upgrade`, which otherwise resets values to the chart's.
 
 The page has an order book and five tabs. The market maker and retail customer tabs are private WebSocket sessions on
 the gateway (`/v4/ws_private`), each logged in with its account's dev token, and the book comes from a public one
@@ -38,7 +45,8 @@ resolves or voids each parlay as its legs resolve (interfaces/gateway/README.md,
 and revoked through its operator API, port 7104 of the `parlays` service (`core/parlays/README.md`), which a
 network policy keeps from every pod: reach it with `kubectl port-forward svc/venue-parlays 7104` (release `venue`).
 Only the gateway reaches the parlay service's port 7103, and the identity service's 8084.
-The same port also serves the gateway itself under `/v4`:
+The same port also serves the gateway itself under `/v4`, and the FIX adapter listens on the `venue-fix` Service
+(`kubectl port-forward svc/venue-fix 9879`, then `adapters/fix/scripts/fix-shell.py --port 9879`):
 
 ```sh
 curl -s localhost:8080/v4/markets?resolved=false
@@ -52,6 +60,25 @@ curl -s -H 'Authorization: Bearer dev-retail-customer' localhost:8080/v4/keys \
 
 `up` is safe to repeat. After rebuilding, it replaces every pod, the core included, which replays its journal before
 it is ready. `down` deletes the cluster and the journal with it.
+
+### On an address of this machine
+
+`up` installs an Ingress (Traefik's, which k3d ships) that serves the page and the gateway on one port, and the FIX
+adapter's Service is a LoadBalancer that k3s publishes on the cluster's node. Neither reaches the machine until k3d's
+load balancer maps a host address to them; `expose` adds both mappings, bound to the one address given:
+
+```sh
+deploy/laptop.sh expose 127.0.0.1                    # page and /v4 on 127.0.0.1:8088, FIX on 127.0.0.1:9878
+deploy/laptop.sh expose 100.101.132.94 8091 9879     # a private (tailnet) address of the machine
+# which is:
+k3d cluster edit venue --port-add 100.101.132.94:8091:80@loadbalancer --port-add 100.101.132.94:9879:9879@loadbalancer
+ss -tln | grep -E ':(8091|9879) '                   # listening on that address only, not 0.0.0.0
+```
+
+k3d recreates its load balancer container with the ports; the cluster keeps running, and the mappings persist.
+Never give an address the public can reach: the page and its operator APIs are unauthenticated and its tokens are
+fixed dev tokens (`ingress.operatorApis`, below). k3d's own API port mapping is set when the cluster is created
+(`k3d cluster create venue --api-port 127.0.0.1:6550` keeps it off other interfaces).
 
 ## Several gateways
 
@@ -97,12 +124,50 @@ every gateway's log; each file holds only its own gateway's traffic.
 of its own and the audit instance of its pod name. The web page and the bots are given both Services. A Service
 balances connections, not requests: a WebSocket stays on the pod it reached, a REST call may land on any, and neither
 needs session affinity, since nothing a client depends on lives in one pod; a client whose pod goes reconnects to
-another and resumes. Two things are not in the chart. An Ingress that exposes the venue under one host name routes by
-path: `/v4/ws_public` and `/v4/markets` with everything under it to the public Service, and `/v4/ws_private`,
-`/v4/account`, `/v4/orders`, `/v4/transfers`, `/v4/rfqs` and `/v4/keys` with everything under them to the private
-one, with WebSocket idle timeouts above the clients' heartbeat interval. And `deploy/laptop.sh up` restarts
-Deployments after a rebuild, not these StatefulSets: `kubectl rollout restart statefulset <release>-gateway-public
-<release>-gateway-private` does.
+another and resumes. `deploy/laptop.sh up` replaces these StatefulSets' pods after a rebuild, as it does the
+Deployments'.
+
+**One host name.** With `ingress.enabled` (`ingress.className`, default `traefik`; `ingress.host`, default any host),
+an Ingress routes by path as the gateway tells its halves apart (`Half::of` in `core/gateway/src/api.rs`):
+`/v4/ws_public` and `/v4/markets` with everything under it to the public Service, the rest of `/v4` (`/v4/ws_private`,
+`/v4/account`, `/v4/orders`, `/v4/transfers`, `/v4/rfqs`, `/v4/keys`) to the private one, and everything else to the
+page. A path cannot name a method, so a POST to `/v4/markets` reaches the public half too, which refuses it as the
+gateway would. Without the split, `/v4` goes to the one gateway. WebSockets pass through Traefik as they are; the
+page's and the bots' sessions heartbeat every 15 s, well inside its timeouts. `/oracle` and `/treasury`, the dummy
+oracle's control API and the treasury's reconciliation summary, reach the page's server and through it those services,
+as under `laptop.sh web`: for a demo on a private network only. `ingress.operatorApis: false` routes only `/` and
+`/api` to the page, so neither is served (and the settlement tab and the reconciliation section stop working); that
+is the setting for anything beyond a demo, and even then the page hands out dev tokens.
+
+**Scaling each half.** The halves' replica counts are independent values:
+
+```sh
+helm upgrade venue deploy/charts/venue-mini --reuse-values --set gateway.split.public.replicas=3
+helm upgrade venue deploy/charts/venue-mini --reuse-values --set gateway.split.private.replicas=1
+deploy/laptop.sh scale public 3                      # the same, and waits for the rollout
+```
+
+A new pod takes traffic once it has caught up with the core's feed (its readiness probe). A pod scaled away is
+first taken out of its Service's endpoints and keeps answering for `gateway.drainSeconds` (a `preStop` sleep), so
+the ingress and kube-proxy stop sending it new connections; then it stops at once, closing its sessions, whose clients
+(the page, the bots, the FIX adapter's gateway sessions and so FIX sessions) reconnect through the Service to a pod
+that remains. The page's server passes `/v4` to the Services, not to pods, so it keeps working as either half scales.
+The gateway does not close its audit file on SIGTERM: the file of a pod scaled away stays unsealed on its volume, which
+scaling down keeps (`persistentVolumeClaimRetentionPolicy: Retain`), until a pod of the same name returns and seals
+it. Its chain verifies as it is (`interfaces/tools/audit_verify.py` without `--closed`); copy the files out with
+`kubectl cp <pod>:/var/lib/gateway-audit <dir>` while the pod runs.
+
+**FIX.** With `fix.enabled`, the FIX adapter runs as a StatefulSet of one (`<release>-fix`: Artio's session state has
+one writer), its sessions' gateway WebSockets going to the private Service and its security list read from the public
+one (`--public-gateway`), or both to the one gateway without the split. A FIX session whose private gateway pod goes
+away is logged out, and the client logs on again to another. Its data (Artio's sequence numbers and message archive)
+and its audit log are volumes of their own, kept across replacements; the pod's name is its audit instance. Artio's
+archive keeps every Logon's Password (554), API key secrets included, in clear, so the adapter runs with umask 077 and
+keeps its files in subdirectories private to its user, no other pod mounts the volumes, the pod has no service account
+token, and wherever real keys are used the volumes belong on encrypted storage with access to the node's disk
+restricted. Its network policy lets anything reach its FIX port (a Logon's credential admits a client) and lets the
+adapter reach only the gateway pods and cluster DNS. `fix.service.type` is `LoadBalancer` for k3d (published on the
+node, then mapped by `expose`), `ClusterIP` to keep FIX inside the cluster; `fix.service.port` is its port.
 
 ## What the chart does and does not do
 
@@ -123,7 +188,8 @@ Deployments after a rebuild, not these StatefulSets: `kubectl rollout restart st
   reach it. Dev tokens keep working beside keys. Test-environment identity only (`core/identity/README.md`).
 - **Seeding is idempotent.** The seed job runs after every install and upgrade; its commands have fixed IDs.
 - **Not production.** Production runs the core on dedicated hosts behind Aeron Cluster (blueprint §5, §9). Tokens are
-  fixed dev tokens, and the page and operator actions are unauthenticated; never expose them outside the cluster.
+  fixed dev tokens, and the page and operator actions are unauthenticated; never expose them beyond a private network
+  (a loopback or tailnet address, above).
 - **One oracle, bounded by the core's capacity.** The oracle is `replicas: 1` with `Recreate`, so two never act on a
   round. The engine releases a settled round half an hour after it resolves (the seed's retention), so the calendar
   runs indefinitely on the `small` profile.
