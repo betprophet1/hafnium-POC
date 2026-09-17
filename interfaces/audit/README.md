@@ -209,8 +209,11 @@ it was read from, and nowhere else.
 ## Writing
 
 - **Off the hot path.** The code that serves clients (the gateway's event loops, the adapter's Aeron subscriber) builds
-  a record and puts it on a bounded in-memory queue. One writer thread per process takes records off it, chains them,
-  writes each line with one `write`, and syncs the file once for everything it took together.
+  a record and keeps it until it has served what was ready, then puts that turn's records on a bounded in-memory queue
+  together: one order is six records, and queueing each on its own woke the writer six times. One writer thread per
+  process takes them off, chains them, and hands everything it took to the kernel with one `write`, then syncs the file
+  for all of it. It hands over as soon as the queue is empty, so what a killed process can lose is the records it was
+  in the middle of writing.
 - **fsync** is on by default (`--audit-fsync true`) and can be turned off for tests. With it on, a record is durable
   within one batch of being written; with it off, when the operating system writes it.
 - **A client is not made to wait for the disk.** Its answer can leave before the record of it is durable. A record is

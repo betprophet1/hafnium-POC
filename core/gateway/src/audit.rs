@@ -2,18 +2,20 @@
 //! refusals above all, since those never reach the journal (blueprint §12, flood protection).
 //!
 //! The event loops must never wait on a disk, so they only take a record — the connection it is about and what was
-//! said — and put it on a bounded queue. One writer thread chains the records into lines, writes each with one write,
-//! and syncs the file once for everything it took together. A full queue is waited on rather than dropped from: a
-//! loop that cannot queue a record for `STALL` takes the disk to have hung, and a record that cannot be written stops
-//! the process (the format document says why).
+//! said — and put it on a bounded queue. One writer thread chains the records into lines and hands everything it took
+//! at once to the kernel, then syncs the file for all of it: an order is six records, and a write each was six calls
+//! into the kernel for every order. What a signal can lose is bounded by that handover, which happens as soon as the
+//! queue is empty. A full queue is waited on rather than dropped from: a loop that cannot queue a record for `STALL`
+//! takes the disk to have hung, and a record that cannot be written stops the process (the format document says why).
 
 use crate::limits::monotonic;
 use crate::metrics::AuditMetrics;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -33,6 +35,9 @@ pub const CAPACITY: usize = 65_536;
 const STALL_WAITS: u32 = 10_000;
 /// Records written between syncs at most.
 const BATCH: usize = 1024;
+/// What the writer holds before it goes to the kernel. A drain writes what was queued and then flushes, so this only
+/// decides how many writes a large drain takes: the full batch of records is about half a megabyte.
+const BUFFER: usize = 256 * 1024;
 /// A quiet log still looks at the clock this often, to rotate soon after midnight.
 const IDLE: Duration = Duration::from_secs(1);
 /// The exit status of a gateway whose audit log failed: EX_IOERR.
@@ -112,10 +117,23 @@ struct Record {
     fields: Fields,
 }
 
+thread_local! {
+    /// Whether this thread gathers its records and hands them over together.
+    static BATCH_HERE: Cell<bool> = const { Cell::new(false) };
+    /// What it has gathered since its last `Audit::flush`.
+    static PENDING: RefCell<Vec<Record>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Says that this thread takes records in batches, which an event loop calls once at its start: it then hands a whole
+/// order's records to the writer at once (`Audit::flush`) rather than waking it for each of the six.
+pub fn batch_here() {
+    BATCH_HERE.with(|batching| batching.set(true));
+}
+
 /// Where records are taken. Cheap to clone; every clone feeds the same writer.
 #[derive(Clone)]
 pub struct Audit {
-    queue: Option<SyncSender<Record>>,
+    queue: Option<SyncSender<Vec<Record>>>,
     failure: Failure,
     metrics: AuditMetrics,
 }
@@ -161,26 +179,53 @@ impl Audit {
     /// A handle whose records wait on `capacity` places for whoever holds the receiver: for testing what a full queue
     /// does.
     #[cfg(test)]
-    fn queue_only(capacity: usize, failure: Failure) -> (Self, Receiver<Record>) {
+    fn queue_only(capacity: usize, failure: Failure) -> (Self, Receiver<Vec<Record>>) {
         let (queue, records) = mpsc::sync_channel(capacity);
         (Self { queue: Some(queue), failure, metrics: AuditMetrics::default() }, records)
     }
 
-    /// Takes a record of `kind` now. Waits while the queue is full, and fails the log if it stays full.
+    /// Takes a record of `kind` now. On a thread that batches (`batch_here`), it waits with what that thread has
+    /// taken since its last `flush`; anywhere else it goes to the writer on its own. Neither waits on a disk.
     pub fn record(&self, kind: &'static str, fields: Fields) {
+        if self.queue.is_none() {
+            return;
+        }
+        let record = Record { micros: wall_micros(), kind, fields };
+        if BATCH_HERE.with(Cell::get) {
+            PENDING.with(|pending| pending.borrow_mut().push(record));
+        } else {
+            self.send(vec![record]);
+        }
+    }
+
+    /// Hands the writer what this thread has taken. An event loop calls this before it waits for anything else, so a
+    /// record is never held back by a quiet socket.
+    pub fn flush(&self) {
+        if self.queue.is_none() {
+            return;
+        }
+        let batch = PENDING.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+        if !batch.is_empty() {
+            self.send(batch);
+        }
+    }
+
+    /// Puts a batch on the queue, waiting while it is full and failing the log if it stays full.
+    fn send(&self, batch: Vec<Record>) {
         let Some(queue) = &self.queue else { return };
-        let mut record = Record { micros: wall_micros(), kind, fields };
+        let taken = i64::try_from(batch.len()).unwrap_or(i64::MAX);
+        let mut batch = batch;
         for wait in 0..STALL_WAITS {
-            match queue.try_send(record) {
+            match queue.try_send(batch) {
                 Ok(()) => {
-                    self.metrics.queue_depth.inc();
+                    self.metrics.queue_depth.inc_by(taken);
                     return;
                 }
                 Err(TrySendError::Full(back)) => {
                     if wait == 0 {
                         self.metrics.queue_full_waits.inc();
                     }
-                    record = back;
+                    batch = back;
                     thread::sleep(Duration::from_millis(1));
                 }
                 Err(TrySendError::Disconnected(_)) => {
@@ -413,7 +458,7 @@ struct Writer {
     component: String,
     instance: String,
     fsync: bool,
-    file: File,
+    file: BufWriter<File>,
     name: String,
     day: u64,
     next: u64,
@@ -456,6 +501,7 @@ impl Writer {
         let lock = lock_instance(dir, component, &instance)?;
         let after = seal_earlier_files(dir, component, &instance, fsync, micros)?;
         let (file, name) = create_file(dir, component, &instance, micros / MICROS_PER_DAY)?;
+        let file = BufWriter::with_capacity(BUFFER, file);
         let mut writer = Self {
             dir: dir.to_path_buf(),
             component: component.to_string(),
@@ -479,16 +525,25 @@ impl Writer {
     }
 
     /// Writes what arrives until every handle has gone, then closes the file.
-    fn run(&mut self, records: &Receiver<Record>) -> io::Result<()> {
+    fn run(&mut self, records: &Receiver<Vec<Record>>) -> io::Result<()> {
         loop {
             match records.recv_timeout(IDLE) {
                 Ok(first) => {
                     let started = monotonic();
-                    self.append(first.micros, first.kind, &first.fields)?;
-                    let mut written = 1;
-                    for record in records.try_iter().take(BATCH - 1) {
-                        self.append(record.micros, record.kind, &record.fields)?;
-                        written += 1;
+                    let mut written = 0;
+                    let mut batch = first;
+                    loop {
+                        for record in batch.drain(..) {
+                            self.append(record.micros, record.kind, &record.fields)?;
+                            written += 1;
+                        }
+                        if written >= BATCH as i64 {
+                            break;
+                        }
+                        match records.try_recv() {
+                            Ok(next) => batch = next,
+                            Err(_) => break,
+                        }
                     }
                     let appended = monotonic();
                     self.metrics.queue_depth.dec_by(written);
@@ -513,9 +568,8 @@ impl Writer {
         self.write_line(micros, kind, fields)
     }
 
-    /// One record, built in the buffer this writer keeps and written with one write. The write is per record and not
-    /// per batch on purpose: a record already written survives a gateway that is killed, and only the machine going
-    /// down loses what has not been synced.
+    /// One record, built in the buffer this writer keeps. It goes to the kernel with everything else the drain took
+    /// (`sync`), not on its own: a record cost a write each, and there are six of them for every order.
     fn write_line(&mut self, micros: u64, kind: &str, fields: &Fields) -> io::Result<()> {
         let mut line = std::mem::take(&mut self.line);
         line.clear();
@@ -532,9 +586,13 @@ impl Writer {
         Ok(())
     }
 
-    fn sync(&self) -> io::Result<()> {
+    /// Hands what the drain wrote to the kernel, and to the disk when the log is synced. The flush is not conditional:
+    /// after it, a record is in the kernel and survives the gateway being killed, which is what bounds what a signal
+    /// can lose to the records of the drain it interrupted. Only the machine going down loses what is not synced.
+    fn sync(&mut self) -> io::Result<()> {
+        self.file.flush()?;
         if self.fsync {
-            self.file.sync_data()?;
+            self.file.get_ref().sync_data()?;
         }
         Ok(())
     }
@@ -552,7 +610,8 @@ impl Writer {
 
     fn open_file(&mut self, micros: u64, after: Option<Value>) -> io::Result<()> {
         let day = micros / MICROS_PER_DAY;
-        (self.file, self.name) = create_file(&self.dir, &self.component, &self.instance, day)?;
+        let (file, name) = create_file(&self.dir, &self.component, &self.instance, day)?;
+        (self.file, self.name) = (BufWriter::with_capacity(BUFFER, file), name);
         self.day = day;
         self.next = 0;
         self.prev = ZEROS.to_string();
@@ -835,6 +894,8 @@ mod tests {
         for text in ["one", "two", "three"] {
             writer.append(LATE - 4, "ws-frame", &fields(text)).expect("written");
         }
+        // As a drain does once its queue is empty: until then the records are the writer's, not the file's.
+        writer.sync().expect("handed to the kernel");
         let path = writer.path();
         assert_eq!(verify(&path), Ok(false), "an open file verifies, as open");
         let text = fs::read_to_string(&path).expect("read");
@@ -953,9 +1014,9 @@ mod tests {
             let _ = sent.send(());
         });
         assert!(done.recv_timeout(Duration::from_millis(200)).is_err(), "a record was queued past a full queue");
-        assert_eq!(records.recv().as_ref().map(wire_of).ok(), Some("1".to_string()));
+        assert_eq!(records.recv().ok().as_deref().and_then(<[Record]>::first).map(wire_of), Some("1".to_string()));
         assert!(done.recv_timeout(Duration::from_secs(5)).is_ok(), "the waiting record was never queued");
-        let rest: Vec<String> = records.try_iter().map(|r| wire_of(&r)).collect();
+        let rest: Vec<String> = records.try_iter().flatten().map(|r| wire_of(&r)).collect();
         assert_eq!(rest, ["2", "3"]);
         assert_eq!(failures.load(Ordering::SeqCst), 0);
     }

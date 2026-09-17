@@ -197,6 +197,9 @@ struct Conn {
 
 /// One loop, for ever.
 fn run(mut poll: Poll, shared: &Arc<Shared>, reactors: &Reactors, gateway: &Arc<Gateway>, max_behind: usize) {
+    // A turn of this loop takes several records for the same order — what the client sent, what it was told, what the
+    // hub queued for it — and they go to the writer together at the end of the turn, rather than waking it for each.
+    audit::batch_here();
     let mut events = Events::with_capacity(1024);
     let mut conns: Vec<Option<Conn>> = Vec::new();
     let mut free: Vec<usize> = Vec::new();
@@ -245,6 +248,8 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, reactors: &Reactors, gateway: &Arc<
             swept = now;
             sweep(gateway, &mut conns, &mut free, now);
         }
+        // Before waiting on anything again, so a quiet socket never holds a record back.
+        gateway.audit.flush();
         gateway.metrics.loop_turn.observe_duration(monotonic().duration_since(turn));
     }
 }
