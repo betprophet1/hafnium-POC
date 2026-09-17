@@ -51,10 +51,20 @@ pub fn parse(buf: &[u8]) -> Result<Option<Request>, String> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let query =
         query.split('&').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();
-    let mut headers = BTreeMap::new();
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
     for header in lines.take(MAX_HEADERS) {
         if let Some((name, value)) = header.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            let (name, value) = (name.trim().to_ascii_lowercase(), value.trim());
+            match headers.get_mut(&name) {
+                // A list a proxy may have added a line of its own to: every line counts, in order (`forwarded.rs`).
+                Some(earlier) if name == "x-forwarded-for" || name == "forwarded" => {
+                    earlier.push_str(", ");
+                    earlier.push_str(value);
+                }
+                _ => {
+                    headers.insert(name, value.to_string());
+                }
+            }
         }
     }
     let length = match headers.get("content-length") {
@@ -113,6 +123,15 @@ mod tests {
         assert_eq!(request.query.get("x").map(String::as_str), Some("1"));
         assert_eq!(request.headers.get("authorization").map(String::as_str), Some("Bearer t"));
         assert_eq!(request.body, b"body");
+    }
+
+    #[test]
+    fn every_line_of_a_forwarding_header_is_kept_in_order() {
+        let head =
+            b"GET / HTTP/1.1\r\nX-Forwarded-For: 1.2.3.4\r\nx-forwarded-for: 10.0.0.1\r\nHost: a\r\nHost: b\r\n\r\n";
+        let request = parse(head).expect("parsed").expect("whole");
+        assert_eq!(request.headers.get("x-forwarded-for").map(String::as_str), Some("1.2.3.4, 10.0.0.1"));
+        assert_eq!(request.headers.get("host").map(String::as_str), Some("b"), "any other header's last line counts");
     }
 
     #[test]

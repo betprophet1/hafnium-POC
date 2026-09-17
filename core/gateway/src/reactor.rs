@@ -23,6 +23,7 @@
 
 use crate::api::{Gateway, Half, Pending};
 use crate::audit;
+use crate::forwarded::Forwarding;
 use crate::hub::Outbox;
 use crate::identity::Credential;
 use crate::limits::monotonic;
@@ -33,13 +34,13 @@ use mio::net::TcpStream as Stream;
 use mio::{Events, Interest, Poll, Registry, Token, Waker};
 use serde_json::{json, Map, Value};
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
-use tungstenite::handshake::server::{NoCallback, ServerHandshake};
+use tungstenite::handshake::server::{Callback, ErrorResponse, Request, Response, ServerHandshake};
 use tungstenite::handshake::MidHandshake;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{HandshakeError, Message, WebSocket};
@@ -159,7 +160,7 @@ struct Http {
 enum Socket {
     /// Accepted; its first bytes have not said what it is yet.
     Undecided(Stream),
-    Handshake(MidHandshake<ServerHandshake<Stream, NoCallback>>),
+    Handshake(MidHandshake<ServerHandshake<Stream, Upgrade>>),
     Open(WebSocket<Stream>),
     Http(Http),
 }
@@ -176,9 +177,10 @@ struct Conn {
     unread: bool,
     /// When the connection was accepted, for `ARRIVAL`.
     accepted: Instant,
-    /// Who the audit log says a record is about: this connection's number and the address it came from.
-    id: u64,
-    peer: String,
+    /// Who the audit log says a record is about.
+    origin: Origin,
+    /// The forwarding headers of a WebSocket's upgrade request, once read, when it came from a trusted proxy.
+    upgrade: Option<Arc<OnceLock<Forwarding>>>,
     /// The path of a WebSocket's upgrade request.
     path: String,
     /// Why the connection ended, for the audit log, when something other than the client or the network ended it.
@@ -260,7 +262,8 @@ fn take_on(
 ) -> Option<usize> {
     stream.set_nonblocking(true).ok()?;
     let _ = stream.set_nodelay(true);
-    let peer = stream.peer_addr().map_or_else(|_| "unknown".to_string(), |a| a.to_string());
+    let address = stream.peer_addr().ok();
+    let peer = address.map_or_else(|| "unknown".to_string(), |a| a.to_string());
     let mut stream = Stream::from_std(stream);
     let token = free.pop().unwrap_or_else(|| {
         conns.push(None);
@@ -283,8 +286,13 @@ fn take_on(
         notify,
         unread: true,
         accepted: monotonic(),
-        id: CONNECTIONS.fetch_add(1, Ordering::Relaxed),
-        peer,
+        origin: Origin {
+            id: CONNECTIONS.fetch_add(1, Ordering::Relaxed),
+            peer,
+            ip: address.map(|a| a.ip()),
+            client: None,
+        },
+        upgrade: None,
         path: String::new(),
         ending: "closed",
     });
@@ -301,7 +309,7 @@ fn serve(gateway: &Arc<Gateway>, conn: &mut Conn, max_behind: usize, registry: &
         }
     }
     if let Some(Socket::Http(request)) = conn.socket.as_mut() {
-        return serve_http(gateway, request, &conn.notify, conn.id, &conn.peer);
+        return serve_http(gateway, request, &conn.notify, &mut conn.origin);
     }
     serve_ws(gateway, conn)
 }
@@ -353,7 +361,10 @@ fn decide(gateway: &Gateway, conn: &mut Conn, max_behind: usize, registry: &Regi
     }
     conn.socket = Some(if method == "GET" && path == gateway.half.websocket() {
         conn.path = path.to_string();
-        match tungstenite::accept_with_config(stream, Some(socket_config(max_behind))) {
+        // Its headers are read by the handshake; the forwarding ones are kept only from a trusted proxy.
+        conn.upgrade = gateway.proxies.trusts_peer(conn.origin.ip).then(|| Arc::new(OnceLock::new()));
+        let upgrade = Upgrade(conn.upgrade.clone());
+        match tungstenite::accept_hdr_with_config(stream, upgrade, Some(socket_config(max_behind))) {
             Ok(ws) => Socket::Open(ws),
             Err(HandshakeError::Interrupted(mid)) => Socket::Handshake(mid),
             Err(HandshakeError::Failure(_)) => {
@@ -378,7 +389,7 @@ fn decide(gateway: &Gateway, conn: &mut Conn, max_behind: usize, registry: &Regi
 
 /// A REST connection: read until the request is whole, answer it — now, or when the node has — write the response,
 /// and let the connection go.
-fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, id: u64, peer: &str) -> bool {
+fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, origin: &mut Origin) -> bool {
     if http.pending.is_none() && http.call.is_none() && http.response.is_empty() {
         let mut chunk = [0u8; READ_BUFFER];
         loop {
@@ -399,7 +410,12 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, id: u64, peer
                     .get("authorization")
                     .and_then(|h| h.strip_prefix("Bearer "))
                     .and_then(|token| gateway.authenticate(token.trim()).ok());
-                record_request(gateway, id, peer, http, &request);
+                let forwarding = Forwarding {
+                    x_forwarded_for: request.headers.get("x-forwarded-for").cloned(),
+                    forwarded: request.headers.get("forwarded").cloned(),
+                };
+                origin.client = gateway.proxies.client(origin.ip, &forwarding);
+                record_request(gateway, origin, http, &request);
                 match rest::route(gateway, &request, notify) {
                     rest::Routed::Now(answer) => http.response = rest::response(answer),
                     rest::Routed::Later(pending) => http.pending = Some(pending),
@@ -407,7 +423,7 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, id: u64, peer
                 }
             }
             Err(reason) => {
-                let mut fields = about(gateway, id, peer, None, None, None);
+                let mut fields = about(gateway, origin, None, None, None);
                 fields.insert("dir".into(), json!("in"));
                 fields.insert("line".into(), json!(request_line(&http.request)));
                 fields.insert("unreadable".into(), json!(reason));
@@ -428,7 +444,7 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, id: u64, peer
     }
     if !http.recorded {
         http.recorded = true;
-        record_response(gateway, id, peer, http);
+        record_response(gateway, origin, http);
     }
     while http.written < http.response.len() {
         match http.stream.write(&http.response[http.written..]) {
@@ -464,13 +480,14 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
         let Some(outbox) = conn.outbox.take() else { return false };
         conn.session = Session::open(gateway, outbox, Arc::clone(&conn.notify));
         if let Some(session) = &conn.session {
-            let mut fields = about(gateway, conn.id, &conn.peer, None, None, Some(session.id()));
+            forwarded_client(gateway, &mut conn.origin, conn.upgrade.take());
+            let mut fields = about(gateway, &conn.origin, None, None, Some(session.id()));
             fields.insert("path".into(), json!(conn.path));
             gateway.audit.record("ws-open", fields);
         }
     }
     let Some(session) = conn.session.as_mut() else { return false };
-    let (id, peer, ending) = (conn.id, conn.peer.as_str(), &mut conn.ending);
+    let (origin, ending) = (&conn.origin, &mut conn.ending);
     for _ in 0..PASSES {
         let mut answered = false;
         // What the client sent, until there is nothing more or the session may take no more.
@@ -478,21 +495,21 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
             match socket.read() {
                 Ok(Message::Text(text)) => {
                     session.heard();
-                    record_from_client(gateway, id, peer, session, text.as_str());
+                    record_from_client(gateway, origin, session, text.as_str());
                     for reply in ws::handle(gateway, session, text.as_str()) {
-                        record_to_client(gateway, id, peer, session, &reply, true);
+                        record_to_client(gateway, origin, session, &reply, true);
                         if !queue(socket, reply, ending) {
                             return false;
                         }
                     }
                 }
                 Ok(Message::Binary(data)) => {
-                    let mut fields = about(gateway, id, peer, session.account(), session.api_key(), Some(session.id()));
+                    let mut fields = about(gateway, origin, session.account(), session.api_key(), Some(session.id()));
                     fields.insert("dir".into(), json!("in"));
                     fields.insert("binary".into(), json!(data.len()));
                     gateway.audit.record("ws-frame", fields);
                     let refused = ws::binary_refused();
-                    record_to_client(gateway, id, peer, session, &refused, true);
+                    record_to_client(gateway, origin, session, &refused, true);
                     if !queue(socket, refused, ending) {
                         return false;
                     }
@@ -506,14 +523,14 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
         // Replies in the order they were asked for.
         for reply in ws::ready_replies(gateway, session) {
             answered = true;
-            record_to_client(gateway, id, peer, session, &reply, true);
+            record_to_client(gateway, origin, session, &reply, true);
             if !queue(socket, reply, ending) {
                 return false;
             }
         }
         // Messages the hub queued.
         while let Ok(message) = conn.queue.try_recv() {
-            record_to_client(gateway, id, peer, session, &message, false);
+            record_to_client(gateway, origin, session, &message, false);
             if !queue(socket, message, ending) {
                 return false;
             }
@@ -545,7 +562,7 @@ fn sweep(gateway: &Arc<Gateway>, conns: &mut [Option<Conn>], free: &mut Vec<usiz
         let Some(session) = conn.session.as_mut() else { continue };
         if ws::key_withdrawn(gateway, session) {
             let told = ws::key_withdrawn_error();
-            record_to_client(gateway, conn.id, &conn.peer, session, &told, true);
+            record_to_client(gateway, &conn.origin, session, &told, true);
             if let Some(Socket::Open(socket)) = conn.socket.as_mut() {
                 let _ = socket.write(Message::text(told));
                 let _ = socket.close(None);
@@ -577,8 +594,7 @@ fn close_slot(
 ) {
     if let Some(conn) = conns[token].take() {
         if let Some(session) = &conn.session {
-            let mut fields =
-                about(gateway, conn.id, &conn.peer, session.account(), session.api_key(), Some(session.id()));
+            let mut fields = about(gateway, &conn.origin, session.account(), session.api_key(), Some(session.id()));
             fields.insert("reason".into(), json!(reason.unwrap_or(conn.ending)));
             gateway.audit.record("ws-close", fields);
             ws::end(gateway, session);
@@ -590,18 +606,57 @@ fn close_slot(
 // ---------------------------------------------------------------------------------------------------------------------
 // The audit log (interfaces/audit/README.md, gateway)
 
+/// Who the records of one connection are about.
+struct Origin {
+    /// The connection's number.
+    id: u64,
+    /// The address it came from, as `address:port`: behind a proxy, the proxy.
+    peer: String,
+    ip: Option<IpAddr>,
+    /// The client a trusted proxy said it forwarded the connection's request for (`forwarded.rs`), once read.
+    client: Option<String>,
+}
+
+/// Takes a WebSocket upgrade request's forwarding headers as the handshake reads them, when there is somewhere to
+/// keep them: only a connection from a trusted proxy has.
+struct Upgrade(Option<Arc<OnceLock<Forwarding>>>);
+
+impl Callback for Upgrade {
+    fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
+        if let Some(seen) = self.0 {
+            let every = |name: &str| {
+                let values: Vec<&str> =
+                    request.headers().get_all(name).iter().filter_map(|v| v.to_str().ok()).collect();
+                (!values.is_empty()).then(|| values.join(", "))
+            };
+            let _ = seen.set(Forwarding { x_forwarded_for: every("x-forwarded-for"), forwarded: every("forwarded") });
+        }
+        Ok(response)
+    }
+}
+
+/// Settles the client of a WebSocket from its upgrade request's forwarding headers, if they were kept.
+fn forwarded_client(gateway: &Gateway, origin: &mut Origin, upgrade: Option<Arc<OnceLock<Forwarding>>>) {
+    if let Some(forwarding) = upgrade.as_deref().and_then(OnceLock::get) {
+        origin.client = gateway.proxies.client(origin.ip, forwarding);
+    }
+}
+
 /// The fields that say which connection a record is about.
 fn about(
     gateway: &Gateway,
-    id: u64,
-    peer: &str,
+    origin: &Origin,
     account: Option<u64>,
     key: Option<&str>,
     session: Option<u64>,
 ) -> Map<String, Value> {
     let mut fields = Map::new();
-    fields.insert("conn".into(), json!(id));
-    fields.insert("peer".into(), json!(peer));
+    fields.insert("conn".into(), json!(origin.id));
+    fields.insert("peer".into(), json!(origin.peer));
+    // Only when a trusted proxy named one: otherwise the peer is the client.
+    if let Some(client) = &origin.client {
+        fields.insert("client".into(), json!(client));
+    }
     fields.insert("half".into(), json!(gateway.half.name()));
     if let Some(account) = account {
         fields.insert("account".into(), json!(account.to_string()));
@@ -623,9 +678,9 @@ fn request_line(request: &[u8]) -> String {
     String::from_utf8_lossy(line).trim_end_matches('\r').to_string()
 }
 
-fn record_request(gateway: &Gateway, id: u64, peer: &str, http: &Http, request: &http::Request) {
+fn record_request(gateway: &Gateway, origin: &Origin, http: &Http, request: &http::Request) {
     let who = http.who.as_ref();
-    let mut fields = about(gateway, id, peer, who.map(|c| c.account), who.and_then(|c| c.key.as_deref()), None);
+    let mut fields = about(gateway, origin, who.map(|c| c.account), who.and_then(|c| c.key.as_deref()), None);
     fields.insert("dir".into(), json!("in"));
     fields.insert("line".into(), json!(request_line(&http.request)));
     let headers: Map<String, Value> =
@@ -635,12 +690,12 @@ fn record_request(gateway: &Gateway, id: u64, peer: &str, http: &Http, request: 
     gateway.audit.record("http-request", fields);
 }
 
-fn record_response(gateway: &Gateway, id: u64, peer: &str, http: &Http) {
+fn record_response(gateway: &Gateway, origin: &Origin, http: &Http) {
     let response = &http.response;
     let status = response.get(9..12).and_then(|s| std::str::from_utf8(s).ok()).and_then(|s| s.parse::<u16>().ok());
     let body = response.windows(4).position(|w| w == b"\r\n\r\n").map_or(&response[..0], |i| &response[i + 4..]);
     let who = http.who.as_ref();
-    let mut fields = about(gateway, id, peer, who.map(|c| c.account), who.and_then(|c| c.key.as_deref()), None);
+    let mut fields = about(gateway, origin, who.map(|c| c.account), who.and_then(|c| c.key.as_deref()), None);
     fields.insert("dir".into(), json!("out"));
     fields.insert("status".into(), json!(status));
     if gateway.half == Half::Public && status.is_some_and(|s| s < 400) {
@@ -656,21 +711,22 @@ fn record_response(gateway: &Gateway, id: u64, peer: &str, http: &Http) {
     gateway.audit.record("http-response", fields);
 }
 
-fn record_refused_upgrade(gateway: &Gateway, conn: &Conn) {
-    let mut fields = about(gateway, conn.id, &conn.peer, None, None, None);
+fn record_refused_upgrade(gateway: &Gateway, conn: &mut Conn) {
+    forwarded_client(gateway, &mut conn.origin, conn.upgrade.take());
+    let mut fields = about(gateway, &conn.origin, None, None, None);
     fields.insert("path".into(), json!(conn.path));
     gateway.audit.record("ws-refused", fields);
 }
 
 /// A text frame from the client. On the public half a heartbeat is not recorded: viewers send them all day, and
 /// nothing about one can be in dispute.
-fn record_from_client(gateway: &Gateway, id: u64, peer: &str, session: &Session, text: &str) {
+fn record_from_client(gateway: &Gateway, origin: &Origin, session: &Session, text: &str) {
     if gateway.half == Half::Public
         && serde_json::from_str::<Value>(text).is_ok_and(|m| m.get("op").and_then(Value::as_str) == Some("heartbeat"))
     {
         return;
     }
-    let mut fields = about(gateway, id, peer, session.account(), session.api_key(), Some(session.id()));
+    let mut fields = about(gateway, origin, session.account(), session.api_key(), Some(session.id()));
     fields.insert("dir".into(), json!("in"));
     fields.insert("msg".into(), json!(audit::mask_tokens(text)));
     gateway.audit.record("ws-frame", fields);
@@ -678,13 +734,13 @@ fn record_from_client(gateway: &Gateway, id: u64, peer: &str, session: &Session,
 
 /// A frame for the client: on the private half every one; on the public half only the errors that answer what the
 /// client sent, never the market data the hub queues (`answer` says which this is).
-fn record_to_client(gateway: &Gateway, id: u64, peer: &str, session: &Session, text: &str, answer: bool) {
+fn record_to_client(gateway: &Gateway, origin: &Origin, session: &Session, text: &str, answer: bool) {
     if gateway.half == Half::Public
         && !(answer && serde_json::from_str::<Value>(text).is_ok_and(|m| m.get("type") == Some(&json!("error"))))
     {
         return;
     }
-    let mut fields = about(gateway, id, peer, session.account(), session.api_key(), Some(session.id()));
+    let mut fields = about(gateway, origin, session.account(), session.api_key(), Some(session.id()));
     fields.insert("dir".into(), json!("out"));
     fields.insert("msg".into(), json!(text));
     gateway.audit.record("ws-frame", fields);

@@ -2,6 +2,7 @@
 //! as an `OrderResult` (interfaces/gateway/openapi.yaml).
 
 use crate::audit::Audit;
+use crate::forwarded::TrustedProxies;
 use crate::hub::{self, id, Hub};
 use crate::identity::{Credential, Identity};
 use crate::limits::{monotonic, Bucket};
@@ -322,6 +323,8 @@ pub struct Gateway {
     pub audit: Audit,
     /// Who a credential is (`identity.rs`): dev tokens, and API keys through the identity service.
     pub identity: Identity,
+    /// The proxies whose forwarding headers name the client a record is about (`forwarded.rs`); none by default.
+    pub proxies: TrustedProxies,
 }
 
 impl Gateway {
@@ -347,12 +350,19 @@ impl Gateway {
             treasury: None,
             audit: Audit::disabled(),
             identity: Identity::new(None, true),
+            proxies: TrustedProxies::default(),
         }
     }
 
     /// The same half, recording what its clients send and are answered in `audit`.
     pub fn with_audit(mut self, audit: Audit) -> Self {
         self.audit = audit;
+        self
+    }
+
+    /// The same half, taking the client a record is about from the forwarding headers of connections from `proxies`.
+    pub fn with_trusted_proxies(mut self, proxies: TrustedProxies) -> Self {
+        self.proxies = proxies;
         self
     }
 

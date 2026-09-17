@@ -82,7 +82,8 @@ WebSocket, under the `gatewaySession` above.
 ### Gateway (`component: gateway`)
 
 Every record has `conn` (a connection number, unique within the process), `peer` (`address:port` as the gateway saw
-it; behind a load balancer, the balancer) and `half` (`public` or `private`); once a session or request is
+it; behind a load balancer or an ingress, the proxy) and `half` (`public` or `private`); `client`, when a trusted
+proxy named the client it forwarded for (below); once a session or request is
 authenticated, `account`, and `key`, the API key's ID, when it was authenticated with one rather than a dev token; on a
 WebSocket once it has one, `session` (the engine session ID the gateway gave it).
 
@@ -114,6 +115,26 @@ Heartbeats on the public half, which viewers send all day, are not recorded eith
 that never completes a request line, a whole request or a WebSocket handshake within the gateway's arrival time has
 said nothing to record, and is not recorded. Refusals are always recorded: every 4xx and 5xx response, and every `error` frame,
 including flood limits and failed logins.
+
+### The client behind a proxy
+
+Behind an ingress, `peer` is the ingress. The gateway is given the addresses and networks of the proxies in front of
+it (`--trusted-proxies`, `VENUE_TRUSTED_PROXIES`, for example `10.42.0.0/16`; none by default). On a connection whose
+peer is one of them, it reads whom the request was forwarded for, from a REST request's headers or a WebSocket's
+upgrade request, and records it as `client`, an IP address (or, for an entry that is not one, such as `unknown`, the
+entry as sent, at most 64 characters) on every record of that request or session. `peer` stays the proxy.
+
+- `X-Forwarded-For` if the request has one (every line of it, in order), otherwise `Forwarded` (RFC 7239, each
+  element's `for=`, an element without one standing for `unknown`). A proxy that writes only `Forwarded` must remove
+  any `X-Forwarded-For` a client sent.
+- The list is read from the right: each proxy appends the address it was reached from, so entries that are trusted
+  proxies are skipped, and the first that is not is the client. Anything left of it may have been written by the
+  client and is ignored. If every entry is a trusted proxy, the left-most is recorded.
+- From a peer that is not a trusted proxy, or when the list is empty, there is no `client`: forwarding headers are
+  never believed from anyone else, and are recorded only among `headers`.
+
+The client address is recorded only. Flood and logon limits are kept per account (REST) and per session and account
+(WebSocket), never per address, so nothing a forwarding header says changes what a client is allowed.
 
 ### Masking
 

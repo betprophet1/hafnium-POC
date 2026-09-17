@@ -106,6 +106,11 @@ containers:
       {{- end }}
       - name: VENUE_AUDIT_FSYNC
         value: {{ $.Values.gateway.audit.fsync | quote }}
+      {{- if and $.Values.ingress.enabled $.Values.ingress.trustedProxies }}
+      # Behind the ingress every connection comes from its pods: their X-Forwarded-For names the client.
+      - name: VENUE_TRUSTED_PROXIES
+        value: {{ $.Values.ingress.trustedProxies | quote }}
+      {{- end }}
     ports:
       - name: http
         containerPort: 8081

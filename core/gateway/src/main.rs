@@ -5,6 +5,7 @@ mod api;
 mod audit;
 #[cfg(test)]
 mod fleet;
+mod forwarded;
 mod http;
 mod hub;
 mod identity;
@@ -20,6 +21,7 @@ mod ws;
 
 use api::{Gateway, Limits};
 use audit::Audit;
+use forwarded::TrustedProxies;
 use hub::Hub;
 use reactor::Reactors;
 use std::collections::BTreeMap;
@@ -37,7 +39,7 @@ const USAGE: &str = "usage:
   venue-gateway verify-audit FILE...
   venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--treasury ADDR] [--parlays ADDR]
                 [--identity ADDR] [--dev-tokens true] [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
-                [--audit-dir ./gateway-audit] [--audit-instance HOSTNAME] [--audit-fsync true]
+                [--audit-dir ./gateway-audit] [--audit-instance HOSTNAME] [--audit-fsync true] [--trusted-proxies ADDRS]
 
 --serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
 /v4/ws_public and GET /v4/markets; private is orders and accounts on /v4/ws_private, /v4/account and /v4/orders,
@@ -48,6 +50,9 @@ as unavailable. --identity is the identity service (venue-identity) the private 
 /v4/keys to; without it keys are refused as unavailable. --dev-tokens false refuses the catalogue's dev tokens, which
 otherwise act as their accounts with every permission. Every request and what it was answered is written to the audit log in --audit-dir
 (interfaces/audit/README.md); a gateway that cannot write it does not start, and one that stops being able to exits.
+--trusted-proxies is a comma-separated list of addresses and networks (such as 10.42.0.0/16) of proxies in front of
+the gateway, an ingress: on a connection from one, the audit log also records the client its X-Forwarded-For or
+Forwarded header names. None by default, and those headers are never believed from any other address.
 Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
 struct Args(BTreeMap<String, String>);
@@ -145,13 +150,15 @@ fn run(args: &Args) -> Result<(), Error> {
         "false" => false,
         other => return Err(format!("--audit-fsync must be true or false, not {other}").into()),
     };
+    let proxies = TrustedProxies::parse(&args.get("trusted-proxies", Some(""))?)
+        .map_err(|e| format!("--trusted-proxies: {e}"))?;
     // Before anything listens: a gateway that cannot keep its audit log takes no connection.
     let audit = Audit::start(&audit_dir, &args.get("audit-instance", Some(&hostname))?, fsync)
         .map_err(|e| format!("audit log in {}: {e}", audit_dir.display()))?;
     let halves = Halves {
         public: if public {
             let gateway = Gateway::public(Hub::new(Catalogue::load(&catalogue_file)?), limits);
-            Some(start_half(gateway.with_audit(audit.clone()), &feed))
+            Some(start_half(gateway.with_audit(audit.clone()).with_trusted_proxies(proxies.clone()), &feed))
         } else {
             None
         },
@@ -164,6 +171,7 @@ fn run(args: &Args) -> Result<(), Error> {
             };
             let mut gateway = Gateway::private(Hub::new(catalogue), ingress, limits)
                 .with_audit(audit.clone())
+                .with_trusted_proxies(proxies)
                 .with_identity(args.optional("identity").filter(|a| !a.is_empty()), dev_tokens);
             let treasury = args.get("treasury", Some(""))?;
             if !treasury.is_empty() {

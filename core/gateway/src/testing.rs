@@ -6,6 +6,7 @@
 
 use crate::api::{Gateway, Limits};
 use crate::audit::Audit;
+use crate::forwarded::TrustedProxies;
 use crate::hub::Hub;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -56,7 +57,7 @@ pub struct Venue {
 /// A seeded node, a treasury on it with a fake bank that decides `dummy_bank` transfers within half a second and never
 /// fails one, and a gateway serving both halves that passes transfers to it.
 pub fn venue_with_treasury(name: &str) -> Venue {
-    venue_with(name, true, true, true)
+    venue_with(name, true, true, true, "")
 }
 
 fn free_address() -> String {
@@ -130,19 +131,26 @@ pub fn venue(name: &str) -> Venue {
 /// The same, with the gateway process serving only the halves asked for, as `--serve` does. Both halves' gateways
 /// still follow the feed, so a test can look at either.
 pub fn venue_serving(name: &str, public: bool, private: bool) -> Venue {
-    venue_with(name, public, private, false)
+    venue_with(name, public, private, false, "")
 }
 
-fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue {
+/// A venue serving both halves whose gateway takes connections from `proxies` (`--trusted-proxies`) as a proxy's.
+pub fn venue_trusting(name: &str, proxies: &str) -> Venue {
+    venue_with(name, true, true, false, proxies)
+}
+
+fn venue_with(name: &str, public: bool, private: bool, treasury: bool, proxies: &str) -> Venue {
     let (ingress, feed) = start_node(name);
     seed(name, &ingress);
     let limits = Limits { per_second: 1_000_000, burst: 1_000_000, logons_per_minute: 1_000_000 };
     let audit_dir = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}.audit", std::process::id()));
     let _ = std::fs::remove_dir_all(&audit_dir);
     let audit = Audit::start(&audit_dir, "test", false).expect("an audit log");
+    let proxies = TrustedProxies::parse(proxies).expect("trusted proxies");
     let hub = || Hub::new(Catalogue::load(CATALOGUE).expect("the mini venue's catalogue"));
     let mut private_half = Gateway::private(hub(), Submit::spawn(&ingress), limits)
         .with_audit(audit.clone())
+        .with_trusted_proxies(proxies.clone())
         .with_identity(Some(start_identity(name)), true);
     let treasury = treasury.then(|| start_treasury(name, &ingress, &feed));
     if let Some(address) = &treasury {
@@ -154,7 +162,8 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
     }
     let (service, parlays) = start_parlays(&ingress, &feed);
     Gateway::connect_parlays(&gateway, &parlays);
-    let public_half = crate::start_half(Gateway::public(hub(), limits).with_audit(audit), &feed);
+    let public_half =
+        crate::start_half(Gateway::public(hub(), limits).with_audit(audit).with_trusted_proxies(proxies), &feed);
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
     let address = listener.local_addr().expect("its address").to_string();
     let halves = crate::Halves {

@@ -79,7 +79,10 @@ The log is written under `--audit-dir` (`VENUE_AUDIT_DIR`, default `./gateway-au
 (`VENUE_AUDIT_FSYNC`). The event loops only queue records; a writer thread writes them. A full queue makes a loop
 wait rather than drop a record, and a queue full for 10 seconds, a failed write or an audit directory that cannot be
 written stops the gateway (exit status 74) rather than let it serve unrecorded. `venue-gateway verify-audit FILE...`
-checks a file's chain, as `interfaces/tools/audit_verify.py` does. Each gateway process records only its own traffic,
+checks a file's chain, as `interfaces/tools/audit_verify.py` does. Behind an ingress, `--trusted-proxies`
+(`VENUE_TRUSTED_PROXIES`, a comma-separated list of addresses and networks, none by default) names the proxies whose
+`X-Forwarded-For` or `Forwarded` header the gateway believes, and records then carry the client address they give as
+`client` beside `peer`, the proxy (interfaces/audit/README.md, the client behind a proxy). Each gateway process records only its own traffic,
 under an instance of its own: a gateway whose instance another live process is writing in the same directory does not
 start.
 

@@ -788,11 +788,25 @@ mod recorded {
 
     /// A request's status and the body of its response, as sent.
     fn exchange(address: &str, method: &str, path: &str, token: Option<&str>, body: &str) -> (u16, String) {
+        exchange_with(address, method, path, token, "", body)
+    }
+
+    /// The same, with `headers`, each line ending `\r\n`, added to the request.
+    fn exchange_with(
+        address: &str,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        headers: &str,
+        body: &str,
+    ) -> (u16, String) {
         let mut stream = TcpStream::connect(address).expect("the gateway accepts a connection");
         stream.set_read_timeout(Some(Duration::from_secs(5))).expect("a read timeout");
         let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
-        let head =
-            format!("{method} {path} HTTP/1.1\r\nHost: {address}\r\n{auth}Content-Length: {}\r\n\r\n", body.len());
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {address}\r\n{auth}{headers}Content-Length: {}\r\n\r\n",
+            body.len()
+        );
         stream.write_all(format!("{head}{body}").as_bytes()).expect("sent");
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("a response");
@@ -857,6 +871,71 @@ mod recorded {
 
         assert_eq!(request(&venue.address, "GET", "/v4/nowhere", None, ""), 404);
         find(dir, "a route that does not exist", |r| is(r, "http-response", "out") && r["status"] == 404);
+
+        // Nothing is trusted by default: forwarding headers from any peer name no client.
+        let forged = "X-Forwarded-For: 198.51.100.1\r\nForwarded: for=198.51.100.2\r\n";
+        assert_eq!(exchange_with(&venue.address, "GET", "/v4/account", Some(MAKER_TOKEN), forged, "").0, 200);
+        let asked = find(dir, "the forged request", |r| {
+            is(r, "http-request", "in") && r["headers"]["x-forwarded-for"] == "198.51.100.1"
+        });
+        assert!(asked.get("client").is_none(), "a header from an untrusted peer was believed: {asked}");
+        let answered = find(dir, "its answer", |r| is(r, "http-response", "out") && r["conn"] == asked["conn"]);
+        assert!(answered.get("client").is_none(), "{answered}");
+    }
+
+    #[test]
+    fn behind_a_trusted_proxy_records_name_the_client_it_forwarded_for() {
+        // The test's connections come from 127.0.0.1, which plays the ingress.
+        let venue = testing::venue_trusting("audit-proxy", "127.0.0.1, 10.42.0.0/16");
+        let dir = &venue.audit_dir;
+        let hops = "X-Forwarded-For: 203.0.113.9, 100.101.132.94\r\nX-Forwarded-For: 10.42.0.3\r\n";
+        assert_eq!(exchange_with(&venue.address, "GET", "/v4/markets", None, hops, "").0, 200);
+        let asked = find(dir, "the public request", |r| {
+            is(r, "http-request", "in") && r["half"] == "public" && r["line"] == "GET /v4/markets HTTP/1.1"
+        });
+        assert_eq!(asked["client"], "100.101.132.94", "the right-most entry no trusted proxy wrote: {asked}");
+        assert!(asked["peer"].as_str().is_some_and(|p| p.starts_with("127.0.0.1:")), "the peer is the proxy: {asked}");
+        let answered = find(dir, "its answer", |r| is(r, "http-response", "out") && r["conn"] == asked["conn"]);
+        assert_eq!(answered["client"], "100.101.132.94", "{answered}");
+
+        let forwarded = "Forwarded: for=192.0.2.60;proto=http\r\n";
+        assert_eq!(exchange_with(&venue.address, "GET", "/v4/account", Some(MAKER_TOKEN), forwarded, "").0, 200);
+        find(dir, "the private request", |r| {
+            is(r, "http-request", "in") && r["half"] == "private" && r["client"] == "192.0.2.60"
+        });
+
+        assert_eq!(request(&venue.address, "GET", "/v4/nowhere", None, ""), 404);
+        let direct = find(dir, "a request no proxy forwarded", |r| {
+            is(r, "http-request", "in") && r["line"] == "GET /v4/nowhere HTTP/1.1"
+        });
+        assert!(direct.get("client").is_none(), "{direct}");
+
+        // A WebSocket: the client is taken from its upgrade request, and every record of the session carries it.
+        let mut upgrade =
+            tungstenite::client::IntoClientRequest::into_client_request(venue.ws_private.as_str()).expect("a request");
+        upgrade.headers_mut().insert("x-forwarded-for", "198.51.100.7".parse().expect("a header value"));
+        let (mut private, _) = tungstenite::connect(upgrade).expect("a WebSocket");
+        if let MaybeTlsStream::Plain(stream) = private.get_ref() {
+            stream.set_read_timeout(Some(Duration::from_secs(5))).expect("a read timeout");
+        }
+        private.send(Message::text(json!({"op": "login", "id": "l", "token": MAKER_TOKEN}).to_string())).expect("sent");
+        answer(&mut private, "welcome", "l");
+        let opened = find(dir, "the upgrade", |r| r["kind"] == "ws-open" && r["path"] == "/v4/ws_private");
+        assert_eq!(opened["client"], "198.51.100.7", "{opened}");
+        let welcomed = find(dir, "the welcome", |r| {
+            is(r, "ws-frame", "out")
+                && r["conn"] == opened["conn"]
+                && r["msg"].as_str().is_some_and(|m| m.contains("welcome"))
+        });
+        assert_eq!(welcomed["client"], "198.51.100.7", "{welcomed}");
+        drop(private);
+        let closed = find(dir, "the session's end", |r| r["kind"] == "ws-close" && r["conn"] == opened["conn"]);
+        assert_eq!(closed["client"], "198.51.100.7", "{closed}");
+        let public = connect(&venue.ws_public);
+        drop(public);
+        let viewer =
+            find(dir, "a viewer no proxy forwarded", |r| r["kind"] == "ws-open" && r["path"] == "/v4/ws_public");
+        assert!(viewer.get("client").is_none(), "{viewer}");
     }
 
     #[test]

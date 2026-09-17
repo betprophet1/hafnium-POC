@@ -127,6 +127,12 @@ ingress:
   # APIs: true only for a demo on a private network; false routes only the page itself (/ and /api), so they are not
   # served, and the page's settlement tab and reconciliation section stop working.
   operatorApis: true
+  # Addresses and networks, comma-separated, of the proxies in front of the gateway whose X-Forwarded-For the gateway
+  # believes for its audit log's client field (interfaces/audit/README.md, the client behind a proxy): the ingress
+  # controller's pods, here the cluster's pod network, 10.42.0.0/16 by default in k3s and k3d (a cluster created with
+  # another --cluster-cidr needs its own). It trusts every pod in that network to say whom it forwards for, which only
+  # changes what audit records say. Set only while the ingress is enabled; empty trusts nothing.
+  trustedProxies: 10.42.0.0/16
 
 # The FIX 4.4 adapter (adapters/fix, interface 4) in front of the gateway's private half: a StatefulSet of one, since
 # Artio's session state is one writer's, with its data (sequence numbers and the message archive) and its audit log

@@ -138,6 +138,10 @@ oracle's control API and the treasury's reconciliation summary, reach the page's
 as under `laptop.sh web`: for a demo on a private network only. `ingress.operatorApis: false` routes only `/` and
 `/api` to the page, so neither is served (and the settlement tab and the reconciliation section stop working); that
 is the setting for anything beyond a demo, and even then the page hands out dev tokens.
+Behind the ingress every gateway connection comes from Traefik's pod, so the gateways are told to believe the
+`X-Forwarded-For` of connections from the pod network (`ingress.trustedProxies`, `10.42.0.0/16`, k3s's default
+cluster CIDR), and their audit records carry the address Traefik received the request from as `client` beside `peer`,
+the Traefik pod (interfaces/audit/README.md, the client behind a proxy).
 
 **Scaling each half.** The halves' replica counts are independent values:
 
