@@ -125,19 +125,7 @@ pub fn venue_serving(name: &str, public: bool, private: bool) -> Venue {
 
 fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue {
     let (ingress, feed) = start_node(name);
-    // Sends wait for the forwarder's first connection, so seeding can start before the node is listening.
-    let seeder = Submit::spawn(&ingress);
-    let catalogue = Catalogue::load(CATALOGUE).expect("the mini venue's catalogue");
-    let profile = catalogue::capacity_profile("small").expect("a known profile");
-    // The seed's commands have fixed IDs, so one resent after its connection ended under load is sequenced once.
-    for input in catalogue.seed(&profile).expect("the seed") {
-        let mut attempt = 0;
-        while let Err(e) = seeder.send(input.clone()) {
-            attempt += 1;
-            assert!(attempt < 5, "seeding {name} failed five times: {e}");
-            thread::sleep(Duration::from_millis(200));
-        }
-    }
+    seed(name, &ingress);
     let limits = Limits { per_second: 1_000_000, burst: 1_000_000, logons_per_minute: 1_000_000 };
     let audit_dir = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}.audit", std::process::id()));
     let _ = std::fs::remove_dir_all(&audit_dir);
@@ -154,26 +142,7 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
     if let Some(address) = treasury {
         crate::treasury::follow_updates(&gateway, address);
     }
-    let parlays = free_address();
-    let config = venue_parlays::service::Config {
-        ingress: ingress.clone(),
-        feed: feed.clone(),
-        listen: parlays.clone(),
-        window_seconds: 30,
-        max_parlays: 20,
-        capacity: {
-            let profile = catalogue::capacity_profile("small").expect("a known profile");
-            venue_parlays::rules::Capacity {
-                events: profile.events,
-                instruments: profile.instruments,
-                levels: profile.levels,
-            }
-        },
-        responders: None,
-        min_quantity: venue_parlays::rules::LOT_STEP,
-    };
-    let service = venue_parlays::service::start(Catalogue::load(CATALOGUE).expect("the catalogue"), &config)
-        .expect("parlay service");
+    let (service, parlays) = start_parlays(&ingress, &feed);
     Gateway::connect_parlays(&gateway, &parlays);
     let public_half = crate::start_half(Gateway::public(hub(), limits).with_audit(audit), &feed);
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
@@ -200,6 +169,46 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
     });
     let (ws_public, ws_private) = (format!("ws://{address}/v4/ws_public"), format!("ws://{address}/v4/ws_private"));
     Venue { gateway, address, ws_public, ws_private, ingress, audit_dir }
+}
+
+/// Seeds a node with the mini venue's catalogue.
+fn seed(name: &str, ingress: &str) {
+    // Sends wait for the forwarder's first connection, so seeding can start before the node is listening.
+    let seeder = Submit::spawn(ingress);
+    let catalogue = Catalogue::load(CATALOGUE).expect("the mini venue's catalogue");
+    let profile = catalogue::capacity_profile("small").expect("a known profile");
+    // The seed's commands have fixed IDs, so one resent after its connection ended under load is sequenced once.
+    for input in catalogue.seed(&profile).expect("the seed") {
+        let mut attempt = 0;
+        while let Err(e) = seeder.send(input.clone()) {
+            attempt += 1;
+            assert!(attempt < 5, "seeding {name} failed five times: {e}");
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+/// Starts a parlay service on the node, with the catalogue's responders approved, and returns it and where it listens.
+fn start_parlays(ingress: &str, feed: &str) -> (Arc<venue_parlays::service::Service>, String) {
+    let listen = free_address();
+    let profile = catalogue::capacity_profile("small").expect("a known profile");
+    let config = venue_parlays::service::Config {
+        ingress: ingress.to_string(),
+        feed: feed.to_string(),
+        listen: listen.clone(),
+        window_seconds: 30,
+        max_parlays: 20,
+        capacity: venue_parlays::rules::Capacity {
+            events: profile.events,
+            instruments: profile.instruments,
+            levels: profile.levels,
+        },
+        responders: None,
+        min_quantity: venue_parlays::rules::LOT_STEP,
+    };
+    let service = venue_parlays::service::start(Catalogue::load(CATALOGUE).expect("the catalogue"), &config)
+        .expect("parlay service");
+    (service, listen)
 }
 
 /// Starts an identity service of the test's own, with a fresh store, and returns where it listens.
@@ -242,5 +251,220 @@ pub fn eventually(what: &str, mut ready: impl FnMut() -> bool) {
         }
         assert!(wait < 1_500, "never happened: {what}");
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A stand-in for the network between a client and a server, which a test can cut: it accepts connections on a port of
+/// its own and passes each through to its target, both ways. Cutting it ends every connection it carries, as a server
+/// that went away would, and a closed one takes new connections only to drop them. Its target can change, so that the
+/// next connection reaches a server started in place of the old one.
+pub struct Proxy {
+    /// Where clients dial.
+    pub address: String,
+    target: Arc<std::sync::Mutex<String>>,
+    carried: Arc<std::sync::Mutex<Vec<TcpStream>>>,
+    open: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Proxy {
+    pub fn start(target: &str) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a port for a proxy");
+        let address = listener.local_addr().expect("its address").to_string();
+        let target = Arc::new(Mutex::new(target.to_string()));
+        let carried: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let open = Arc::new(AtomicBool::new(true));
+        let (to, streams, accepting) = (Arc::clone(&target), Arc::clone(&carried), Arc::clone(&open));
+        thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(client) = client else { continue };
+                if !accepting.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let upstream = to.lock().map(|t| t.clone()).unwrap_or_default();
+                let Ok(server) = TcpStream::connect(&upstream) else { continue };
+                let _ = (client.set_nodelay(true), server.set_nodelay(true));
+                let clones = (client.try_clone(), server.try_clone(), client.try_clone(), server.try_clone());
+                let (Ok(mut from_client), Ok(mut to_client), Ok(kept_client), Ok(kept_server)) = clones else {
+                    continue;
+                };
+                if let Ok(mut carried) = streams.lock() {
+                    carried.retain(|s| s.peer_addr().is_ok());
+                    carried.extend([kept_client, kept_server]);
+                }
+                let (mut to_server, mut from_server) = (server, client);
+                thread::spawn(move || {
+                    let _ = std::io::copy(&mut from_client, &mut to_server);
+                    let _ = to_server.shutdown(std::net::Shutdown::Both);
+                    let _ = from_client.shutdown(std::net::Shutdown::Both);
+                });
+                thread::spawn(move || {
+                    let _ = std::io::copy(&mut to_client, &mut from_server);
+                    let _ = from_server.shutdown(std::net::Shutdown::Both);
+                    let _ = to_client.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        Self { address, target, carried, open }
+    }
+
+    /// Ends every connection carried now; later ones are carried as before.
+    pub fn cut(&self) {
+        if let Ok(mut carried) = self.carried.lock() {
+            for stream in carried.drain(..) {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    /// Ends every connection and carries no more: the server has gone.
+    pub fn close(&self) {
+        self.open.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.cut();
+    }
+
+    /// New connections go to `target` from now on.
+    pub fn retarget(&self, target: &str) {
+        if let Ok(mut to) = self.target.lock() {
+            *to = target.to_string();
+        }
+    }
+}
+
+/// What a gateway process of a fleet serves (`--serve`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Serve {
+    Public,
+    Private,
+    Both,
+}
+
+/// One gateway process of a fleet, as its clients and a test see it.
+pub struct Member {
+    /// Its `--audit-instance`.
+    pub instance: String,
+    /// Where its clients dial it, for REST, through a proxy that stands for the network (`Proxy`).
+    pub address: String,
+    pub ws_public: String,
+    pub ws_private: String,
+    /// Its private half, if `--serve` made one.
+    pub private: Option<Arc<Gateway>>,
+    front: Proxy,
+}
+
+impl Member {
+    /// The private half, which the test asked for.
+    pub fn private(&self) -> &Arc<Gateway> {
+        self.private.as_ref().expect("a gateway serving the private half")
+    }
+
+    /// The gateway goes away as far as its clients can tell: every connection to it ends and it takes no more. Its
+    /// halves stay in memory, unreachable, which a test in one process cannot avoid; they still see their sessions end.
+    pub fn stop(&self) {
+        self.front.close();
+    }
+}
+
+/// Several gateway processes' worth of gateways in one test: one node, seeded; the shared services every gateway
+/// forwards to (identity, a treasury, a parlay service); and gateways added one at a time, each serving what `--serve`
+/// would, with its own feed follower, its own audit instance in one shared audit directory, and its own port. The
+/// gateways reach the parlay service through a proxy, so that a test can restart it.
+pub struct Fleet {
+    name: String,
+    pub ingress: String,
+    feed: String,
+    identity: String,
+    treasury: String,
+    /// The parlay service now behind `parlay_proxy`.
+    pub parlays: std::sync::Mutex<Arc<venue_parlays::service::Service>>,
+    parlay_proxy: Proxy,
+    /// Every gateway's audit log, one instance each.
+    pub audit_dir: PathBuf,
+    pub gateways: Vec<Member>,
+}
+
+/// Limits no test meets unless it means to.
+pub const GENEROUS: Limits = Limits { per_second: 1_000_000, burst: 1_000_000, logons_per_minute: 1_000_000 };
+
+impl Fleet {
+    /// The node and the shared services, and no gateway yet.
+    pub fn start(name: &str) -> Self {
+        let (ingress, feed) = start_node(name);
+        seed(name, &ingress);
+        let identity = start_identity(name);
+        let treasury = start_treasury(name, &ingress, &feed);
+        let (service, parlays) = start_parlays(&ingress, &feed);
+        eventually("the parlay service catches up with the feed", || service.ready());
+        let audit_dir = std::env::temp_dir().join(format!("venue-gateway-fleet-{name}-{}.audit", std::process::id()));
+        let _ = std::fs::remove_dir_all(&audit_dir);
+        Self {
+            name: name.to_string(),
+            ingress,
+            feed,
+            identity,
+            treasury,
+            parlays: std::sync::Mutex::new(service),
+            parlay_proxy: Proxy::start(&parlays),
+            audit_dir,
+            gateways: Vec::new(),
+        }
+    }
+
+    /// Adds a gateway serving `serve`, with generous limits, and returns its index.
+    pub fn add(&mut self, serve: Serve) -> usize {
+        self.add_with(serve, GENEROUS)
+    }
+
+    /// Adds a gateway serving `serve` with flood limits `limits`, started as `main` starts one, and returns its index
+    /// once it is ready: its halves have the venue from the feed and its private half has reached the parlay service.
+    pub fn add_with(&mut self, serve: Serve, limits: Limits) -> usize {
+        let index = self.gateways.len();
+        let instance = format!("{}-{index}", self.name);
+        let audit = Audit::start(&self.audit_dir, &instance, false).expect("an audit log");
+        let hub = || Hub::new(Catalogue::load(CATALOGUE).expect("the mini venue's catalogue"));
+        let public = (serve != Serve::Private)
+            .then(|| crate::start_half(Gateway::public(hub(), limits).with_audit(audit.clone()), &self.feed));
+        let private = (serve != Serve::Public).then(|| {
+            let half = Gateway::private(hub(), Submit::spawn(&self.ingress), limits)
+                .with_audit(audit.clone())
+                .with_identity(Some(self.identity.clone()), true)
+                .with_treasury(&self.treasury);
+            let half = crate::start_half(half, &self.feed);
+            crate::treasury::follow_updates(&half, self.treasury.clone());
+            Gateway::connect_parlays(&half, &self.parlay_proxy.address);
+            half
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
+        let listening = listener.local_addr().expect("its address").to_string();
+        let halves = crate::Halves { public: public.clone(), private: private.clone() };
+        thread::spawn(move || crate::serve_with(&halves, &listener, MAX_BEHIND));
+        for half in public.iter().chain(private.iter()) {
+            eventually("a gateway's half has the venue from the feed", || half.hub().market(MARKET).is_some());
+        }
+        if let Some(half) = &private {
+            eventually("a private half reaches the parlay service", || {
+                half.open_rfqs_pending(RESPONDER, None).is_ok_and(|pending| half.wait_for(pending).is_ok())
+            });
+        }
+        let front = Proxy::start(&listening);
+        let address = front.address.clone();
+        let (ws_public, ws_private) = (format!("ws://{address}/v4/ws_public"), format!("ws://{address}/v4/ws_private"));
+        self.gateways.push(Member { instance, address, ws_public, ws_private, private, front });
+        index
+    }
+
+    /// Replaces the parlay service with a fresh one, as a restart would: it knows no requests and no subscriptions,
+    /// every gateway's connection to the old one ends, and their next connection reaches the new one once it has
+    /// caught up with the feed.
+    pub fn restart_parlays(&self) -> Arc<venue_parlays::service::Service> {
+        let (service, listen) = start_parlays(&self.ingress, &self.feed);
+        eventually("the new parlay service catches up with the feed", || service.ready());
+        if let Ok(mut current) = self.parlays.lock() {
+            *current = Arc::clone(&service);
+        }
+        self.parlay_proxy.retarget(&listen);
+        self.parlay_proxy.cut();
+        service
     }
 }

@@ -272,6 +272,11 @@ clean close or a dropped connection, a `MassCancel` of the session's resting ord
 gateway's connection to the sequencer group, so a failover does not empty the books (blueprint §5). REST requests
 have no session and never cancel on disconnect.
 
+The mass cancel is sent by the gateway the session was on, so a gateway that stops without seeing its sessions end (a
+crash, a killed pod) cancels nothing for them: their orders stay resting under their old session IDs, which no later
+session has. A client that asked for cancel-on-disconnect and reconnects through another gateway cancels them itself
+(`cancelAll`, which reaches every order of the account) or takes them up from `GET /v4/account`.
+
 A `heartbeat` that carries an `id` is answered with an empty `reply`. A client that sends one on a schedule always
 hears back from a gateway that is alive, so it can close and reconnect a session that has gone silent instead of
 mistaking a lost gateway for a quiet market. The mini venue's web page does this every 15 seconds.
@@ -287,8 +292,11 @@ idle session costs nothing to be prompt for, and screens watch the market on the
 
 Per session, in the gateway's memory, as generic cell rate buckets (blueprint §12): messages per second, and logons
 per minute per account. Exceeding one is HTTP 429 with `Retry-After`, or an `error` with `RATE_LIMITED`. Nothing
-refused this way reaches the journal. The limits are set comfortably above legitimate use; what a customer should
-actually meet is a rule limit, which is sequenced and explainable (spec E-9.4).
+refused this way reaches the journal. REST requests have no session, so their bucket is per account. Buckets are kept
+by each gateway process and shared with no other (decision G-13): an account refused by one gateway is still served by
+another, and a venue of N gateways lets an account through up to N times the REST and logon limits. The limits are
+set comfortably above legitimate use; what a customer should actually meet is a rule limit, which is sequenced and
+explainable (spec E-9.4).
 
 ## Market data
 

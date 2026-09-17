@@ -3,6 +3,8 @@
 
 mod api;
 mod audit;
+#[cfg(test)]
+mod fleet;
 mod http;
 mod hub;
 mod identity;
