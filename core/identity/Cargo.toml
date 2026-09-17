@@ -1,0 +1,17 @@
+[package]
+name = "venue-identity"
+version = "0.1.0"
+description = "The identity service of test environments: API keys, their permissions, and their verification for the gateways"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+venue-link = { path = "../link" }
+serde_json = "1"
+# A key's secret is kept as its SHA-256 (interfaces/gateway/decisions.md, G-2); the gateway already builds with it.
+sha2 = "0.11"

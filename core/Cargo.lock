@@ -350,6 +350,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "venue-identity"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+ "venue-link",
+]
+
+[[package]]
 name = "venue-link"
 version = "0.1.0"
 dependencies = [
