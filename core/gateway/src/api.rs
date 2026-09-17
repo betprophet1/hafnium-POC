@@ -1,6 +1,7 @@
 //! Order entry shared by REST and WebSocket: total validation, price and stake conversion, and the sequenced outcome
 //! as an `OrderResult` (interfaces/gateway/openapi.yaml).
 
+use crate::audit::Audit;
 use crate::hub::{self, id, Hub};
 use crate::limits::{monotonic, Bucket};
 use crate::parlays::{self, Parlays};
@@ -209,6 +210,14 @@ pub enum Half {
 }
 
 impl Half {
+    /// The half's name, as the audit log gives it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
+
     /// Where this half's WebSocket is served.
     pub const fn websocket(self) -> &'static str {
         match self {
@@ -245,6 +254,8 @@ pub struct Gateway {
     logon_buckets: Mutex<BTreeMap<u64, Bucket>>,
     /// Where deposits and withdrawals go, when this private half offers them.
     treasury: Option<Treasury>,
+    /// Where what clients sent and were answered is recorded (`audit.rs`).
+    pub audit: Audit,
 }
 
 impl Gateway {
@@ -268,7 +279,14 @@ impl Gateway {
             rest_buckets: Mutex::new(BTreeMap::new()),
             logon_buckets: Mutex::new(BTreeMap::new()),
             treasury: None,
+            audit: Audit::disabled(),
         }
+    }
+
+    /// The same half, recording what its clients send and are answered in `audit`.
+    pub fn with_audit(mut self, audit: Audit) -> Self {
+        self.audit = audit;
+        self
     }
 
     /// The same half, passing deposits and withdrawals to the treasury at `address`.

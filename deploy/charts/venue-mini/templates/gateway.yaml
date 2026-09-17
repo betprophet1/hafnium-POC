@@ -15,7 +15,27 @@ spec:
       port: 8081
       targetPort: http
 ---
-# Interface 1, the REST and WebSocket gateway (interfaces/gateway): the only client-facing way into the core.
+# The gateway's audit log (interfaces/audit): every request and what it was answered, refusals above all. It outlives
+# the pod, and a gateway that cannot write it does not run. Nothing ships it to retained storage yet.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-gateway-audit
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.gateway.audit.storage.className }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.gateway.audit.storage.size }}
+---
+# Interface 1, the REST and WebSocket gateway (interfaces/gateway): the only client-facing way into the core. One
+# writer to its audit volume, so an old pod stops before a new one starts; the new one seals a file the old one left
+# open, which it can because they share an instance name.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,6 +45,8 @@ metadata:
     app.kubernetes.io/component: gateway
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "venue-mini.selector" (dict "ctx" . "component" "gateway") | nindent 6 }}
@@ -64,6 +86,12 @@ spec:
               value: {{ .Values.gateway.burst | quote }}
             - name: VENUE_LOGONS_PER_MINUTE
               value: {{ .Values.gateway.logonsPerMinute | quote }}
+            - name: VENUE_AUDIT_DIR
+              value: /var/lib/gateway-audit
+            - name: VENUE_AUDIT_INSTANCE
+              value: "{{ $name }}-gateway"
+            - name: VENUE_AUDIT_FSYNC
+              value: {{ .Values.gateway.audit.fsync | quote }}
           ports:
             - name: http
               containerPort: 8081
@@ -82,10 +110,15 @@ spec:
           volumeMounts:
             - name: catalogue
               mountPath: /catalogue
+            - name: audit
+              mountPath: /var/lib/gateway-audit
       volumes:
         - name: catalogue
           configMap:
             name: {{ $name }}-catalogue
+        - name: audit
+          persistentVolumeClaim:
+            claimName: {{ $name }}-gateway-audit
 ---
 # Only the gateway, the treasury, the operator tools (seed job, parlay service, dummy oracle, the web page's event
 # list) and the core's own smoke test may reach the core's ingress and feed. Everything a customer or bot does goes

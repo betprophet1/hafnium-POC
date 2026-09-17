@@ -2,6 +2,7 @@
 //! `interfaces/gateway/`; this is its first implementation, for the mini venue.
 
 mod api;
+mod audit;
 mod http;
 mod hub;
 mod limits;
@@ -15,10 +16,12 @@ mod treasury;
 mod ws;
 
 use api::{Gateway, Limits};
+use audit::Audit;
 use hub::Hub;
 use reactor::Reactors;
 use std::collections::BTreeMap;
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
@@ -28,15 +31,19 @@ use venue_link::submit::Submit;
 use venue_link::wire::{self, Error};
 
 const USAGE: &str = "usage:
+  venue-gateway verify-audit FILE...
   venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--treasury ADDR] [--parlays ADDR]
                 [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
+                [--audit-dir ./gateway-audit] [--audit-instance HOSTNAME] [--audit-fsync true]
 
 --serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
 /v4/ws_public and GET /v4/markets; private is orders and accounts on /v4/ws_private, /v4/account and /v4/orders,
 and needs --ingress. With --treasury, the private half also passes deposits and withdrawals (/v4/transfers) to the
 treasury there and sends its updates to private sessions; without it, /v4/transfers answers 503. --parlays is the
 parlay service (venue-parlays) the private half sends requests for quote (/v4/rfqs) to; without it they are refused
-as unavailable. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
+as unavailable. Every request and what it was answered is written to the audit log in --audit-dir
+(interfaces/audit/README.md); a gateway that cannot write it does not start, and one that stops being able to exits.
+Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
 struct Args(BTreeMap<String, String>);
 
@@ -74,12 +81,39 @@ impl Args {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("verify-audit") {
+        return verify_audit(&args[1..]);
+    }
     match Args::parse(&args).and_then(|a| run(&a)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("venue-gateway: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `venue-gateway verify-audit FILE...`: checks audit log files (interfaces/audit/README.md, verifying), as
+/// `interfaces/tools/audit_verify.py` does, for a machine that has the gateway and no Python.
+fn verify_audit(files: &[String]) -> ExitCode {
+    if files.is_empty() {
+        eprintln!("usage: venue-gateway verify-audit FILE...");
+        return ExitCode::from(64);
+    }
+    let mut failed = false;
+    for file in files {
+        match audit::verify(std::path::Path::new(file)) {
+            Ok(closed) => println!("{file}: ok, {}", if closed { "closed" } else { "open" }),
+            Err(broken) => {
+                println!("FAIL {file}: {broken}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -99,15 +133,26 @@ fn run(args: &Args) -> Result<(), Error> {
     };
     let feed = args.get("feed", None)?;
     let catalogue_file = args.get("catalogue", None)?;
+    let hostname = std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()).unwrap_or_else(|| "gateway".into());
+    let audit_dir = PathBuf::from(args.get("audit-dir", Some("./gateway-audit"))?);
+    let fsync = match args.get("audit-fsync", Some("true"))?.as_str() {
+        "true" => true,
+        "false" => false,
+        other => return Err(format!("--audit-fsync must be true or false, not {other}").into()),
+    };
+    // Before anything listens: a gateway that cannot keep its audit log takes no connection.
+    let audit = Audit::start(&audit_dir, &args.get("audit-instance", Some(&hostname))?, fsync)
+        .map_err(|e| format!("audit log in {}: {e}", audit_dir.display()))?;
     let halves = Halves {
         public: if public {
-            Some(start_half(Gateway::public(Hub::new(Catalogue::load(&catalogue_file)?), limits), &feed))
+            let gateway = Gateway::public(Hub::new(Catalogue::load(&catalogue_file)?), limits);
+            Some(start_half(gateway.with_audit(audit.clone()), &feed))
         } else {
             None
         },
         private: if private {
             let ingress = Submit::spawn(&args.get("ingress", None)?);
-            let mut gateway = Gateway::private(Hub::new(catalogue), ingress, limits);
+            let mut gateway = Gateway::private(Hub::new(catalogue), ingress, limits).with_audit(audit.clone());
             let treasury = args.get("treasury", Some(""))?;
             if !treasury.is_empty() {
                 gateway = gateway.with_treasury(&treasury);
@@ -126,8 +171,9 @@ fn run(args: &Args) -> Result<(), Error> {
     };
     let listener = TcpListener::bind(args.get("listen", Some("127.0.0.1:8081"))?)?;
     eprintln!(
-        "gateway on {}: serving {serving} (public /v4/ws_public, private /v4/ws_private)",
-        listener.local_addr()?
+        "gateway on {}: serving {serving} (public /v4/ws_public, private /v4/ws_private), audit log in {}",
+        listener.local_addr()?,
+        audit_dir.display()
     );
     serve(&halves, &listener);
     Ok(())

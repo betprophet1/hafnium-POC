@@ -68,6 +68,14 @@ gateway:
   perSecond: 200
   burst: 400
   logonsPerMinute: 30
+  # The audit log of every request and answer (interfaces/audit), one file a day on a volume of its own. fsync stays
+  # on as production has it; the demo's traffic is light.
+  audit:
+    fsync: true
+    storage:
+      size: 1Gi
+      # Empty uses the cluster's default class (k3d: local-path).
+      className: ""
 
 # The parlay service: parlays listed on request, requests for quote routed to the catalogue's responders, and
 # settlement from the legs. A request accepts quotes for windowSeconds of sequencer time. Every book reserves its

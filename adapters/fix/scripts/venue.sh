@@ -36,7 +36,8 @@ case "${1:-}" in
     "$BIN/venue-sim" seed --ingress "$ingress" --catalogue "$CATALOGUE" >"$dir/seed.log" 2>&1
     # Generous flood limits: a test sends in bursts no client would.
     "$BIN/venue-gateway" --feed "$feed" --ingress "$ingress" --catalogue "$CATALOGUE" --listen "$gateway" \
-      --per-second 10000 --burst 10000 --logons-per-minute 10000 >"$dir/gateway.log" 2>&1 &
+      --per-second 10000 --burst 10000 --logons-per-minute 10000 --audit-dir "$dir/gateway-audit" --audit-fsync false \
+      >"$dir/gateway.log" 2>&1 &
     echo $! >>"$dir/pids"
     wait_port "$((BASE + 2))" "the gateway"
     echo "$gateway" >"$dir/gateway.address"

@@ -86,7 +86,7 @@ authenticated, `account`; on a WebSocket once it has one, `session` (the engine 
 | `ws-open` | A WebSocket upgrade completed: `path`. |
 | `ws-refused` | A WebSocket upgrade that failed its handshake: `path`. |
 | `ws-frame` | `dir`, and `msg`, the text frame (secrets masked); for a binary frame from a client, `binary` (its length) instead. |
-| `ws-close` | The connection ended: `reason` (`closed` by the client or the network, `heartbeat missed`, `too far behind`, or `ended` for anything else). |
+| `ws-close` | The connection ended: `reason` (`heartbeat missed`, `too far behind` on what it was sent, or `closed`: by the client, the network or an error). |
 
 What is recorded on each half:
 
@@ -96,7 +96,9 @@ What is recorded on each half:
 | WebSocket | open, close; every frame from the client; every frame to it (replies, errors, executions, account updates, quotes, transfers) | open, close; every frame from the client except `heartbeat`; every `error` sent to it |
 
 Market data (book, trade and market messages) is not recorded: it is the same for every viewer, high in volume, and
-reconstructable from the journal. Refusals are always recorded: every 4xx and 5xx response, and every `error` frame,
+reconstructable from the journal. Neither are heartbeats on the public half, which viewers send all day. A connection
+that never completes a request line, a whole request or a WebSocket handshake within the gateway's arrival time has
+said nothing to record, and is not recorded. Refusals are always recorded: every 4xx and 5xx response, and every `error` frame,
 including flood limits and failed logins.
 
 ### Masking
@@ -133,6 +135,7 @@ Secrets are replaced by `***` before a record is taken; nothing unmasked is ever
 ```sh
 python3 interfaces/tools/audit_verify.py FILE...            # every chain; exit 1 at the first broken line
 python3 interfaces/tools/audit_verify.py --closed FILE...   # and each file must end with its close record
+venue-gateway verify-audit FILE...                         # the same checks, where there is a gateway and no Python
 ```
 
 A file verifies when every line is a JSON object; line 0 is an `open` record naming the file's component and

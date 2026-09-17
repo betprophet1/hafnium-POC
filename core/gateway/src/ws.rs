@@ -56,6 +56,16 @@ impl Session {
         })
     }
 
+    /// The account logged in on this session, once one has.
+    pub const fn account(&self) -> Option<u64> {
+        self.account
+    }
+
+    /// The engine session ID this session's orders carry.
+    pub const fn id(&self) -> u64 {
+        self.engine_session
+    }
+
     /// The client said something, so it is still there.
     pub fn heard(&mut self) {
         self.last_heard = monotonic();

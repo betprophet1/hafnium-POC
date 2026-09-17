@@ -16,8 +16,13 @@
 //! the other half goes to that half's loops, a WebSocket upgrade becomes a session (`ws.rs`), and anything else one
 //! REST request (`rest.rs`), answered — at once, or when the node answers — and closed. This file only reads, writes
 //! and waits.
+//!
+//! It is also where what a client said and was told is taken for the audit log (`audit.rs`,
+//! interfaces/audit/README.md): each REST request and its response, and a WebSocket's upgrade, frames and end. Taking a
+//! record only queues it; nothing here waits on the disk.
 
 use crate::api::{Gateway, Half, Pending};
+use crate::audit;
 use crate::hub::Outbox;
 use crate::limits::monotonic;
 use crate::treasury::Call;
@@ -25,9 +30,10 @@ use crate::ws::{self, Session};
 use crate::{http, rest};
 use mio::net::TcpStream as Stream;
 use mio::{Events, Interest, Poll, Registry, Token, Waker};
+use serde_json::{json, Map, Value};
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
@@ -55,6 +61,9 @@ const READ_BUFFER: usize = 4 * 1024;
 /// How long a connection has to say what it is, complete a WebSocket handshake, or send a whole REST request. A
 /// client that trickles its bytes holds only its buffers while it does, but it does not hold them for ever.
 const ARRIVAL: Duration = Duration::from_secs(10);
+
+/// Connection numbers for the audit log, unique across both halves' loops within a process.
+static CONNECTIONS: AtomicU64 = AtomicU64::new(1);
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -140,6 +149,10 @@ struct Http {
     call: Option<Call>,
     response: Vec<u8>,
     written: usize,
+    /// The account the request's token names, for the audit log.
+    account: Option<u64>,
+    /// Whether the response has been recorded in the audit log.
+    recorded: bool,
 }
 
 enum Socket {
@@ -162,6 +175,13 @@ struct Conn {
     unread: bool,
     /// When the connection was accepted, for `ARRIVAL`.
     accepted: Instant,
+    /// Who the audit log says a record is about: this connection's number and the address it came from.
+    id: u64,
+    peer: String,
+    /// The path of a WebSocket's upgrade request.
+    path: String,
+    /// Why the connection ended, for the audit log, when something other than the client or the network ended it.
+    ending: &'static str,
 }
 
 /// One loop, for ever.
@@ -205,7 +225,7 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, reactors: &Reactors, gateway: &Arc<
                 None => continue,
             };
             if !alive {
-                close_slot(gateway, &mut conns, &mut free, token);
+                close_slot(gateway, &mut conns, &mut free, token, None);
             }
         }
         let now = monotonic();
@@ -239,6 +259,7 @@ fn take_on(
 ) -> Option<usize> {
     stream.set_nonblocking(true).ok()?;
     let _ = stream.set_nodelay(true);
+    let peer = stream.peer_addr().map_or_else(|_| "unknown".to_string(), |a| a.to_string());
     let mut stream = Stream::from_std(stream);
     let token = free.pop().unwrap_or_else(|| {
         conns.push(None);
@@ -261,6 +282,10 @@ fn take_on(
         notify,
         unread: true,
         accepted: monotonic(),
+        id: CONNECTIONS.fetch_add(1, Ordering::Relaxed),
+        peer,
+        path: String::new(),
+        ending: "closed",
     });
     Some(token)
 }
@@ -275,7 +300,7 @@ fn serve(gateway: &Arc<Gateway>, conn: &mut Conn, max_behind: usize, registry: &
         }
     }
     if let Some(Socket::Http(request)) = conn.socket.as_mut() {
-        return serve_http(gateway, request, &conn.notify);
+        return serve_http(gateway, request, &conn.notify, conn.id, &conn.peer);
     }
     serve_ws(gateway, conn)
 }
@@ -326,20 +351,33 @@ fn decide(gateway: &Gateway, conn: &mut Conn, max_behind: usize, registry: &Regi
         }
     }
     conn.socket = Some(if method == "GET" && path == gateway.half.websocket() {
+        conn.path = path.to_string();
         match tungstenite::accept_with_config(stream, Some(socket_config(max_behind))) {
             Ok(ws) => Socket::Open(ws),
             Err(HandshakeError::Interrupted(mid)) => Socket::Handshake(mid),
-            Err(HandshakeError::Failure(_)) => return Decided::Gone,
+            Err(HandshakeError::Failure(_)) => {
+                record_refused_upgrade(gateway, conn);
+                return Decided::Gone;
+            }
         }
     } else {
-        Socket::Http(Http { stream, request: Vec::new(), pending: None, call: None, response: Vec::new(), written: 0 })
+        Socket::Http(Http {
+            stream,
+            request: Vec::new(),
+            pending: None,
+            call: None,
+            response: Vec::new(),
+            written: 0,
+            account: None,
+            recorded: false,
+        })
     });
     Decided::Here
 }
 
 /// A REST connection: read until the request is whole, answer it — now, or when the node has — write the response,
 /// and let the connection go.
-fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify) -> bool {
+fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, id: u64, peer: &str) -> bool {
     if http.pending.is_none() && http.call.is_none() && http.response.is_empty() {
         let mut chunk = [0u8; READ_BUFFER];
         loop {
@@ -354,12 +392,27 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify) -> bool {
         }
         match http::parse(&http.request) {
             Ok(None) => return true,
-            Ok(Some(request)) => match rest::route(gateway, &request, notify) {
-                rest::Routed::Now(answer) => http.response = rest::response(answer),
-                rest::Routed::Later(pending) => http.pending = Some(pending),
-                rest::Routed::Treasury(call) => http.call = Some(call),
-            },
-            Err(reason) => http.response = rest::unreadable(&reason),
+            Ok(Some(request)) => {
+                http.account = request
+                    .headers
+                    .get("authorization")
+                    .and_then(|h| h.strip_prefix("Bearer "))
+                    .and_then(|token| gateway.authenticate(token.trim()).ok());
+                record_request(gateway, id, peer, http, &request);
+                match rest::route(gateway, &request, notify) {
+                    rest::Routed::Now(answer) => http.response = rest::response(answer),
+                    rest::Routed::Later(pending) => http.pending = Some(pending),
+                    rest::Routed::Treasury(call) => http.call = Some(call),
+                }
+            }
+            Err(reason) => {
+                let mut fields = about(gateway, id, peer, None, None);
+                fields.insert("dir".into(), json!("in"));
+                fields.insert("line".into(), json!(request_line(&http.request)));
+                fields.insert("unreadable".into(), json!(reason));
+                gateway.audit.record("http-request", fields);
+                http.response = rest::unreadable(&reason);
+            }
         }
     }
     if let Some(pending) = &http.pending {
@@ -371,6 +424,10 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify) -> bool {
         let Some(response) = call.take() else { return true };
         http.response = response;
         http.call = None;
+    }
+    if !http.recorded {
+        http.recorded = true;
+        record_response(gateway, id, peer, http);
     }
     while http.written < http.response.len() {
         match http.stream.write(&http.response[http.written..]) {
@@ -395,15 +452,24 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
                 conn.socket = Some(Socket::Handshake(mid));
                 return true;
             }
-            Err(HandshakeError::Failure(_)) => return false,
+            Err(HandshakeError::Failure(_)) => {
+                record_refused_upgrade(gateway, conn);
+                return false;
+            }
         }
     }
     let Some(Socket::Open(socket)) = conn.socket.as_mut() else { return false };
     if conn.session.is_none() {
         let Some(outbox) = conn.outbox.take() else { return false };
         conn.session = Session::open(gateway, outbox, Arc::clone(&conn.notify));
+        if let Some(session) = &conn.session {
+            let mut fields = about(gateway, conn.id, &conn.peer, None, Some(session.id()));
+            fields.insert("path".into(), json!(conn.path));
+            gateway.audit.record("ws-open", fields);
+        }
     }
     let Some(session) = conn.session.as_mut() else { return false };
+    let (id, peer, ending) = (conn.id, conn.peer.as_str(), &mut conn.ending);
     for _ in 0..PASSES {
         let mut answered = false;
         // What the client sent, until there is nothing more or the session may take no more.
@@ -411,14 +477,22 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
             match socket.read() {
                 Ok(Message::Text(text)) => {
                     session.heard();
+                    record_from_client(gateway, id, peer, session, text.as_str());
                     for reply in ws::handle(gateway, session, text.as_str()) {
-                        if !queue(socket, reply) {
+                        record_to_client(gateway, id, peer, session, &reply, true);
+                        if !queue(socket, reply, ending) {
                             return false;
                         }
                     }
                 }
-                Ok(Message::Binary(_)) => {
-                    if !queue(socket, ws::binary_refused()) {
+                Ok(Message::Binary(data)) => {
+                    let mut fields = about(gateway, id, peer, session.account(), Some(session.id()));
+                    fields.insert("dir".into(), json!("in"));
+                    fields.insert("binary".into(), json!(data.len()));
+                    gateway.audit.record("ws-frame", fields);
+                    let refused = ws::binary_refused();
+                    record_to_client(gateway, id, peer, session, &refused, true);
+                    if !queue(socket, refused, ending) {
                         return false;
                     }
                 }
@@ -431,13 +505,15 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
         // Replies in the order they were asked for.
         for reply in ws::ready_replies(gateway, session) {
             answered = true;
-            if !queue(socket, reply) {
+            record_to_client(gateway, id, peer, session, &reply, true);
+            if !queue(socket, reply, ending) {
                 return false;
             }
         }
         // Messages the hub queued.
         while let Ok(message) = conn.queue.try_recv() {
-            if !queue(socket, message) {
+            record_to_client(gateway, id, peer, session, &message, false);
+            if !queue(socket, message, ending) {
                 return false;
             }
         }
@@ -461,7 +537,7 @@ fn sweep(gateway: &Arc<Gateway>, conns: &mut [Option<Conn>], free: &mut Vec<usiz
         };
         if arriving {
             if now.duration_since(conn.accepted) > ARRIVAL {
-                close_slot(gateway, conns, free, token);
+                close_slot(gateway, conns, free, token, None);
             }
             continue;
         }
@@ -474,24 +550,115 @@ fn sweep(gateway: &Arc<Gateway>, conns: &mut [Option<Conn>], free: &mut Vec<usiz
             let _ = socket.close(None);
             let _ = socket.flush();
         }
-        close_slot(gateway, conns, free, token);
+        close_slot(gateway, conns, free, token, Some("heartbeat missed"));
     }
 }
 
-/// Forgets a connection: dropping its socket closes it and takes it out of the loop, and its session ends.
-fn close_slot(gateway: &Arc<Gateway>, conns: &mut [Option<Conn>], free: &mut Vec<usize>, token: usize) {
+/// Forgets a connection: dropping its socket closes it and takes it out of the loop, and its session ends. `reason`
+/// is why, for the audit log, when the connection does not already know.
+fn close_slot(
+    gateway: &Arc<Gateway>,
+    conns: &mut [Option<Conn>],
+    free: &mut Vec<usize>,
+    token: usize,
+    reason: Option<&'static str>,
+) {
     if let Some(conn) = conns[token].take() {
         if let Some(session) = &conn.session {
+            let mut fields = about(gateway, conn.id, &conn.peer, session.account(), Some(session.id()));
+            fields.insert("reason".into(), json!(reason.unwrap_or(conn.ending)));
+            gateway.audit.record("ws-close", fields);
             ws::end(gateway, session);
         }
         free.push(token);
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The audit log (interfaces/audit/README.md, gateway)
+
+/// The fields that say which connection a record is about.
+fn about(gateway: &Gateway, id: u64, peer: &str, account: Option<u64>, session: Option<u64>) -> Map<String, Value> {
+    let mut fields = Map::new();
+    fields.insert("conn".into(), json!(id));
+    fields.insert("peer".into(), json!(peer));
+    fields.insert("half".into(), json!(gateway.half.name()));
+    if let Some(account) = account {
+        fields.insert("account".into(), json!(account.to_string()));
+    }
+    if let Some(session) = session {
+        fields.insert("session".into(), json!(session.to_string()));
+    }
+    fields
+}
+
+/// The request line of what has arrived of a request, as text, however much of it there is.
+fn request_line(request: &[u8]) -> String {
+    let line = request.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    let line = &line[..line.len().min(http::MAX_LINE)];
+    String::from_utf8_lossy(line).trim_end_matches('\r').to_string()
+}
+
+fn record_request(gateway: &Gateway, id: u64, peer: &str, http: &Http, request: &http::Request) {
+    let mut fields = about(gateway, id, peer, http.account, None);
+    fields.insert("dir".into(), json!("in"));
+    fields.insert("line".into(), json!(request_line(&http.request)));
+    let headers: Map<String, Value> =
+        request.headers.iter().map(|(name, value)| (name.clone(), json!(audit::header_value(name, value)))).collect();
+    fields.insert("headers".into(), Value::Object(headers));
+    fields.insert("body".into(), json!(audit::mask_tokens(&String::from_utf8_lossy(&request.body))));
+    gateway.audit.record("http-request", fields);
+}
+
+fn record_response(gateway: &Gateway, id: u64, peer: &str, http: &Http) {
+    let response = &http.response;
+    let status = response.get(9..12).and_then(|s| std::str::from_utf8(s).ok()).and_then(|s| s.parse::<u16>().ok());
+    let body = response.windows(4).position(|w| w == b"\r\n\r\n").map_or(&response[..0], |i| &response[i + 4..]);
+    let mut fields = about(gateway, id, peer, http.account, None);
+    fields.insert("dir".into(), json!("out"));
+    fields.insert("status".into(), json!(status));
+    fields.insert("body".into(), json!(String::from_utf8_lossy(body)));
+    gateway.audit.record("http-response", fields);
+}
+
+fn record_refused_upgrade(gateway: &Gateway, conn: &Conn) {
+    let mut fields = about(gateway, conn.id, &conn.peer, None, None);
+    fields.insert("path".into(), json!(conn.path));
+    gateway.audit.record("ws-refused", fields);
+}
+
+/// A text frame from the client. On the public half a heartbeat is not recorded: viewers send them all day, and
+/// nothing about one can be in dispute.
+fn record_from_client(gateway: &Gateway, id: u64, peer: &str, session: &Session, text: &str) {
+    if gateway.half == Half::Public
+        && serde_json::from_str::<Value>(text).is_ok_and(|m| m.get("op").and_then(Value::as_str) == Some("heartbeat"))
+    {
+        return;
+    }
+    let mut fields = about(gateway, id, peer, session.account(), Some(session.id()));
+    fields.insert("dir".into(), json!("in"));
+    fields.insert("msg".into(), json!(audit::mask_tokens(text)));
+    gateway.audit.record("ws-frame", fields);
+}
+
+/// A frame for the client: on the private half every one; on the public half only the errors that answer what the
+/// client sent, never the market data the hub queues (`answer` says which this is).
+fn record_to_client(gateway: &Gateway, id: u64, peer: &str, session: &Session, text: &str, answer: bool) {
+    if gateway.half == Half::Public
+        && !(answer && serde_json::from_str::<Value>(text).is_ok_and(|m| m.get("type") == Some(&json!("error"))))
+    {
+        return;
+    }
+    let mut fields = about(gateway, id, peer, session.account(), Some(session.id()));
+    fields.insert("dir".into(), json!("out"));
+    fields.insert("msg".into(), json!(text));
+    gateway.audit.record("ws-frame", fields);
+}
+
 /// Queues a message for the client, and says whether the connection is still worth keeping. A would-block is not a
 /// failure: the message stays in the socket's own buffer and goes out on a later flush, when the loop is told the
-/// socket can take more.
-fn queue(socket: &mut WebSocket<Stream>, message: String) -> bool {
+/// socket can take more. A connection dropped for being too far behind says so in `ending`.
+fn queue(socket: &mut WebSocket<Stream>, message: String, ending: &mut &'static str) -> bool {
     match socket.write(Message::text(message)) {
         Ok(()) => true,
         Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => true,
@@ -500,6 +667,7 @@ fn queue(socket: &mut WebSocket<Stream>, message: String) -> bool {
         Err(tungstenite::Error::WriteBufferFull(_)) => {
             let peer = socket.get_ref().peer_addr().map_or_else(|_| "a client".to_string(), |a| a.to_string());
             eprintln!("gateway: disconnected {peer}: too far behind on what it has been sent");
+            *ending = "too far behind";
             false
         }
         Err(_) => false,

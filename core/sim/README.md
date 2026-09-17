@@ -96,7 +96,7 @@ target/release/venue-sim seed --ingress 127.0.0.1:7101 --catalogue $CAT
 target/release/venue-treasury --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT --ledger /tmp/venue/treasury.jsonl &
 target/release/venue-parlays --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT &
 target/release/venue-gateway --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT --treasury 127.0.0.1:8083 \
-  --parlays 127.0.0.1:7103 &
+  --parlays 127.0.0.1:7103 --audit-dir /tmp/venue/gateway-audit &
 target/release/venue-sim oracle --ingress 127.0.0.1:7101 --feed 127.0.0.1:7102 --catalogue $CAT \
   --calendar ../deploy/charts/venue-mini/files/calendar.json &
 target/release/venue-sim maker --gateway 127.0.0.1:8081 &

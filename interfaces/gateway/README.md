@@ -60,6 +60,21 @@ A `clientOrderId` is remembered for **two hours** per account, across every mark
 window it cannot be reused, even by an order the engine rejected; an order the gateway refused never reached the
 engine and does not use up its ID.
 
+## The audit log
+
+A refusal at the edge is never journaled, so the gateway keeps the record of it: every REST request and its
+response, and every WebSocket's upgrade, frames and end, in the audit log format of `interfaces/audit/` (blueprint
+§12, flood protection). On the private half every frame both ways is recorded; on the public half the client's frames
+except heartbeats and the errors sent back, but not market data. Tokens are masked: the `Authorization` value becomes
+`Bearer ***`, and the `token` of a `login` becomes `***`.
+
+The log is written under `--audit-dir` (`VENUE_AUDIT_DIR`, default `./gateway-audit`), one file per UTC day named for
+`--audit-instance` (`VENUE_AUDIT_INSTANCE`, default the host name), synced unless `--audit-fsync false`
+(`VENUE_AUDIT_FSYNC`). The event loops only queue records; a writer thread writes them. A full queue makes a loop
+wait rather than drop a record, and a queue full for 10 seconds, a failed write or an audit directory that cannot be
+written stops the gateway (exit status 74) rather than let it serve unrecorded. `venue-gateway verify-audit FILE...`
+checks a file's chain, as `interfaces/tools/audit_verify.py` does.
+
 ## Deposits and withdrawals
 
 `POST /v4/transfers` moves money into the account or out of it, `GET /v4/transfers` lists the account's transfers

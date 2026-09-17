@@ -3,8 +3,10 @@
 //! the node's feed, conflates its books and serves connections on a port of its own. What a test sees is what the engine and the gateway actually do.
 
 use crate::api::{Gateway, Limits};
+use crate::audit::Audit;
 use crate::hub::Hub;
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -44,6 +46,8 @@ pub struct Venue {
     pub ws_private: String,
     /// The node's ingress, for a test that acts as an operator.
     pub ingress: String,
+    /// The gateway's audit log: a directory of the test's own, written without syncing.
+    pub audit_dir: PathBuf,
 }
 
 /// A seeded node, a treasury on it with a fake bank that decides `dummy_bank` transfers within half a second and never
@@ -126,8 +130,11 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
         seeder.send(input).expect("seeded");
     }
     let limits = Limits { per_second: 1_000_000, burst: 1_000_000, logons_per_minute: 1_000_000 };
+    let audit_dir = std::env::temp_dir().join(format!("venue-gateway-test-{name}-{}.audit", std::process::id()));
+    let _ = std::fs::remove_dir_all(&audit_dir);
+    let audit = Audit::start(&audit_dir, "test", false).expect("an audit log");
     let hub = || Hub::new(Catalogue::load(CATALOGUE).expect("the mini venue's catalogue"));
-    let mut private_half = Gateway::private(hub(), Submit::spawn(&ingress), limits);
+    let mut private_half = Gateway::private(hub(), Submit::spawn(&ingress), limits).with_audit(audit.clone());
     let treasury = treasury.then(|| start_treasury(name, &ingress, &feed));
     if let Some(address) = &treasury {
         private_half = private_half.with_treasury(address);
@@ -154,7 +161,7 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
     };
     venue_parlays::service::start(Catalogue::load(CATALOGUE).expect("the catalogue"), &config).expect("parlay service");
     Gateway::connect_parlays(&gateway, &parlays);
-    let public_half = crate::start_half(Gateway::public(hub(), limits), &feed);
+    let public_half = crate::start_half(Gateway::public(hub(), limits).with_audit(audit), &feed);
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
     let address = listener.local_addr().expect("its address").to_string();
     let halves = crate::Halves {
@@ -172,7 +179,7 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool) -> Venue 
         thread::sleep(Duration::from_millis(20));
     }
     let (ws_public, ws_private) = (format!("ws://{address}/v4/ws_public"), format!("ws://{address}/v4/ws_private"));
-    Venue { gateway, address, ws_public, ws_private, ingress }
+    Venue { gateway, address, ws_public, ws_private, ingress, audit_dir }
 }
 
 /// Starts a treasury of the test's own on the node, with a fresh book, and returns where it listens.
