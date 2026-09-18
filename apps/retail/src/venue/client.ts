@@ -10,6 +10,7 @@ import type {
   Account,
   Book,
   CheckYourEmail,
+  Environment,
   HeldSession,
   Market,
   Member,
@@ -127,6 +128,17 @@ export class Venue {
     } finally {
       this.credential = undefined;
     }
+  }
+
+  /** Which venues this one says an app may point itself at. Sent with the session when there is one, because a
+   * venue names its test environments only to its own people; asked without one before anybody has signed in. Either
+   * way it is discovery and not permission — the environment named still decides for itself who may do anything
+   * there (interface 1 README, choosing an environment). */
+  async bootstrap(): Promise<Environment[]> {
+    const answer = await this.call<{ environments: Environment[] }>("GET", "/v4/bootstrap", undefined, {
+      anonymous: !this.credential,
+    });
+    return answer.environments ?? [];
   }
 
   /** Every market open for trading. Public: no credential needed. */

@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Venue, marketsOf } from "./client";
+import { BUILT_IN, fallback, readKept, stillOffered } from "./environment";
 import { openPrivateStream, higher } from "./stream";
 import type { Timers, WebSocketLike } from "./stream";
 import { VenueError } from "./types";
@@ -238,6 +239,57 @@ function fakeTimers() {
   };
   return { timers, run: () => due.splice(0).forEach((run) => run()) };
 }
+
+describe("choosing an environment", () => {
+  const prod = { id: "prod", label: "Live", url: "https://venue.test", live: true };
+  const preview = { id: "pr-7", label: "PR 7", url: "https://pr-7.venue.test", live: false };
+
+  it("asks the venue where it may go, and carries the session only when there is one", async () => {
+    const { doFetch, asked } = fetchStub([
+      { status: 200, body: { environments: [prod] } },
+      { status: 200, body: { environments: [prod, preview] } },
+    ]);
+
+    // Before anyone has signed in: asked without a credential, and the venue names only the live one.
+    const anonymous = new Venue({ baseUrl: "https://venue.test", fetch: doFetch });
+    assert.deepEqual(await anonymous.bootstrap(), [prod]);
+    assert.equal(asked[0].url, "https://venue.test/v4/bootstrap");
+    assert.equal(asked[0].auth, undefined, "a stranger asks as a stranger");
+
+    // With a session, the venue may name more. Whether it does is the venue's business, not the app's.
+    const signed = new Venue({ baseUrl: "https://venue.test", credential: "vs_0123456789abcdef.aa", fetch: doFetch });
+    assert.deepEqual(await signed.bootstrap(), [prod, preview]);
+    assert.equal(asked[1].auth, "Bearer vs_0123456789abcdef.aa");
+  });
+
+  it("keeps a session with the venue it belongs to, and refuses to read one that does not say", () => {
+    const kept = { environment: preview, member: { session: { credential: "vs_0123456789abcdef.aa" } } };
+    assert.deepEqual(readKept(JSON.stringify(kept)), kept);
+
+    // Anything that does not name a venue is treated as nothing kept at all. That costs a sign-in; the alternative
+    // is replaying a credential against a venue it was never issued for, which is the one thing that must not happen.
+    assert.equal(readKept(null), null);
+    assert.equal(readKept("not json"), null);
+    assert.equal(readKept(JSON.stringify({ member: { session: {} } })), null, "no venue named");
+    assert.equal(readKept(JSON.stringify({ environment: preview })), null, "no member");
+    assert.equal(readKept(JSON.stringify({ environment: { id: "x" }, member: {} })), null, "no url");
+  });
+
+  it("goes back to the live venue when the one a session belongs to has gone", () => {
+    const kept = { environment: preview, member: {} };
+    assert.equal(stillOffered(kept, [prod, preview]), true);
+    // A preview environment outlives no pull request: once it is reaped it is simply not on the list any more.
+    assert.equal(stillOffered(kept, [prod]), false);
+    // And one that kept the name but moved is not the same venue either.
+    assert.equal(stillOffered(kept, [prod, { ...preview, url: "https://pr-7b.venue.test" }]), false);
+  });
+
+  it("always has somewhere to point", () => {
+    assert.equal(fallback([prod, preview]), prod, "the live one");
+    assert.equal(fallback([preview]), preview, "or whatever there is");
+    assert.equal(fallback([]), BUILT_IN, "or the address it was built with");
+  });
+});
 
 describe("the private stream", () => {
   it("logs in, and asks to carry on from where it was when the connection comes back", () => {

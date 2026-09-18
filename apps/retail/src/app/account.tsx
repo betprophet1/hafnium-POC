@@ -19,7 +19,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, 
 
 import { VenueError } from '@/venue/types';
 import type { HeldSession } from '@/venue/types';
-import { useVenue, VENUE_URL } from '@/venue/session';
+import { useVenue } from '@/venue/session';
 
 const money = (cents: number) => `$${(cents / 100).toFixed(2)}`;
 
@@ -267,7 +267,7 @@ export default function AccountScreen() {
 
         {said ? <Text style={styles.said}>{said}</Text> : null}
         {failed ? <Text style={styles.failed}>{failed}</Text> : null}
-        <Text style={styles.note}>Talking to {VENUE_URL}</Text>
+        <Where />
       </ScrollView>
     );
   }
@@ -367,6 +367,8 @@ export default function AccountScreen() {
 
       {said ? <Text style={styles.said}>{said}</Text> : null}
       {failed ? <Text style={styles.failed}>{failed}</Text> : null}
+
+      <Where />
 
       <Pressable onPress={() => void venue.logOut()} style={styles.action}>
         <Text>Log out</Text>
@@ -558,6 +560,40 @@ function Security({
         <Text style={styles.note}>none</Text>
       )}
     </>
+  );
+}
+
+/** Which venue the app is talking to, and — for somebody the venue offers a choice — how to move between them.
+ *
+ * A venue that is not the live one is said so plainly, because the whole hazard of test environments is somebody
+ * trading imaginary money while believing it is real. Moving signs you out: a session belongs to the venue that
+ * issued it and is nobody else's, so there is nothing to carry across (interface 1 README, choosing an environment).
+ */
+function Where() {
+  const { environment, environments, chooseEnvironment } = useVenue();
+  const elsewhere = environments.filter((e) => e.url !== environment.url);
+  return (
+    <View style={styles.card}>
+      <Text style={styles.note}>
+        Talking to {environment.label} · {environment.url}
+      </Text>
+      {environment.live ? null : (
+        <Text style={styles.failed}>This is not the live venue. Nothing here is real money.</Text>
+      )}
+      {elsewhere.length ? (
+        <>
+          <Text style={styles.note}>Switching signs you out: a session belongs to the venue that issued it.</Text>
+          {elsewhere.map((e) => (
+            <Pressable key={e.id} onPress={() => void chooseEnvironment(e)} style={styles.action}>
+              <Text>
+                Switch to {e.label}
+                {e.live ? ' (live)' : ''}
+              </Text>
+            </Pressable>
+          ))}
+        </>
+      ) : null}
+    </View>
   );
 }
 

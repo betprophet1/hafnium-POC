@@ -12,12 +12,12 @@ import { Platform } from "react-native";
 import { Venue } from "./client";
 import { openPrivateStream } from "./stream";
 import type { Stream } from "./stream";
+import { BOOTSTRAP_URL, BUILT_IN, fallback, readKept, stillOffered } from "./environment";
 import { clearSession, keptSession, loadSession, saveSession, unlockKind, unlockName } from "./storage";
 import type { Unlock } from "./storage";
-import type { About, Account, HeldSession, Member } from "./types";
+import type { About, Account, Environment, HeldSession, Member } from "./types";
 
-/** Where the venue is. Set it for a build with EXPO_PUBLIC_VENUE_URL; the default suits the demo on a laptop. */
-export const VENUE_URL = process.env.EXPO_PUBLIC_VENUE_URL ?? "http://127.0.0.1:8080";
+export { BOOTSTRAP_URL } from "./environment";
 
 /** What this app calls the thing it runs on, so a member can pick this session out of their own list. A name, not a
  * fingerprint of the device: the venue is told "an iPhone", never anything that identifies one. */
@@ -44,6 +44,12 @@ type VenueState = {
   /** What this device can unlock with, and what to call it on a button. */
   unlock: Unlock;
   unlockWith: string;
+  /** The venue this app is pointed at, and the ones it has been told it may point itself at. */
+  environment: Environment;
+  environments: Environment[];
+  /** Points the app at another venue. Signs out first: a session belongs to the venue that issued it and is nobody
+   * else's, so there is nothing to carry across (decision G-20). */
+  chooseEnvironment: (to: Environment) => Promise<void>;
   /** Signing up answers nothing but "check your mail": no session, so the app asks for the code and then logs in. */
   signUp: (email: string, password: string) => Promise<void>;
   /** `code` is from an authenticator app or a recovery code, for an account that asks for one. The venue refuses
@@ -69,7 +75,11 @@ export function useVenue(): VenueState {
 }
 
 export function VenueProvider({ children }: { children: ReactNode }) {
-  const venue = useMemo(() => new Venue({ baseUrl: VENUE_URL }), []);
+  // Which venue, and therefore which client. Rebuilt when the target moves, because a Venue is bound to one address
+  // and a session is bound to one venue.
+  const [environment, setEnvironment] = useState<Environment>(BUILT_IN);
+  const [environments, setEnvironments] = useState<Environment[]>([]);
+  const venue = useMemo(() => new Venue({ baseUrl: environment.url }), [environment.url]);
   const [member, setMember] = useState<Member | null>(null);
   const [account, setAccount] = useState<Account | null>(null);
   const [about, setAbout] = useState<About | null>(null);
@@ -104,7 +114,9 @@ export function VenueProvider({ children }: { children: ReactNode }) {
       venue.credential = who.session.credential;
       setMember(who);
       setLocked(false);
-      await saveSession(JSON.stringify(who));
+      // The venue goes in with it: restoring a session against the wrong one would send a credential somewhere it
+      // does not belong, which is the one thing that must never happen here.
+      await saveSession(JSON.stringify({ environment, member: who }));
       await Promise.all([refresh(), refreshAbout()]);
       stream.current?.stop();
       stream.current = openPrivateStream({
@@ -126,7 +138,7 @@ export function VenueProvider({ children }: { children: ReactNode }) {
     },
     // `forget` is defined below and never changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [venue, refresh, refreshAbout],
+    [venue, environment, refresh, refreshAbout],
   );
 
   const forget = useCallback(async () => {
@@ -144,13 +156,15 @@ export function VenueProvider({ children }: { children: ReactNode }) {
   /** The kept session, behind the phone's lock. Called from a button, never at launch: a prompt nobody asked for is
    * the fastest way to teach people to dismiss it. */
   const unlockSession = useCallback(async () => {
-    const kept = await loadSession();
+    const kept = readKept(await loadSession());
     if (!kept) {
       setLocked(false);
       return false;
     }
     try {
-      await start(JSON.parse(kept) as Member);
+      // Back to the venue it came from, not wherever the app happens to be pointed now.
+      setEnvironment(kept.environment);
+      await start(kept.member as Member);
       return true;
     } catch {
       await clearSession();
@@ -170,16 +184,41 @@ export function VenueProvider({ children }: { children: ReactNode }) {
       // member asks for the prompt. One kept without a lock — a phone with nothing enrolled, or the web — is read
       // straight away, which is what it was before there was a lock at all.
       if (kept.kept && !kept.locked) {
-        const session = await loadSession();
-        if (!cancelled && session) {
+        const held = readKept(await loadSession());
+        if (!cancelled && held) {
+          // Asked of the venue the session belongs to, carrying that session, because that is the only venue that
+          // can say whether it is still good and the only one entitled to see it. If the venue has gone — a preview
+          // environment outlives no pull request — this throws and the app falls back to where it was built
+          // pointing, rather than retrying an address that no longer answers.
           try {
-            await start(JSON.parse(session) as Member);
+            const there = new Venue({ baseUrl: held.environment.url, credential: (held.member as Member).session.credential });
+            const offered = await there.bootstrap();
+            if (!cancelled && stillOffered(held, offered)) {
+              setEnvironments(offered);
+              setEnvironment(held.environment);
+              await start(held.member as Member);
+              if (!cancelled) setStarting(false);
+              return;
+            }
           } catch {
-            await clearSession();
+            // Fall through to starting afresh against the built-in address.
           }
+          await clearSession();
         }
       } else if (!cancelled) {
         setLocked(kept.kept);
+      }
+      // Nobody signed in, or what was kept is no good: ask the address the app was built with where it may go.
+      if (!cancelled) {
+        try {
+          const offered = await new Venue({ baseUrl: BOOTSTRAP_URL }).bootstrap();
+          if (!cancelled && offered.length) {
+            setEnvironments(offered);
+            setEnvironment(fallback(offered));
+          }
+        } catch {
+          // A venue that does not offer the route, or cannot be reached: the app stays where it was built pointing.
+        }
       }
       if (!cancelled) setStarting(false);
     })();
@@ -191,6 +230,42 @@ export function VenueProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /** Points the app at another venue. Signing out first is not tidiness: the session belongs to the venue that
+   * issued it, so carrying it across would mean handing a credential to a venue it is not for. */
+  const chooseEnvironment = useCallback(
+    async (to: Environment) => {
+      if (to.url === environment.url) return;
+      try {
+        await venue.logOut();
+      } catch {
+        // The old venue could not be told. The credential is dropped here regardless, which is what matters.
+      }
+      await forget();
+      setEnvironment(to);
+    },
+    // `forget` never changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [venue, environment.url],
+  );
+
+  // Once somebody is signed in, ask again: a venue names its test environments only to its own people, so the list
+  // an app was given before anyone signed in is the short one.
+  useEffect(() => {
+    if (!member) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const offered = await venue.bootstrap();
+        if (!cancelled && offered.length) setEnvironments(offered);
+      } catch {
+        // Keep the list already held; it is only ever used to offer a choice.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [member, venue]);
+
   const state: VenueState = {
     venue,
     member,
@@ -200,6 +275,9 @@ export function VenueProvider({ children }: { children: ReactNode }) {
     locked,
     unlock,
     unlockWith,
+    environment,
+    environments,
+    chooseEnvironment,
     live,
     signUp: async (email, password) => {
       await venue.signUp(email, password);

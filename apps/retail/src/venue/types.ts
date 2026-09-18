@@ -69,6 +69,15 @@ export type Member = {
 
 export type Session = { sessionId: string; credential: string; expiresAt: string };
 
+/** A venue an app may point itself at, as `GET /v4/bootstrap` names it. `live` says whose money is real; an app
+ * shows that where a person can see it, and an entry that does not say is taken as not live. */
+export type Environment = {
+  id: string;
+  label: string;
+  url: string;
+  live: boolean;
+};
+
 /** What the member's own routes say about them, which `GET /v4/members/me` answers. */
 export type About = {
   memberId: string;
@@ -78,6 +87,8 @@ export type About = {
   emailVerified: boolean;
   secondFactor: boolean;
   recoveryCodesLeft: number;
+  /** One of the venue's own people, which decides only which environments the bootstrap names to them. */
+  staff: boolean;
 };
 
 /** One of a member's sessions, as `GET /v4/sessions` lists them, so they can end one they do not recognise. */
