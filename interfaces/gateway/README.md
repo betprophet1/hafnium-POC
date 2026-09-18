@@ -411,6 +411,36 @@ responder's session stays subscribed across a service restart without doing anyt
 (its gateway restarted, or it reconnected) subscribes on its new session. While the service is unreachable,
 `subscribeRfqs`, `requestQuote`, `attachQuote` and `GET /v4/rfqs` are refused with `UNAVAILABLE`.
 
+## Members and sessions
+
+A person who uses an app is a **member**: an email, a password and an account of their own. This is the first cut of
+interface 6, enough for the venue's own apps to sign people in; what a real identity service adds is listed at the end
+of this section.
+
+| | |
+|---|---|
+| `POST /v4/members` | Signs up: `email`, `password` (10 to 256 characters) and an optional `displayName`. Answers with `memberId`, `accountId`, `email`, `displayName` and a `session`. Taken from nobody, so it is limited by the address it came from. |
+| `POST /v4/sessions` | Logs in: `email` and `password`, answered the same way. An email is the same member whatever its case. |
+| `DELETE /v4/sessions/current` | Logs out the session the request is made with. |
+
+A session's `credential` is a bearer token like an API key's, and works everywhere one does: the `Authorization`
+header on REST, and `login` on `/v4/ws_private`. It holds `read`, `trade`, `transfers` and `keys` over its own
+account — not `respond`, which is a market maker's and needs the parlay service's approval. It lasts 30 days, and
+logging out ends it at once: the gateway forgets what it remembered about a credential whose session it has just
+ended, rather than letting it stand for the few seconds a cached answer would.
+
+A new member's account has no money. Deposits work as they do for any account (`POST /v4/transfers`), through the
+treasury and, in a test environment, its fake bank.
+
+The password is kept only as an Argon2id hash, and the session token only as a SHA-256 of itself, as an API key's
+secret is (G-2). An email that is not a member's and a password that is wrong are refused in the same words, and
+take the same time, so a refusal says nothing about which emails the venue knows.
+
+**Not in this cut**, and needed before anyone but a test environment relies on it: proving an email by sending to it,
+resetting a forgotten password, a second factor, locking an account after repeated failures, listing and ending a
+member's other sessions, and telling a member that someone signed in. Signing up also says whether an email is
+already a member's, which the real flow avoids by answering the same either way and sending mail.
+
 ## Browsers
 
 A page the venue serves itself calls the API from the same origin and needs nothing here. A page served from anywhere

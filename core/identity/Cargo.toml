@@ -15,5 +15,8 @@ venue-link = { path = "../link" }
 serde_json = "1"
 # A key's secret is kept as its SHA-256 (interfaces/gateway/decisions.md, G-2); the gateway already builds with it.
 sha2 = "0.11"
+# Argon2id for a member's password (core/identity/README.md, members): what a password store is meant to use, from
+# the same RustCrypto tree as sha2, so it shares digest 0.11 rather than bringing a second copy of it.
+argon2 = { version = "0.6", features = ["password-hash"] }
 # Its accounts and keys, in PostgreSQL.
 venue-store = { path = "../store" }

@@ -86,7 +86,8 @@ WebSocket, under the `gatewaySession` above.
 Every record has `conn` (a connection number, unique within the process), `peer` (`address:port` as the gateway saw
 it; behind a load balancer or an ingress, the proxy) and `half` (`public` or `private`); `client`, when a trusted
 proxy named the client it forwarded for (below); once a session or request is
-authenticated, `account`, and `key`, the API key's ID, when it was authenticated with one rather than a dev token; on a
+authenticated, `account`, and `key` — the API key's ID, or the member session's, whose prefixes tell them apart —
+when it was authenticated with one rather than a dev token; on a
 WebSocket once it has one, `session` (the engine session ID the gateway gave it).
 
 | `kind` | Fields |

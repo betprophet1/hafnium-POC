@@ -43,14 +43,19 @@ const fn rest_session(account: u64) -> u64 {
     account * 10
 }
 
+/// The token a request presents, if it presents one.
+pub(crate) fn bearer(request: &Request) -> Option<&str> {
+    request.headers.get("authorization").and_then(|h| h.strip_prefix("Bearer ")).map(str::trim)
+}
+
 /// The request's credential, authenticated, within its flood limit, and holding `permission`.
-fn credential(gateway: &Gateway, request: &Request, permission: Permissions) -> Result<Credential, ApiError> {
-    let token = request
-        .headers
-        .get("authorization")
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .ok_or_else(ApiError::unauthorized)?;
-    let credential = gateway.authenticate(token.trim())?;
+pub(crate) fn credential(
+    gateway: &Gateway,
+    request: &Request,
+    permission: Permissions,
+) -> Result<Credential, ApiError> {
+    let token = bearer(request).ok_or_else(ApiError::unauthorized)?;
+    let credential = gateway.authenticate(token)?;
     gateway.rest_rate(credential.account)?;
     credential.require(permission)?;
     Ok(credential)
@@ -81,11 +86,11 @@ fn body(request: &Request) -> Result<Value, ApiError> {
 }
 
 /// What `request` comes to. A request for the node is given `notify` to call once its answer can be taken.
-pub fn route(gateway: &Gateway, request: &Request, notify: &Notify) -> Routed {
-    route_or_refuse(gateway, request, notify).unwrap_or_else(|e| Routed::Now(Err(e)))
+pub fn route(gateway: &Gateway, request: &Request, client: &str, notify: &Notify) -> Routed {
+    route_or_refuse(gateway, request, client, notify).unwrap_or_else(|e| Routed::Now(Err(e)))
 }
 
-fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Result<Routed, ApiError> {
+fn route_or_refuse(gateway: &Gateway, request: &Request, client: &str, notify: &Notify) -> Result<Routed, ApiError> {
     // A path of the other half is not served here, as if it did not exist (README, public and private).
     if Half::of(&request.path).is_some_and(|half| half != gateway.half) {
         return Err(ApiError::not_found("no such route"));
@@ -174,6 +179,10 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, notify: &Notify) -> Res
             }
             Ok(Routed::Later(gateway.attach_quote_pending(account, &body, later())?))
         }
+        // Members and their sessions. Signing up and logging in are the only requests taken from nobody.
+        ("POST", ["v4", "members"] | ["v4", "sessions"]) | ("DELETE", ["v4", "sessions", _]) => {
+            Ok(Routed::Service(identity::members(gateway, request, client, notify)?))
+        }
         ("GET" | "POST", ["v4", "keys"]) | ("DELETE", ["v4", "keys", _]) => {
             let credential = credential(gateway, request, Permissions::KEYS)?;
             Ok(Routed::Service(identity::manage(gateway, &credential, request, notify)?))
@@ -254,6 +263,45 @@ mod tests {
         // Asked from anywhere else, it is a route that does not exist.
         let unasked = from_origin(&venue.address, "OPTIONS", "/v4/orders", Some("http://elsewhere.test"));
         assert!(unasked.starts_with("HTTP/1.1 404"), "{unasked}");
+    }
+
+    #[test]
+    fn a_member_signs_up_through_the_gateway_and_trades_with_the_session_it_answers() {
+        let venue = testing::venue("members");
+        let signing = json!({"email": "someone@example.com", "password": "a good long password"}).to_string();
+        let (status, member) = request(&venue.address, "POST", "/v4/members", None, Some(&signing));
+        assert_eq!(status, 200, "{member}");
+        let credential = member["session"]["credential"].as_str().expect("a credential").to_string();
+        let account = member["accountId"].as_str().expect("an account").to_string();
+
+        // The session is a credential everywhere a token is: its own account, and nobody else's.
+        let (status, seen) = request(&venue.address, "GET", "/v4/account", Some(&credential), None);
+        assert_eq!((status, &seen["accountId"]), (200, &json!(account)), "{seen}");
+        assert_eq!(seen["availableCents"], 0, "a new member has no money until they deposit: {seen}");
+
+        // It may trade, though it has nothing to trade with yet, and it may hold keys of its own.
+        // The order reaches the engine and is refused for want of money, not for want of a credential.
+        let (status, refused) = request(&venue.address, "POST", "/v4/orders", Some(&credential), Some(&order("m1")));
+        assert_eq!((status, refused["rejectReason"].as_str()), (200, Some("insufficient_sleeve")), "{refused}");
+        assert_eq!(request(&venue.address, "GET", "/v4/keys", Some(&credential), None).0, 200);
+
+        // Logging in again answers another session, and both work until one is ended.
+        let (status, again) = request(&venue.address, "POST", "/v4/sessions", None, Some(&signing));
+        assert_eq!(status, 200, "{again}");
+        let second = again["session"]["credential"].as_str().expect("a credential").to_string();
+        assert_eq!(request(&venue.address, "GET", "/v4/account", Some(&second), None).0, 200);
+        assert_eq!(request(&venue.address, "DELETE", "/v4/sessions/current", Some(&second), None).0, 200);
+        assert_eq!(
+            request(&venue.address, "GET", "/v4/account", Some(&second), None).0,
+            401,
+            "a session that logged out is nobody"
+        );
+        assert_eq!(request(&venue.address, "GET", "/v4/account", Some(&credential), None).0, 200, "the other stands");
+
+        // A dev token is not a member session, so it cannot log one out.
+        assert_eq!(request(&venue.address, "DELETE", "/v4/sessions/current", Some(MAKER_TOKEN), None).0, 400);
+        // Nor is a session anyone can guess.
+        assert_eq!(request(&venue.address, "GET", "/v4/account", Some("vs_0000000000000000.00"), None).0, 401);
     }
 
     /// POST /v4/rfqs as the retail customer. A parlay service refuses requests as unavailable while it is catching up

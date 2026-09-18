@@ -10,7 +10,8 @@
 
 use crate::clock;
 use crate::key::{self, Permissions};
-use crate::records::{KeyRecords, KeyRow};
+use crate::member;
+use crate::records::{KeyRecords, KeyRow, MemberRow, SessionRow};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -116,6 +117,7 @@ impl Key {
 /// A key a credential was verified as.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Verified {
+    /// The API key's ID, or the session's: both are IDs a log can name, and their prefixes tell them apart.
     pub key_id: String,
     pub account: u64,
     pub permissions: Permissions,
@@ -125,8 +127,10 @@ pub struct Verified {
 impl Verified {
     /// The answer to `POST /v1/verify`.
     pub fn json(&self) -> Value {
+        let session = self.key_id.starts_with(member::SESSION_PREFIX);
         json!({
-            "keyId": self.key_id, "accountId": self.account.to_string(), "permissions": self.permissions.names(),
+            "keyId": (!session).then(|| self.key_id.clone()), "sessionId": session.then(|| self.key_id.clone()),
+            "accountId": self.account.to_string(), "permissions": self.permissions.names(),
             "expiresAt": self.expires_at.map(clock::rfc3339)
         })
     }
@@ -135,6 +139,11 @@ impl Verified {
 #[derive(Default)]
 struct State {
     keys: BTreeMap<String, Key>,
+    /// Sessions that have not ended, by their ID: read at start and kept current, as the keys are, so that verifying
+    /// one costs a lock and a hash.
+    sessions: BTreeMap<String, SessionRow>,
+    /// The accounts this environment has: the catalogue's, and one for each member who has signed up.
+    accounts: BTreeSet<u64>,
     /// Each account's key IDs, oldest first.
     by_account: BTreeMap<u64, Vec<String>>,
     /// A write failed, so the records may hold something memory does not (a revocation whose acknowledgement was
@@ -142,11 +151,31 @@ struct State {
     stale: bool,
 }
 
+/// Account IDs for members who sign up start here, above anything a catalogue seeds, so an account a person made is
+/// told from an environment's own at a glance.
+const MEMBER_ACCOUNTS_FROM: u64 = 100_000;
+
+/// What a member may do with their own account: everything but answering requests for quote, which needs an approval
+/// the parlay service gives and is a market maker's business rather than a member's.
+const MEMBER_PERMISSIONS: Permissions =
+    Permissions::READ.with(Permissions::TRADE).with(Permissions::TRANSFERS).with(Permissions::KEYS);
+
+/// An Argon2id hash of a password nobody has, verified against when no member holds the email that was given, so that
+/// a refusal takes as long either way and says nothing about which emails this venue knows.
+const NO_SUCH_MEMBER_PHC: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$7a9UvJ5BPrGDQJXsfoRBqH4LKgXUcrFMnwjWBxbGGfM";
+
+fn records_refusal(e: venue_store::Error) -> Refusal {
+    if e.is_unavailable() {
+        Refusal::unavailable(e.to_string())
+    } else {
+        Refusal::bad(e.to_string())
+    }
+}
+
 pub struct Store {
     state: Mutex<State>,
     records: Arc<dyn KeyRecords>,
-    /// The accounts keys may be made for: the environment's catalogue.
-    accounts: BTreeSet<u64>,
 }
 
 fn locked(m: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -158,11 +187,15 @@ fn insert(state: &mut State, made: Key) {
     state.keys.insert(made.id.clone(), made);
 }
 
-fn read(records: &dyn KeyRecords) -> Result<State, String> {
-    let mut state = State::default();
+fn read(records: &dyn KeyRecords, accounts: BTreeSet<u64>, now: u64) -> Result<State, String> {
+    let mut state = State { accounts, ..State::default() };
     for row in records.load_keys()? {
         let key = Key::from_row(row)?;
         insert(&mut state, key);
+    }
+    for session in records.load_sessions(now)? {
+        state.accounts.insert(session.account);
+        state.sessions.insert(session.id.clone(), session);
     }
     Ok(state)
 }
@@ -170,8 +203,8 @@ fn read(records: &dyn KeyRecords) -> Result<State, String> {
 impl Store {
     /// The store whose keys are in `records`, read into memory.
     pub fn open(records: Arc<dyn KeyRecords>, accounts: BTreeSet<u64>) -> Result<Self, String> {
-        let state = read(records.as_ref())?;
-        Ok(Self { state: Mutex::new(state), records, accounts })
+        let state = read(records.as_ref(), accounts, clock::wall_ms())?;
+        Ok(Self { state: Mutex::new(state), records })
     }
 
     /// Reads the keys again if a write failed since they were last read. Verification carries on from memory if the
@@ -180,7 +213,7 @@ impl Store {
         if !state.stale {
             return Ok(());
         }
-        match read(self.records.as_ref()) {
+        match read(self.records.as_ref(), state.accounts.clone(), clock::wall_ms()) {
             Ok(mut again) => {
                 again.stale = false;
                 *state = again;
@@ -209,7 +242,7 @@ impl Store {
         {
             return Err(Refusal::bad(format!("unknown field {unknown}")));
         }
-        if !self.accounts.contains(&account) {
+        if !locked(&self.state).accounts.contains(&account) {
             return Err(Refusal::not_found("no such account"));
         }
         let label = fields
@@ -324,7 +357,146 @@ impl Store {
 
     /// Which key a credential is, if it is a valid one now, noting its use. Every refusal is `UNAUTHORIZED`; only a
     /// caller that knew the secret learns that the key was revoked or has expired (decision G-11).
+    /// A member signing up: an account of their own, their email and a hash of their password, and a session so the
+    /// app they signed up in does not have to log in again at once (interface 1 README, members and sessions).
+    pub fn sign_up(&self, body: &Value, now: u64) -> Result<Value, Refusal> {
+        let fields = body.as_object().ok_or_else(|| Refusal::bad("the body must be a JSON object"))?;
+        if let Some(unknown) = fields.keys().find(|k| !["email", "password", "displayName"].contains(&k.as_str())) {
+            return Err(Refusal::bad(format!("unknown field {unknown}")));
+        }
+        let email = member::normalise_email(fields.get("email").and_then(Value::as_str).unwrap_or_default());
+        if !member::looks_like_email(&email) {
+            return Err(Refusal::bad("email must be an email address"));
+        }
+        let password = fields.get("password").and_then(Value::as_str).unwrap_or_default();
+        if !(member::MIN_PASSWORD..=member::MAX_PASSWORD).contains(&password.chars().count()) {
+            return Err(Refusal::bad(format!(
+                "password must be {} to {} characters",
+                member::MIN_PASSWORD,
+                member::MAX_PASSWORD
+            )));
+        }
+        let display_name = match fields.get("displayName").and_then(Value::as_str) {
+            Some(name) if (1..=64).contains(&name.chars().count()) => name.to_string(),
+            Some(_) => return Err(Refusal::bad("displayName must be 1 to 64 characters")),
+            None => email.split('@').next().unwrap_or("member").to_string(),
+        };
+        let account = self.records.next_account(MEMBER_ACCOUNTS_FROM).map_err(records_refusal)?;
+        let row = MemberRow {
+            id: member::new_member_id().map_err(|e| Refusal::unavailable(format!("an ID: {e}")))?,
+            account,
+            email,
+            password_phc: member::hash_password(password).map_err(Refusal::unavailable)?,
+            display_name: display_name.clone(),
+            created_at: now,
+            disabled_at: None,
+        };
+        self.records.create_member(&row, &display_name, now).map_err(records_refusal)?;
+        locked(&self.state).accounts.insert(account);
+        let session = self.start_session(&row, now)?;
+        Ok(json!({
+            "memberId": row.id, "accountId": account.to_string(), "email": row.email,
+            "displayName": row.display_name, "session": session
+        }))
+    }
+
+    /// Logging in: the email and password of a member, answered with a session for their app to hold.
+    pub fn log_in(&self, body: &Value, now: u64) -> Result<Value, Refusal> {
+        let fields = body.as_object().ok_or_else(|| Refusal::bad("the body must be a JSON object"))?;
+        let email = member::normalise_email(fields.get("email").and_then(Value::as_str).unwrap_or_default());
+        let password = fields.get("password").and_then(Value::as_str).unwrap_or_default();
+        let wrong = || Refusal::unauthorized("the email or password is wrong");
+        let found = self.records.member_by_email(&email).map_err(records_refusal)?;
+        let Some(row) = found else {
+            // A password is hashed either way, so that how long a refusal took says nothing about whether the email
+            // is one this venue knows.
+            let _ = member::password_matches(NO_SUCH_MEMBER_PHC, password);
+            return Err(wrong());
+        };
+        if !member::password_matches(&row.password_phc, password) {
+            return Err(wrong());
+        }
+        if row.disabled_at.is_some() {
+            return Err(Refusal::unauthorized("this member cannot log in"));
+        }
+        let session = self.start_session(&row, now)?;
+        Ok(json!({
+            "memberId": row.id, "accountId": row.account.to_string(), "email": row.email,
+            "displayName": row.display_name, "session": session
+        }))
+    }
+
+    /// A session, written down and then kept in memory, and answered with its credential — the only time the secret
+    /// exists anywhere but the app that asked for it.
+    fn start_session(&self, member: &MemberRow, now: u64) -> Result<Value, Refusal> {
+        let id = member::new_session_id().map_err(|e| Refusal::unavailable(format!("an ID: {e}")))?;
+        let secret = member::new_secret().map_err(|e| Refusal::unavailable(format!("a secret: {e}")))?;
+        let row = SessionRow {
+            id: id.clone(),
+            member: member.id.clone(),
+            account: member.account,
+            hash: member::hash(&id, &secret),
+            created_at: now,
+            expires_at: now.saturating_add(member::SESSION_SECONDS * 1000),
+            ended_at: None,
+            last_used: None,
+        };
+        self.records.create_session(&row).map_err(records_refusal)?;
+        let expires = row.expires_at;
+        locked(&self.state).sessions.insert(id.clone(), row);
+        Ok(json!({
+            "sessionId": id, "credential": format!("{id}.{secret}"), "expiresAt": clock::rfc3339(expires)
+        }))
+    }
+
+    /// Logging out. A session that has already ended answers as it did, so an app repeating the call is not an error.
+    pub fn log_out(&self, session_id: &str, now: u64) -> Result<Value, Refusal> {
+        let ended = self.records.end_session(session_id, now).map_err(|e| match e {
+            e if e.is_unavailable() => Refusal::unavailable(e.to_string()),
+            _ => Refusal::not_found("no such session"),
+        })?;
+        let mut state = locked(&self.state);
+        state.sessions.remove(session_id);
+        Ok(json!({"sessionId": session_id, "endedAt": clock::rfc3339(ended)}))
+    }
+
+    /// Verifying a session: the same shape as a key's, and the same answer to the gateway, with the permissions a
+    /// member holds over their own account.
+    fn verify_session(&self, credential: &str, now: u64) -> Result<Verified, Refusal> {
+        let invalid = || Refusal::unauthorized("the session is not valid");
+        let (id, secret) = member::split(credential).ok_or_else(invalid)?;
+        let presented = member::hash(id, secret);
+        let mut state = locked(&self.state);
+        let _ = self.fresh(&mut state);
+        let found = state.sessions.get(id).ok_or_else(invalid)?;
+        if !key::same(&found.hash, &presented) {
+            return Err(invalid());
+        }
+        if found.ended_at.is_some() {
+            return Err(Refusal::unauthorized("the session has ended"));
+        }
+        if found.expires_at <= now {
+            return Err(Refusal::unauthorized("the session has expired"));
+        }
+        let verified = Verified {
+            key_id: found.id.clone(),
+            account: found.account,
+            permissions: MEMBER_PERMISSIONS,
+            expires_at: Some(found.expires_at),
+        };
+        let due = found.last_used.is_none_or(|t| now >= t.saturating_add(USED_EVERY_MS));
+        if due && self.records.session_used(id, now).is_ok() {
+            if let Some(s) = state.sessions.get_mut(id) {
+                s.last_used = Some(now);
+            }
+        }
+        Ok(verified)
+    }
+
     pub fn verify(&self, credential: &str, now: u64) -> Result<Verified, Refusal> {
+        if member::looks_like_session(credential) {
+            return self.verify_session(credential, now);
+        }
         let invalid = || Refusal::unauthorized("the API key is not valid");
         let (id, secret) = key::split(credential).ok_or_else(invalid)?;
         let presented = key::hash(id, secret);

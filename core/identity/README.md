@@ -61,8 +61,28 @@ interface 1's terms (`Key`, `KeyCreated`, `Keys`, `Error`), so the gateway passe
 | `POST /v1/accounts/{accountId}/keys` | makes a key: a `KeyRequest`, plus `createdBy` (a key ID) when a key asked; answers `KeyCreated` |
 | `GET /v1/accounts/{accountId}/keys` | every key of the account, newest first |
 | `DELETE /v1/accounts/{accountId}/keys/{keyId}` | revokes a key; one already revoked is answered as it is |
-| `POST /v1/verify` | `{"credential": "<keyId>.<secret>"}`: `{"keyId", "accountId", "permissions", "expiresAt"}`, or 401 `UNAUTHORIZED` for an unknown, wrong, revoked or expired key; notes the key's use |
+| `POST /v1/members` | signs a member up: `email`, `password`, optional `displayName`; makes their account and answers with a session |
+| `POST /v1/sessions` | logs a member in: `email` and `password`, answered as signing up is |
+| `DELETE /v1/sessions/{sessionId}` | ends a session; one already ended is answered as it is |
+| `POST /v1/verify` | `{"credential": "<id>.<secret>"}` for a key or a session: `{"keyId", "sessionId", "accountId", "permissions", "expiresAt"}` — whichever it was is named and the other is null — or 401 `UNAUTHORIZED` for an unknown, wrong, revoked, ended or expired credential; notes the use |
 | `GET /healthz` | |
+
+## Members
+
+A member is the person behind an account: an email, a password and nothing else about them yet. This is the first cut
+of interface 6 (interfaces/gateway/README.md, members and sessions; decision G-16), for the venue's own apps to sign
+people in with.
+
+- **The password** is kept as an Argon2id hash and never as itself. Ten characters at least, and nothing else is
+  demanded: composition rules make weaker passwords, and checking one against the breached corpora is the real
+  service's to do.
+- **A session** is what an app holds afterwards. Its token is kept as a SHA-256, as a key's secret is, and the
+  service verifies it from memory as it verifies keys — sessions are read at start and kept current. It lasts 30
+  days, and logging out ends it.
+- **An account** comes with the member, numbered from 100,000 so that accounts people made are told from an
+  environment's own at a glance. It starts with no money.
+- **Personal data** lives here and nowhere else (blueprint §12): `members` holds the email, and nothing about a member
+  reaches the journal, ClickHouse or Valkey. The account ID is what everything else refers to.
 
 The gateway enforces what a caller may make (a key's permissions and expiry no more than the key asking); the service
 checks only that a key is well formed and its account is in the catalogue. An operator with network access to the

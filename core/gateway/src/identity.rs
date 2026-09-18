@@ -28,6 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use venue_identity::clock;
 use venue_identity::key::{self, Permissions};
+use venue_identity::member;
 use venue_link::submit::Notify;
 use venue_telemetry::log;
 
@@ -56,7 +57,8 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone, Debug)]
 pub struct Credential {
     pub account: u64,
-    /// The API key's ID; none for a dev token.
+    /// The ID of the credential that authenticated: an API key's (`ak_`) or a member session's (`vs_`), which their
+    /// prefixes tell apart. None for a dev token, which has no ID.
     pub key: Option<String>,
     pub permissions: Permissions,
     /// When the key expires, in milliseconds since the epoch.
@@ -151,8 +153,8 @@ impl Identity {
             .ok_or_else(|| ApiError::unavailable("API keys are not served here: this gateway has no identity service"))
     }
 
-    /// Who a key's credential is: remembered, or asked of the service.
-    pub fn verify_key(&self, credential: &str) -> Result<Credential, ApiError> {
+    /// Who a credential is — an API key's or a member's session — remembered, or asked of the service.
+    pub fn verify_credential(&self, credential: &str) -> Result<Credential, ApiError> {
         let address = self.address()?;
         let fingerprint: [u8; 32] = Sha256::digest(credential.as_bytes()).into();
         let now = monotonic();
@@ -166,6 +168,14 @@ impl Identity {
         let answer = verdict.answer();
         self.remember(fingerprint, credential, verdict, now);
         answer
+    }
+
+    /// Forgets what was remembered about a credential, so the next request asks the identity service again. Used
+    /// when the gateway itself has just ended a session: waiting for the answer to go stale would leave a token that
+    /// logged out working until it did.
+    pub fn forget(&self, credential: &str) {
+        let fingerprint: [u8; 32] = Sha256::digest(credential.as_bytes()).into();
+        locked(&self.remembered).remove(&fingerprint);
     }
 
     fn remember(&self, fingerprint: [u8; 32], credential: &str, verdict: Verdict, now: Instant) {
@@ -218,6 +228,11 @@ impl Identity {
 
     /// Passes a call managing keys to the service, as the same call under the account's own path there.
     fn pass(&self, account: u64, method: &str, suffix: &str, body: &[u8], notify: Notify) -> Result<Call, ApiError> {
+        self.pass_to(method, &format!("/v1/accounts/{account}/keys{suffix}"), body, notify)
+    }
+
+    /// The same, to a path of the identity service's own: members and sessions are not an account's keys.
+    fn pass_to(&self, method: &str, path: &str, body: &[u8], notify: Notify) -> Result<Call, ApiError> {
         let address = self.address()?.to_string();
         if self.calls.fetch_add(1, Ordering::SeqCst) >= MAX_CALLS {
             self.calls.fetch_sub(1, Ordering::SeqCst);
@@ -225,7 +240,7 @@ impl Identity {
             return Err(ApiError::unavailable("too many key requests at once; nothing was sent, so try again"));
         }
         let head = format!(
-            "{method} /v1/accounts/{account}/keys{suffix} HTTP/1.1\r\nHost: identity\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: identity\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         let mut request = head.into_bytes();
@@ -289,7 +304,14 @@ fn valid(answer: &Value, fingerprint: [u8; 32]) -> Option<Credential> {
     let names = answer["permissions"].as_array()?.iter().map(Value::as_str).collect::<Option<Vec<&str>>>()?;
     Some(Credential {
         account: answer["accountId"].as_str()?.parse().ok()?,
-        key: Some(answer["keyId"].as_str().filter(|id| key::is_id(id))?.to_string()),
+        // A key or a session: the identity service answers with whichever it verified.
+        key: Some(
+            answer["keyId"]
+                .as_str()
+                .filter(|id| key::is_id(id))
+                .or_else(|| answer["sessionId"].as_str().filter(|id| member::is_session_id(id)))?
+                .to_string(),
+        ),
         permissions: Permissions::from_names(names).ok()?,
         expires_at: match &answer["expiresAt"] {
             Value::Null => None,
@@ -324,6 +346,41 @@ fn verify_call(address: &str, credential: &str) -> Result<(u16, Value), String> 
 }
 
 /// `/v4/keys`: the caller authenticated and allowed to manage keys, then the call passed to the identity service.
+/// Signing up, logging in and logging out, passed to the identity service (interface 1 README, members and
+/// sessions). The first two are the only requests the gateway takes from nobody, so they are limited by where they
+/// came from rather than by an account.
+pub fn members(gateway: &Gateway, request: &Request, client: &str, notify: &Notify) -> Result<Call, ApiError> {
+    let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
+    let identity = &gateway.identity;
+    let notify = Arc::clone(notify);
+    match (request.method.as_str(), segments.as_slice()) {
+        ("POST", ["v4", "members"]) => {
+            gateway.anonymous_rate(client)?;
+            identity.pass_to("POST", "/v1/members", &request.body, notify)
+        }
+        ("POST", ["v4", "sessions"]) => {
+            gateway.anonymous_rate(client)?;
+            identity.pass_to("POST", "/v1/sessions", &request.body, notify)
+        }
+        ("DELETE", ["v4", "sessions", "current"]) => {
+            // Only the session itself may end itself, which is what holding its credential proves.
+            let credential = crate::rest::credential(gateway, request, Permissions::READ)?;
+            let session = credential
+                .key
+                .as_deref()
+                .filter(|id| member::is_session_id(id))
+                .ok_or_else(|| ApiError::bad("this is not a member session"))?;
+            // Forgotten here rather than when the answer comes: if the call fails the session stands, and the only
+            // cost is that the next request verifies it again.
+            if let Some(token) = crate::rest::bearer(request) {
+                identity.forget(token);
+            }
+            identity.pass_to("DELETE", &format!("/v1/sessions/{session}"), &[], notify)
+        }
+        _ => Err(ApiError::not_found("no such route")),
+    }
+}
+
 pub fn manage(
     gateway: &Gateway,
     credential: &Credential,
@@ -817,6 +874,6 @@ mod tests {
         assert_eq!(closed.authenticate(MAKER_TOKEN).map(|_| ()).expect_err("dev tokens refused").status, 401);
         let metrics = crate::metrics::Metrics::unregistered().half(crate::api::Half::Private);
         let away = Identity::new(Some("127.0.0.1:17998".into()), true, metrics);
-        assert_eq!(away.verify_key(&key).map(|_| ()).expect_err("nobody answers").status, 503);
+        assert_eq!(away.verify_credential(&key).map(|_| ()).expect_err("nobody answers").status, 503);
     }
 }

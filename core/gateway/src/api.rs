@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use venue_identity::key;
+use venue_identity::member;
 use venue_link::submit::{self, Notify, Submit};
 use venue_link::wire;
 use venue_telemetry::log;
@@ -293,11 +294,10 @@ impl Half {
         let path = path.split('?').next().unwrap_or("");
         match path {
             "/v4/ws_public" | "/v4/markets" => Some(Self::Public),
-            "/v4/ws_private" | "/v4/account" | "/v4/orders" | "/v4/transfers" | "/v4/rfqs" | "/v4/keys" => {
-                Some(Self::Private)
-            }
+            "/v4/ws_private" | "/v4/account" | "/v4/orders" | "/v4/transfers" | "/v4/rfqs" | "/v4/keys"
+            | "/v4/members" | "/v4/sessions" => Some(Self::Private),
             p if p.starts_with("/v4/markets/") => Some(Self::Public),
-            p if ["/v4/orders/", "/v4/transfers/", "/v4/rfqs/", "/v4/keys/"]
+            p if ["/v4/orders/", "/v4/transfers/", "/v4/rfqs/", "/v4/keys/", "/v4/sessions/"]
                 .iter()
                 .any(|under| p.starts_with(under)) =>
             {
@@ -307,6 +307,10 @@ impl Half {
         }
     }
 }
+
+/// Clients kept in the anonymous flood-limit table before one bucket stands for the rest: enough for every device a
+/// demo or a small venue sees at once, and bounded so that a flood of addresses cannot grow it without end.
+const MAX_ANONYMOUS: usize = 10_000;
 
 pub struct Gateway {
     pub half: Half,
@@ -318,6 +322,8 @@ pub struct Gateway {
     parlays: OnceLock<Parlays>,
     pub limits: Limits,
     rest_buckets: Mutex<BTreeMap<u64, Bucket>>,
+    /// Buckets for requests nobody has authenticated, by the client they came from (`anonymous_rate`).
+    anonymous_buckets: Mutex<BTreeMap<String, Bucket>>,
     logon_buckets: Mutex<BTreeMap<u64, Bucket>>,
     /// Where deposits and withdrawals go, when this private half offers them.
     treasury: Option<Treasury>,
@@ -354,6 +360,7 @@ impl Gateway {
             parlays: OnceLock::new(),
             limits,
             rest_buckets: Mutex::new(BTreeMap::new()),
+            anonymous_buckets: Mutex::new(BTreeMap::new()),
             logon_buckets: Mutex::new(BTreeMap::new()),
             treasury: None,
             audit: Audit::disabled(),
@@ -428,13 +435,39 @@ impl Gateway {
     /// Who a credential is: an API key's, by the identity service (interfaces/gateway/README.md, API keys and
     /// permissions), or a dev token's, by the catalogue, holding every permission.
     pub fn authenticate(&self, token: &str) -> Result<Credential, ApiError> {
-        if key::looks_like_key(token) {
-            return self.identity.verify_key(token);
+        if key::looks_like_key(token) || member::looks_like_session(token) {
+            return self.identity.verify_credential(token);
         }
         if !self.identity.dev_tokens {
             return Err(ApiError::unauthorized());
         }
         self.hub().account_for(token).map(Credential::dev_token).ok_or_else(ApiError::unauthorized)
+    }
+
+    /// Requests nobody has authenticated — signing up, logging in — are limited by where they came from, since there
+    /// is no account yet to limit. A client behind a proxy is whoever the proxy said it was (`forwarded.rs`), so one
+    /// address behind a load balancer does not stand for everyone. The rate is the logon rate: guessing a password is
+    /// what this stops, and a person logs in seldom.
+    pub fn anonymous_rate(&self, client: &str) -> Result<(), ApiError> {
+        let mut buckets = locked(&self.anonymous_buckets);
+        if buckets.len() > MAX_ANONYMOUS && !buckets.contains_key(client) {
+            // Every address gets its own bucket until there are too many to keep; past that, one shared bucket bounds
+            // what a flood of new addresses can do, which is the only thing left to protect.
+            let shared = buckets.entry(String::new()).or_insert_with(|| {
+                Bucket::per_minute(self.limits.logons_per_minute * 10, self.limits.logons_per_minute * 10)
+            });
+            return shared.take(monotonic()).map_err(|wait| {
+                self.metrics.rate_limited(Limit::Logon);
+                ApiError::rate_limited(wait)
+            });
+        }
+        let bucket = buckets
+            .entry(client.to_string())
+            .or_insert_with(|| Bucket::per_minute(self.limits.logons_per_minute, self.limits.logons_per_minute));
+        bucket.take(monotonic()).map_err(|wait| {
+            self.metrics.rate_limited(Limit::Logon);
+            ApiError::rate_limited(wait)
+        })
     }
 
     /// REST requests have no session, so their flood limit is per account.

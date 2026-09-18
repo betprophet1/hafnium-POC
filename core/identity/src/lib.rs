@@ -6,6 +6,7 @@
 
 pub mod clock;
 pub mod key;
+pub mod member;
 pub mod records;
 pub mod service;
 pub mod store;

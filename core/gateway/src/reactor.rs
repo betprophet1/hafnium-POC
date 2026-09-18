@@ -449,7 +449,15 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, origin: &mut 
                     let allowed = http.cors.take().unwrap_or_default();
                     http.response = http::preflight(&allowed);
                 } else {
-                    match rest::route(gateway, &request, notify) {
+                    // Whom a flood limit counts against when nobody has authenticated: the client a trusted proxy named,
+                    // or the address the connection came from.
+                    // The address, never the port: a new connection from one client would otherwise be a new bucket.
+                    let client = origin
+                        .client
+                        .clone()
+                        .or_else(|| origin.ip.map(|ip| ip.to_string()))
+                        .unwrap_or_else(|| origin.peer.clone());
+                    match rest::route(gateway, &request, &client, notify) {
                         rest::Routed::Now(answer) => http.response = rest::response(answer),
                         rest::Routed::Later(pending) => http.pending = Some(pending),
                         rest::Routed::Service(call) => http.call = Some(call),

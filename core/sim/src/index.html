@@ -149,6 +149,7 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
       <button data-tab="account">Account</button>
       <button data-tab="parlays">Parlays</button>
       <button data-tab="settle">Settlement</button>
+      <button data-tab="members">Sign up</button>
     </div>
 
     <div id="tab-maker">
@@ -246,6 +247,25 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
       </div>
       <h3>Requests and quotes</h3><div id="rfqs"></div>
       <h3>Parlays</h3><div id="parlays"></div>
+    </div>
+
+    <div id="tab-members" hidden>
+      <p class="note">What an app's customer does: sign up with an email and a password, and hold the session the venue answers with. The same credential works everywhere a dev token does — REST and the private WebSocket — so the phone apps and this page reach the venue the same way. A new member has an account of their own and no money in it; deposit on the account tab to trade.</p>
+      <div class="money">
+        <form id="signUpForm">
+          <h4>Sign up</h4>
+          <label>Email<input id="suEmail" type="email" placeholder="someone@example.com" autocomplete="username"></label>
+          <label>Password<input id="suPassword" type="password" placeholder="at least 10 characters" autocomplete="new-password"></label>
+          <button class="primary">Sign up</button>
+        </form>
+        <form id="logInForm">
+          <h4>Log in</h4>
+          <label>Email<input id="liEmail" type="email" autocomplete="username"></label>
+          <label>Password<input id="liPassword" type="password" autocomplete="current-password"></label>
+          <button>Log in</button>
+        </form>
+      </div>
+      <div id="memberWho"></div>
     </div>
 
     <div id="tab-settle" hidden>
@@ -381,8 +401,16 @@ function onFeed(msg) {
 function openSession(name) {
   const account = C.accounts.find(a => a.tab === name);
   if (!account) return;
-  const s = sessions[name] = {name, token: account.token, label: account.name, id: String(account.id), ws: null, open: false, account: null, last: null, refresh: 0};
+  startSession({name, token: account.token, label: account.name, id: String(account.id)});
+}
+
+// A private session over the WebSocket, whatever the credential is: a dev token here, a member's session on the
+// members tab, an API key in someone else's client. The gateway tells them apart; nothing below this line does.
+function startSession(who) {
+  const name = who.name;
+  const s = sessions[name] = {...who, ws: null, open: false, account: null, last: null, refresh: 0};
   const connect = () => {
+    if (sessions[name] !== s) return;
     const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/v4/ws_private');
     s.ws = ws;
     ws.onopen = () => {
@@ -1071,13 +1099,86 @@ function placeRetail() {
   send('retail', 'order', body);
 }
 
+// A member of the venue, as an app's customer is: what signing up answered, kept in this browser so a reload does
+// not log them out. The credential is the only copy of the session's secret anywhere but the records' hash of it.
+let member = null;
+try { member = JSON.parse(localStorage.getItem('venue-member') || 'null'); } catch (e) { member = null; }
+
+function rememberMember(who) {
+  member = who;
+  try {
+    if (who) localStorage.setItem('venue-member', JSON.stringify(who));
+    else localStorage.removeItem('venue-member');
+  } catch (e) { /* a browser that keeps nothing still works for this session */ }
+  if (who) startSession({name: 'member', token: who.session.credential, label: who.email, id: who.accountId});
+  else { const s = sessions.member; delete sessions.member; if (s && s.ws) { clearInterval(s.beat); s.ws.close(); } }
+  renderMember();
+  renderStatus();
+}
+
+async function memberCall(path, body) {
+  const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const answer = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((answer.error && answer.error.message) || ('the venue answered ' + r.status));
+  return answer;
+}
+
+function renderMember() {
+  const who = $('#memberWho');
+  if (!who) return;
+  if (!member) {
+    who.innerHTML = '<p class="note">Nobody is signed in on this browser.</p>';
+    return;
+  }
+  const s = sessions.member;
+  const cash = s && s.account ? money(s.account.availableCents) : '—';
+  const reserved = s && s.account ? money(s.account.reservedCents) : '—';
+  who.innerHTML = `<h3>Signed in</h3>
+    <table>
+      <tr><th>Email</th><td>${esc(member.email)}</td></tr>
+      <tr><th>Member</th><td><code>${esc(member.memberId)}</code></td></tr>
+      <tr><th>Account</th><td><code>${esc(member.accountId)}</code></td></tr>
+      <tr><th>Session</th><td><code>${esc(member.session.sessionId)}</code>, until ${esc(member.session.expiresAt)}</td></tr>
+      <tr><th>Stream</th><td>${s && s.open ? 'connected' : 'connecting'}</td></tr>
+      <tr><th>Available</th><td>${cash}</td></tr>
+      <tr><th>Reserved</th><td>${reserved}</td></tr>
+    </table>
+    <p><button id="logOut">Log out</button></p>
+    <p class="note">This is what an app holds after logging in. Deposit on the account tab to give it money to trade with.</p>`;
+}
+
 function showTab(name) {
   tab = name;
   for (const b of document.querySelectorAll('[data-tab]')) b.classList.toggle('on', b.dataset.tab === name);
-  for (const t of ['maker', 'retail', 'account', 'parlays', 'settle']) $('#tab-' + t).hidden = t !== name;
+  for (const t of ['maker', 'retail', 'account', 'parlays', 'settle', 'members']) $('#tab-' + t).hidden = t !== name;
   render();
   if (name === 'parlays') loadAllMarkets();
+  if (name === 'members') renderMember();
 }
+
+for (const [form, path, fields] of [['#signUpForm', '/v4/members', ['#suEmail', '#suPassword']],
+                                   ['#logInForm', '/v4/sessions', ['#liEmail', '#liPassword']]]) {
+  const node = $(form);
+  if (!node) continue;
+  node.addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const [email, password] = fields.map(f => $(f).value);
+    try {
+      rememberMember(await memberCall(path, {email, password}));
+      for (const f of fields) $(f).value = '';
+    } catch (e) { toast(String(e.message || e), 'bad'); }
+  });
+}
+
+document.addEventListener('click', ev => {
+  if (ev.target && ev.target.id === 'logOut') {
+    const token = member && member.session.credential;
+    rememberMember(null);
+    // Ending it at the venue as well, so the token stops working there and not only here.
+    if (token) fetch('/v4/sessions/current', {method: 'DELETE', headers: {Authorization: 'Bearer ' + token}}).catch(() => {});
+    return;
+  }
+});
 
 document.addEventListener('click', ev => {
   const t = ev.target.closest('button, .q');

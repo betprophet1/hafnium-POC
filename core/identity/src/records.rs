@@ -21,11 +21,18 @@ pub use venue_store::Error;
 use venue_store::{big, millis, time, unsigned, Database, Migration};
 
 /// The identity service's schema, in order. A released migration is never edited: a change is a new one.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: "20260917000001",
-    name: "accounts_and_keys",
-    sql: include_str!("../migrations/20260917000001_accounts_and_keys.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: "20260917000001",
+        name: "accounts_and_keys",
+        sql: include_str!("../migrations/20260917000001_accounts_and_keys.sql"),
+    },
+    Migration {
+        version: "20260918000001",
+        name: "members_and_sessions",
+        sql: include_str!("../migrations/20260918000001_members_and_sessions.sql"),
+    },
+];
 
 /// An account as the catalogue describes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +66,31 @@ pub struct KeyRow {
     pub last_used: Option<u64>,
 }
 
+/// A member: the person behind an account (`member.rs`). The password is here only as its Argon2id hash.
+#[derive(Clone, Debug)]
+pub struct MemberRow {
+    pub id: String,
+    pub account: u64,
+    pub email: String,
+    pub password_phc: String,
+    pub display_name: String,
+    pub created_at: u64,
+    pub disabled_at: Option<u64>,
+}
+
+/// A session a member logged in with. The token is here only as its SHA-256.
+#[derive(Clone, Debug)]
+pub struct SessionRow {
+    pub id: String,
+    pub member: String,
+    pub account: u64,
+    pub hash: [u8; 32],
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub ended_at: Option<u64>,
+    pub last_used: Option<u64>,
+}
+
 pub trait KeyRecords: Send + Sync {
     /// Makes the accounts table say what the catalogue says: new accounts added, names and dev tokens brought up to
     /// date, accounts no longer listed kept (a mapping outlives the records that refer to it).
@@ -70,12 +102,26 @@ pub trait KeyRecords: Send + Sync {
     fn revoke(&self, key_id: &str, at: u64) -> Result<u64, Error>;
     fn used(&self, key_id: &str, at: u64) -> Result<(), Error>;
     fn ping(&self) -> Result<(), Error>;
+
+    /// The account ID a member signing up is given: one above every account the environment holds, and never below
+    /// `floor`, so that accounts people made are told apart from the catalogue's at a glance.
+    fn next_account(&self, floor: u64) -> Result<u64, Error>;
+    /// Writes an account and the member of it together: either both or neither.
+    fn create_member(&self, member: &MemberRow, name: &str, now: u64) -> Result<(), Error>;
+    /// The member who logs in with `email`, if there is one. Read when someone logs in, not on every request.
+    fn member_by_email(&self, email: &str) -> Result<Option<MemberRow>, Error>;
+    /// Every session that has not ended and has not expired at `now`, read once at start.
+    fn load_sessions(&self, now: u64) -> Result<Vec<SessionRow>, Error>;
+    fn create_session(&self, session: &SessionRow) -> Result<(), Error>;
+    /// Ends a session, and returns when it ended: `at`, or an earlier end the records already hold.
+    fn end_session(&self, session_id: &str, at: u64) -> Result<u64, Error>;
+    fn session_used(&self, session_id: &str, at: u64) -> Result<(), Error>;
 }
 
 /// Records in memory: shared by clones, so a store opened again on a clone is a restarted one; can be told to be
 /// unreachable.
 /// The accounts and keys held in memory.
-type Held = (BTreeMap<u64, Account>, Vec<KeyRow>);
+type Held = (BTreeMap<u64, Account>, Vec<KeyRow>, Vec<MemberRow>, Vec<SessionRow>);
 
 #[derive(Clone, Default)]
 pub struct Memory {
@@ -134,6 +180,49 @@ impl KeyRecords for Memory {
 
     fn ping(&self) -> Result<(), Error> {
         self.data().map(|_| ())
+    }
+
+    fn next_account(&self, floor: u64) -> Result<u64, Error> {
+        let data = self.data()?;
+        Ok(data.0.keys().copied().max().map_or(floor, |top| top.saturating_add(1).max(floor)))
+    }
+
+    fn create_member(&self, member: &MemberRow, name: &str, _now: u64) -> Result<(), Error> {
+        let mut data = self.data()?;
+        if data.2.iter().any(|m| m.email == member.email) {
+            return Err(Error::refused("that email already has an account"));
+        }
+        data.0.insert(member.account, Account { id: member.account, name: name.to_string(), dev_token: None });
+        data.2.push(member.clone());
+        Ok(())
+    }
+
+    fn member_by_email(&self, email: &str) -> Result<Option<MemberRow>, Error> {
+        Ok(self.data()?.2.iter().find(|m| m.email == email).cloned())
+    }
+
+    fn load_sessions(&self, now: u64) -> Result<Vec<SessionRow>, Error> {
+        Ok(self.data()?.3.iter().filter(|s| s.ended_at.is_none() && s.expires_at > now).cloned().collect())
+    }
+
+    fn create_session(&self, session: &SessionRow) -> Result<(), Error> {
+        self.data()?.3.push(session.clone());
+        Ok(())
+    }
+
+    fn end_session(&self, session_id: &str, at: u64) -> Result<u64, Error> {
+        let mut data = self.data()?;
+        let session =
+            data.3.iter_mut().find(|s| s.id == session_id).ok_or_else(|| Error::refused("no such session"))?;
+        Ok(*session.ended_at.get_or_insert(at))
+    }
+
+    fn session_used(&self, session_id: &str, at: u64) -> Result<(), Error> {
+        let mut data = self.data()?;
+        if let Some(session) = data.3.iter_mut().find(|s| s.id == session_id) {
+            session.last_used = Some(session.last_used.map_or(at, |t| t.max(at)));
+        }
+        Ok(())
     }
 }
 
@@ -231,6 +320,101 @@ impl KeyRecords for Postgres {
     fn ping(&self) -> Result<(), Error> {
         self.db.ping()
     }
+
+    fn next_account(&self, floor: u64) -> Result<u64, Error> {
+        let row = self.db.get()?.query_one("SELECT coalesce(max(account_id), 0) + 1 FROM accounts", &[])?;
+        Ok(unsigned(row.get(0))?.max(floor))
+    }
+
+    fn create_member(&self, m: &MemberRow, name: &str, now: u64) -> Result<(), Error> {
+        self.db.transaction(|tx| {
+            tx.execute(
+                "INSERT INTO accounts (account_id, display_name, dev_token_sha256, created_at, updated_at)
+                 VALUES ($1, $2, NULL, $3, $3)",
+                &[&big(m.account)?, &name, &time(now)],
+            )?;
+            tx.execute(
+                "INSERT INTO members (member_id, account_id, email, password_phc, display_name, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[&m.id, &big(m.account)?, &m.email, &m.password_phc, &m.display_name, &time(m.created_at)],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn member_by_email(&self, email: &str) -> Result<Option<MemberRow>, Error> {
+        let row = self.db.get()?.query_opt("SELECT * FROM members WHERE email = $1", &[&email])?;
+        row.as_ref().map(member_from).transpose()
+    }
+
+    fn load_sessions(&self, now: u64) -> Result<Vec<SessionRow>, Error> {
+        self.db
+            .get()?
+            .query(
+                "SELECT s.*, m.account_id FROM member_sessions s JOIN members m USING (member_id)
+                 WHERE s.ended_at IS NULL AND s.expires_at > $1",
+                &[&time(now)],
+            )?
+            .iter()
+            .map(session_from)
+            .collect()
+    }
+
+    fn create_session(&self, s: &SessionRow) -> Result<(), Error> {
+        self.db.get()?.execute(
+            "INSERT INTO member_sessions (session_id, member_id, token_sha256, created_at, expires_at)
+             VALUES ($1, $2, $3, $4, $5)",
+            &[&s.id, &s.member, &s.hash.to_vec(), &time(s.created_at), &time(s.expires_at)],
+        )?;
+        Ok(())
+    }
+
+    fn end_session(&self, session_id: &str, at: u64) -> Result<u64, Error> {
+        let mut conn = self.db.get()?;
+        conn.execute(
+            "UPDATE member_sessions SET ended_at = $2 WHERE session_id = $1 AND ended_at IS NULL",
+            &[&session_id, &time(at)],
+        )?;
+        let row = conn
+            .query_opt("SELECT ended_at FROM member_sessions WHERE session_id = $1", &[&session_id])?
+            .ok_or_else(|| Error::refused(format!("no session {session_id}")))?;
+        Ok(row.get::<_, Option<SystemTime>>(0).map_or(at, millis))
+    }
+
+    fn session_used(&self, session_id: &str, at: u64) -> Result<(), Error> {
+        self.db.get()?.execute(
+            "UPDATE member_sessions SET last_used_at = $2
+             WHERE session_id = $1 AND (last_used_at IS NULL OR last_used_at < $2)",
+            &[&session_id, &time(at)],
+        )?;
+        Ok(())
+    }
+}
+
+fn member_from(row: &Row) -> Result<MemberRow, Error> {
+    Ok(MemberRow {
+        id: row.get("member_id"),
+        account: unsigned(row.get("account_id"))?,
+        email: row.get("email"),
+        password_phc: row.get("password_phc"),
+        display_name: row.get("display_name"),
+        created_at: millis(row.get("created_at")),
+        disabled_at: row.get::<_, Option<SystemTime>>("disabled_at").map(millis),
+    })
+}
+
+fn session_from(row: &Row) -> Result<SessionRow, Error> {
+    let hash: Vec<u8> = row.get("token_sha256");
+    Ok(SessionRow {
+        id: row.get("session_id"),
+        member: row.get("member_id"),
+        account: unsigned(row.get("account_id"))?,
+        hash: hash.try_into().map_err(|_| Error::refused("a session hash that is not 32 bytes"))?,
+        created_at: millis(row.get("created_at")),
+        expires_at: millis(row.get("expires_at")),
+        ended_at: row.get::<_, Option<SystemTime>>("ended_at").map(millis),
+        last_used: row.get::<_, Option<SystemTime>>("last_used_at").map(millis),
+    })
 }
 
 /// `venue-identity import`: moves a key store kept by earlier versions in a JSON-lines file into empty records, each
