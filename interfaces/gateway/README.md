@@ -497,6 +497,41 @@ reaching the treasury, without which a member cannot deposit at all (above); a r
 outbox; checking a password against the breached-password corpora; and rate limits on the emailed codes themselves,
 which today are limited only as anonymous requests are.
 
+## Choosing an environment
+
+An app is built knowing one address and asks the venue where it may go. `GET /v4/bootstrap` answers the venues it may
+point itself at, and nothing else:
+
+```json
+{"environments": [{"id": "prod", "label": "Live", "url": "https://venue.example", "live": true}]}
+```
+
+Most callers are told about the live venue alone. A caller whose session belongs to one of the venue's own people is
+also told which test environments exist, so a developer can point the app in their hand at the environment their
+branch is running in. `live` says which venue's money is real; an app shows that where a person can see it, and a
+branch is never dressed up as the live venue — an entry that forgets to say is taken as not live.
+
+The list is a file the gateway is given (`--environments`), read afresh on every request, so environments coming and
+going does not mean restarting anything. Without the flag the route is not offered and an app stays where it was
+built pointing.
+
+**This is discovery, not authorization.** What is answered decides what a client is *told about*; it cannot protect a
+test environment, because a URL is not a secret and anything reachable will be reached. Each environment
+authenticates its own callers out of its own records. Withholding the list buys two smaller things, both worth
+having: internal addresses are not advertised, and nobody wanders onto a venue whose money is imaginary while
+believing it is real.
+
+**A credential never crosses.** A session belongs to the venue that issued it and to no other: the environments keep
+separate identity services and separate databases, so a member of the live venue is nobody in a test one and signs in
+there separately. That is the point the whole arrangement rests on, and the reason is in decision G-20.
+
+Being one of the venue's own people is a member attribute, not a permission — permissions are what a credential may
+do with an account, and this is a fact about a person that no account has anything to do with. **There is no route
+that sets it.** An operator runs `venue-identity staff --email ADDRESS` against the records, so that nothing a member
+sends can reach it: not a session, not a key, not a request that got as far as the gateway. It is asked of the
+records on each bootstrap rather than kept with the credential, so granting or withdrawing it takes effect at once
+rather than whenever a cached answer expires.
+
 ## Browsers
 
 A page the venue serves itself calls the API from the same origin and needs nothing here. A page served from anywhere

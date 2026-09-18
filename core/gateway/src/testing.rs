@@ -50,6 +50,9 @@ pub struct Venue {
     pub ws_private: String,
     /// The node's ingress, for a test that acts as an operator.
     pub ingress: String,
+    /// The identity service's records, so a test can do what an operator does — making somebody staff, say — which
+    /// deliberately has no route (decision G-20).
+    pub identity_records: Arc<dyn venue_identity::records::KeyRecords>,
     /// The gateway's audit log: a directory of the test's own, written without syncing.
     pub audit_dir: PathBuf,
     /// The node's data directory, which holds the journal a test can replay.
@@ -151,11 +154,23 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool, proxies: 
     let audit = Audit::start(&audit_dir, "test", false).expect("an audit log");
     let proxies = TrustedProxies::parse(proxies).expect("trusted proxies");
     let hub = || Hub::new(Catalogue::load(CATALOGUE).expect("the mini venue's catalogue"));
+    let (identity_address, identity_records) = start_identity(name);
+    // Two environments, so a test can see which of them a caller is told about: the live venue, and a branch.
+    let environments_file = std::env::temp_dir().join(format!("venue-environments-{name}-{}.json", std::process::id()));
+    std::fs::write(
+        &environments_file,
+        r#"{"environments": [
+             {"id": "prod", "label": "Live", "url": "https://venue.test", "live": true},
+             {"id": "pr-7", "label": "PR 7", "url": "https://pr-7.venue.test", "live": false}
+           ]}"#,
+    )
+    .expect("an environments file");
     let mut private_half = Gateway::private(hub(), Submit::spawn(&ingress), limits)
         .with_audit(audit.clone())
         .with_trusted_proxies(proxies.clone())
         .with_origins(vec!["http://app.test".into()])
-        .with_identity(Some(start_identity(name)), true);
+        .with_environments(crate::bootstrap::Environments::from_file(&environments_file))
+        .with_identity(Some(identity_address), true);
     let treasury = treasury.then(|| start_treasury(name, &ingress, &feed));
     if let Some(address) = &treasury {
         private_half = private_half.with_treasury(address);
@@ -196,7 +211,7 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool, proxies: 
         gateway.open_rfqs_pending(RESPONDER, None).is_ok_and(|pending| gateway.wait_for(pending).is_ok())
     });
     let (ws_public, ws_private) = (format!("ws://{address}/v4/ws_public"), format!("ws://{address}/v4/ws_private"));
-    Venue { gateway, address, ws_public, ws_private, ingress, audit_dir, data_dir }
+    Venue { gateway, address, ws_public, ws_private, ingress, identity_records, audit_dir, data_dir }
 }
 
 /// Seeds a node with the mini venue's catalogue.
@@ -241,7 +256,7 @@ fn start_parlays(ingress: &str, feed: &str) -> (Arc<venue_parlays::service::Serv
 
 /// Starts an identity service of the test's own, with a fresh store, and returns where it listens. Its keys are in
 /// PostgreSQL, in a schema of the test's own, when `VENUE_TEST_DATABASE_URL` names a server, and in memory otherwise.
-fn start_identity(name: &str) -> String {
+fn start_identity(name: &str) -> (String, Arc<dyn venue_identity::records::KeyRecords>) {
     let settings = venue_identity::Settings { catalogue: CATALOGUE.to_string(), show_mail: true };
     let storage =
         match venue_store::testing::url().and_then(|_| venue_store::testing::config(&format!("gw_identity_{name}"))) {
@@ -251,8 +266,8 @@ fn start_identity(name: &str) -> String {
     let records = venue_identity::records(&storage).expect("the identity service's records");
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the identity service");
     let address = listener.local_addr().expect("its address").to_string();
-    venue_identity::start(&settings, records, listener).expect("an identity service");
-    address
+    venue_identity::start(&settings, Arc::clone(&records), listener).expect("an identity service");
+    (address, records)
 }
 
 /// Starts a treasury of the test's own on the node, with a fresh book, and returns where it listens. Its records are
@@ -429,7 +444,8 @@ impl Fleet {
     pub fn start(name: &str) -> Self {
         let (ingress, feed, _data_dir) = start_node(name);
         seed(name, &ingress);
-        let identity = start_identity(name);
+        // The fleet tests do not act as an operator, so the records go unused here.
+        let (identity, _identity_records) = start_identity(name);
         let treasury = start_treasury(name, &ingress, &feed);
         let (service, parlays) = start_parlays(&ingress, &feed);
         eventually("the parlay service catches up with the feed", || service.ready());

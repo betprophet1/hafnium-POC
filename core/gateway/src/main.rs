@@ -3,6 +3,7 @@
 
 mod api;
 mod audit;
+mod bootstrap;
 #[cfg(test)]
 mod fleet;
 mod forwarded;
@@ -49,7 +50,7 @@ const USAGE: &str = "usage:
   venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--treasury ADDR] [--parlays ADDR]
                 [--identity ADDR] [--dev-tokens true] [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
                 [--audit-dir ./gateway-audit] [--audit-instance HOSTNAME] [--audit-fsync true] [--trusted-proxies ADDRS]
-                [--allowed-origins ORIGINS]
+                [--allowed-origins ORIGINS] [--environments FILE]
                 [--metrics ADDR]
 
 --serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
@@ -61,6 +62,9 @@ as unavailable. --identity is the identity service (venue-identity) the private 
 /v4/keys to; without it keys are refused as unavailable. --dev-tokens false refuses the catalogue's dev tokens, which
 otherwise act as their accounts with every permission. Every request and what it was answered is written to the audit log in --audit-dir
 (interfaces/audit/README.md); a gateway that cannot write it does not start, and one that stops being able to exits.
+--environments names a JSON file listing the venues an app may point itself at, served as GET /v4/bootstrap and read
+afresh on every request so that a file replaced under a running gateway is noticed; without it the route is not
+offered (interfaces/gateway/README.md, choosing an environment).
 --allowed-origins is a comma-separated list of the origins a browser page may call this gateway from, such as
 https://app.example.com or http://127.0.0.1:8081 for a front end in development. None by default, which serves a page
 from the gateway's own origin and refuses every other, since a browser asks before it sends.
@@ -243,8 +247,15 @@ fn run(args: &Args) -> Result<(), Error> {
                 "false" => false,
                 other => return Err(format!("--dev-tokens must be true or false, not {other}").into()),
             };
+            // Where an app may point itself (`bootstrap.rs`). Without it the route is not offered at all, and an app
+            // stays on the venue it was built knowing.
+            let environments = match args.get("environments", Some(""))?.as_str() {
+                "" => crate::bootstrap::Environments::none(),
+                file => crate::bootstrap::Environments::from_file(file),
+            };
             let mut gateway = Gateway::private(Hub::new(catalogue), ingress, limits)
                 .with_origins(origins.clone())
+                .with_environments(environments)
                 .with_metrics(half_metrics)
                 .with_audit(audit.clone())
                 .with_trusted_proxies(proxies)

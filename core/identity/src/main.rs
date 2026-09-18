@@ -14,6 +14,7 @@ const USAGE: &str = "usage:
   venue-identity [serve] --catalogue FILE --store memory [--listen 127.0.0.1:8084] [--show-mail false]
   venue-identity migrate --database-url URL
   venue-identity import --file FILE --catalogue FILE --database-url URL
+  venue-identity staff --email ADDRESS [--on true] --database-url URL
 
 Keeps the catalogue's accounts and their API keys in PostgreSQL, and answers the gateways' questions about keys.
 --database-url postgres://USER:PASSWORD@HOST:5432/DATABASE, with --database-schema (default identity),
@@ -21,7 +22,9 @@ Keeps the catalogue's accounts and their API keys in PostgreSQL, and answers the
 (core/store/README.md). serve waits for the database and for its schema to be at this build's migration, which
 migrate applies (--migrate-on-start true applies it at start instead). --store memory keeps keys in memory only, for
 tests and throwaway local venues. import moves a key store kept by an earlier version in a JSON-lines file into
-empty records. --show-mail true answers GET /v1/mail with the mail this environment would have sent, which a demo
+empty records. staff says a member is one of the venue's own people, which decides only which environments the
+bootstrap will name to them (interfaces/gateway/README.md, choosing an environment) and is never a way into one.
+--show-mail true answers GET /v1/mail with the mail this environment would have sent, which a demo
 needs and a venue with real addresses must never turn on: the messages hold the codes. Every flag can also be given as VENUE_<FLAG>, for example VENUE_DATABASE_URL.";
 
 struct Args(BTreeMap<String, String>);
@@ -64,7 +67,7 @@ impl Args {
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let command = match args.first().map(String::as_str) {
-        Some(c @ ("serve" | "migrate" | "import")) => {
+        Some(c @ ("serve" | "migrate" | "import" | "staff")) => {
             let c = c.to_string();
             args.remove(0);
             c
@@ -74,6 +77,7 @@ fn main() -> ExitCode {
     let outcome = Args::parse(&args).and_then(|a| match command.as_str() {
         "migrate" => migrate(&a),
         "import" => import(&a),
+        "staff" => staff(&a),
         _ => run(&a),
     });
     match outcome {
@@ -82,6 +86,29 @@ fn main() -> ExitCode {
             eprintln!("venue-identity: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `venue-identity staff --email ADDRESS [--on false]`: says that a member is one of the venue's own people, which
+/// decides only whether the live venue will name its test environments to them (decision G-20). Run by an operator
+/// against the records; there is deliberately no API for it, because nothing a member does should be able to reach
+/// it — not a session, not a key, not a request that got as far as the gateway.
+fn staff(args: &Args) -> Result<(), String> {
+    let email = venue_identity::member::normalise_email(&args.get("email", None)?);
+    let on = match args.get("on", Some("true"))?.as_str() {
+        "true" => true,
+        "false" => false,
+        other => return Err(format!("--on must be true or false, not {other}")),
+    };
+    let config = args.database()?;
+    let db = Database::connect_retrying(&config, "venue-identity")?;
+    db.wait_for_schema(records::MIGRATIONS, "venue-identity")?;
+    let records = records::Postgres::new(db);
+    if records::KeyRecords::set_staff(&records, &email, on)? {
+        eprintln!("venue-identity: {email} is {}", if on { "staff" } else { "no longer staff" });
+        Ok(())
+    } else {
+        Err(format!("no member with the address {email}"))
     }
 }
 

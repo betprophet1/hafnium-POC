@@ -454,6 +454,32 @@ mod tests {
     }
 
     #[test]
+    fn nobody_is_staff_by_signing_up_and_only_the_records_can_make_them() {
+        let a = venue();
+        let signing = json!({"email": "dev@example.com", "password": "a good long password"});
+        assert_eq!(call(&a, "POST", "/v1/members", Some(&signing)).0, 200);
+        let (_, member) = call(&a, "POST", "/v1/sessions", Some(&signing));
+        let id = member["memberId"].as_str().expect("a member").to_string();
+
+        // Signing up never grants it, whatever the request says. The field is not one of the ones sign-up reads, so
+        // asking for it is a malformed request rather than a quietly ignored one.
+        let (status, asked) = call(
+            &a,
+            "POST",
+            "/v1/members",
+            Some(&json!({"email": "sneak@example.com", "password": "a good long password", "staff": true})),
+        );
+        assert_eq!((status, asked["error"]["code"].as_str()), (400, Some("BAD_REQUEST")), "{asked}");
+
+        let (status, about) = call(&a, "GET", &format!("/v1/members/{id}"), None);
+        assert_eq!((status, &about["staff"]), (200, &json!(false)), "{about}");
+
+        // There is no route that sets it: an operator does, against the records, and that is the whole point — no
+        // session, no key and no request can reach it (decision G-20).
+        assert_eq!(call(&a, "POST", &format!("/v1/members/{id}/staff"), Some(&json!({"staff": true}))).0, 404);
+    }
+
+    #[test]
     fn mail_is_only_shown_where_the_venue_was_told_to_show_it() {
         let settings = Settings {
             catalogue: concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/charts/venue-mini/files/markets.json").into(),

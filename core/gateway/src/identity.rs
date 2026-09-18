@@ -269,6 +269,37 @@ impl Identity {
     }
 }
 
+impl Identity {
+    /// Whether a member is one of the venue's own people, asked of the identity service each time rather than kept
+    /// with the credential. Being made one of them, or ceasing to be, should take effect when it is done and not at
+    /// whatever later moment a cached answer expires or a member next signs in — and this is asked once when an app
+    /// opens, so there is nothing to save by remembering it.
+    ///
+    /// False whenever the answer is not plainly yes: no identity service, no such member, a service that did not
+    /// answer. The failure worth avoiding is naming an internal address to somebody who should not have it, so the
+    /// direction to fail in is obvious.
+    pub fn staff(&self, member_id: &str) -> bool {
+        let Ok(address) = self.address() else { return false };
+        if !member::is_member_id(member_id) {
+            return false;
+        }
+        let request = format!(
+            "GET /v1/members/{member_id} HTTP/1.1\r\nHost: identity\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        match treasury::exchange(address, request.as_bytes()) {
+            Ok(response) => {
+                let text = String::from_utf8_lossy(&response);
+                let Some((_, body)) = text.split_once("\r\n\r\n") else { return false };
+                serde_json::from_str::<Value>(body).is_ok_and(|v| v["staff"] == Value::Bool(true))
+            }
+            Err(e) => {
+                log::warn("asking whether a member is staff failed", &[("identity", &address), ("error", &e)]);
+                false
+            }
+        }
+    }
+}
+
 /// Keeps asking about the credentials a half's clients are using, for as long as the half exists.
 pub fn keep_checking(gateway: &Arc<Gateway>) {
     let half = Arc::downgrade(gateway);

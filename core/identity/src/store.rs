@@ -457,6 +457,8 @@ impl Store {
                     email_verified_at: None,
                     failed_logins: 0,
                     locked_until: None,
+                    // Never by signing up: an operator says so afterwards, deliberately.
+                    staff: false,
                 };
                 self.records.create_member(&row, &display_name, now).map_err(records_refusal)?;
                 locked(&self.state).accounts.insert(account);
@@ -824,7 +826,8 @@ impl Store {
         Ok(json!({
             "memberId": member.id, "accountId": member.account.to_string(), "email": member.email,
             "displayName": member.display_name, "emailVerified": member.email_verified_at.is_some(),
-            "secondFactor": totp.is_some_and(|t| t.confirmed_at.is_some()), "recoveryCodesLeft": left
+            "secondFactor": totp.is_some_and(|t| t.confirmed_at.is_some()), "recoveryCodesLeft": left,
+            "staff": member.staff
         }))
     }
 

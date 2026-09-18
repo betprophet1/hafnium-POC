@@ -179,6 +179,8 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, client: &str, notify: &
             }
             Ok(Routed::Later(gateway.attach_quote_pending(account, &body, later())?))
         }
+        // Where an app may point itself. Asked before anyone has signed in, and again once somebody has.
+        ("GET", ["v4", "bootstrap"]) => Ok(Routed::Now(crate::bootstrap::answer(gateway, request, client))),
         // Members and their sessions. The ones a person reaches before they have a session — signing up, proving an
         // address, getting a password back, logging in — are the only requests the gateway takes from nobody.
         ("POST", ["v4", "members"] | ["v4", "sessions"] | ["v4", "members", _])
@@ -374,6 +376,49 @@ mod tests {
             json!("NOT_FOUND"),
             "a member still cannot deposit, for want of a ledger rather than a permission: {moved}"
         );
+    }
+
+    #[test]
+    fn the_bootstrap_names_the_live_venue_to_everyone_and_the_rest_only_to_staff() {
+        let venue = testing::venue("bootstrap");
+
+        // Asked by nobody, which is how an app asks before anyone has signed in.
+        let (status, seen) = request(&venue.address, "GET", "/v4/bootstrap", None, None);
+        assert_eq!(status, 200, "{seen}");
+        let named: Vec<&str> =
+            seen["environments"].as_array().expect("environments").iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert_eq!(named, ["prod"], "a stranger is told about the live venue and nothing else: {seen}");
+        assert_eq!(seen["environments"][0]["live"], json!(true), "{seen}");
+
+        // A member who is not one of the venue's own people is told exactly the same. Signing up cannot change it,
+        // which is the point: this is not a thing a caller can ask to be.
+        let signing = json!({"email": "someone@example.com", "password": "a good long password"}).to_string();
+        assert_eq!(request(&venue.address, "POST", "/v4/members", None, Some(&signing)).0, 200);
+        let (_, member) = request(&venue.address, "POST", "/v4/sessions", None, Some(&signing));
+        let credential = member["session"]["credential"].as_str().expect("a credential").to_string();
+        let (status, theirs) = request(&venue.address, "GET", "/v4/bootstrap", Some(&credential), None);
+        assert_eq!(status, 200, "{theirs}");
+        assert_eq!(theirs["environments"].as_array().map(Vec::len), Some(1), "{theirs}");
+
+        // An API key belongs to an account rather than to a person, so it is nobody's staff either.
+        let (status, keyed) = request(&venue.address, "GET", "/v4/bootstrap", Some(MAKER_TOKEN), None);
+        assert_eq!((status, keyed["environments"].as_array().map(Vec::len)), (200, Some(1)), "{keyed}");
+
+        // Made staff in the records, as an operator does — there is no route for it — and the branch appears.
+        venue.identity_records.set_staff("someone@example.com", true).expect("made staff");
+        let (status, staff) = request(&venue.address, "GET", "/v4/bootstrap", Some(&credential), None);
+        assert_eq!(status, 200, "{staff}");
+        let named: Vec<&str> =
+            staff["environments"].as_array().expect("environments").iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert_eq!(named, ["prod", "pr-7"], "{staff}");
+        // And a branch is never dressed up as the live venue.
+        assert_eq!(staff["environments"][1]["live"], json!(false), "{staff}");
+
+        // Taking it away takes the branch away again, without waiting for the session to end: the question is asked
+        // of the records each time rather than kept with the credential.
+        venue.identity_records.set_staff("someone@example.com", false).expect("no longer staff");
+        let (_, after) = request(&venue.address, "GET", "/v4/bootstrap", Some(&credential), None);
+        assert_eq!(after["environments"].as_array().map(Vec::len), Some(1), "{after}");
     }
 
     /// POST /v4/rfqs as the retail customer. A parlay service refuses requests as unavailable while it is catching up

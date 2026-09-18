@@ -49,6 +49,12 @@ pub fn is_session_id(text: &str) -> bool {
     text.strip_prefix(SESSION_PREFIX).is_some_and(|hex| is_lower_hex(hex, ID_DIGITS))
 }
 
+/// Whether `text` is a member ID. Checked before one is put in a path to the identity service, so that nothing a
+/// caller sends can be made to mean a different route.
+pub fn is_member_id(text: &str) -> bool {
+    text.strip_prefix(MEMBER_PREFIX).is_some_and(|hex| is_lower_hex(hex, ID_DIGITS))
+}
+
 /// A credential's session ID and secret, if it is `<sessionId>.<secret>` in the right form.
 pub fn split(credential: &str) -> Option<(&str, &str)> {
     let (id, secret) = credential.split_once('.')?;

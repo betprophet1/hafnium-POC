@@ -96,6 +96,12 @@ people in with.
   or a note that somebody tried with an address that has no account (or already has one). A wrong password and an
   address nobody has are refused in the same words and take the same time — a password is hashed against a dummy PHC
   when there is no member, so the two take the same work.
+- **Staff** is a member attribute saying this person is one of the venue's own, which decides only which
+  environments the bootstrap will name to them (interfaces/gateway/README.md, choosing an environment; decision
+  G-20). It is not a permission — permissions are what a credential may do with an account — and it is **not a way
+  in**: a test environment keeps its own members and its own sessions, and this flag is never sent to one. There is
+  no route that sets it. `venue-identity staff --email ADDRESS [--on false]` does, against the records, so that
+  nothing a member sends can reach it.
 - **Personal data** lives here and nowhere else (blueprint §12): `members` holds the email, and nothing about a member
   reaches the journal, ClickHouse or Valkey. The account ID is what everything else refers to.
 

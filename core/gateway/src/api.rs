@@ -295,7 +295,7 @@ impl Half {
         match path {
             "/v4/ws_public" | "/v4/markets" => Some(Self::Public),
             "/v4/ws_private" | "/v4/account" | "/v4/orders" | "/v4/transfers" | "/v4/rfqs" | "/v4/keys"
-            | "/v4/members" | "/v4/sessions" | "/v4/mail" => Some(Self::Private),
+            | "/v4/members" | "/v4/sessions" | "/v4/mail" | "/v4/bootstrap" => Some(Self::Private),
             p if p.starts_with("/v4/markets/") => Some(Self::Public),
             p if ["/v4/orders/", "/v4/transfers/", "/v4/rfqs/", "/v4/keys/", "/v4/sessions/", "/v4/members/"]
                 .iter()
@@ -336,6 +336,8 @@ pub struct Gateway {
     /// The origins a browser page may call this gateway from (interface 1 README, browsers). Empty by default, which
     /// answers without the headers and so allows a page served from the gateway's own origin and nothing else.
     origins: Vec<String>,
+    /// Which venues an app may point itself at (`bootstrap.rs`); none by default, and the route is then not offered.
+    environments: crate::bootstrap::Environments,
     /// What this half counts (`metrics.rs`); registered nowhere unless `with_metrics` gave it a registry's.
     pub metrics: Arc<HalfMetrics>,
 }
@@ -367,6 +369,7 @@ impl Gateway {
             identity: Identity::new(None, true, Arc::clone(&metrics)),
             proxies: TrustedProxies::default(),
             origins: Vec::new(),
+            environments: crate::bootstrap::Environments::none(),
             metrics,
         }
     }
@@ -394,6 +397,16 @@ impl Gateway {
     pub fn with_origins(mut self, origins: Vec<String>) -> Self {
         self.origins = origins;
         self
+    }
+
+    /// Serves `/v4/bootstrap` from the environments listed in `path`, read afresh on every request.
+    pub fn with_environments(mut self, environments: crate::bootstrap::Environments) -> Self {
+        self.environments = environments;
+        self
+    }
+
+    pub const fn environments(&self) -> &crate::bootstrap::Environments {
+        &self.environments
     }
 
     /// The origin to answer with, for a request that came from one: `None` when the request names no origin or names

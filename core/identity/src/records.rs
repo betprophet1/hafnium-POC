@@ -37,6 +37,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "member_security",
         sql: include_str!("../migrations/20260918000002_member_security.sql"),
     },
+    Migration {
+        version: "20260918000003",
+        name: "member_staff",
+        sql: include_str!("../migrations/20260918000003_member_staff.sql"),
+    },
 ];
 
 /// An account as the catalogue describes it.
@@ -86,6 +91,9 @@ pub struct MemberRow {
     /// Failed logins in a row, and until when those failures have locked the member out.
     pub failed_logins: u32,
     pub locked_until: Option<u64>,
+    /// One of the venue's own people. It decides only what the live venue will name to them — which test
+    /// environments exist — and is never sent to one of those environments (decision G-20).
+    pub staff: bool,
 }
 
 /// A session a member logged in with. The token is here only as its SHA-256.
@@ -170,6 +178,9 @@ pub trait KeyRecords: Send + Sync {
 
     /// The member an ID names, for the calls a signed-in member makes about themselves.
     fn member(&self, member_id: &str) -> Result<Option<MemberRow>, Error>;
+    /// Makes a member staff, or stops them being: what `venue-identity staff` runs. Returns whether there was such a
+    /// member to change.
+    fn set_staff(&self, email: &str, staff: bool) -> Result<bool, Error>;
     /// Marks an email proved, and returns whether it had not been already.
     fn verify_email(&self, member_id: &str, at: u64) -> Result<bool, Error>;
     /// Replaces a member's password hash.
@@ -349,6 +360,17 @@ impl KeyRecords for Memory {
 
     fn member(&self, member_id: &str) -> Result<Option<MemberRow>, Error> {
         Ok(self.data()?.members.iter().find(|m| m.id == member_id).cloned())
+    }
+
+    fn set_staff(&self, email: &str, staff: bool) -> Result<bool, Error> {
+        let mut data = self.data()?;
+        match data.members.iter_mut().find(|m| m.email == email) {
+            Some(member) => {
+                member.staff = staff;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     fn verify_email(&self, member_id: &str, at: u64) -> Result<bool, Error> {
@@ -700,6 +722,11 @@ impl KeyRecords for Postgres {
         row.as_ref().map(member_from).transpose()
     }
 
+    fn set_staff(&self, email: &str, staff: bool) -> Result<bool, Error> {
+        let changed = self.db.get()?.execute("UPDATE members SET staff = $2 WHERE email = $1", &[&email, &staff])?;
+        Ok(changed == 1)
+    }
+
     fn verify_email(&self, member_id: &str, at: u64) -> Result<bool, Error> {
         let changed = self.db.get()?.execute(
             "UPDATE members SET email_verified_at = $2 WHERE member_id = $1 AND email_verified_at IS NULL",
@@ -910,6 +937,7 @@ fn member_from(row: &Row) -> Result<MemberRow, Error> {
         email_verified_at: row.get::<_, Option<SystemTime>>("email_verified_at").map(millis),
         failed_logins: u32::try_from(row.get::<_, i32>("failed_logins")).unwrap_or(0),
         locked_until: row.get::<_, Option<SystemTime>>("locked_until").map(millis),
+        staff: row.get("staff"),
     })
 }
 
