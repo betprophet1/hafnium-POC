@@ -24,3 +24,8 @@ adapters/fix/.toolchain/
 adapters/fix/.gradle/
 adapters/fix/build/
 adapters/fix/gradle/wrapper/gradle-wrapper.jar
+
+# Where a venue's address is set for a local app build (EXPO_PUBLIC_VENUE_URL). Kept out of the repository because
+# an address of somebody's own network is theirs, not the project's (apps/retail/README.md, pointing it at a venue).
+.env.local
+.env.*.local

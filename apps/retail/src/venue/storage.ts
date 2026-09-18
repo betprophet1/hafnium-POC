@@ -53,9 +53,17 @@ export async function unlockName(): Promise<string> {
   return "the phone's lock";
 }
 
+/** What the phone shows above its own prompt. Worth setting: the system's default says nothing about who is asking
+ * or why, and this is the one piece of our own words that appears inside the operating system's dialog. */
+const PROMPT = "Unlock the session this phone is holding for the venue";
+
 export async function saveSession(value: string): Promise<void> {
   const locked = (await unlockKind()) !== "none";
-  await SecureStore.setItemAsync(KEY, value, locked ? { requireAuthentication: true } : {});
+  // On Android this prompts as well — there, authentication is required for every operation on a locked entry,
+  // where iOS asks only when reading or updating one that already exists. So a member signing in on Android is
+  // asked for their fingerprint once here, before they have unlocked anything.
+  const options = locked ? { requireAuthentication: true, authenticationPrompt: PROMPT } : {};
+  await SecureStore.setItemAsync(KEY, value, options);
   await SecureStore.setItemAsync(MARKER, locked ? "locked" : "open");
 }
 
@@ -77,7 +85,8 @@ export async function loadSession(): Promise<string | null> {
   const { kept, locked } = await keptSession();
   if (!kept) return null;
   try {
-    return await SecureStore.getItemAsync(KEY, locked ? { requireAuthentication: true } : {});
+    const options = locked ? { requireAuthentication: true, authenticationPrompt: PROMPT } : {};
+    return await SecureStore.getItemAsync(KEY, options);
   } catch {
     // Either the member said no, or the key is gone for good. Telling those apart is not worth the guessing: the
     // next screen asks for the password, and a member who meant to unlock can try again from there.

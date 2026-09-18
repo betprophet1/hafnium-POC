@@ -58,6 +58,15 @@ second factor instead.
 fingerprints or faces change, because the phone can no longer say the same person is asking. The read then fails, and
 the app forgets the entry and asks for the password — which is the honest answer, not a bug to work around.
 
+**Android asks sooner than iOS.** On Android a locked entry needs authentication for every operation, where iOS asks
+only when reading or updating one that already exists. So on Android the prompt appears at the end of *logging in*,
+when the session is written down, and not only when a later launch unlocks it. It looks like a bug the first time
+and is not one.
+
+**A simulator cannot test any of this.** `expo-secure-store` says so itself: emulators and simulators do not require
+biometric authentication when retrieving a secret, so they hand the session back with no prompt and the flow appears
+to pass without ever having been exercised. A real device is the only way to see it work.
+
 There is no web equivalent, and the app does not pretend otherwise.
 
 ## Pointing it at a venue
@@ -68,6 +77,17 @@ laptop demo (`deploy/README.md`, on a laptop).
 ```sh
 EXPO_PUBLIC_VENUE_URL=https://venue.local npm start
 ```
+
+For a build onto a device, put it in `.env.local` beside `package.json` instead, which the Expo CLI reads and the
+repository ignores — an address on somebody's own network is theirs, not the project's:
+
+```sh
+echo 'EXPO_PUBLIC_VENUE_URL=http://<the venue's address>:8088' > .env.local
+```
+
+A development build is a debug build, and React Native's gradle plugin allows cleartext traffic in debug (and
+forbids it in release), so plain HTTP works on Android while testing without any extra configuration. A release
+build needs the certificate below.
 
 Two things the venue must be told before a front end of its own can reach it, both in `deploy/README.md` under *from
 a phone*: the origin this app is served from (`gateway.allowedOrigins`, or `--allowed-origins`), because a browser
