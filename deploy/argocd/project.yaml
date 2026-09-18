@@ -18,7 +18,7 @@ metadata:
 spec:
   description: One venue per pull request, each in a namespace of its own and nowhere else.
   sourceRepos:
-    - git@github.com:LordNacho/prediction-exchange.git
+    - https://github.com/LordNacho/prediction-exchange.git
   # Namespaces of its own, and no others. Not the live venue's, not argocd's, not kube-system.
   destinations:
     - server: https://kubernetes.default.svc

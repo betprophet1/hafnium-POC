@@ -29,9 +29,10 @@ spec:
           tokenRef:
             secretName: venue-github-token
             key: token
-        # Only the branches that asked. See above.
-        filters:
-          - labels: ["deploy-env"]
+          # Only the branches that asked. See above. This belongs to the github provider and not to `filters`,
+          # which offers only branchMatch, targetBranchMatch and titleMatch — the API server refuses a labels
+          # entry there outright, which is how this was found.
+          labels: ["deploy-env"]
         # How often the pull requests are read again. Short enough that labelling one feels immediate, long enough
         # not to spend the API rate limit on an idle repository.
         requeueAfterSeconds: 120
@@ -48,7 +49,7 @@ spec:
     spec:
       project: venue-previews
       source:
-        repoURL: git@github.com:LordNacho/prediction-exchange.git
+        repoURL: https://github.com/LordNacho/prediction-exchange.git
         targetRevision: "{{ .head_sha }}"
         path: deploy/charts/venue-mini
         helm:
