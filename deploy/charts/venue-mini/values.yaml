@@ -97,6 +97,12 @@ postgres:
   # A Secret of your own instead of the generated one, with keys postgres-password and <service>-password for each
   # service (treasury, identity, parlays, oracle).
   existingSecret: ""
+  # Passwords, given rather than generated. Empty means the chart makes them, which needs a real `helm install` or
+  # `helm upgrade` — see the note in templates/postgres.yaml. Anything ArgoCD deploys must set these, or name a
+  # Secret it did not make with `existingSecret`.
+  #
+  # Whatever is put here is as secret as the file it is written in. A repository is not a secret.
+  passwords: {}
   storage:
     size: 1Gi
     # Whether the volume outlives the StatefulSet. True everywhere that matters: deleting a release must not take the

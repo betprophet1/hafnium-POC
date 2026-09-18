@@ -76,22 +76,6 @@ spec:
       destination:
         server: https://kubernetes.default.svc
         namespace: "venue-pr-{{ .number }}"
-      # The chart generates its database passwords once and reuses them by looking the Secret up in the cluster —
-      # which works under `helm install`, and cannot work here. ArgoCD renders with `helm template`, which has no
-      # cluster, so `lookup` returns nothing and the random branch is taken on *every* reconcile: a new password
-      # written to the Secret each time, while PostgreSQL keeps the one its data directory was initialised with.
-      # Every service then fails to authenticate, and the environment comes up half dead with
-      # "password authentication failed for user postgres" three containers down.
-      #
-      # So ArgoCD is told to write that Secret once and stop comparing it. Sound for a preview, whose database holds
-      # nothing and dies with the pull request. A venue meant to last wants its passwords made outside the chart
-      # altogether and named through postgres.existingSecret, which the chart already supports.
-      ignoreDifferences:
-        - group: ""
-          kind: Secret
-          name: "venue-pr-{{ .number }}-postgres"
-          jsonPointers:
-            - /data
       syncPolicy:
         automated:
           # Both on purpose. A preview environment is worth nothing if it does not follow the branch, and a namespace
@@ -100,8 +84,6 @@ spec:
           selfHeal: true
         syncOptions:
           - CreateNamespace=true
-          # Without this, `selfHeal` overwrites the Secret anyway and ignoreDifferences achieves nothing.
-          - RespectIgnoreDifferences=true
           # The migrate job is a pre-upgrade hook and the chart's own; leaving its history behind fills the namespace
           # with completed pods for no one's benefit.
           - PruneLast=true

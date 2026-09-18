@@ -4,8 +4,16 @@
 {{- if not .Values.postgres.existingSecret }}
 {{- $secretName := printf "%s-postgres" $name }}
 {{- $existing := lookup "v1" "Secret" .Release.Namespace $secretName }}
-# The superuser's password and one per service, generated once and kept across upgrades (and an uninstall, since the
-# data volume outlives it and was initialised with them). Passwords are URL-safe: the services put them in a URL.
+# The superuser's password and one per service. A password given in `postgres.passwords` is used as it stands;
+# otherwise one already in the cluster is reused, and otherwise one is generated. Passwords are URL-safe: the
+# services put them in a URL.
+#
+# The middle branch is the one to understand before relying on it. `lookup` reads the live cluster, which `helm
+# install` and `helm upgrade` can do and `helm template` cannot — and `helm template` is what ArgoCD renders with. So
+# under GitOps that branch never fires: a fresh password would be invented on every reconcile while PostgreSQL went
+# on wanting the one it was initialised with, and every service would fail to authenticate. Anything deployed by
+# ArgoCD must therefore give its passwords, whether through `postgres.passwords` or `postgres.existingSecret`
+# (deploy/README.md, an environment per pull request).
 apiVersion: v1
 kind: Secret
 metadata:
@@ -18,7 +26,10 @@ metadata:
 type: Opaque
 data:
   {{- range $key := list "postgres-password" "treasury-password" "identity-password" "parlays-password" "oracle-password" }}
-  {{- if and $existing (hasKey $existing.data $key) }}
+  {{- $given := get ($.Values.postgres.passwords | default dict) $key }}
+  {{- if $given }}
+  {{ $key }}: {{ $given | b64enc }}
+  {{- else if and $existing (hasKey $existing.data $key) }}
   {{ $key }}: {{ index $existing.data $key }}
   {{- else }}
   {{ $key }}: {{ randAlphaNum 32 | b64enc }}

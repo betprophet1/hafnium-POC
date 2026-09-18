@@ -16,6 +16,23 @@ core:
   storage:
     keepOnDelete: false
 postgres:
+  # Known passwords, in the open, on purpose.
+  #
+  # A preview's database has to have a password the chart can produce identically on every render, or ArgoCD invents
+  # a new one each reconcile and PostgreSQL — still wanting the one it was initialised with — refuses every service
+  # (deploy/README.md). Giving them here makes the rendered Secret deterministic, which is what lets ArgoCD manage it
+  # honestly rather than be told to ignore it.
+  #
+  # These are safe here and nowhere else. A preview holds no money, no member and no personal data; it is reachable
+  # only inside its own namespace, and it is destroyed with its pull request. **A venue anybody relies on must never
+  # take these values**: it names a Secret made outside the chart with `postgres.existingSecret` instead. Nothing
+  # enforces that but this comment and the fact that this file is only ever read by the preview ApplicationSet.
+  passwords:
+    postgres-password: preview-only-not-a-secret-postgres
+    identity-password: preview-only-not-a-secret-identity
+    treasury-password: preview-only-not-a-secret-treasury
+    parlays-password: preview-only-not-a-secret-parlays
+    oracle-password: preview-only-not-a-secret-oracle
   storage:
     keepOnDelete: false
 
