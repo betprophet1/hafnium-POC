@@ -14,5 +14,7 @@
     "jsx": "react-jsx",
     "skipLibCheck": true
   },
+  // The app's own config excludes tests, because Metro never builds them; this config exists to build them.
+  "exclude": ["build"],
   "include": ["src/venue/**/*.ts"]
 }
