@@ -95,6 +95,10 @@ spec:
           volumeMounts:
             - name: journal
               mountPath: /var/lib/venue
+  persistentVolumeClaimRetentionPolicy:
+    # Scaling never discards a journal; deleting only does where the values say so.
+    whenScaled: Retain
+    whenDeleted: {{ ternary "Retain" "Delete" .Values.core.storage.keepOnDelete }}
   volumeClaimTemplates:
     - metadata:
         name: journal

@@ -22,6 +22,11 @@ core:
   fsync: false
   storage:
     size: 1Gi
+    # Whether the volume outlives the StatefulSet. True everywhere that matters: deleting a release must not take the
+    # journal or the ledger with it, and a volume kept by mistake costs a little disk while one deleted by mistake
+    # costs everything. A preview environment sets it false, because its whole namespace is thrown away with its
+    # pull request and volumes left behind would pile up a gigabyte at a time (deploy/argocd/preview.yaml).
+    keepOnDelete: true
     # Empty uses the cluster's default class (k3d: local-path).
     className: ""
   resources:
@@ -94,6 +99,11 @@ postgres:
   existingSecret: ""
   storage:
     size: 1Gi
+    # Whether the volume outlives the StatefulSet. True everywhere that matters: deleting a release must not take the
+    # journal or the ledger with it, and a volume kept by mistake costs a little disk while one deleted by mistake
+    # costs everything. A preview environment sets it false, because its whole namespace is thrown away with its
+    # pull request and volumes left behind would pile up a gigabyte at a time (deploy/argocd/preview.yaml).
+    keepOnDelete: true
     # Empty uses the cluster's default class (k3d: local-path).
     className: ""
   resources:

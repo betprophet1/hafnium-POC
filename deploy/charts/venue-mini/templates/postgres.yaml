@@ -104,6 +104,9 @@ spec:
           emptyDir: {}
         - name: tmp
           emptyDir: {}
+  persistentVolumeClaimRetentionPolicy:
+    whenScaled: Retain
+    whenDeleted: {{ ternary "Retain" "Delete" .Values.postgres.storage.keepOnDelete }}
   volumeClaimTemplates:
     - metadata:
         name: data
