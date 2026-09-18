@@ -25,6 +25,7 @@ agent needs to build its core, and the core itself. Read this before changing an
 | `core/identity/` | The identity service of test environments: API keys with permissions behind the gateway's `/v4/keys`, kept hashed in an append-only store, and verified for the gateways. Its decisions are `interfaces/gateway/decisions.md`. Test environments only. |
 | `core/parlays/` | The parlay service: lists parlays, keeps the approved responders, routes requests for quote to those that subscribe, and settles each parlay from its legs. Test environments only. |
 | `core/sim/` | The mini venue's actors: synthetic makers (which also answer requests for quote) and takers, the dummy oracle and its calendar, demo markets and the web page. Test environments only. |
+| `apps/retail/` | The retail app: one Expo project for the web, iOS and Android. `src/venue/` is the venue client with no React in it, tested in Node; `src/app/` is the screens. Test environments only. |
 | `adapters/fix/` | Interface 4, the FIX 4.4 adapter (Java, Artio) in front of the gateway's private half; its dialect is `interfaces/fix/`. Not part of the Rust workspace: `bootstrap.sh` fetches its JDK and Gradle, `test.sh` runs its integration test, `scripts/fix-shell.py` is a console for trying it by hand. |
 | `core/prototypes/` | Experiments behind blueprint claims. Learn from them; nothing depends on them. |
 | `core/WORK_PACKAGES.md` | The order in which the core is built, and what "done" means for each piece. |

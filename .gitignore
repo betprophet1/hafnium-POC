@@ -7,6 +7,8 @@ target/
 # Screenshots and renders from blueprint/tools
 blueprint/tools/out/
 *.png
+# The retail app's own icons are not renders: an app cannot be built without them.
+!apps/retail/assets/**/*.png
 
 # Java codecs from interfaces/tools/sbe.sh (the Rust codec is committed as core/journal)
 interfaces/generated/

@@ -1,0 +1,18 @@
+// Building the venue client on its own, so `node --test` can run its tests without a phone, a simulator or Metro.
+// Only src/venue is built: it is the part that has no React in it, which is why it can be tested this way.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "build/test",
+    "rootDir": "src/venue",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2022",
+    "lib": ["es2023", "dom"],
+    "types": ["node"],
+    "jsx": "react-jsx",
+    "skipLibCheck": true
+  },
+  "include": ["src/venue/**/*.ts"]
+}
