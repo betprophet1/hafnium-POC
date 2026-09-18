@@ -290,7 +290,8 @@ mod tests {
 
     #[test]
     fn a_member_signs_up_through_the_gateway_and_trades_with_the_session_it_answers() {
-        let venue = testing::venue("members");
+        // With a treasury, so that what a member may do with money is the treasury's answer rather than its absence.
+        let venue = testing::venue_with_treasury("members");
         let signing = json!({"email": "someone@example.com", "password": "a good long password"}).to_string();
         // Signing up answers nothing but that a message went out, so the session comes from logging in.
         let (status, asked) = request(&venue.address, "POST", "/v4/members", None, Some(&signing));
@@ -363,6 +364,16 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
         assert_ne!(moved["error"]["code"], json!("FORBIDDEN"), "the same session may move money now: {moved}");
+        // And then it fails for the next reason along, which is a gap rather than a rule: the treasury knows only the
+        // accounts the catalogue names, and a member's was made at sign-up, so it has no ledger to move money in
+        // (interfaces/gateway/README.md, members and sessions). Asserted so that the day an account made at sign-up
+        // reaches the treasury, this test fails and says so, instead of a weaker `is not FORBIDDEN` quietly passing
+        // either way — which is what it did, and why this gap went unnoticed.
+        assert_eq!(
+            moved["error"]["code"],
+            json!("NOT_FOUND"),
+            "a member still cannot deposit, for want of a ledger rather than a permission: {moved}"
+        );
     }
 
     /// POST /v4/rfqs as the retail customer. A parlay service refuses requests as unavailable while it is catching up

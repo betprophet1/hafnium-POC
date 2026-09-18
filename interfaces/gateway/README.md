@@ -460,8 +460,11 @@ already open gains it without logging in again — within the five seconds the g
 same window a revoked key keeps working in. No session ever holds `respond`, which is a market maker's and needs the
 parlay service's approval.
 
-A new member's account has no money. Deposits work as they do for any account (`POST /v4/transfers`), through the
-treasury and, in a test environment, its fake bank.
+A new member's account has no money, **and cannot yet be given any**: the treasury knows only the accounts the
+catalogue names, and a member's is allocated by the identity service from 100,000 upwards, so `POST /v4/transfers`
+answers `404 NOT_FOUND`. Proving the address grants the `transfers` permission, and the call then fails one step
+later for want of a ledger rather than for want of a right. Until an account made at sign-up reaches the treasury, a
+member can look and trade but cannot fund the account they trade with.
 
 ### What the refusals mean
 
@@ -489,9 +492,10 @@ follow one the way a person follows it out of an inbox. **The identity service a
 with `--show-mail`**, because the messages hold the very codes they were sent to keep secret: a venue that can really
 post to an address must never turn it on.
 
-**Not in this cut**, and needed before anyone but a test environment relies on it: a real mail provider in place of
-the outbox; checking a password against the breached-password corpora; and rate limits on the emailed codes
-themselves, which today are limited only as anonymous requests are.
+**Not in this cut**, and needed before anyone but a test environment relies on it: an account made at sign-up
+reaching the treasury, without which a member cannot deposit at all (above); a real mail provider in place of the
+outbox; checking a password against the breached-password corpora; and rate limits on the emailed codes themselves,
+which today are limited only as anonymous requests are.
 
 ## Browsers
 
