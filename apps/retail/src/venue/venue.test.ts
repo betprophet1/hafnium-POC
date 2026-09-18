@@ -30,27 +30,108 @@ function fetchStub(replies: { status: number; body: unknown; headers?: Record<st
 }
 
 describe("the venue client", () => {
-  it("signs a member in and then speaks as them", async () => {
-    const member = {
-      memberId: "m_0123456789abcdef",
-      accountId: "100000",
-      email: "someone@example.com",
-      displayName: "someone",
-      session: { sessionId: "vs_0123456789abcdef", credential: "vs_0123456789abcdef.aa", expiresAt: "2026-10-18" },
-    };
+  const member = {
+    memberId: "m_0123456789abcdef",
+    accountId: "100000",
+    email: "someone@example.com",
+    displayName: "someone",
+    emailVerified: true,
+    session: { sessionId: "vs_0123456789abcdef", credential: "vs_0123456789abcdef.aa", expiresAt: "2026-10-18" },
+  };
+
+  it("signs a member up, proves the address, logs in, and then speaks as them", async () => {
     const { doFetch, asked } = fetchStub([
+      { status: 200, body: { checkYourEmail: true } },
+      { status: 200, body: { verified: true } },
       { status: 200, body: member },
       { status: 200, body: { accountId: "100000", availableCents: 0, reservedCents: 0, positions: [], orders: [] } },
     ]);
     const venue = new Venue({ baseUrl: "https://venue.test/", fetch: doFetch });
-    const signed = await venue.signUp("someone@example.com", "a good long password");
+
+    // Signing up answers only that a message went out: there is no session here to hold.
+    const asking = await venue.signUp("someone@example.com", "a good long password");
+    assert.deepEqual(asking, { checkYourEmail: true });
+    await venue.verifyEmail("0123456789abcdef0123456789abcdef");
+    const signed = await venue.logIn("someone@example.com", "a good long password", undefined, "an iPhone");
     venue.credential = signed.session.credential;
     await venue.account();
 
     assert.equal(asked[0].url, "https://venue.test/v4/members");
     assert.equal(asked[0].auth, undefined, "signing up is not signed in");
     assert.deepEqual(asked[0].body, { email: "someone@example.com", password: "a good long password" });
-    assert.equal(asked[1].auth, "Bearer vs_0123456789abcdef.aa", "afterwards every call carries the session");
+    assert.equal(asked[1].url, "https://venue.test/v4/members/verify");
+    assert.equal(asked[1].auth, undefined, "proving an address is reached with no session, which is the point");
+    assert.deepEqual(asked[2].body, {
+      email: "someone@example.com",
+      password: "a good long password",
+      device: "an iPhone",
+    });
+    assert.equal(asked[3].auth, "Bearer vs_0123456789abcdef.aa", "afterwards every call carries the session");
+  });
+
+  it("asks for a second-factor code rather than saying the password was wrong", async () => {
+    const { doFetch, asked } = fetchStub([
+      {
+        status: 401,
+        body: { error: { code: "SECOND_FACTOR_REQUIRED", message: "this account asks for a code" } },
+      },
+      { status: 200, body: member },
+    ]);
+    const venue = new Venue({ baseUrl: "https://venue.test", fetch: doFetch });
+
+    // The one refusal that means "send something different", not "send that again".
+    const wanted = await venue.logIn("someone@example.com", "a good long password").catch((e: unknown) => e);
+    assert.ok(wanted instanceof VenueError);
+    assert.equal(wanted.code, "SECOND_FACTOR_REQUIRED");
+    assert.equal(wanted.worthRetrying, false, "retrying the same request would be refused the same way");
+
+    await venue.logIn("someone@example.com", "a good long password", "123456");
+    assert.equal((asked[1].body as { code?: string }).code, "123456");
+  });
+
+  it("locks a member out with a code of its own, so an app can say what is actually wrong", async () => {
+    const { doFetch } = fetchStub([
+      { status: 429, body: { error: { code: "LOCKED_OUT", message: "too many attempts" } } },
+    ]);
+    const venue = new Venue({ baseUrl: "https://venue.test", fetch: doFetch });
+    const locked = await venue.logIn("someone@example.com", "a good long password").catch((e: unknown) => e);
+    assert.ok(locked instanceof VenueError);
+    assert.equal(locked.code, "LOCKED_OUT");
+    assert.equal(locked.status, 429);
+  });
+
+  it("reaches a member's own routes with their session and nothing else", async () => {
+    const { doFetch, asked } = fetchStub([
+      {
+        status: 200,
+        body: { ...member, secondFactor: true, recoveryCodesLeft: 9 },
+      },
+      {
+        status: 200,
+        body: {
+          sessions: [
+            { sessionId: "vs_0123456789abcdef", device: "an iPhone", createdAt: "2026-09-18", live: true },
+            { sessionId: "vs_fedcba9876543210", device: "a browser", createdAt: "2026-09-17", live: true },
+          ],
+        },
+      },
+      { status: 200, body: {} },
+    ]);
+    const venue = new Venue({ baseUrl: "https://venue.test", credential: "vs_0123456789abcdef.aa", fetch: doFetch });
+
+    const about = await venue.about();
+    assert.equal(about.secondFactor, true);
+    assert.equal(about.recoveryCodesLeft, 9);
+    const held = await venue.sessions();
+    assert.equal(held.length, 2);
+    await venue.endSession("vs_fedcba9876543210");
+
+    assert.equal(asked[0].url, "https://venue.test/v4/members/me");
+    assert.equal(asked[1].url, "https://venue.test/v4/sessions");
+    // The member is never named in the request: the session says who is asking, so it can only reach its own.
+    assert.equal(asked[2].url, "https://venue.test/v4/sessions/vs_fedcba9876543210");
+    assert.equal(asked[2].method, "DELETE");
+    for (const call of asked) assert.equal(call.auth, "Bearer vs_0123456789abcdef.aa");
   });
 
   it("turns a refusal into something the app can act on", async () => {

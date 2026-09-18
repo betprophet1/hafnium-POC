@@ -62,10 +62,41 @@ export type Member = {
   accountId: string;
   email: string;
   displayName: string;
+  /** Whether the address has been proved. Until it is, this session may trade but not move money. */
+  emailVerified: boolean;
   session: Session;
 };
 
 export type Session = { sessionId: string; credential: string; expiresAt: string };
+
+/** What the member's own routes say about them, which `GET /v4/members/me` answers. */
+export type About = {
+  memberId: string;
+  accountId: string;
+  email: string;
+  displayName: string;
+  emailVerified: boolean;
+  secondFactor: boolean;
+  recoveryCodesLeft: number;
+};
+
+/** One of a member's sessions, as `GET /v4/sessions` lists them, so they can end one they do not recognise. */
+export type HeldSession = {
+  sessionId: string;
+  device: string | null;
+  createdAt: string;
+  lastUsedAt: string | null;
+  expiresAt: string;
+  endedAt: string | null;
+  live: boolean;
+};
+
+/** A second factor being set up: what goes into an authenticator app. */
+export type TotpStart = { secret: string; uri: string; digits: number; periodSeconds: number };
+
+/** Signing up, asking for a code again, and asking for a new password all answer this and nothing else — the same
+ * whether or not the address is anybody's (interface 1 README, members and sessions). */
+export type CheckYourEmail = { checkYourEmail: true };
 
 /** What an order asks for. The tick comes from the market's ladder, so the app never invents a price. */
 export type OrderRequest = {

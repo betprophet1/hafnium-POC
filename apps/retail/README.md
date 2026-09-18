@@ -21,10 +21,44 @@ npm run build:web               # a static site in dist/
 |---|---|
 | `src/venue/` | The venue, in TypeScript and nothing else: the REST client, the private stream, the types and where a session is kept. No React. This is what `npm test` tests, and what a different front end would keep if the screens were thrown away. |
 | `src/app/` | The screens, as Expo Router's files: `index` (markets), `market/[id]` (book and ticket), `account` (sign in, balances, resting orders). |
-| `src/venue/storage.ts` and `storage.web.ts` | The one real difference between the platforms: a phone keeps the session in the keychain or keystore (`expo-secure-store`), a browser in `localStorage`, because a browser has no keychain. The bundler picks the file; nothing else in the app knows. |
+| `src/venue/storage.ts` and `storage.web.ts` | The one real difference between the platforms: a phone keeps the session in the keychain or keystore (`expo-secure-store`), behind the phone's own lock, and a browser keeps it in `localStorage`, because a browser has neither a keychain nor a reader. The bundler picks the file; nothing else in the app knows, and `unlockKind()` answers `"none"` on the web so the screens simply do not offer it. |
 
 Responsiveness is measured, not guessed: the markets list is one column on a phone and as many as fit a wide window,
 from `useWindowDimensions`. There is no phone-versus-desktop branch anywhere.
+
+## Signing in
+
+Signing in is a few steps, and which of them a person sees depends on what the venue answers rather than on what the
+app guesses (interface 1 README, members and sessions):
+
+- **Signing up** answers only "check your mail", never whether the address is already somebody's, so the app asks for
+  the code from that message rather than pretending a session came back.
+- **Until the address is proved** a session may look and trade but not move money. The account screen says so and
+  takes the code.
+- **A second factor** shows up as `SECOND_FACTOR_REQUIRED` on a login whose password was right — the one refusal that
+  asks for something different rather than the same thing again — so the app reveals a code field instead of saying
+  the password was wrong. A recovery code goes in the same field.
+- **A forgotten password** is set again with a code, and doing it signs every session out, this one among them.
+- **The sessions a member holds** are listed on the account screen, each with the name the app gave for the device it
+  runs on, and any but the current one can be ended from there.
+
+### Unlocking with a fingerprint
+
+On a phone the session is kept behind the device's own lock: `expo-secure-store` with `requireAuthentication`, so
+reading it asks for the fingerprint, the face or the passcode. The app does not ask at launch — it draws a screen
+offering to unlock, and the member asks for the prompt, because a prompt nobody asked for is the fastest way to teach
+people to dismiss one.
+
+**What this is, and what it is not.** It unlocks a credential this device already holds. It is not how the venue
+knows who the member is: the venue only ever sees the session credential, exactly as it would if the password had
+been typed, and it is not told that a fingerprint was used. Anything the venue itself must be sure of belongs in the
+second factor instead.
+
+**It can stop working, by design.** A keystore entry that asks for biometrics is invalidated when the enrolled
+fingerprints or faces change, because the phone can no longer say the same person is asking. The read then fails, and
+the app forgets the entry and asks for the password — which is the honest answer, not a bug to work around.
+
+There is no web equivalent, and the app does not pretend otherwise.
 
 ## Pointing it at a venue
 
@@ -45,3 +79,8 @@ Android emulator reaches its host as `10.0.2.2`; neither can use `127.0.0.1`, wh
 
 Deposits (the venue's own page does them), parlays, settlement, market search, price history, push notifications, and
 anything a store would ask for before it listed a real-money app.
+
+The codes that prove an address and set a password arrive by mail, and a test venue has no mail provider: the
+messages sit in the identity service's outbox and the venue's own page lists them (`GET /v4/mail`, on only where the
+service was started with `--show-mail`). This app does not read that list — it asks for the code, as it would if a
+real message had arrived — so testing a sign-up against a demo venue means reading the code off that page.

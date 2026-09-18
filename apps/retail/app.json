@@ -33,7 +33,13 @@
           "imageWidth": 76
         }
       ],
-      "expo-secure-store"
+      "expo-secure-store",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Unlock the session this phone is holding, so you do not type your password every time."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,
