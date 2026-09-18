@@ -139,6 +139,18 @@ migrations:
   backoffLimit: 20
   # How long Atlas waits for another run's lock before giving up (its --lock-timeout).
   lockTimeout: 5m
+  # A one-time bridge for a database migrated before Atlas was adopted (core/store/decisions.md, S-2). Such a schema
+  # has tables Atlas has no history for, and it refuses the whole run: "connected database is not clean: found table
+  # ... baseline version or allow-dirty is required". Naming the last migration that database already has tells Atlas
+  # to record it as applied and carry on from the next one. Nothing is re-run and nothing is dropped.
+  #
+  #   baseline:
+  #     identity: "20260917000001"
+  #
+  # Set it, upgrade once, then take it out again: on a schema Atlas already knows it does nothing, and left in place
+  # it would quietly hide the same error on a database that is genuinely in the wrong state. A database this chart
+  # created is never in this position, so this is empty by default (deploy/README.md, migrations).
+  baseline: {}
 
 # Interface 1. Flood limits per WebSocket session, and per account for REST: messages a second and burst, logons a
 # minute per account (blueprint §12). Set well above what the page and bots need: a maker requoting every market can

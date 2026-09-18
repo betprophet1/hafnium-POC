@@ -499,11 +499,18 @@ impl Database {
         if !outcome.status.success() {
             let said = String::from_utf8_lossy(&outcome.stderr);
             let said = if said.trim().is_empty() { String::from_utf8_lossy(&outcome.stdout) } else { said };
-            return Err(Error::refused(format!(
-                "atlas could not apply {} to schema {schema}: {}",
-                dir.display(),
-                said.trim()
-            )));
+            let said = said.trim();
+            // The one failure an operator cannot act on from what Atlas says: a schema built before Atlas was
+            // adopted holds tables it has no history for, and it will not touch it. Saying so plainly, with the
+            // remedy, is the difference between a minute and an afternoon (deploy/README.md, migrations).
+            if said.contains("not clean") {
+                return Err(Error::refused(format!(
+                    "schema {schema} has tables from before Atlas kept this history, so it will not apply {}.                      Tell it which migration that schema already has — the last one applied to it by hand or by an                      earlier version — and it will record that and carry on from the next:                      `atlas migrate apply --dir file://{} --url <the service's url> --revisions-schema {schema}                      --baseline <version>`, or migrations.baseline.<service> in the chart. Atlas said: {said}",
+                    dir.display(),
+                    dir.display()
+                )));
+            }
+            return Err(Error::refused(format!("atlas could not apply {} to schema {schema}: {said}", dir.display())));
         }
         let after = self.applied_versions()?;
         Ok(after.into_iter().filter(|v| !before.contains(v)).collect())

@@ -77,6 +77,9 @@ spec:
                 --dir "file:///usr/share/venue/migrations/{{ $service }}" \
                 --url "$url" \
                 --revisions-schema "$VENUE_DATABASE_SCHEMA" \
+                {{- with (get ($.Values.migrations.baseline | default dict) $service) }}
+                --baseline {{ . | quote }} \
+                {{- end }}
                 --lock-timeout {{ $.Values.migrations.lockTimeout | quote }}
           env:
             {{- include "venue-mini.databaseEnv" (dict "ctx" $ "service" $service) | trim | nindent 12 }}

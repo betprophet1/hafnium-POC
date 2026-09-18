@@ -262,6 +262,22 @@ never migrate in the chart: at start each waits, saying so in its log, until its
 built with, and refuses to start against a newer one or one whose SQL has changed since it was applied. Every run takes
 Atlas's lock, so overlapping runs are safe, and a run repeated applies nothing.
 
+**A database made before Atlas** has tables Atlas kept no history for, and it refuses the whole run rather than
+guess: `connected database is not clean: found table "accounts" in schema "identity"`. The migrate job then fails and,
+being a pre-upgrade hook, the upgrade fails with it and nothing is rolled. Tell Atlas which migration that schema
+already has, and it records that one as applied and carries on from the next — nothing is re-run, and nothing is
+dropped:
+
+```sh
+helm upgrade --install venue deploy/charts/venue-mini --set migrations.baseline.identity=20260917000001
+```
+
+The version to name is the last migration that database really has. Read it off the schema rather than guessing: if
+`identity` holds `accounts` and `api_keys` but no `members`, it is at `20260917000001`. **Take the value out again
+after the upgrade.** On a schema Atlas already knows it does nothing, but left in place it would quietly bridge the
+same error on a database that is genuinely in the wrong state, which is the one case you want to hear about. A
+database this chart created is never in this position.
+
 **Rolling back a migration** is Atlas's `migrate down`, which plans the revert against a throwaway dev database and
 checks before it destroys anything (a column with data in it stops the revert rather than being dropped). It needs a
 database Atlas may create for the planning, so it is run from a machine with Docker rather than from the job:
