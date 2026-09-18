@@ -48,6 +48,7 @@ spec:
     spec:
       # Nothing in the adapter talks to the Kubernetes API.
       automountServiceAccountToken: false
+      {{- include "venue-mini.imagePullSecrets" . | trim | nindent 6 }}
       securityContext:
         {{- include "venue-mini.podSecurity" . | nindent 8 }}
         # The volumes' roots are given the pod's group once; their contents are not opened up to the group again at

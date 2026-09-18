@@ -1,0 +1,67 @@
+# Builds the venue image for a pull request that has asked for an environment, and pushes it tagged with the commit
+# it was built from (deploy/README.md, an image per pull request).
+#
+# Without this a preview deploys the branch's *chart* against whatever image happened to be on the node, which looks
+# entirely healthy and tests the wrong binary — the worst shape a test environment can take. The ApplicationSet names
+# `image.tag` as the pull request's head, so the chart and the code it runs move together or not at all.
+#
+# Only labelled pull requests are built. A release build of this workspace is long, and building every push on every
+# branch would spend an afternoon of runner time a day to produce images nobody pulls. The label is the same one that
+# asks for the environment, so there is one thing to remember rather than two.
+name: preview image
+
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+# The image goes to this repository's own package registry, which needs nothing configured: GITHUB_TOKEN can push
+# there when told it may.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # One build per pull request. A second push supersedes the first, because only the newest head is ever deployed.
+  group: preview-image-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # `labeled` fires for any label; the other triggers fire whatever the labels are. Both have to be filtered, or a
+    # passing remark on an unrelated pull request starts a twenty-minute build.
+    if: contains(github.event.pull_request.labels.*.name, 'deploy-env')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The pull request's head, which is what the environment will be built from. The default for a
+          # pull_request event is a merge commit that exists nowhere else, and an image tagged with a SHA no branch
+          # has is an image the ApplicationSet can never ask for.
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/images/venue-node.Dockerfile
+          push: true
+          # Lower-cased: a registry path may not carry capitals, and a GitHub owner may.
+          tags: ghcr.io/${{ github.repository_owner }}/venue:${{ github.event.pull_request.head.sha }}
+          # Cached between runs, because a release build of this workspace from cold is the slowest thing here by a
+          # wide margin and most pushes change one crate.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Say what was built
+        run: |
+          echo "### Preview image" >> "$GITHUB_STEP_SUMMARY"
+          echo '`ghcr.io/${{ github.repository_owner }}/venue:${{ github.event.pull_request.head.sha }}`' \
+            >> "$GITHUB_STEP_SUMMARY"

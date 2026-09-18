@@ -29,6 +29,7 @@ spec:
         app.kubernetes.io/component: migrate
     spec:
       restartPolicy: OnFailure
+      {{- include "venue-mini.imagePullSecrets" . | trim | nindent 6 }}
       securityContext:
         {{- include "venue-mini.podSecurity" . | nindent 8 }}
       {{- if .Values.postgres.enabled }}

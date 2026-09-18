@@ -7,6 +7,10 @@ image:
   repository: venue
   tag: dev
   pullPolicy: IfNotPresent
+  # Secrets to pull with, for a registry that asks. Empty for a venue whose image was built and imported by hand,
+  # which is what the laptop script does; a preview names one, because it pulls its own branch's build from a
+  # private registry (deploy/README.md, an image per pull request).
+  pullSecrets: []
 
 core:
   # One sequencer group, one node. Order and trade IDs carry the group (spec E-2.8).

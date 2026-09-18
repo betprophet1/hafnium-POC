@@ -68,6 +68,20 @@ spec:
             # from its own origin and every call to this venue is cross-origin (decision G-15).
             - name: gateway.allowedOrigins
               value: "https://app.venue.example"
+            # The image built from this very commit, and the credential to pull it with. Without these a preview
+            # deploys the branch's chart against whatever image is already on the node: healthy, convincing and
+            # testing the wrong binary. The workflow in .github/workflows/preview-image.yml puts it there, tagged
+            # with the same head this Application is rendered from, so the chart and the code move together.
+            - name: image.repository
+              value: ghcr.io/lordnacho/venue
+            - name: image.tag
+              value: "{{ .head_sha }}"
+            # A tag here is a commit, so it never comes to mean a different image and there is nothing to re-pull;
+            # a force-push produces a new head and therefore a new tag, which is a different image again.
+            - name: image.pullPolicy
+              value: IfNotPresent
+            - name: image.pullSecrets[0]
+              value: ghcr-pull
             # What the environment calls itself in its metrics, so a dashboard can tell one branch from another.
             - name: metrics.labels.environment
               value: "pr-{{ .number }}"

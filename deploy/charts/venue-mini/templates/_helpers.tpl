@@ -26,6 +26,20 @@ app.kubernetes.io/instance: {{ .ctx.Release.Name }}
 app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
+{{/*
+What to pull images with, where the registry is not open. Empty by default: a venue built and imported by hand, as
+the laptop script does, needs nothing here. A preview pulls its own branch's image from a private registry and does
+(deploy/README.md, an image per pull request).
+*/}}
+{{- define "venue-mini.imagePullSecrets" -}}
+{{- with .Values.image.pullSecrets }}
+imagePullSecrets:
+{{- range . }}
+  - name: {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
 {{- define "venue-mini.podSecurity" -}}
 runAsNonRoot: true
 runAsUser: 10001
@@ -49,6 +63,7 @@ forwards to; a public one only follows the feed. Each pod of a split gateway wri
 {{- $ := .ctx }}
 {{- $name := include "venue-mini.fullname" $ }}
 {{- $core := printf "%s-core" $name -}}
+{{- include "venue-mini.imagePullSecrets" $ | trim | nindent 0 }}
 securityContext:
   {{- include "venue-mini.podSecurity" $ | nindent 2 }}
 # A stopping gateway first drains (preStop), then gets SIGTERM, which ends it at once: its sessions close, and their

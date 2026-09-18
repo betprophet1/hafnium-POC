@@ -39,6 +39,7 @@ spec:
         app.kubernetes.io/component: observer
     spec:
       automountServiceAccountToken: false
+      {{- include "venue-mini.imagePullSecrets" . | trim | nindent 6 }}
       securityContext:
         {{- include "venue-mini.podSecurity" . | nindent 8 }}
       containers:

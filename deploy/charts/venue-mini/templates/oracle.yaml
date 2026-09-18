@@ -52,6 +52,7 @@ spec:
         # A changed calendar replaces the pod, which reads the file only at start.
         checksum/calendar: {{ .Files.Get "files/calendar.json" | sha256sum }}
     spec:
+      {{- include "venue-mini.imagePullSecrets" . | trim | nindent 6 }}
       securityContext:
         {{- include "venue-mini.podSecurity" . | nindent 8 }}
       containers:

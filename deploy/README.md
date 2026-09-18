@@ -280,6 +280,38 @@ several containers failing to authenticate. The ApplicationSet works around it b
 ignoring it, which is sound for a database that dies with its pull request. **Anything meant to last should make its
 passwords outside the chart and name them through `postgres.existingSecret`**, which the chart already supports.
 
+### An image per pull request
+
+A preview deploys the branch's chart, and it has to run the branch's *code* too, or it is a convincing test of the
+wrong binary. `.github/workflows/preview-image.yml` builds the image when a pull request is labelled or pushed to,
+and pushes it to this repository's own registry tagged with the head commit:
+
+```
+ghcr.io/<owner>/venue:<head sha>
+```
+
+The ApplicationSet names that exact tag, so the chart and the code it runs move together or not at all. The workflow
+builds **only for labelled pull requests** — a release build of this workspace is long, and building every push on
+every branch would spend an afternoon of runner time a day producing images nobody pulls. It is the same label that
+asks for the environment, so there is one thing to remember rather than two.
+
+It checks out `pull_request.head.sha` rather than the default. A `pull_request` event checks out a merge commit that
+exists on no branch, and an image tagged with a SHA the ApplicationSet can never ask for is an image that never gets
+deployed.
+
+**The cluster needs a credential to pull it**, because the package is as private as the repository. One secret, in
+each preview namespace — and since the namespaces come and go, the practical answer is a secret the cluster copies
+into new namespaces, or one created alongside. A token with `read:packages` is all it needs:
+
+```sh
+kubectl create secret docker-registry ghcr-pull \
+  --docker-server=ghcr.io --docker-username=<user> --docker-password=<a token with read:packages> \
+  -n venue-pr-<number>
+```
+
+`image.pullSecrets` is empty by default, so a venue whose image was built and imported by hand — which is what
+`laptop.sh` does — needs none of this and is unchanged.
+
 **A preview never sees live data.** Each environment has its own identity service and its own database, so a session
 from the live venue is nobody's in a preview and a developer signs in there separately (decision G-20). That is not
 politeness: a preview runs a branch nobody has reviewed, and a branch that could verify live credentials could be

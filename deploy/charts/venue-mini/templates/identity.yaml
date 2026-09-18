@@ -38,6 +38,7 @@ spec:
         {{- include "venue-mini.labels" . | nindent 8 }}
         app.kubernetes.io/component: identity
     spec:
+      {{- include "venue-mini.imagePullSecrets" . | trim | nindent 6 }}
       securityContext:
         {{- include "venue-mini.podSecurity" . | nindent 8 }}
       containers:

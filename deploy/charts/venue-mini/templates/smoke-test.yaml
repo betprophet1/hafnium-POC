@@ -22,6 +22,7 @@ metadata:
     helm.sh/hook-delete-policy: before-hook-creation
 spec:
   restartPolicy: Never
+  {{- include "venue-mini.imagePullSecrets" . | trim | nindent 2 }}
   securityContext:
     {{- include "venue-mini.podSecurity" . | nindent 4 }}
   containers:
