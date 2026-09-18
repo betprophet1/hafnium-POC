@@ -6,10 +6,18 @@
 # many branches can be looked at on one afternoon, so each thing left out is left out for a stated reason rather
 # than because it seemed large.
 
-# The smallest engine: 16k resting orders and about 90 MiB. A branch is reviewed, not load-tested; a branch that is
-# about capacity says so by overriding this itself.
+# The volumes go when the environment does. A preview's namespace is thrown away with its pull request, and a
+# journal and a database left behind each time would fill the node a gigabyte at a time — which is exactly what
+# happened the first time this was run, and is why these are here.
 core:
+  # The smallest engine: 16k resting orders and about 90 MiB. A branch is reviewed, not load-tested; a branch that
+  # is about capacity says so by overriding this itself.
   capacity: small
+  storage:
+    keepOnDelete: false
+postgres:
+  storage:
+    keepOnDelete: false
 
 # The synthetic traders stay. A venue with an empty book tells a reviewer nothing — no prices, no fills, nothing to
 # trade against — and they are the cheapest part of the deployment.

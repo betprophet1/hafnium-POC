@@ -272,6 +272,14 @@ happened, because an environment vanishing mid-review with no explanation is wor
 The reaper compares timestamps **as strings**. RFC3339 in UTC sorts lexicographically in time order, so nothing has
 to parse a date — which matters, because the image's `date` is busybox's and cannot read RFC3339 at all.
 
+**The chart cannot generate its own database passwords under ArgoCD.** It makes them with `randAlphaNum` and reuses
+them by looking the Secret up in the cluster — correct under `helm install`, and impossible here, because ArgoCD
+renders with `helm template`, which has no cluster to look in. `lookup` returns nothing, a new password is written on
+every reconcile, and PostgreSQL goes on wanting the one it was initialised with; the environment comes up with
+several containers failing to authenticate. The ApplicationSet works around it by writing that Secret once and then
+ignoring it, which is sound for a database that dies with its pull request. **Anything meant to last should make its
+passwords outside the chart and name them through `postgres.existingSecret`**, which the chart already supports.
+
 **A preview never sees live data.** Each environment has its own identity service and its own database, so a session
 from the live venue is nobody's in a preview and a developer signs in there separately (decision G-20). That is not
 politeness: a preview runs a branch nobody has reviewed, and a branch that could verify live credentials could be
@@ -290,6 +298,26 @@ do not match any of the allowed destinations in project 'venue-previews'
 
 — with nothing deployed. So the boundary holds, but what an operator sees is an Application sitting in error rather
 than a `kubectl apply` that failed. Measured against this cluster, not assumed.
+
+**Two things that will waste an afternoon on a single-node cluster**, neither of them the chart's fault, both met
+the first time these environments were run:
+
+- **Nothing external resolves from inside a pod**, on a k3s node whose host runs systemd-resolved. CoreDNS is
+  configured `forward . /etc/resolv.conf`, the host's resolv.conf says `nameserver 127.0.0.53`, and from a pod that
+  address is the pod's own loopback. Internal names work, so it looks like a firewall rather than DNS. k3s imports
+  `coredns-custom`, so an `external.override` naming the resolver the host really uses fixes it:
+
+  ```sh
+  kubectl create configmap coredns-custom -n kube-system \
+    --from-literal=external.override='forward . <the real resolver> 1.1.1.1 { policy sequential }'
+  kubectl rollout restart deploy/coredns -n kube-system
+  ```
+
+- **ArgoCD's repo-server looks like it is crash-looping and is being killed.** Its liveness probe asks
+  `/healthz?full=true` with a five-second timeout, and on a loaded node that check does not return in time, so the
+  kubelet restarts it — over and over, mid-manifest-generation, leaving every Application unable to load its target
+  state. The container exits 0 each time, which is the tell: it is being asked to stop, not falling over. Give the
+  probe a longer timeout and a larger failure threshold.
 
 **Finding an environment from the app** is `GET /v4/bootstrap` (interface 1 README, choosing an environment). The
 live venue names the previews only to members its records mark as staff, and `--environments` points the gateway at

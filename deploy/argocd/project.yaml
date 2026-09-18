@@ -23,15 +23,25 @@ spec:
   destinations:
     - server: https://kubernetes.default.svc
       namespace: "venue-pr-*"
-  # Nothing cluster-scoped at all. A preview has no business making a ClusterRole, a webhook, a CRD or a
-  # PersistentVolume: everything a venue needs is namespaced, so an empty list here costs nothing and refuses the
-  # whole class of ways a branch could reach outside its namespace.
-  clusterResourceWhitelist: []
+  # One cluster-scoped kind, and one only: the Namespace a preview lives in, which `CreateNamespace=true` has to
+  # make before anything else can go into it. An empty list here is what you first reach for and it does not work —
+  # every sync fails with "resource :Namespace is not permitted in project venue-previews", which reads like a
+  # destination problem and is not one. Measured, on venue-pr-1.
+  #
+  # Everything else cluster-scoped stays refused, which is the part that matters: no ClusterRole, no
+  # ClusterRoleBinding, no CRD, no webhook, no PersistentVolume. A branch cannot grant itself anything outside its
+  # own namespace, and so cannot reach the live venue or read the token in argocd.
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
   namespaceResourceWhitelist:
     - group: "*"
       kind: "*"
-  # Turned off deliberately: a preview may not lend its rights to another project's Applications.
-  permitOnlyProjectScopedClusters: true
+  # `permitOnlyProjectScopedClusters` is deliberately NOT set. It sounds like what is wanted here and is not: it
+  # requires every destination cluster to be a cluster secret explicitly scoped to this project, and the built-in
+  # in-cluster destination is not one — so with it on, every preview is refused with an InvalidSpecError naming a
+  # destination that plainly is in the list above. Measured, after it refused venue-pr-1. The confinement that
+  # matters is `destinations` and the empty `clusterResourceWhitelist`, both of which are doing their job.
   roles:
     - name: read-only
       description: Seeing what a preview is doing, without being able to change it.
