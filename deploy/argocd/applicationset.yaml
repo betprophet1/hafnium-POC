@@ -1,0 +1,88 @@
+# A venue per pull request (deploy/README.md, an environment per pull request).
+#
+# ArgoCD watches the repository's open pull requests and keeps one Application — one whole venue, in a namespace of
+# its own — for each that asks for one. When the request is closed, or stops asking, the Application goes and the
+# namespace goes with it, databases and journal included.
+#
+# Two things about this file are deliberate and easy to undo by accident:
+#
+#   - **Environments are opt-in, by the `deploy-env` label.** A node that fits three or four venues cannot give one
+#     to every open branch, and an environment nobody asked for is one nobody is looking at. Remove the filter and
+#     the next busy week fills the cluster.
+#   - **The time limit works by taking that label off, not by deleting anything.** This ApplicationSet owns its
+#     Applications: delete one and it is recreated within `requeueAfterSeconds`, which looks like a reaper that does
+#     not work and is really a reaper fighting a controller. The CronJob beside this file removes the label, and
+#     then ArgoCD tears the environment down itself, which is the only version that stays torn down.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: venue-previews
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - pullRequest:
+        github:
+          owner: LordNacho
+          repo: prediction-exchange
+          tokenRef:
+            secretName: venue-github-token
+            key: token
+        # Only the branches that asked. See above.
+        filters:
+          - labels: ["deploy-env"]
+        # How often the pull requests are read again. Short enough that labelling one feels immediate, long enough
+        # not to spend the API rate limit on an idle repository.
+        requeueAfterSeconds: 120
+  template:
+    metadata:
+      name: "venue-pr-{{ .number }}"
+      labels:
+        venue.environment: preview
+        venue.pull-request: "{{ .number }}"
+      annotations:
+        # What the reaper reads. It is the branch's head when the environment was made, so a pull request that is
+        # still being pushed to keeps its environment: see the CronJob.
+        venue.head-sha: "{{ .head_sha }}"
+    spec:
+      project: venue-previews
+      source:
+        repoURL: git@github.com:LordNacho/prediction-exchange.git
+        targetRevision: "{{ .head_sha }}"
+        path: deploy/charts/venue-mini
+        helm:
+          valueFiles:
+            - ../../argocd/preview.yaml
+          parameters:
+            # The host this venue answers on, which is also the URL the bootstrap will name to the venue's own
+            # people (interface 1 README, choosing an environment).
+            - name: ingress.enabled
+              value: "true"
+            - name: ingress.host
+              value: "pr-{{ .number }}.preview.venue.example"
+            - name: ingress.tls.secretName
+              value: preview-venue-tls
+            # Without this the app is refused by the browser before it can do anything at all: the app is served
+            # from its own origin and every call to this venue is cross-origin (decision G-15).
+            - name: gateway.allowedOrigins
+              value: "https://app.venue.example"
+            # What the environment calls itself in its metrics, so a dashboard can tell one branch from another.
+            - name: metrics.labels.environment
+              value: "pr-{{ .number }}"
+            - name: metrics.labels.profile
+              value: preview
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "venue-pr-{{ .number }}"
+      syncPolicy:
+        automated:
+          # Both on purpose. A preview environment is worth nothing if it does not follow the branch, and a namespace
+          # left behind after its pull request closed is worth less than nothing.
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          # The migrate job is a pre-upgrade hook and the chart's own; leaving its history behind fills the namespace
+          # with completed pods for no one's benefit.
+          - PruneLast=true

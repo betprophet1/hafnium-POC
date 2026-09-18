@@ -1,0 +1,108 @@
+# Takes the `deploy-env` label off pull requests whose environment has been up longer than it is worth, so that
+# ArgoCD tears those environments down (deploy/README.md, an environment per pull request).
+#
+# **Why it removes a label rather than deleting anything.** The ApplicationSet owns its Applications. Deleting one,
+# or the namespace under it, only means the controller makes it again on its next pass — a reaper that appears not to
+# work, and is really two controllers disagreeing. Removing the label makes the pull request stop matching the
+# generator, and ArgoCD then removes the Application itself, prunes the namespace, and leaves it removed. Re-label a
+# pull request and it comes back.
+#
+# The age it measures is the Application's, not the pull request's: a branch that has been open for a month but only
+# got an environment this morning has had that environment for a morning.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: venue-preview-reaper
+  namespace: argocd
+spec:
+  # Every half hour. The limit is in hours, so anything finer only wakes the API server up.
+  schedule: "*/30 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: venue-preview-reaper
+          containers:
+            - name: reaper
+              image: alpine/k8s:1.31.1
+              env:
+                - name: MAX_HOURS
+                  value: "8"
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: venue-github-token
+                      key: token
+                - name: REPO
+                  value: LordNacho/prediction-exchange
+              command: ["/bin/sh", "-euo", "pipefail", "-c"]
+              args:
+                - |
+                  # The cutoff is built as a timestamp and the comparison is a string one. RFC3339 in UTC sorts
+                  # lexicographically in time order, so nothing here has to parse a date — which matters, because
+                  # this image's `date` is busybox's and cannot read RFC3339 at all. Both busybox and GNU can format
+                  # an epoch (`-d @seconds`), and that is all this needs.
+                  cutoff=$(date -u -d "@$(( $(date -u +%s) - MAX_HOURS * 3600 ))" +%Y-%m-%dT%H:%M:%SZ)
+                  echo "taking down preview environments made before $cutoff"
+                  # Every preview environment ArgoCD is holding, with the number of the request it belongs to.
+                  kubectl get applications.argoproj.io -n argocd \
+                    -l venue.environment=preview \
+                    -o jsonpath='{range .items[*]}{.metadata.labels.venue\.pull-request}{" "}{.metadata.creationTimestamp}{"\n"}{end}' \
+                    | while read -r number made; do
+                        [ -n "$number" ] || continue
+                        if [ ! "$made" \< "$cutoff" ]; then
+                          echo "pr $number: made $made, leaving it"
+                          continue
+                        fi
+                        echo "pr $number: made $made, taking the label off"
+                        # ArgoCD sees the pull request stop matching the generator on its next pass and removes the
+                        # environment itself. Nothing here deletes an Application: see the note at the top.
+                        curl -sS -X DELETE \
+                          -H "Authorization: Bearer $GITHUB_TOKEN" \
+                          -H "Accept: application/vnd.github+json" \
+                          "https://api.github.com/repos/$REPO/issues/$number/labels/deploy-env" >/dev/null
+                        # And say so where the person who asked for it will see it, rather than letting an
+                        # environment disappear under somebody mid-review.
+                        curl -sS -X POST \
+                          -H "Authorization: Bearer $GITHUB_TOKEN" \
+                          -H "Accept: application/vnd.github+json" \
+                          -d "{\"body\": \"The preview environment for this pull request has been up since ${made} and has been taken down to make room. Add the \`deploy-env\` label to bring it back.\"}" \
+                          "https://api.github.com/repos/$REPO/issues/$number/comments" >/dev/null
+                      done
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: venue-preview-reaper
+  namespace: argocd
+---
+# It reads Applications and changes nothing in the cluster: what it changes is a label on GitHub. Anything more than
+# reading would let a bug here delete an environment directly, which is the failure mode the whole design avoids.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: venue-preview-reaper
+  namespace: argocd
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: venue-preview-reaper
+  namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: venue-preview-reaper
+subjects:
+  - kind: ServiceAccount
+    name: venue-preview-reaper
+    namespace: argocd

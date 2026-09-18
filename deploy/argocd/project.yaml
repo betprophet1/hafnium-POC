@@ -1,0 +1,34 @@
+# What a pull request's venue is allowed to be (deploy/README.md, an environment per pull request).
+#
+# This is the boundary, and it is the reason previews are a separate project rather than sharing the live venue's.
+# An Application built from a pull request is built from **code nobody has reviewed yet** — that is what a pull
+# request is — and ArgoCD will deploy whatever the chart in that branch says. Without a project saying otherwise, a
+# branch could change the chart to deploy into the live namespace, or to make cluster-wide objects, and ArgoCD would
+# do it faithfully. The list below is what stops that, and it is the only thing that stops it.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: venue-previews
+  namespace: argocd
+spec:
+  description: One venue per pull request, each in a namespace of its own and nowhere else.
+  sourceRepos:
+    - git@github.com:LordNacho/prediction-exchange.git
+  # Namespaces of its own, and no others. Not the live venue's, not argocd's, not kube-system.
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: "venue-pr-*"
+  # Nothing cluster-scoped at all. A preview has no business making a ClusterRole, a webhook, a CRD or a
+  # PersistentVolume: everything a venue needs is namespaced, so an empty list here costs nothing and refuses the
+  # whole class of ways a branch could reach outside its namespace.
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  # Turned off deliberately: a preview may not lend its rights to another project's Applications.
+  permitOnlyProjectScopedClusters: true
+  roles:
+    - name: read-only
+      description: Seeing what a preview is doing, without being able to change it.
+      policies:
+        - p, proj:venue-previews:read-only, applications, get, venue-previews/*, allow

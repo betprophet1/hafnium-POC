@@ -1,0 +1,48 @@
+# What a pull request's venue is, on top of the chart's defaults: everything a reviewer needs to open the page, sign
+# in and trade, and nothing that only matters when a venue is meant to stay up.
+#
+# The point is footprint. A full environment asks for about 1150m of CPU and 3.1 GiB of memory, so a node with six
+# cores and 15 GiB fits three or four of them beside whatever else it is doing. Trimming here is what decides how
+# many branches can be looked at on one afternoon, so each thing left out is left out for a stated reason rather
+# than because it seemed large.
+
+# The smallest engine: 16k resting orders and about 90 MiB. A branch is reviewed, not load-tested; a branch that is
+# about capacity says so by overriding this itself.
+core:
+  capacity: small
+
+# The synthetic traders stay. A venue with an empty book tells a reviewer nothing — no prices, no fills, nothing to
+# trade against — and they are the cheapest part of the deployment.
+maker:
+  enabled: true
+taker:
+  enabled: true
+
+# The oracle stays too: without it nothing ever settles, and settlement is where most of the interesting bugs are.
+oracle:
+  enabled: true
+
+# The FIX adapter goes. It is a second front door onto the same venue, it needs a JVM, and a reviewer who wants it
+# turns it on for their own branch.
+fix:
+  enabled: false
+
+# So does the observer, which exists to watch an environment over time. Nobody watches a preview over time.
+observer:
+  enabled: false
+
+# Mail is readable here, because there is no mail provider and the codes that prove an address have to reach
+# somebody (decision G-19). It is the same reasoning as the demo, and the same warning: never where an address could
+# really receive them.
+identity:
+  showMail: true
+
+# One of each half. The split is kept rather than collapsed to a single gateway, because the halves are part of what
+# a reviewer is looking at, and two small pods cost less than the surprise of reviewing a shape that is not the one
+# that runs.
+gateway:
+  split:
+    public:
+      replicas: 1
+    private:
+      replicas: 1

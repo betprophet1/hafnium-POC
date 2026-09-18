@@ -228,6 +228,57 @@ Where the device looks for the venue: a real phone and an iOS simulator use the 
 they share; an Android emulator reaches its host as `10.0.2.2`. Neither can use `127.0.0.1`, which is the device
 itself.
 
+## An environment per pull request
+
+A pull request labelled `deploy-env` gets a venue of its own — its own namespace, its own databases, its own journal
+— and loses it again when the label comes off, the request closes, or the time limit passes. `deploy/argocd/` holds
+the four pieces:
+
+| | |
+|---|---|
+| `project.yaml` | What a preview is allowed to be: its own namespaces and nothing else, no cluster-scoped objects. |
+| `applicationset.yaml` | One Application per labelled pull request, from that request's head. |
+| `preview.yaml` | The values a preview runs with, chosen for footprint. |
+| `reaper.yaml` | Takes the label off environments older than the limit, so ArgoCD takes them down. |
+
+```sh
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+kubectl create secret generic venue-github-token -n argocd --from-literal=token=<a token that may read PRs and write labels>
+kubectl apply -f deploy/argocd/
+```
+
+Then label a pull request `deploy-env` and it appears at `pr-<number>.preview.venue.example` within a couple of
+minutes.
+
+**Environments are opt-in on purpose.** A full venue asks for about 1150m of CPU and 3.1 GiB of memory, so a node
+with six cores and 15 GiB holds three or four beside everything else. Giving one to every open branch fills the
+cluster the first busy week; giving one to every branch somebody asked about does not. `preview.yaml` trims what it
+can — no FIX adapter, no observer, the smallest engine — and keeps what a reviewer actually needs, which is the
+synthetic traders (an empty book shows nothing) and the oracle (without it nothing ever settles).
+
+**The time limit works by removing the label, not by deleting anything.** This is the part that catches people. The
+ApplicationSet owns its Applications: delete one, or its namespace, and the controller makes it again on its next
+pass — which looks like a reaper that does not work, and is really two controllers disagreeing. The CronJob removes
+`deploy-env` from the pull request instead; it then stops matching the generator, and ArgoCD removes the Application,
+prunes the namespace and leaves it gone. Re-label to bring it back. The job also comments on the request saying what
+happened, because an environment vanishing mid-review with no explanation is worse than one that never existed.
+
+The reaper compares timestamps **as strings**. RFC3339 in UTC sorts lexicographically in time order, so nothing has
+to parse a date — which matters, because the image's `date` is busybox's and cannot read RFC3339 at all.
+
+**A preview never sees live data.** Each environment has its own identity service and its own database, so a session
+from the live venue is nobody's in a preview and a developer signs in there separately (decision G-20). That is not
+politeness: a preview runs a branch nobody has reviewed, and a branch that could verify live credentials could be
+written to collect them. The `AppProject` is the other half of the same thought — a branch can change the chart, so
+without a project restricting destinations to `venue-pr-*` it could deploy itself into the live namespace and ArgoCD
+would oblige.
+
+**Finding an environment from the app** is `GET /v4/bootstrap` (interface 1 README, choosing an environment). The
+live venue names the previews only to members its records mark as staff, and `--environments` points the gateway at
+the file listing them — a ConfigMap, read afresh on every request, so environments coming and going needs no
+restart.
+
 ## Databases
 
 The treasury, identity, parlay and oracle services keep their records in PostgreSQL (`core/store/README.md`; the
