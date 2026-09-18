@@ -5,6 +5,11 @@
 # request is — and ArgoCD will deploy whatever the chart in that branch says. Without a project saying otherwise, a
 # branch could change the chart to deploy into the live namespace, or to make cluster-wide objects, and ArgoCD would
 # do it faithfully. The list below is what stops that, and it is the only thing that stops it.
+#
+# It stops it at sync rather than at admission. ArgoCD has no admission webhook for destinations, so an Application
+# aimed at a namespace it may not have is created without complaint and then simply never syncs, carrying an
+# `InvalidSpecError` that names the project and the destination. Nothing is deployed, which is what matters — but
+# somebody looking for a rejected apply will not find one, so look at the Application's conditions instead.
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:

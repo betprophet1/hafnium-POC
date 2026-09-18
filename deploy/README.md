@@ -243,10 +243,15 @@ the four pieces:
 
 ```sh
 kubectl create namespace argocd
-kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+# --server-side, not a plain apply: the ApplicationSet CRD is larger than the 256 KiB annotation a client-side apply
+# writes, and a plain apply fails with "metadata.annotations: Too long".
+kubectl apply --server-side -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 kubectl create secret generic venue-github-token -n argocd --from-literal=token=<a token that may read PRs and write labels>
 kubectl apply -f deploy/argocd/
 ```
+
+ArgoCD also needs to be able to read the repository — a deploy key on it, added as a `repo` secret in `argocd` — or
+every Application sits unsynced saying it cannot fetch the source.
 
 Then label a pull request `deploy-env` and it appears at `pr-<number>.preview.venue.example` within a couple of
 minutes.
@@ -273,6 +278,18 @@ politeness: a preview runs a branch nobody has reviewed, and a branch that could
 written to collect them. The `AppProject` is the other half of the same thought — a branch can change the chart, so
 without a project restricting destinations to `venue-pr-*` it could deploy itself into the live namespace and ArgoCD
 would oblige.
+
+**That refusal happens at sync, not at admission**, which is worth knowing before you go looking for it. ArgoCD has
+no admission webhook for destinations: an Application aimed somewhere it may not go is *created* quite happily, and
+then never syncs, carrying a condition that says why —
+
+```
+InvalidSpecError: application destination server 'https://kubernetes.default.svc' and namespace 'default'
+do not match any of the allowed destinations in project 'venue-previews'
+```
+
+— with nothing deployed. So the boundary holds, but what an operator sees is an Application sitting in error rather
+than a `kubectl apply` that failed. Measured against this cluster, not assumed.
 
 **Finding an environment from the app** is `GET /v4/bootstrap` (interface 1 README, choosing an environment). The
 live venue names the previews only to members its records mark as staff, and `--environments` points the gateway at
