@@ -18,5 +18,8 @@ sha2 = "0.11"
 # Argon2id for a member's password (core/identity/README.md, members): what a password store is meant to use, from
 # the same RustCrypto tree as sha2, so it shares digest 0.11 rather than bringing a second copy of it.
 argon2 = { version = "0.6", features = ["password-hash"] }
+# One-time codes from an authenticator app (RFC 6238), which every such app computes over HMAC-SHA-1.
+hmac = "0.13"
+sha1 = "0.11"
 # Its accounts and keys, in PostgreSQL.
 venue-store = { path = "../store" }

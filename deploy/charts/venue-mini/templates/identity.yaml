@@ -50,6 +50,8 @@ spec:
               value: "0.0.0.0:8084"
             - name: VENUE_CATALOGUE
               value: /catalogue/markets.json
+            - name: VENUE_SHOW_MAIL
+              value: {{ .Values.identity.showMail | default false | quote }}
             {{- include "venue-mini.databaseEnv" (dict "ctx" . "service" "identity") | trim | nindent 12 }}
           ports:
             - name: http

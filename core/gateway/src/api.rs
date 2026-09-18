@@ -295,9 +295,9 @@ impl Half {
         match path {
             "/v4/ws_public" | "/v4/markets" => Some(Self::Public),
             "/v4/ws_private" | "/v4/account" | "/v4/orders" | "/v4/transfers" | "/v4/rfqs" | "/v4/keys"
-            | "/v4/members" | "/v4/sessions" => Some(Self::Private),
+            | "/v4/members" | "/v4/sessions" | "/v4/mail" => Some(Self::Private),
             p if p.starts_with("/v4/markets/") => Some(Self::Public),
-            p if ["/v4/orders/", "/v4/transfers/", "/v4/rfqs/", "/v4/keys/", "/v4/sessions/"]
+            p if ["/v4/orders/", "/v4/transfers/", "/v4/rfqs/", "/v4/keys/", "/v4/sessions/", "/v4/members/"]
                 .iter()
                 .any(|under| p.starts_with(under)) =>
             {

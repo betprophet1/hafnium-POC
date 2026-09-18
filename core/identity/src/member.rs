@@ -22,6 +22,8 @@ const ID_DIGITS: usize = 16;
 const SECRET_DIGITS: usize = 64;
 /// What a stored session hash is over, besides the ID and the secret: a version, so a later scheme cannot collide.
 const HASH_TAG: &str = "venue-session/1:";
+/// The same, for an emailed token or a recovery code, so a hash of one can never be mistaken for a hash of the other.
+const TOKEN_TAG: &str = "venue-token/1:";
 
 /// How long a session lasts before an app must log in again. Long enough that an app used daily is not asked every
 /// time, short enough that a token taken from a device stops working (interfaces/gateway/decisions.md, G-16).
@@ -78,6 +80,41 @@ pub fn hash(id: &str, secret: &str) -> [u8; 32] {
     hasher.update(id.as_bytes());
     hasher.update(b":");
     hasher.update(secret.as_bytes());
+    hasher.finalize().into()
+}
+
+/// A token emailed to a member: 128 random bits as hex. More than a code read once out of a message needs, and short
+/// enough to go in a link or be typed by hand.
+pub fn new_token() -> io::Result<String> {
+    random_hex(16)
+}
+
+/// A recovery code as a person reads it out: ten hex digits in two groups, so it can be written down and typed back.
+/// Matched case-insensitively and with the groups' dash optional, because how it was copied should not matter.
+pub fn new_recovery_code() -> io::Result<String> {
+    let hex = random_hex(5)?;
+    Ok(format!("{}-{}", &hex[..5], &hex[5..]))
+}
+
+/// How a recovery code is written before it is hashed or compared, so that case and spacing cannot refuse a code the
+/// member has right.
+pub fn tidy_recovery_code(code: &str) -> String {
+    code.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_lowercase()
+}
+
+/// The secret an authenticator app is given: 160 bits, which is what RFC 4226 asks for.
+pub fn new_totp_secret() -> io::Result<Vec<u8>> {
+    let mut buffer = vec![0u8; 20];
+    std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut buffer)?;
+    Ok(buffer)
+}
+
+/// What is stored in place of an emailed token or a recovery code. They carry their own randomness, as a session's
+/// secret does, so a fast hash over one is as safe here as a slow one — and only a password needs the slow one.
+pub fn token_hash(token: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(TOKEN_TAG.as_bytes());
+    hasher.update(token.trim().as_bytes());
     hasher.finalize().into()
 }
 

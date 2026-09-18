@@ -250,7 +250,8 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
     </div>
 
     <div id="tab-members" hidden>
-      <p class="note">What an app's customer does: sign up with an email and a password, and hold the session the venue answers with. The same credential works everywhere a dev token does — REST and the private WebSocket — so the phone apps and this page reach the venue the same way. A new member has an account of their own and no money in it; deposit on the account tab to trade.</p>
+      <p class="note">What an app's customer does: sign up with an email and a password, prove the address with the code that was sent to it, and hold the session the venue answers with. The same credential works everywhere a dev token does — REST and the private WebSocket — so the phone apps and this page reach the venue the same way. A new member has an account of their own and no money in it; deposit on the account tab to trade.</p>
+      <p class="note">Signing up answers nothing but "check your mail", whether or not the address already has an account: asking the venue which addresses it knows is not something this page or anyone else can do. There is no mail provider here, so the messages are listed below, the way the fake bank stands in for a real one.</p>
       <div class="money">
         <form id="signUpForm">
           <h4>Sign up</h4>
@@ -262,10 +263,30 @@ label.check { display: flex; align-items: center; gap: 6px; font-size: 13px; col
           <h4>Log in</h4>
           <label>Email<input id="liEmail" type="email" autocomplete="username"></label>
           <label>Password<input id="liPassword" type="password" autocomplete="current-password"></label>
+          <label>Code from your authenticator, if you have one<input id="liCode" inputmode="numeric" placeholder="123456 or a recovery code" autocomplete="one-time-code"></label>
           <button>Log in</button>
+        </form>
+        <form id="verifyForm">
+          <h4>Prove an address</h4>
+          <label>Code from the message<input id="veToken" placeholder="paste it, or use the button below"></label>
+          <button>Prove it</button>
+        </form>
+        <form id="resetForm">
+          <h4>Forgotten password</h4>
+          <label>Email<input id="reEmail" type="email" autocomplete="username"></label>
+          <button>Send a code</button>
+        </form>
+        <form id="setPasswordForm">
+          <h4>Set a new password</h4>
+          <label>Code from the message<input id="spToken" placeholder="paste it, or use the button below"></label>
+          <label>New password<input id="spPassword" type="password" placeholder="at least 10 characters" autocomplete="new-password"></label>
+          <button>Set it</button>
         </form>
       </div>
       <div id="memberWho"></div>
+      <h3>Mail this venue would have sent</h3>
+      <p class="note">Every message, newest first. In a venue that can really post to an address this list does not exist: the messages hold the codes themselves, so the identity service serves them only where it was started with <code>--show-mail</code>.</p>
+      <div id="memberMail"></div>
     </div>
 
     <div id="tab-settle" hidden>
@@ -1116,35 +1137,134 @@ function rememberMember(who) {
   renderStatus();
 }
 
-async function memberCall(path, body) {
-  const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+async function memberCall(path, body, method) {
+  const headers = {'Content-Type': 'application/json'};
+  // Signed in, the member's own routes are reached with their session, as an app reaches them.
+  if (member) headers.Authorization = 'Bearer ' + member.session.credential;
+  const options = {method: method || 'POST', headers};
+  if (body !== undefined && body !== null) options.body = JSON.stringify(body);
+  const r = await fetch(path, options);
   const answer = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error((answer.error && answer.error.message) || ('the venue answered ' + r.status));
+  if (!r.ok) {
+    const e = new Error((answer.error && answer.error.message) || ('the venue answered ' + r.status));
+    e.code = (answer.error && answer.error.code) || String(r.status);
+    throw e;
+  }
   return answer;
 }
+
+// What the member's own routes last said about them: whether the address is proved, whether there is a second
+// factor, and the sessions they hold. Read again after anything that changes one of them.
+let memberAbout = null, memberSessions = [], memberTotp = null, memberMail = [];
 
 function renderMember() {
   const who = $('#memberWho');
   if (!who) return;
   if (!member) {
-    who.innerHTML = '<p class="note">Nobody is signed in on this browser.</p>';
+    who.innerHTML = '<p class="note">Nobody is signed in on this browser. Sign up, prove the address with the code from the message below, and log in.</p>';
     return;
   }
   const s = sessions.member;
   const cash = s && s.account ? money(s.account.availableCents) : '—';
   const reserved = s && s.account ? money(s.account.reservedCents) : '—';
+  const proved = memberAbout ? memberAbout.emailVerified : member.emailVerified;
+  const address = proved
+    ? 'proved'
+    : 'not proved yet — this session may trade but not move money. Use the code in the message below.';
+  const factor = memberAbout && memberAbout.secondFactor
+    ? `on, ${memberAbout.recoveryCodesLeft} recovery ${memberAbout.recoveryCodesLeft === 1 ? 'code' : 'codes'} left`
+    : 'off';
   who.innerHTML = `<h3>Signed in</h3>
     <table>
       <tr><th>Email</th><td>${esc(member.email)}</td></tr>
+      <tr><th>Address</th><td>${esc(address)}</td></tr>
       <tr><th>Member</th><td><code>${esc(member.memberId)}</code></td></tr>
       <tr><th>Account</th><td><code>${esc(member.accountId)}</code></td></tr>
       <tr><th>Session</th><td><code>${esc(member.session.sessionId)}</code>, until ${esc(member.session.expiresAt)}</td></tr>
       <tr><th>Stream</th><td>${s && s.open ? 'connected' : 'connecting'}</td></tr>
       <tr><th>Available</th><td>${cash}</td></tr>
       <tr><th>Reserved</th><td>${reserved}</td></tr>
+      <tr><th>Second factor</th><td>${esc(factor)}</td></tr>
     </table>
-    <p><button id="logOut">Log out</button></p>
+    <p><button id="logOut">Log out</button>
+      ${memberAbout && memberAbout.secondFactor
+        ? '<button data-totp="off">Take the second factor off</button>'
+        : '<button data-totp="on">Add a second factor</button>'}</p>
+    ${renderTotp()}
+    <h4>Sessions</h4>
+    ${renderSessions()}
     <p class="note">This is what an app holds after logging in. Deposit on the account tab to give it money to trade with.</p>`;
+}
+
+function renderTotp() {
+  if (!memberTotp) return '';
+  if (memberTotp.recoveryCodes) {
+    return `<div class="note"><p><b>Recovery codes.</b> Ten, each good once, for when the authenticator is gone.
+      They are kept only as hashes, so this is the only time anyone sees them — write them down now.</p>
+      <p><code>${memberTotp.recoveryCodes.map(esc).join('</code> <code>')}</code></p>
+      <p><button data-totp="done">Done</button></p></div>`;
+  }
+  return `<div class="note"><p><b>Put this in an authenticator app</b>, by camera or by hand, then type the code it
+      shows. Nothing changes until that code arrives, so a secret typed wrong cannot lock you out.</p>
+    <p><code>${esc(memberTotp.secret)}</code></p>
+    <p><code>${esc(memberTotp.uri)}</code></p>
+    <form id="confirmTotpForm"><label>Code<input id="ctCode" inputmode="numeric" placeholder="123456"></label>
+      <button class="primary">Confirm</button></form></div>`;
+}
+
+function renderSessions() {
+  if (!memberSessions.length) return '<p class="note">None to show yet.</p>';
+  const rows = memberSessions.map(s => {
+    const here = s.sessionId === member.session.sessionId;
+    const when = s.lastUsedAt || s.createdAt;
+    const end = s.live && !here ? `<button data-endsession="${esc(s.sessionId)}">End it</button>` : '';
+    return `<tr><td><code>${esc(s.sessionId)}</code>${here ? ' (this one)' : ''}</td>
+      <td>${esc(s.device || 'an app')}</td><td>${esc(when)}</td>
+      <td>${s.live ? 'live' : 'ended'}</td><td>${end}</td></tr>`;
+  }).join('');
+  return `<table><tr><th>Session</th><th>Device</th><th>Last used</th><th></th><th></th></tr>${rows}</table>`;
+}
+
+function renderMail() {
+  const box = $('#memberMail');
+  if (!box) return;
+  if (!memberMail.length) {
+    box.innerHTML = '<p class="note">Nothing yet. Sign up, or ask for a new password, and the message appears here.</p>';
+    return;
+  }
+  box.innerHTML = memberMail.map(m => {
+    const code = (m.body.match(/\b[0-9a-f]{32}\b/) || [])[0];
+    const use = code ? `<button data-code="${esc(code)}">Use this code</button>` : '';
+    return `<div class="note"><p><b>${esc(m.subject)}</b> — to ${esc(m.to)}, ${esc(m.at)}</p>
+      <pre>${esc(m.body)}</pre>${use}</div>`;
+  }).join('');
+}
+
+/// Reads the member's own routes again, and the mail, so the page shows what the venue now holds.
+async function refreshMember() {
+  if (member) {
+    try {
+      memberAbout = await memberCall('/v4/members/me', null, 'GET');
+      memberSessions = (await memberCall('/v4/sessions', null, 'GET')).sessions || [];
+    } catch (e) { /* a session that has just ended: the next render says so */ }
+  } else {
+    memberAbout = null; memberSessions = []; memberTotp = null;
+  }
+  renderMember();
+  await refreshMail();
+}
+
+async function refreshMail() {
+  try {
+    memberMail = (await memberCall('/v4/mail', null, 'GET')).mail || [];
+  } catch (e) {
+    // A venue that can really post to an address does not serve this, which is the point.
+    memberMail = [];
+    const box = $('#memberMail');
+    if (box) box.innerHTML = '<p class="note">This venue does not show its mail, so the codes go to the address itself.</p>';
+    return;
+  }
+  renderMail();
 }
 
 function showTab(name) {
@@ -1153,31 +1273,103 @@ function showTab(name) {
   for (const t of ['maker', 'retail', 'account', 'parlays', 'settle', 'members']) $('#tab-' + t).hidden = t !== name;
   render();
   if (name === 'parlays') loadAllMarkets();
-  if (name === 'members') renderMember();
+  if (name === 'members') refreshMember();
 }
 
-for (const [form, path, fields] of [['#signUpForm', '/v4/members', ['#suEmail', '#suPassword']],
-                                   ['#logInForm', '/v4/sessions', ['#liEmail', '#liPassword']]]) {
-  const node = $(form);
-  if (!node) continue;
-  node.addEventListener('submit', async ev => {
-    ev.preventDefault();
-    const [email, password] = fields.map(f => $(f).value);
+// Each of the member forms: what it sends, and what to do with the answer. The four that a person reaches with no
+// session all answer the same thing, whether or not the address is anybody's, so all four say the same back.
+const memberForms = [
+  ['#signUpForm', async () => {
+    await memberCall('/v4/members', {email: $('#suEmail').value, password: $('#suPassword').value});
+    $('#suPassword').value = '';
+    $('#liEmail').value = $('#suEmail').value;
+    toast('Check the mail below for the code', 'ok');
+  }],
+  ['#logInForm', async () => {
+    const body = {email: $('#liEmail').value, password: $('#liPassword').value, device: 'this browser'};
+    if ($('#liCode').value.trim()) body.code = $('#liCode').value.trim();
     try {
-      rememberMember(await memberCall(path, {email, password}));
-      for (const f of fields) $(f).value = '';
-    } catch (e) { toast(String(e.message || e), 'bad'); }
-  });
-}
+      rememberMember(await memberCall('/v4/sessions', body));
+    } catch (e) {
+      if (e.code === 'SECOND_FACTOR_REQUIRED') { $('#liCode').focus(); }
+      throw e;
+    }
+    $('#liPassword').value = ''; $('#liCode').value = '';
+  }],
+  ['#verifyForm', async () => {
+    await memberCall('/v4/members/verify', {token: $('#veToken').value.trim()});
+    $('#veToken').value = '';
+    toast('The address is proved: this session may move money now', 'ok');
+  }],
+  ['#resetForm', async () => {
+    await memberCall('/v4/members/reset', {email: $('#reEmail').value});
+    toast('Check the mail below for the code', 'ok');
+  }],
+  ['#setPasswordForm', async () => {
+    const answer = await memberCall('/v4/members/password',
+      {token: $('#spToken').value.trim(), password: $('#spPassword').value});
+    $('#spToken').value = ''; $('#spPassword').value = '';
+    // Setting a password ends every session, this one among them.
+    rememberMember(null);
+    toast(`Password set; ${answer.sessionsEnded} session${answer.sessionsEnded === 1 ? '' : 's'} signed out`, 'ok');
+  }],
+  ['#confirmTotpForm', async () => {
+    memberTotp = await memberCall('/v4/members/me/totp', {code: $('#ctCode').value.trim()}, 'PUT');
+    toast('The second factor is on: write the recovery codes down', 'ok');
+  }],
+];
 
-document.addEventListener('click', ev => {
-  if (ev.target && ev.target.id === 'logOut') {
+// Delegated, because the confirm form is drawn only while a second factor is being added.
+document.addEventListener('submit', async ev => {
+  const entry = memberForms.find(([selector]) => ev.target.matches(selector));
+  if (!entry) return;
+  ev.preventDefault();
+  try {
+    await entry[1]();
+    await refreshMember();
+  } catch (e) {
+    toast(String(e.message || e), 'bad');
+    await refreshMail();
+  }
+});
+
+document.addEventListener('click', async ev => {
+  const t = ev.target;
+  if (!t) return;
+  if (t.id === 'logOut') {
     const token = member && member.session.credential;
     rememberMember(null);
     // Ending it at the venue as well, so the token stops working there and not only here.
     if (token) fetch('/v4/sessions/current', {method: 'DELETE', headers: {Authorization: 'Bearer ' + token}}).catch(() => {});
-    return;
+    memberAbout = null; memberSessions = []; memberTotp = null;
+    return renderMember();
   }
+  // A code out of a message, put where it is wanted: proving an address, or setting a password.
+  if (t.dataset.code) {
+    $('#veToken').value = t.dataset.code;
+    $('#spToken').value = t.dataset.code;
+    return toast('Code filled in above', 'ok');
+  }
+  if (t.dataset.endsession) {
+    try {
+      await memberCall('/v4/sessions/' + t.dataset.endsession, null, 'DELETE');
+      toast('That session is signed out', 'ok');
+    } catch (e) { toast(String(e.message || e), 'bad'); }
+    return refreshMember();
+  }
+  if (t.dataset.totp === 'on') {
+    try { memberTotp = await memberCall('/v4/members/me/totp', null, 'POST'); }
+    catch (e) { toast(String(e.message || e), 'bad'); }
+    return renderMember();
+  }
+  if (t.dataset.totp === 'off') {
+    const password = prompt('Taking the second factor off needs the password, so a session somebody else is holding cannot.');
+    if (!password) return;
+    try { await memberCall('/v4/members/me/totp', {password}, 'DELETE'); memberTotp = null; toast('The second factor is off', 'ok'); }
+    catch (e) { toast(String(e.message || e), 'bad'); }
+    return refreshMember();
+  }
+  if (t.dataset.totp === 'done') { memberTotp = null; return renderMember(); }
 });
 
 document.addEventListener('click', ev => {

@@ -179,9 +179,18 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, client: &str, notify: &
             }
             Ok(Routed::Later(gateway.attach_quote_pending(account, &body, later())?))
         }
-        // Members and their sessions. Signing up and logging in are the only requests taken from nobody.
-        ("POST", ["v4", "members"] | ["v4", "sessions"]) | ("DELETE", ["v4", "sessions", _]) => {
+        // Members and their sessions. The ones a person reaches before they have a session — signing up, proving an
+        // address, getting a password back, logging in — are the only requests the gateway takes from nobody.
+        ("POST", ["v4", "members"] | ["v4", "sessions"] | ["v4", "members", _])
+        | ("GET", ["v4", "mail"])
+        | ("DELETE", ["v4", "sessions", "current"]) => {
             Ok(Routed::Service(identity::members(gateway, request, client, notify)?))
+        }
+        // And the ones that are a member's own, which their session says who they are.
+        ("GET", ["v4", "members", "me"] | ["v4", "sessions"])
+        | ("DELETE", ["v4", "sessions", _] | ["v4", "members", "me", "totp"])
+        | ("POST" | "PUT", ["v4", "members", "me", "totp"]) => {
+            Ok(Routed::Service(identity::me(gateway, request, notify)?))
         }
         ("GET" | "POST", ["v4", "keys"]) | ("DELETE", ["v4", "keys", _]) => {
             let credential = credential(gateway, request, Permissions::KEYS)?;
@@ -265,11 +274,28 @@ mod tests {
         assert!(unasked.starts_with("HTTP/1.1 404"), "{unasked}");
     }
 
+    /// The code out of the newest message to `to` that carries one, as a person would read it from their inbox.
+    fn code(address: &str, to: &str) -> String {
+        let path = format!("/v4/mail?to={}", to.replace('@', "%40"));
+        let (status, mail) = request(address, "GET", &path, None, None);
+        assert_eq!(status, 200, "{mail}");
+        let hex = |word: &&str| word.len() == 32 && word.bytes().all(|b| b.is_ascii_hexdigit());
+        mail["mail"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find_map(|m| m["body"].as_str()?.split_whitespace().find(hex).map(str::to_string))
+            .unwrap_or_else(|| panic!("a code in {mail}"))
+    }
+
     #[test]
     fn a_member_signs_up_through_the_gateway_and_trades_with_the_session_it_answers() {
         let venue = testing::venue("members");
         let signing = json!({"email": "someone@example.com", "password": "a good long password"}).to_string();
-        let (status, member) = request(&venue.address, "POST", "/v4/members", None, Some(&signing));
+        // Signing up answers nothing but that a message went out, so the session comes from logging in.
+        let (status, asked) = request(&venue.address, "POST", "/v4/members", None, Some(&signing));
+        assert_eq!((status, &asked), (200, &json!({"checkYourEmail": true})), "{asked}");
+        let (status, member) = request(&venue.address, "POST", "/v4/sessions", None, Some(&signing));
         assert_eq!(status, 200, "{member}");
         let credential = member["session"]["credential"].as_str().expect("a credential").to_string();
         let account = member["accountId"].as_str().expect("an account").to_string();
@@ -302,6 +328,41 @@ mod tests {
         assert_eq!(request(&venue.address, "DELETE", "/v4/sessions/current", Some(MAKER_TOKEN), None).0, 400);
         // Nor is a session anyone can guess.
         assert_eq!(request(&venue.address, "GET", "/v4/account", Some("vs_0000000000000000.00"), None).0, 401);
+
+        // A member's own routes: what they are, and the sessions they hold.
+        let (status, me) = request(&venue.address, "GET", "/v4/members/me", Some(&credential), None);
+        assert_eq!((status, &me["email"]), (200, &json!("someone@example.com")), "{me}");
+        assert_eq!((&me["emailVerified"], &me["secondFactor"]), (&json!(false), &json!(false)), "{me}");
+        let (status, held) = request(&venue.address, "GET", "/v4/sessions", Some(&credential), None);
+        assert_eq!(status, 200, "{held}");
+        let live = held["sessions"].as_array().expect("sessions").iter().filter(|s| s["live"] == json!(true));
+        assert_eq!(live.count(), 1, "the one they are using: {held}");
+        // An API key is an account's, not a person's, so it has no member routes at all.
+        assert_eq!(request(&venue.address, "GET", "/v4/members/me", Some(MAKER_TOKEN), None).0, 400);
+
+        // Until the address is proved a member may trade but not move money, and proving it needs only the code
+        // that was sent there.
+        let deposit = json!({"amountCents": 100, "reference": "d1"}).to_string();
+        let (status, refused) = request(&venue.address, "POST", "/v4/transfers", Some(&credential), Some(&deposit));
+        assert_eq!(status, 403, "no transfers before the address is proved: {refused}");
+        let token = code(&venue.address, "someone@example.com");
+        let proving = json!({"token": token}).to_string();
+        let (status, proved) = request(&venue.address, "POST", "/v4/members/verify", None, Some(&proving));
+        assert_eq!((status, &proved), (200, &json!({"verified": true})), "{proved}");
+        let (status, now_me) = request(&venue.address, "GET", "/v4/members/me", Some(&credential), None);
+        assert_eq!((status, &now_me["emailVerified"]), (200, &json!(true)), "{now_me}");
+        // The session already open gains it without logging in again — after the few seconds the gateway remembers
+        // an answer for, which is the same window a revoked key keeps working in (identity::REMEMBER).
+        let mut moved = json!(null);
+        for _ in 0..40 {
+            let (status, answer) = request(&venue.address, "POST", "/v4/transfers", Some(&credential), Some(&deposit));
+            moved = answer;
+            if status != 403 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        assert_ne!(moved["error"]["code"], json!("FORBIDDEN"), "the same session may move money now: {moved}");
     }
 
     /// POST /v4/rfqs as the retail customer. A parlay service refuses requests as unavailable while it is catching up

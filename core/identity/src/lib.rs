@@ -10,6 +10,7 @@ pub mod member;
 pub mod records;
 pub mod service;
 pub mod store;
+pub mod totp;
 
 use records::{Account, KeyRecords};
 use std::collections::BTreeSet;
@@ -23,6 +24,10 @@ use venue_store::Database;
 pub struct Settings {
     /// The environment's catalogue, whose accounts keys may be made for.
     pub catalogue: String,
+    /// Whether `GET /v1/mail` answers with the mail this environment would have sent. A demo needs it, because there
+    /// is no mail provider here and the codes have to reach somebody; anywhere a real address could receive them it
+    /// must stay off, since the messages hold those codes (core/identity/README.md, mail).
+    pub show_mail: bool,
 }
 
 /// Where the accounts and keys are kept.
@@ -74,7 +79,7 @@ pub fn start(settings: &Settings, records: Arc<dyn KeyRecords>, listener: TcpLis
     let accounts = accounts(&catalogue);
     records.seed_accounts(&accounts, clock::wall_ms())?;
     let ids: BTreeSet<u64> = accounts.iter().map(|a| a.id).collect();
-    let store = Arc::new(Store::open(records, ids)?);
+    let store = Arc::new(Store::open(records, ids, settings.show_mail)?);
     let server = Arc::clone(&store);
     thread::spawn(move || service::serve(&listener, &server));
     Ok(store)

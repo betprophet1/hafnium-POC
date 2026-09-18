@@ -11,7 +11,7 @@ use venue_store::Database;
 
 const USAGE: &str = "usage:
   venue-identity [serve] --catalogue FILE --database-url URL [--listen 127.0.0.1:8084] [--migrate-on-start false]
-  venue-identity [serve] --catalogue FILE --store memory [--listen 127.0.0.1:8084]
+  venue-identity [serve] --catalogue FILE --store memory [--listen 127.0.0.1:8084] [--show-mail false]
   venue-identity migrate --database-url URL
   venue-identity import --file FILE --catalogue FILE --database-url URL
 
@@ -21,7 +21,8 @@ Keeps the catalogue's accounts and their API keys in PostgreSQL, and answers the
 (core/store/README.md). serve waits for the database and for its schema to be at this build's migration, which
 migrate applies (--migrate-on-start true applies it at start instead). --store memory keeps keys in memory only, for
 tests and throwaway local venues. import moves a key store kept by an earlier version in a JSON-lines file into
-empty records. Every flag can also be given as VENUE_<FLAG>, for example VENUE_DATABASE_URL.";
+empty records. --show-mail true answers GET /v1/mail with the mail this environment would have sent, which a demo
+needs and a venue with real addresses must never turn on: the messages hold the codes. Every flag can also be given as VENUE_<FLAG>, for example VENUE_DATABASE_URL.";
 
 struct Args(BTreeMap<String, String>);
 
@@ -116,7 +117,14 @@ fn import(args: &Args) -> Result<(), String> {
 }
 
 fn run(args: &Args) -> Result<(), String> {
-    let settings = Settings { catalogue: args.get("catalogue", None)? };
+    // Off unless this environment is asked to show its mail. A demo needs it so the codes reach somebody; anywhere
+    // an address could really receive them it stays off, because the messages hold the codes themselves.
+    let show_mail = match args.get("show-mail", Some("false"))?.as_str() {
+        "true" => true,
+        "false" => false,
+        other => return Err(format!("--show-mail must be true or false, not {other}")),
+    };
+    let settings = Settings { catalogue: args.get("catalogue", None)?, show_mail };
     let storage = match args.get("store", Some("postgres"))?.as_str() {
         "postgres" => {
             let migrate = match args.get("migrate-on-start", Some("false"))?.as_str() {

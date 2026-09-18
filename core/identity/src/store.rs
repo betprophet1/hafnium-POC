@@ -11,7 +11,8 @@
 use crate::clock;
 use crate::key::{self, Permissions};
 use crate::member;
-use crate::records::{KeyRecords, KeyRow, MemberRow, SessionRow};
+use crate::records::{KeyRecords, KeyRow, MemberRow, SessionRow, TokenRow, TotpRow};
+use crate::totp;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -45,6 +46,17 @@ impl Refusal {
 
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self { status: 503, code: "UNAVAILABLE", message: message.into() }
+    }
+
+    /// The password was right and the login still wants the code from an authenticator app. Its own code, because an
+    /// app has to tell this apart from a wrong password: one asks for a code, the other asks for the password again.
+    pub fn second_factor(message: impl Into<String>) -> Self {
+        Self { status: 401, code: "SECOND_FACTOR_REQUIRED", message: message.into() }
+    }
+
+    /// Too many failed attempts in a row: no password works for this member until the lock lifts.
+    pub fn locked(message: impl Into<String>) -> Self {
+        Self { status: 429, code: "LOCKED_OUT", message: message.into() }
     }
 
     pub fn body(&self) -> Value {
@@ -120,6 +132,9 @@ pub struct Verified {
     /// The API key's ID, or the session's: both are IDs a log can name, and their prefixes tell them apart.
     pub key_id: String,
     pub account: u64,
+    /// Which member, when the credential was a session's. An API key is an account's, not a person's, so it has none.
+    /// The gateway keeps this with the rest of the answer, so a member's own routes cost it no second question.
+    pub member: Option<String>,
     pub permissions: Permissions,
     pub expires_at: Option<u64>,
 }
@@ -130,7 +145,7 @@ impl Verified {
         let session = self.key_id.starts_with(member::SESSION_PREFIX);
         json!({
             "keyId": (!session).then(|| self.key_id.clone()), "sessionId": session.then(|| self.key_id.clone()),
-            "accountId": self.account.to_string(), "permissions": self.permissions.names(),
+            "memberId": self.member, "accountId": self.account.to_string(), "permissions": self.permissions.names(),
             "expiresAt": self.expires_at.map(clock::rfc3339)
         })
     }
@@ -155,10 +170,41 @@ struct State {
 /// told from an environment's own at a glance.
 const MEMBER_ACCOUNTS_FROM: u64 = 100_000;
 
-/// What a member may do with their own account: everything but answering requests for quote, which needs an approval
-/// the parlay service gives and is a market maker's business rather than a member's.
-const MEMBER_PERMISSIONS: Permissions =
+/// What a member may do with their own account once the address is proved: everything but answering requests for
+/// quote, which needs an approval the parlay service gives and is a market maker's business rather than a member's.
+const VERIFIED_PERMISSIONS: Permissions =
     Permissions::READ.with(Permissions::TRADE).with(Permissions::TRANSFERS).with(Permissions::KEYS);
+
+/// And before it is proved: everything but moving money. A member can look around and trade what they have; putting
+/// money in or taking it out waits on an address the venue has written to and had answered.
+const UNVERIFIED_PERMISSIONS: Permissions = Permissions::READ.with(Permissions::TRADE).with(Permissions::KEYS);
+
+const fn member_permissions(verified: bool) -> Permissions {
+    if verified {
+        VERIFIED_PERMISSIONS
+    } else {
+        UNVERIFIED_PERMISSIONS
+    }
+}
+
+/// Failed logins in a row before a member is locked out, and for how long. The lock is on the member rather than on
+/// the address it came from, which is what stops guessing spread over many addresses; it is short, because the other
+/// side of that is that anyone who knows an email can keep its owner out for as long as it lasts.
+const LOCK_AFTER: u32 = 5;
+const LOCK_FOR_MS: u64 = 15 * 60 * 1000;
+
+/// How long an emailed token lasts. Long enough to go and find the message, short enough that an old one left in an
+/// inbox is no longer a way in. A reset is the shorter of the two: it sets a password, where the other only proves
+/// an address.
+const VERIFY_TOKEN_MS: u64 = 24 * 60 * 60 * 1000;
+const RESET_TOKEN_MS: u64 = 60 * 60 * 1000;
+
+/// How many recovery codes are made when a second factor is confirmed. Enough that losing a few is not a lockout,
+/// few enough that the set is worth keeping somewhere safe.
+const RECOVERY_CODES: usize = 10;
+
+/// What the venue calls itself in an authenticator app and in the mail it sends.
+const ISSUER: &str = "Venue";
 
 /// An Argon2id hash of a password nobody has, verified against when no member holds the email that was given, so that
 /// a refusal takes as long either way and says nothing about which emails this venue knows.
@@ -176,6 +222,8 @@ fn records_refusal(e: venue_store::Error) -> Refusal {
 pub struct Store {
     state: Mutex<State>,
     records: Arc<dyn KeyRecords>,
+    /// Whether this environment's mail can be read back over the API. See `Settings::show_mail`.
+    show_mail: bool,
 }
 
 fn locked(m: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -202,9 +250,9 @@ fn read(records: &dyn KeyRecords, accounts: BTreeSet<u64>, now: u64) -> Result<S
 
 impl Store {
     /// The store whose keys are in `records`, read into memory.
-    pub fn open(records: Arc<dyn KeyRecords>, accounts: BTreeSet<u64>) -> Result<Self, String> {
+    pub fn open(records: Arc<dyn KeyRecords>, accounts: BTreeSet<u64>, show_mail: bool) -> Result<Self, String> {
         let state = read(records.as_ref(), accounts, clock::wall_ms())?;
-        Ok(Self { state: Mutex::new(state), records })
+        Ok(Self { state: Mutex::new(state), records, show_mail })
     }
 
     /// Reads the keys again if a write failed since they were last read. Verification carries on from memory if the
@@ -355,10 +403,9 @@ impl Store {
         Ok(revoked.json())
     }
 
-    /// Which key a credential is, if it is a valid one now, noting its use. Every refusal is `UNAUTHORIZED`; only a
-    /// caller that knew the secret learns that the key was revoked or has expired (decision G-11).
-    /// A member signing up: an account of their own, their email and a hash of their password, and a session so the
-    /// app they signed up in does not have to log in again at once (interface 1 README, members and sessions).
+    /// A member signing up. The answer says nothing about whether the email was already somebody's: that would tell
+    /// anyone who asked which addresses this venue knows. Either way a message goes to the address — "here is your
+    /// link" or "somebody tried to sign up as you" — and the answer is the same.
     pub fn sign_up(&self, body: &Value, now: u64) -> Result<Value, Refusal> {
         let fields = body.as_object().ok_or_else(|| Refusal::bad("the body must be a JSON object"))?;
         if let Some(unknown) = fields.keys().find(|k| !["email", "password", "displayName"].contains(&k.as_str())) {
@@ -381,65 +428,293 @@ impl Store {
             Some(_) => return Err(Refusal::bad("displayName must be 1 to 64 characters")),
             None => email.split('@').next().unwrap_or("member").to_string(),
         };
-        let account = self.records.next_account(MEMBER_ACCOUNTS_FROM).map_err(records_refusal)?;
-        let row = MemberRow {
-            id: member::new_member_id().map_err(|e| Refusal::unavailable(format!("an ID: {e}")))?,
-            account,
-            email,
-            password_phc: member::hash_password(password).map_err(Refusal::unavailable)?,
-            display_name: display_name.clone(),
-            created_at: now,
-            disabled_at: None,
-        };
-        self.records.create_member(&row, &display_name, now).map_err(records_refusal)?;
-        locked(&self.state).accounts.insert(account);
-        let session = self.start_session(&row, now)?;
-        Ok(json!({
-            "memberId": row.id, "accountId": account.to_string(), "email": row.email,
-            "displayName": row.display_name, "session": session
-        }))
+
+        match self.records.member_by_email(&email).map_err(records_refusal)? {
+            // Somebody already has it. They are told, in case it was not them trying.
+            Some(_) => {
+                self.post(
+                    &email,
+                    "Someone tried to sign up with your address",
+                    &format!(
+                        "Somebody tried to open an account at {ISSUER} with this address, which already has one.\n\n\
+                         If that was you, log in instead — or ask for a new password if you have forgotten \
+                         it.\n\
+                         If it was not, there is nothing to do: no account was made and nothing has changed."
+                    ),
+                    now,
+                )?;
+            }
+            None => {
+                let account = self.records.next_account(MEMBER_ACCOUNTS_FROM).map_err(records_refusal)?;
+                let row = MemberRow {
+                    id: member::new_member_id().map_err(|e| Refusal::unavailable(format!("an ID: {e}")))?,
+                    account,
+                    email: email.clone(),
+                    password_phc: member::hash_password(password).map_err(Refusal::unavailable)?,
+                    display_name: display_name.clone(),
+                    created_at: now,
+                    disabled_at: None,
+                    email_verified_at: None,
+                    failed_logins: 0,
+                    locked_until: None,
+                };
+                self.records.create_member(&row, &display_name, now).map_err(records_refusal)?;
+                locked(&self.state).accounts.insert(account);
+                self.send_verification(&row, now)?;
+            }
+        }
+        // The same answer either way.
+        Ok(json!({"checkYourEmail": true}))
     }
 
-    /// Logging in: the email and password of a member, answered with a session for their app to hold.
+    /// Emails a member a link to prove their address.
+    fn send_verification(&self, member: &MemberRow, now: u64) -> Result<(), Refusal> {
+        let token = member::new_token().map_err(|e| Refusal::unavailable(format!("a token: {e}")))?;
+        self.records
+            .create_token(&TokenRow {
+                hash: member::token_hash(&token),
+                member: member.id.clone(),
+                purpose: "verify".into(),
+                created_at: now,
+                expires_at: now.saturating_add(VERIFY_TOKEN_MS),
+                used_at: None,
+            })
+            .map_err(records_refusal)?;
+        self.post(
+            &member.email,
+            "Confirm your address",
+            &format!(
+                "Welcome to {ISSUER}.\n\nConfirm this address with the code below. It lasts a day.\n\n  {token}\n\n\
+                 Until it is confirmed you can look and trade, but not move money."
+            ),
+            now,
+        )
+    }
+
+    /// Asking for the verification message again, for a member who has lost it. Answered the same way whether or not
+    /// the address is anybody's.
+    pub fn resend_verification(&self, body: &Value, now: u64) -> Result<Value, Refusal> {
+        let email = member::normalise_email(body["email"].as_str().unwrap_or_default());
+        if let Some(member) = self.records.member_by_email(&email).map_err(records_refusal)? {
+            if member.email_verified_at.is_none() {
+                self.send_verification(&member, now)?;
+            }
+        }
+        Ok(json!({"checkYourEmail": true}))
+    }
+
+    /// Proving the address. The token is spent here whether or not it was already proved.
+    pub fn verify_email(&self, body: &Value, now: u64) -> Result<Value, Refusal> {
+        let token = body["token"].as_str().unwrap_or_default().trim();
+        let taken = self
+            .records
+            .take_token(&member::token_hash(token), "verify", now)
+            .map_err(records_refusal)?
+            .ok_or_else(|| Refusal::bad("that code is not one of ours, or it has been used or has expired"))?;
+        self.records.verify_email(&taken.member, now).map_err(records_refusal)?;
+        // Sessions this member already holds are allowed to move money from now on, without logging in again.
+        let mut state = locked(&self.state);
+        for session in state.sessions.values_mut().filter(|s| s.member == taken.member) {
+            session.verified = true;
+        }
+        Ok(json!({"verified": true}))
+    }
+
+    /// Asking for a new password. Answered the same way whether or not the address is anybody's, and a message goes
+    /// either way: a link, or a note that somebody asked about an address with no account.
+    pub fn request_reset(&self, body: &Value, now: u64) -> Result<Value, Refusal> {
+        let email = member::normalise_email(body["email"].as_str().unwrap_or_default());
+        match self.records.member_by_email(&email).map_err(records_refusal)? {
+            Some(member) => {
+                let token = member::new_token().map_err(|e| Refusal::unavailable(format!("a token: {e}")))?;
+                self.records
+                    .create_token(&TokenRow {
+                        hash: member::token_hash(&token),
+                        member: member.id.clone(),
+                        purpose: "reset".into(),
+                        created_at: now,
+                        expires_at: now.saturating_add(RESET_TOKEN_MS),
+                        used_at: None,
+                    })
+                    .map_err(records_refusal)?;
+                self.post(
+                    &member.email,
+                    "Setting a new password",
+                    &format!(
+                        "Somebody asked to set a new password for your {ISSUER} account.\n\n  {token}\n\n\
+                         The code lasts an hour. Using it ends every session you have open, everywhere.\n\
+                         If it was not you, do nothing: nothing has changed."
+                    ),
+                    now,
+                )?;
+            }
+            None => {
+                if member::looks_like_email(&email) {
+                    self.post(
+                        &email,
+                        "Setting a new password",
+                        &format!(
+                            "Somebody asked to set a new password for a {ISSUER} account with this address, which has no \
+                             account.\n\nIf that was you, sign up instead."
+                        ),
+                        now,
+                    )?;
+                }
+            }
+        }
+        Ok(json!({"checkYourEmail": true}))
+    }
+
+    /// Setting the new password, with the code from that message. Every session ends: a password is changed because
+    /// something is wrong as often as because something is tidy.
+    pub fn set_password(&self, body: &Value, now: u64) -> Result<Value, Refusal> {
+        let token = body["token"].as_str().unwrap_or_default().trim();
+        let password = body["password"].as_str().unwrap_or_default();
+        if !(member::MIN_PASSWORD..=member::MAX_PASSWORD).contains(&password.chars().count()) {
+            return Err(Refusal::bad(format!(
+                "password must be {} to {} characters",
+                member::MIN_PASSWORD,
+                member::MAX_PASSWORD
+            )));
+        }
+        let taken = self
+            .records
+            .take_token(&member::token_hash(token), "reset", now)
+            .map_err(records_refusal)?
+            .ok_or_else(|| Refusal::bad("that code is not one of ours, or it has been used or has expired"))?;
+        let phc = member::hash_password(password).map_err(Refusal::unavailable)?;
+        self.records.set_password(&taken.member, &phc, now).map_err(records_refusal)?;
+        let ended = self.records.end_sessions_of(&taken.member, now).map_err(records_refusal)?;
+        let mut state = locked(&self.state);
+        for id in &ended {
+            state.sessions.remove(id);
+        }
+        drop(state);
+        if let Some(member) = self.records.member(&taken.member).map_err(records_refusal)? {
+            self.post(
+                &member.email,
+                "Your password was changed",
+                &format!(
+                    "The password on your {ISSUER} account was changed just now, and every session was signed out.\n\n\
+                     If that was not you, ask for a new password at once: whoever did it knows the old one."
+                ),
+                now,
+            )?;
+        }
+        Ok(json!({"passwordSet": true, "sessionsEnded": ended.len()}))
+    }
+
+    /// Logging in: the email and password of a member, their second factor if they have one, and a session for their
+    /// app to hold.
     pub fn log_in(&self, body: &Value, now: u64) -> Result<Value, Refusal> {
         let fields = body.as_object().ok_or_else(|| Refusal::bad("the body must be a JSON object"))?;
         let email = member::normalise_email(fields.get("email").and_then(Value::as_str).unwrap_or_default());
         let password = fields.get("password").and_then(Value::as_str).unwrap_or_default();
+        let device = fields.get("device").and_then(Value::as_str).unwrap_or("an app");
+        let code = fields.get("code").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty());
         let wrong = || Refusal::unauthorized("the email or password is wrong");
+
         let found = self.records.member_by_email(&email).map_err(records_refusal)?;
         let Some(row) = found else {
-            // A password is hashed either way, so that how long a refusal took says nothing about whether the email
-            // is one this venue knows.
+            // Hashed either way, so a refusal takes as long whether or not the address is anybody's.
             let _ = member::password_matches(NO_SUCH_MEMBER_PHC, password);
             return Err(wrong());
         };
+        if row.locked_until.is_some_and(|until| until > now) {
+            return Err(Refusal::locked(
+                "too many attempts: this account is locked for a few minutes. Setting a new password unlocks it.",
+            ));
+        }
         if !member::password_matches(&row.password_phc, password) {
+            let (failures, locked_until) =
+                self.records.login_failed(&row.id, now, LOCK_AFTER, LOCK_FOR_MS).map_err(records_refusal)?;
+            if locked_until.is_some_and(|until| until > now) && failures == LOCK_AFTER {
+                self.post(
+                    &row.email,
+                    "Too many attempts to log in",
+                    &format!(
+                        "There have been {failures} failed attempts to log in to your {ISSUER} account, so it is \
+                         locked for fifteen minutes.\n\nIf that was not you, nobody has got in — but set a new \
+                         password, because somebody is trying."
+                    ),
+                    now,
+                )?;
+            }
             return Err(wrong());
         }
         if row.disabled_at.is_some() {
             return Err(Refusal::unauthorized("this member cannot log in"));
         }
-        let session = self.start_session(&row, now)?;
-        Ok(json!({
+
+        // The second factor, for a member who has confirmed one.
+        let totp = self.records.totp(&row.id).map_err(records_refusal)?.filter(|t| t.confirmed_at.is_some());
+        if let Some(totp) = &totp {
+            let Some(code) = code else {
+                return Err(Refusal::second_factor("this account asks for a code from your authenticator app"));
+            };
+            let step = totp::step_at(now / 1000);
+            if let Some(used) = totp::matches(&totp.secret, code, step, totp.last_step) {
+                self.records.totp_step_used(&row.id, used).map_err(records_refusal)?;
+            } else if self
+                .records
+                .take_recovery_code(&row.id, &member::token_hash(&member::tidy_recovery_code(code)), now)
+                .map_err(records_refusal)?
+            {
+                let left = self.records.recovery_codes_left(&row.id).map_err(records_refusal)?;
+                self.post(
+                    &row.email,
+                    "A recovery code was used",
+                    &format!(
+                        "One of your {ISSUER} recovery codes was just used to log in. {left} are left.\n\n\
+                         If that was not you, set a new password and start your second factor again."
+                    ),
+                    now,
+                )?;
+            } else {
+                let _ = self.records.login_failed(&row.id, now, LOCK_AFTER, LOCK_FOR_MS);
+                return Err(Refusal::unauthorized("that code is wrong or has been used"));
+            }
+        }
+
+        self.records.login_worked(&row.id).map_err(records_refusal)?;
+        let session = self.start_session(&row, device, now)?;
+        self.post(
+            &row.email,
+            "A new sign-in",
+            &format!(
+                "Your {ISSUER} account was signed in to just now, from {device}.\n\n\
+                 If that was not you, set a new password: that signs every session out."
+            ),
+            now,
+        )?;
+        Ok(self.who(&row, session))
+    }
+
+    /// What every answer about a member says of them.
+    fn who(&self, row: &MemberRow, session: Value) -> Value {
+        json!({
             "memberId": row.id, "accountId": row.account.to_string(), "email": row.email,
-            "displayName": row.display_name, "session": session
-        }))
+            "displayName": row.display_name, "emailVerified": row.email_verified_at.is_some(), "session": session
+        })
     }
 
     /// A session, written down and then kept in memory, and answered with its credential — the only time the secret
     /// exists anywhere but the app that asked for it.
-    fn start_session(&self, member: &MemberRow, now: u64) -> Result<Value, Refusal> {
+    fn start_session(&self, member: &MemberRow, device: &str, now: u64) -> Result<Value, Refusal> {
         let id = member::new_session_id().map_err(|e| Refusal::unavailable(format!("an ID: {e}")))?;
         let secret = member::new_secret().map_err(|e| Refusal::unavailable(format!("a secret: {e}")))?;
+        let device = device.chars().take(64).collect::<String>();
         let row = SessionRow {
             id: id.clone(),
             member: member.id.clone(),
             account: member.account,
+            verified: member.email_verified_at.is_some(),
             hash: member::hash(&id, &secret),
             created_at: now,
             expires_at: now.saturating_add(member::SESSION_SECONDS * 1000),
             ended_at: None,
             last_used: None,
+            device: Some(device),
         };
         self.records.create_session(&row).map_err(records_refusal)?;
         let expires = row.expires_at;
@@ -449,7 +724,151 @@ impl Store {
         }))
     }
 
-    /// Logging out. A session that has already ended answers as it did, so an app repeating the call is not an error.
+    /// The sessions a member holds, so they can see a device they do not know and end it.
+    pub fn sessions_of(&self, member_id: &str, now: u64) -> Result<Value, Refusal> {
+        let rows = self.records.sessions_of(member_id).map_err(records_refusal)?;
+        let sessions: Vec<Value> = rows
+            .iter()
+            .map(|s| {
+                json!({
+                    "sessionId": s.id, "device": s.device, "createdAt": clock::rfc3339(s.created_at),
+                    "lastUsedAt": s.last_used.map(clock::rfc3339), "expiresAt": clock::rfc3339(s.expires_at),
+                    "endedAt": s.ended_at.map(clock::rfc3339),
+                    "live": s.ended_at.is_none() && s.expires_at > now
+                })
+            })
+            .collect();
+        Ok(json!({"sessions": sessions}))
+    }
+
+    /// Starting a second factor: a secret to put in an authenticator app, which does nothing until a code from it is
+    /// confirmed. Starting again replaces one that was never confirmed.
+    pub fn start_totp(&self, member_id: &str, now: u64) -> Result<Value, Refusal> {
+        let member = self.member_or_refuse(member_id)?;
+        if self.records.totp(member_id).map_err(records_refusal)?.is_some_and(|t| t.confirmed_at.is_some()) {
+            return Err(Refusal::bad("this account already has a second factor; remove it before starting another"));
+        }
+        let secret = member::new_totp_secret().map_err(|e| Refusal::unavailable(format!("a secret: {e}")))?;
+        self.records
+            .start_totp(&TotpRow {
+                member: member_id.to_string(),
+                secret: secret.clone(),
+                created_at: now,
+                confirmed_at: None,
+                last_step: None,
+            })
+            .map_err(records_refusal)?;
+        Ok(json!({
+            "secret": totp::base32(&secret), "uri": totp::uri(ISSUER, &member.email, &secret),
+            "digits": 6, "periodSeconds": totp::STEP_SECONDS
+        }))
+    }
+
+    /// Confirming it with a code the app showed, which is also what makes the recovery codes. They are answered once
+    /// and kept only as hashes, so this is the only time anyone sees them.
+    pub fn confirm_totp(&self, member_id: &str, body: &Value, now: u64) -> Result<Value, Refusal> {
+        let member = self.member_or_refuse(member_id)?;
+        let code = body["code"].as_str().unwrap_or_default();
+        let started = self
+            .records
+            .totp(member_id)
+            .map_err(records_refusal)?
+            .ok_or_else(|| Refusal::bad("nothing to confirm: start a second factor first"))?;
+        let step = totp::step_at(now / 1000);
+        let Some(used) = totp::matches(&started.secret, code, step, started.last_step) else {
+            return Err(Refusal::bad("that code does not match: check the app's clock and try the next one"));
+        };
+        self.records.confirm_totp(member_id, now, used).map_err(records_refusal)?;
+        let codes: Vec<String> = (0..RECOVERY_CODES)
+            .map(|_| member::new_recovery_code().map_err(|e| Refusal::unavailable(format!("a code: {e}"))))
+            .collect::<Result<_, _>>()?;
+        let hashes: Vec<[u8; 32]> = codes.iter().map(|c| member::token_hash(&member::tidy_recovery_code(c))).collect();
+        self.records.set_recovery_codes(member_id, &hashes, now).map_err(records_refusal)?;
+        self.post(
+            &member.email,
+            "A second factor was added",
+            &format!(
+                "Your {ISSUER} account now asks for a code from an authenticator app when you log in.\n\n\
+                 If that was not you, set a new password at once."
+            ),
+            now,
+        )?;
+        Ok(json!({"confirmed": true, "recoveryCodes": codes}))
+    }
+
+    /// Taking it off again, which needs the password: a stolen session must not be able to.
+    pub fn remove_totp(&self, member_id: &str, body: &Value, now: u64) -> Result<Value, Refusal> {
+        let member = self.member_or_refuse(member_id)?;
+        let password = body["password"].as_str().unwrap_or_default();
+        if !member::password_matches(&member.password_phc, password) {
+            return Err(Refusal::unauthorized("the password is wrong"));
+        }
+        self.records.remove_totp(member_id).map_err(records_refusal)?;
+        self.post(
+            &member.email,
+            "Your second factor was removed",
+            &format!(
+                "Your {ISSUER} account no longer asks for a code from an authenticator app.\n\n\
+                 If that was not you, set a new password at once."
+            ),
+            now,
+        )?;
+        Ok(json!({"removed": true}))
+    }
+
+    /// What a member is told about themselves, for an app that has a session and wants to know where it stands.
+    pub fn about(&self, member_id: &str) -> Result<Value, Refusal> {
+        let member = self.member_or_refuse(member_id)?;
+        let totp = self.records.totp(member_id).map_err(records_refusal)?;
+        let left = self.records.recovery_codes_left(member_id).map_err(records_refusal)?;
+        Ok(json!({
+            "memberId": member.id, "accountId": member.account.to_string(), "email": member.email,
+            "displayName": member.display_name, "emailVerified": member.email_verified_at.is_some(),
+            "secondFactor": totp.is_some_and(|t| t.confirmed_at.is_some()), "recoveryCodesLeft": left
+        }))
+    }
+
+    fn member_or_refuse(&self, member_id: &str) -> Result<MemberRow, Refusal> {
+        self.records.member(member_id).map_err(records_refusal)?.ok_or_else(|| Refusal::not_found("no such member"))
+    }
+
+    /// Whether this environment answers with the mail it would have sent.
+    pub const fn shows_mail(&self) -> bool {
+        self.show_mail
+    }
+
+    /// Mail this environment would have sent, newest first: a demo shows it, since there is no mail provider here
+    /// (core/identity/README.md, mail).
+    pub fn mailbox(&self, to: Option<&str>, limit: usize) -> Result<Value, Refusal> {
+        let mail = self.records.recent_mail(to, limit).map_err(records_refusal)?;
+        let messages: Vec<Value> = mail
+            .iter()
+            .map(|m| {
+                json!({
+                    "to": m.to, "subject": m.subject, "body": m.body, "at": clock::rfc3339(m.created_at),
+                    "sent": m.sent_at.is_some()
+                })
+            })
+            .collect();
+        Ok(json!({"mail": messages}))
+    }
+
+    /// Queues a message. A test environment's sender writes them down and marks them sent; a real one will not.
+    fn post(&self, to: &str, subject: &str, body: &str, now: u64) -> Result<(), Refusal> {
+        self.records.queue_mail(to, subject, body, now).map_err(records_refusal)
+    }
+
+    /// Ending one of a member's other sessions — the phone they have lost, the browser they left signed in. Only
+    /// their own: a session ID is not a secret, so who is asking has to be checked against who owns it.
+    pub fn end_session_of(&self, member_id: &str, session_id: &str, now: u64) -> Result<Value, Refusal> {
+        let owned =
+            self.records.sessions_of(member_id).map_err(records_refusal)?.into_iter().any(|s| s.id == session_id);
+        if !owned {
+            return Err(Refusal::not_found("no such session of yours"));
+        }
+        self.log_out(session_id, now)
+    }
+
     pub fn log_out(&self, session_id: &str, now: u64) -> Result<Value, Refusal> {
         let ended = self.records.end_session(session_id, now).map_err(|e| match e {
             e if e.is_unavailable() => Refusal::unavailable(e.to_string()),
@@ -481,7 +900,8 @@ impl Store {
         let verified = Verified {
             key_id: found.id.clone(),
             account: found.account,
-            permissions: MEMBER_PERMISSIONS,
+            member: Some(found.member.clone()),
+            permissions: member_permissions(found.verified),
             expires_at: Some(found.expires_at),
         };
         let due = found.last_used.is_none_or(|t| now >= t.saturating_add(USED_EVERY_MS));
@@ -493,6 +913,8 @@ impl Store {
         Ok(verified)
     }
 
+    /// Which key or session a credential is, if it is a valid one now, noting its use. Every refusal is
+    /// `UNAUTHORIZED`; only a caller that knew the secret learns that it was revoked or has expired (decision G-11).
     pub fn verify(&self, credential: &str, now: u64) -> Result<Verified, Refusal> {
         if member::looks_like_session(credential) {
             return self.verify_session(credential, now);
@@ -517,6 +939,7 @@ impl Store {
         let verified = Verified {
             key_id: found.id.clone(),
             account: found.account,
+            member: None,
             permissions: found.permissions,
             expires_at: found.expires_at,
         };
@@ -555,7 +978,7 @@ pub(crate) mod tests {
     const NOW: u64 = 1_789_603_200_000;
 
     fn open(records: &Arc<dyn KeyRecords>) -> Store {
-        Store::open(Arc::clone(records), BTreeSet::from([1, 2])).expect("a store")
+        Store::open(Arc::clone(records), BTreeSet::from([1, 2]), true).expect("a store")
     }
 
     fn memory() -> Arc<dyn KeyRecords> {
@@ -582,6 +1005,7 @@ pub(crate) mod tests {
             Verified {
                 key_id: id.into(),
                 account: 1,
+                member: None,
                 permissions: Permissions::READ.with(Permissions::TRADE),
                 expires_at: None
             }

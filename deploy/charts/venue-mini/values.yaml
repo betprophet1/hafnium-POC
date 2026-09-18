@@ -63,6 +63,11 @@ treasury:
 # only: production identity is interface 6.
 identity:
   enabled: true
+  # Answers GET /v4/mail with the mail this venue would have sent, which the page'"'"'s members tab reads so the codes that
+  # prove an address and set a password reach somebody: there is no mail provider here, as there is no real bank
+  # (interfaces/gateway/decisions.md, G-19). A venue whose addresses are real must leave this false — the messages
+  # hold the codes themselves.
+  showMail: true
 # The dummy oracle: lists a new round of each demo market on the calendar in files/calendar.json, runs it (start,
 # sometimes a suspension, end, close) and settles it through proposal, auto-approval and a dispute window, voiding one
 # now and then. The settlement tab drives it. Off, the markets the seed lists stay open until someone settles them.

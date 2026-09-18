@@ -417,29 +417,81 @@ A person who uses an app is a **member**: an email, a password and an account of
 interface 6, enough for the venue's own apps to sign people in; what a real identity service adds is listed at the end
 of this section.
 
+### Before a session
+
+These are the routes a person reaches with no session, which is the point of them. Each is limited by the address it
+came from rather than by an account, and none of them ever says whether an address is a member's.
+
 | | |
 |---|---|
-| `POST /v4/members` | Signs up: `email`, `password` (10 to 256 characters) and an optional `displayName`. Answers with `memberId`, `accountId`, `email`, `displayName` and a `session`. Taken from nobody, so it is limited by the address it came from. |
-| `POST /v4/sessions` | Logs in: `email` and `password`, answered the same way. An email is the same member whatever its case. |
+| `POST /v4/members` | Signs up: `email`, `password` (10 to 256 characters) and an optional `displayName`. Answers `{"checkYourEmail": true}` and nothing else — no session, and no sign of whether the address was already somebody's. A message goes to it either way: the code that proves it, or a note that somebody tried to sign up with an address that already has an account. |
+| `POST /v4/members/verification` | Sends the proving code again, for a member who has lost the message. Same answer. |
+| `POST /v4/members/verify` | Proves the address: `token`, the code from that message. Answers `{"verified": true}`. The code lasts a day and is good once. |
+| `POST /v4/members/reset` | Asks to set a new password: `email`. Same answer, and a message either way — a code, or a note that the address has no account. |
+| `POST /v4/members/password` | Sets it: `token` (good for an hour, once) and `password`. Answers `passwordSet` and `sessionsEnded`. |
+| `POST /v4/sessions` | Logs in: `email`, `password`, an optional `code` for a second factor, and an optional `device` naming what the app runs on. Answers `memberId`, `accountId`, `email`, `displayName`, `emailVerified` and a `session`. |
 | `DELETE /v4/sessions/current` | Logs out the session the request is made with. |
 
+### With a session
+
+| | |
+|---|---|
+| `GET /v4/members/me` | The member this session belongs to, with `emailVerified`, `secondFactor` and `recoveryCodesLeft`. |
+| `GET /v4/sessions` | Every session this member has held, each with the `device` its app named, when it was made and last used, and whether it is `live`. |
+| `DELETE /v4/sessions/{sessionId}` | Ends one of their own. A session that is not theirs is `404`, whoever holds its ID. |
+| `POST /v4/members/me/totp` | Starts a second factor: answers a `secret`, an `otpauth://` `uri` for the app's camera, and the `digits` and `periodSeconds` it expects. Nothing changes until a code from it arrives. |
+| `PUT /v4/members/me/totp` | Confirms it with `code`, and answers the `recoveryCodes` — ten, shown this once and kept only as hashes. |
+| `DELETE /v4/members/me/totp` | Takes it off. Needs the `password` in the body, so a session somebody else is holding cannot. |
+
+Every route here is addressed by the member the session belongs to, never by one named in the request, so a session
+can only ever reach its own. An API key is an account's rather than a person's, so it has no member routes at all
+and is refused with `400`.
+
+### What a session may do
+
 A session's `credential` is a bearer token like an API key's, and works everywhere one does: the `Authorization`
-header on REST, and `login` on `/v4/ws_private`. It holds `read`, `trade`, `transfers` and `keys` over its own
-account — not `respond`, which is a market maker's and needs the parlay service's approval. It lasts 30 days, and
-logging out ends it at once: the gateway forgets what it remembered about a credential whose session it has just
-ended, rather than letting it stand for the few seconds a cached answer would.
+header on REST, and `login` on `/v4/ws_private`. It lasts 30 days, and logging out ends it at once: the gateway
+forgets what it remembered about a credential whose session it has just ended, rather than letting it stand for the
+few seconds a cached answer would.
+
+**Until the address is proved** it holds `read`, `trade` and `keys` over its own account: a member can look around
+and trade what they have, and cannot move money in or out. Proving the address adds `transfers`, and a session
+already open gains it without logging in again — within the five seconds the gateway remembers an answer for, the
+same window a revoked key keeps working in. No session ever holds `respond`, which is a market maker's and needs the
+parlay service's approval.
 
 A new member's account has no money. Deposits work as they do for any account (`POST /v4/transfers`), through the
 treasury and, in a test environment, its fake bank.
 
-The password is kept only as an Argon2id hash, and the session token only as a SHA-256 of itself, as an API key's
-secret is (G-2). An email that is not a member's and a password that is wrong are refused in the same words, and
-take the same time, so a refusal says nothing about which emails the venue knows.
+### What the refusals mean
 
-**Not in this cut**, and needed before anyone but a test environment relies on it: proving an email by sending to it,
-resetting a forgotten password, a second factor, locking an account after repeated failures, listing and ending a
-member's other sessions, and telling a member that someone signed in. Signing up also says whether an email is
-already a member's, which the real flow avoids by answering the same either way and sending mail.
+| | |
+|---|---|
+| `401 UNAUTHORIZED` | The email or the password is wrong, or a second-factor code is. An email nobody has and a wrong password are refused in the same words and take the same time, so a refusal says nothing about which addresses the venue knows. |
+| `401 SECOND_FACTOR_REQUIRED` | The password was right and this account asks for a code. Its own code, because an app must tell it from a wrong password: one asks for a code, the other asks for the password again. |
+| `429 LOCKED_OUT` | Five failed attempts in a row lock the member for fifteen minutes, and the member is told by mail that it happened. The lock is on the member rather than on the address the attempts came from, which is what stops guessing spread over many addresses. Setting a new password lifts it. |
+
+A second factor is TOTP (RFC 6238): six digits over thirty seconds, one step of drift either way for a clock that is
+a little off, and a code is good once — the step it was accepted at is written down, so the same code inside its own
+window does not work twice. A recovery code gets in when the authenticator is gone, is also good once, and is matched
+however it was copied down: case, spaces and the dash between its groups are all ignored.
+
+The venue writes to a member when something happens to their account that they would want to know about: a new
+sign-in, a password changed, a second factor added or removed, a recovery code used, an account locked. The password
+is kept only as an Argon2id hash, and every other secret here — the session token, the emailed codes, the recovery
+codes — only as a SHA-256 of itself, as an API key's secret is (G-2).
+
+### Reading the mail in a demo
+
+A test environment has no mail provider, so the messages sit in the identity service's outbox and `GET /v4/mail`
+answers with them (`?to=` for one address), newest first. It exists so a demo can show the codes and a test can
+follow one the way a person follows it out of an inbox. **The identity service answers `404` unless it was started
+with `--show-mail`**, because the messages hold the very codes they were sent to keep secret: a venue that can really
+post to an address must never turn it on.
+
+**Not in this cut**, and needed before anyone but a test environment relies on it: a real mail provider in place of
+the outbox; checking a password against the breached-password corpora; and rate limits on the emailed codes
+themselves, which today are limited only as anonymous requests are.
 
 ## Browsers
 

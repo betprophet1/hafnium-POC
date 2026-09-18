@@ -1142,10 +1142,12 @@ mod recorded {
     /// the bytes that were actually sent. The socket's read timeout is short, and a loaded machine can take longer
     /// than that to answer, so a timeout is waited through rather than failed on, as `eventually` does.
     fn streamed(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>, kind: &str) -> String {
-        // Counted in the socket's own timeouts rather than read off a clock, as `eventually` counts its waits. A
-        // frame that has to cross the node and come back through the feed can take a while on a machine running
-        // every other test at the same time, and waiting costs nothing when it arrives.
-        let mut left = 24;
+        // Bounded by time rather than by a count of timeouts. A read that has half a frame already returns
+        // `WouldBlock` at once rather than waiting out the socket's timeout, so counting timeouts can spend a
+        // budget meant for minutes in milliseconds — which is how this failed under a full `./check` and passed on
+        // its own. The budget matches `testing::eventually`: 30 seconds is far longer than a frame crossing the node
+        // and coming back through the feed takes, even on a machine running every other test at the same time.
+        let deadline = crate::limits::monotonic() + Duration::from_secs(30);
         loop {
             match socket.read() {
                 Ok(Message::Text(text)) => {
@@ -1157,9 +1159,10 @@ mod recorded {
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(e))
                     if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
-                        && left > 0 =>
+                        && crate::limits::monotonic() < deadline =>
                 {
-                    left -= 1;
+                    // Nothing yet. A spin is not wanted either: the frame comes from another thread.
+                    std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(e) => panic!("no {kind} frame arrived: {e}"),
             }

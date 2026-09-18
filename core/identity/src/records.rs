@@ -32,6 +32,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "members_and_sessions",
         sql: include_str!("../migrations/20260918000001_members_and_sessions.sql"),
     },
+    Migration {
+        version: "20260918000002",
+        name: "member_security",
+        sql: include_str!("../migrations/20260918000002_member_security.sql"),
+    },
 ];
 
 /// An account as the catalogue describes it.
@@ -76,6 +81,11 @@ pub struct MemberRow {
     pub display_name: String,
     pub created_at: u64,
     pub disabled_at: Option<u64>,
+    /// When the member proved the address; none until they have.
+    pub email_verified_at: Option<u64>,
+    /// Failed logins in a row, and until when those failures have locked the member out.
+    pub failed_logins: u32,
+    pub locked_until: Option<u64>,
 }
 
 /// A session a member logged in with. The token is here only as its SHA-256.
@@ -84,11 +94,48 @@ pub struct SessionRow {
     pub id: String,
     pub member: String,
     pub account: u64,
+    /// Whether the member had proved their email when this was read: what a session may do depends on it.
+    pub verified: bool,
+    /// What the app calls the thing it runs on, so a member can tell their own sessions apart in a list and end the
+    /// one they do not recognise. A name the app gives; never anything the venue works out about the device.
+    pub device: Option<String>,
     pub hash: [u8; 32],
     pub created_at: u64,
     pub expires_at: u64,
     pub ended_at: Option<u64>,
     pub last_used: Option<u64>,
+}
+
+/// A one-time token emailed to a member: proving an address, or setting a new password.
+#[derive(Clone, Debug)]
+pub struct TokenRow {
+    pub hash: [u8; 32],
+    pub member: String,
+    pub purpose: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub used_at: Option<u64>,
+}
+
+/// A member's second factor, before and after they have proved it works.
+#[derive(Clone, Debug)]
+pub struct TotpRow {
+    pub member: String,
+    pub secret: Vec<u8>,
+    pub created_at: u64,
+    pub confirmed_at: Option<u64>,
+    pub last_step: Option<u64>,
+}
+
+/// Mail the venue means to send.
+#[derive(Clone, Debug)]
+pub struct MailRow {
+    pub id: i64,
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+    pub created_at: u64,
+    pub sent_at: Option<u64>,
 }
 
 pub trait KeyRecords: Send + Sync {
@@ -116,12 +163,70 @@ pub trait KeyRecords: Send + Sync {
     /// Ends a session, and returns when it ended: `at`, or an earlier end the records already hold.
     fn end_session(&self, session_id: &str, at: u64) -> Result<u64, Error>;
     fn session_used(&self, session_id: &str, at: u64) -> Result<(), Error>;
+    /// Every session of a member, newest first, ended ones included: what a member is shown of their own sessions.
+    fn sessions_of(&self, member_id: &str) -> Result<Vec<SessionRow>, Error>;
+    /// Ends every session of a member: what setting a new password does.
+    fn end_sessions_of(&self, member_id: &str, at: u64) -> Result<Vec<String>, Error>;
+
+    /// The member an ID names, for the calls a signed-in member makes about themselves.
+    fn member(&self, member_id: &str) -> Result<Option<MemberRow>, Error>;
+    /// Marks an email proved, and returns whether it had not been already.
+    fn verify_email(&self, member_id: &str, at: u64) -> Result<bool, Error>;
+    /// Replaces a member's password hash.
+    fn set_password(&self, member_id: &str, phc: &str, at: u64) -> Result<(), Error>;
+    /// Counts a failed login, and returns how many have failed in a row and until when the member is locked out.
+    fn login_failed(
+        &self,
+        member_id: &str,
+        at: u64,
+        lock_after: u32,
+        lock_for_ms: u64,
+    ) -> Result<(u32, Option<u64>), Error>;
+    /// Forgets the failures: a login that worked.
+    fn login_worked(&self, member_id: &str) -> Result<(), Error>;
+
+    fn create_token(&self, token: &TokenRow) -> Result<(), Error>;
+    /// Takes a token: returns it and marks it used, or nothing if it is unknown, used or expired.
+    fn take_token(&self, hash: &[u8; 32], purpose: &str, at: u64) -> Result<Option<TokenRow>, Error>;
+
+    fn totp(&self, member_id: &str) -> Result<Option<TotpRow>, Error>;
+    fn start_totp(&self, totp: &TotpRow) -> Result<(), Error>;
+    fn confirm_totp(&self, member_id: &str, at: u64, step: u64) -> Result<(), Error>;
+    fn totp_step_used(&self, member_id: &str, step: u64) -> Result<(), Error>;
+    fn remove_totp(&self, member_id: &str) -> Result<(), Error>;
+
+    /// Replaces a member's recovery codes with these hashes.
+    fn set_recovery_codes(&self, member_id: &str, hashes: &[[u8; 32]], at: u64) -> Result<(), Error>;
+    /// Takes one recovery code, if it is one of this member's and unused.
+    fn take_recovery_code(&self, member_id: &str, hash: &[u8; 32], at: u64) -> Result<bool, Error>;
+    /// How many are left.
+    fn recovery_codes_left(&self, member_id: &str) -> Result<usize, Error>;
+
+    /// Queues mail. Sending it is somebody else's (`mail.rs`).
+    fn queue_mail(&self, to: &str, subject: &str, body: &str, at: u64) -> Result<(), Error>;
+    /// Mail that has not been sent, oldest first.
+    fn unsent_mail(&self, limit: usize) -> Result<Vec<MailRow>, Error>;
+    fn mail_sent(&self, id: i64, at: u64) -> Result<(), Error>;
+    /// The last mail this environment would have sent, newest first: how a demo shows what a member was told.
+    fn recent_mail(&self, to: Option<&str>, limit: usize) -> Result<Vec<MailRow>, Error>;
 }
 
 /// Records in memory: shared by clones, so a store opened again on a clone is a restarted one; can be told to be
 /// unreachable.
 /// The accounts and keys held in memory.
-type Held = (BTreeMap<u64, Account>, Vec<KeyRow>, Vec<MemberRow>, Vec<SessionRow>);
+/// What the in-memory records hold. Named rather than a tuple: there are too many of them now to count positions.
+#[derive(Default)]
+struct Held {
+    accounts: BTreeMap<u64, Account>,
+    keys: Vec<KeyRow>,
+    members: Vec<MemberRow>,
+    sessions: Vec<SessionRow>,
+    tokens: Vec<TokenRow>,
+    totp: Vec<TotpRow>,
+    /// A member's recovery codes: the member, the hash, and when it was used.
+    recovery: Vec<(String, [u8; 32], Option<u64>)>,
+    mail: Vec<MailRow>,
+}
 
 #[derive(Clone, Default)]
 pub struct Memory {
@@ -146,33 +251,33 @@ impl KeyRecords for Memory {
     fn seed_accounts(&self, accounts: &[Account], _now: u64) -> Result<(), Error> {
         let mut data = self.data()?;
         for a in accounts {
-            data.0.insert(a.id, a.clone());
+            data.accounts.insert(a.id, a.clone());
         }
         Ok(())
     }
 
     fn load_keys(&self) -> Result<Vec<KeyRow>, Error> {
-        Ok(self.data()?.1.clone())
+        Ok(self.data()?.keys.clone())
     }
 
     fn create(&self, key: &KeyRow) -> Result<(), Error> {
         let mut data = self.data()?;
-        if data.1.iter().any(|k| k.id == key.id) {
+        if data.keys.iter().any(|k| k.id == key.id) {
             return Err(Error::refused(format!("key {} exists", key.id)));
         }
-        data.1.push(key.clone());
+        data.keys.push(key.clone());
         Ok(())
     }
 
     fn revoke(&self, key_id: &str, at: u64) -> Result<u64, Error> {
         let mut data = self.data()?;
-        let key = data.1.iter_mut().find(|k| k.id == key_id).ok_or_else(|| Error::refused("no such key"))?;
+        let key = data.keys.iter_mut().find(|k| k.id == key_id).ok_or_else(|| Error::refused("no such key"))?;
         Ok(*key.revoked_at.get_or_insert(at))
     }
 
     fn used(&self, key_id: &str, at: u64) -> Result<(), Error> {
         let mut data = self.data()?;
-        if let Some(key) = data.1.iter_mut().find(|k| k.id == key_id) {
+        if let Some(key) = data.keys.iter_mut().find(|k| k.id == key_id) {
             key.last_used = Some(key.last_used.map_or(at, |t| t.max(at)));
         }
         Ok(())
@@ -184,45 +289,221 @@ impl KeyRecords for Memory {
 
     fn next_account(&self, floor: u64) -> Result<u64, Error> {
         let data = self.data()?;
-        Ok(data.0.keys().copied().max().map_or(floor, |top| top.saturating_add(1).max(floor)))
+        Ok(data.accounts.keys().copied().max().map_or(floor, |top| top.saturating_add(1).max(floor)))
     }
 
     fn create_member(&self, member: &MemberRow, name: &str, _now: u64) -> Result<(), Error> {
         let mut data = self.data()?;
-        if data.2.iter().any(|m| m.email == member.email) {
+        if data.members.iter().any(|m| m.email == member.email) {
             return Err(Error::refused("that email already has an account"));
         }
-        data.0.insert(member.account, Account { id: member.account, name: name.to_string(), dev_token: None });
-        data.2.push(member.clone());
+        data.accounts.insert(member.account, Account { id: member.account, name: name.to_string(), dev_token: None });
+        data.members.push(member.clone());
         Ok(())
     }
 
     fn member_by_email(&self, email: &str) -> Result<Option<MemberRow>, Error> {
-        Ok(self.data()?.2.iter().find(|m| m.email == email).cloned())
+        Ok(self.data()?.members.iter().find(|m| m.email == email).cloned())
     }
 
     fn load_sessions(&self, now: u64) -> Result<Vec<SessionRow>, Error> {
-        Ok(self.data()?.3.iter().filter(|s| s.ended_at.is_none() && s.expires_at > now).cloned().collect())
+        Ok(self.data()?.sessions.iter().filter(|s| s.ended_at.is_none() && s.expires_at > now).cloned().collect())
     }
 
     fn create_session(&self, session: &SessionRow) -> Result<(), Error> {
-        self.data()?.3.push(session.clone());
+        self.data()?.sessions.push(session.clone());
         Ok(())
     }
 
     fn end_session(&self, session_id: &str, at: u64) -> Result<u64, Error> {
         let mut data = self.data()?;
         let session =
-            data.3.iter_mut().find(|s| s.id == session_id).ok_or_else(|| Error::refused("no such session"))?;
+            data.sessions.iter_mut().find(|s| s.id == session_id).ok_or_else(|| Error::refused("no such session"))?;
         Ok(*session.ended_at.get_or_insert(at))
     }
 
     fn session_used(&self, session_id: &str, at: u64) -> Result<(), Error> {
         let mut data = self.data()?;
-        if let Some(session) = data.3.iter_mut().find(|s| s.id == session_id) {
+        if let Some(session) = data.sessions.iter_mut().find(|s| s.id == session_id) {
             session.last_used = Some(session.last_used.map_or(at, |t| t.max(at)));
         }
         Ok(())
+    }
+
+    fn sessions_of(&self, member_id: &str) -> Result<Vec<SessionRow>, Error> {
+        let mut found: Vec<SessionRow> =
+            self.data()?.sessions.iter().filter(|s| s.member == member_id).cloned().collect();
+        found.sort_by_key(|s| std::cmp::Reverse(s.created_at));
+        Ok(found)
+    }
+
+    fn end_sessions_of(&self, member_id: &str, at: u64) -> Result<Vec<String>, Error> {
+        let mut data = self.data()?;
+        let mut ended = Vec::new();
+        for session in data.sessions.iter_mut().filter(|s| s.member == member_id && s.ended_at.is_none()) {
+            session.ended_at = Some(at);
+            ended.push(session.id.clone());
+        }
+        Ok(ended)
+    }
+
+    fn member(&self, member_id: &str) -> Result<Option<MemberRow>, Error> {
+        Ok(self.data()?.members.iter().find(|m| m.id == member_id).cloned())
+    }
+
+    fn verify_email(&self, member_id: &str, at: u64) -> Result<bool, Error> {
+        let mut data = self.data()?;
+        let member = data.members.iter_mut().find(|m| m.id == member_id).ok_or_else(|| Error::refused("no member"))?;
+        if member.email_verified_at.is_some() {
+            return Ok(false);
+        }
+        member.email_verified_at = Some(at);
+        Ok(true)
+    }
+
+    fn set_password(&self, member_id: &str, phc: &str, _at: u64) -> Result<(), Error> {
+        let mut data = self.data()?;
+        let member = data.members.iter_mut().find(|m| m.id == member_id).ok_or_else(|| Error::refused("no member"))?;
+        member.password_phc = phc.to_string();
+        member.failed_logins = 0;
+        member.locked_until = None;
+        Ok(())
+    }
+
+    fn login_failed(
+        &self,
+        member_id: &str,
+        at: u64,
+        lock_after: u32,
+        lock_for_ms: u64,
+    ) -> Result<(u32, Option<u64>), Error> {
+        let mut data = self.data()?;
+        let member = data.members.iter_mut().find(|m| m.id == member_id).ok_or_else(|| Error::refused("no member"))?;
+        member.failed_logins += 1;
+        if member.failed_logins >= lock_after {
+            member.locked_until = Some(at.saturating_add(lock_for_ms));
+        }
+        Ok((member.failed_logins, member.locked_until))
+    }
+
+    fn login_worked(&self, member_id: &str) -> Result<(), Error> {
+        let mut data = self.data()?;
+        if let Some(member) = data.members.iter_mut().find(|m| m.id == member_id) {
+            member.failed_logins = 0;
+            member.locked_until = None;
+        }
+        Ok(())
+    }
+
+    fn create_token(&self, token: &TokenRow) -> Result<(), Error> {
+        self.data()?.tokens.push(token.clone());
+        Ok(())
+    }
+
+    fn take_token(&self, hash: &[u8; 32], purpose: &str, at: u64) -> Result<Option<TokenRow>, Error> {
+        let mut data = self.data()?;
+        let Some(token) = data
+            .tokens
+            .iter_mut()
+            .find(|t| t.hash == *hash && t.purpose == purpose && t.used_at.is_none() && t.expires_at > at)
+        else {
+            return Ok(None);
+        };
+        token.used_at = Some(at);
+        Ok(Some(token.clone()))
+    }
+
+    fn totp(&self, member_id: &str) -> Result<Option<TotpRow>, Error> {
+        Ok(self.data()?.totp.iter().find(|t| t.member == member_id).cloned())
+    }
+
+    fn start_totp(&self, totp: &TotpRow) -> Result<(), Error> {
+        let mut data = self.data()?;
+        data.totp.retain(|t| t.member != totp.member);
+        data.totp.push(totp.clone());
+        Ok(())
+    }
+
+    fn confirm_totp(&self, member_id: &str, at: u64, step: u64) -> Result<(), Error> {
+        let mut data = self.data()?;
+        let totp = data.totp.iter_mut().find(|t| t.member == member_id).ok_or_else(|| Error::refused("no totp"))?;
+        totp.confirmed_at = Some(at);
+        totp.last_step = Some(step);
+        Ok(())
+    }
+
+    fn totp_step_used(&self, member_id: &str, step: u64) -> Result<(), Error> {
+        let mut data = self.data()?;
+        if let Some(totp) = data.totp.iter_mut().find(|t| t.member == member_id) {
+            totp.last_step = Some(totp.last_step.map_or(step, |t| t.max(step)));
+        }
+        Ok(())
+    }
+
+    fn remove_totp(&self, member_id: &str) -> Result<(), Error> {
+        let mut data = self.data()?;
+        data.totp.retain(|t| t.member != member_id);
+        data.recovery.retain(|(member, _, _)| member != member_id);
+        Ok(())
+    }
+
+    fn set_recovery_codes(&self, member_id: &str, hashes: &[[u8; 32]], _at: u64) -> Result<(), Error> {
+        let mut data = self.data()?;
+        data.recovery.retain(|(member, _, _)| member != member_id);
+        for hash in hashes {
+            data.recovery.push((member_id.to_string(), *hash, None));
+        }
+        Ok(())
+    }
+
+    fn take_recovery_code(&self, member_id: &str, hash: &[u8; 32], at: u64) -> Result<bool, Error> {
+        let mut data = self.data()?;
+        let Some(code) =
+            data.recovery.iter_mut().find(|(member, kept, used)| member == member_id && kept == hash && used.is_none())
+        else {
+            return Ok(false);
+        };
+        code.2 = Some(at);
+        Ok(true)
+    }
+
+    fn recovery_codes_left(&self, member_id: &str) -> Result<usize, Error> {
+        Ok(self.data()?.recovery.iter().filter(|(member, _, used)| member == member_id && used.is_none()).count())
+    }
+
+    fn queue_mail(&self, to: &str, subject: &str, body: &str, at: u64) -> Result<(), Error> {
+        let mut data = self.data()?;
+        let id = data.mail.len() as i64 + 1;
+        data.mail.push(MailRow {
+            id,
+            to: to.to_string(),
+            subject: subject.to_string(),
+            body: body.to_string(),
+            created_at: at,
+            sent_at: None,
+        });
+        Ok(())
+    }
+
+    fn unsent_mail(&self, limit: usize) -> Result<Vec<MailRow>, Error> {
+        Ok(self.data()?.mail.iter().filter(|m| m.sent_at.is_none()).take(limit).cloned().collect())
+    }
+
+    fn mail_sent(&self, id: i64, at: u64) -> Result<(), Error> {
+        let mut data = self.data()?;
+        if let Some(mail) = data.mail.iter_mut().find(|m| m.id == id) {
+            mail.sent_at = Some(at);
+        }
+        Ok(())
+    }
+
+    fn recent_mail(&self, to: Option<&str>, limit: usize) -> Result<Vec<MailRow>, Error> {
+        let data = self.data()?;
+        let mut found: Vec<MailRow> =
+            data.mail.iter().filter(|m| to.is_none_or(|address| m.to == address)).cloned().collect();
+        found.sort_by_key(|m| std::cmp::Reverse(m.id));
+        found.truncate(limit);
+        Ok(found)
     }
 }
 
@@ -351,7 +632,8 @@ impl KeyRecords for Postgres {
         self.db
             .get()?
             .query(
-                "SELECT s.*, m.account_id FROM member_sessions s JOIN members m USING (member_id)
+                "SELECT s.*, m.account_id, m.email_verified_at IS NOT NULL AS verified
+                 FROM member_sessions s JOIN members m USING (member_id)
                  WHERE s.ended_at IS NULL AND s.expires_at > $1",
                 &[&time(now)],
             )?
@@ -362,9 +644,9 @@ impl KeyRecords for Postgres {
 
     fn create_session(&self, s: &SessionRow) -> Result<(), Error> {
         self.db.get()?.execute(
-            "INSERT INTO member_sessions (session_id, member_id, token_sha256, created_at, expires_at)
-             VALUES ($1, $2, $3, $4, $5)",
-            &[&s.id, &s.member, &s.hash.to_vec(), &time(s.created_at), &time(s.expires_at)],
+            "INSERT INTO member_sessions (session_id, member_id, token_sha256, created_at, expires_at, device)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+            &[&s.id, &s.member, &s.hash.to_vec(), &time(s.created_at), &time(s.expires_at), &s.device],
         )?;
         Ok(())
     }
@@ -389,6 +671,231 @@ impl KeyRecords for Postgres {
         )?;
         Ok(())
     }
+
+    fn sessions_of(&self, member_id: &str) -> Result<Vec<SessionRow>, Error> {
+        self.db
+            .get()?
+            .query(
+                "SELECT s.*, m.account_id, m.email_verified_at IS NOT NULL AS verified
+                 FROM member_sessions s JOIN members m USING (member_id)
+                 WHERE s.member_id = $1 ORDER BY s.created_at DESC",
+                &[&member_id],
+            )?
+            .iter()
+            .map(session_from)
+            .collect()
+    }
+
+    fn end_sessions_of(&self, member_id: &str, at: u64) -> Result<Vec<String>, Error> {
+        let rows = self.db.get()?.query(
+            "UPDATE member_sessions SET ended_at = $2 WHERE member_id = $1 AND ended_at IS NULL
+             RETURNING session_id",
+            &[&member_id, &time(at)],
+        )?;
+        Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
+    }
+
+    fn member(&self, member_id: &str) -> Result<Option<MemberRow>, Error> {
+        let row = self.db.get()?.query_opt("SELECT * FROM members WHERE member_id = $1", &[&member_id])?;
+        row.as_ref().map(member_from).transpose()
+    }
+
+    fn verify_email(&self, member_id: &str, at: u64) -> Result<bool, Error> {
+        let changed = self.db.get()?.execute(
+            "UPDATE members SET email_verified_at = $2 WHERE member_id = $1 AND email_verified_at IS NULL",
+            &[&member_id, &time(at)],
+        )?;
+        Ok(changed == 1)
+    }
+
+    fn set_password(&self, member_id: &str, phc: &str, _at: u64) -> Result<(), Error> {
+        self.db.get()?.execute(
+            "UPDATE members SET password_phc = $2, failed_logins = 0, locked_until = NULL WHERE member_id = $1",
+            &[&member_id, &phc],
+        )?;
+        Ok(())
+    }
+
+    fn login_failed(
+        &self,
+        member_id: &str,
+        at: u64,
+        lock_after: u32,
+        lock_for_ms: u64,
+    ) -> Result<(u32, Option<u64>), Error> {
+        let after = i32::try_from(lock_after).unwrap_or(i32::MAX);
+        let row = self.db.get()?.query_one(
+            "UPDATE members SET failed_logins = failed_logins + 1,
+               locked_until = CASE WHEN failed_logins + 1 >= $2 THEN $3 ELSE locked_until END
+             WHERE member_id = $1 RETURNING failed_logins, locked_until",
+            &[&member_id, &after, &time(at.saturating_add(lock_for_ms))],
+        )?;
+        Ok((u32::try_from(row.get::<_, i32>(0)).unwrap_or(0), row.get::<_, Option<SystemTime>>(1).map(millis)))
+    }
+
+    fn login_worked(&self, member_id: &str) -> Result<(), Error> {
+        self.db
+            .get()?
+            .execute("UPDATE members SET failed_logins = 0, locked_until = NULL WHERE member_id = $1", &[&member_id])?;
+        Ok(())
+    }
+
+    fn create_token(&self, token: &TokenRow) -> Result<(), Error> {
+        self.db.get()?.execute(
+            "INSERT INTO member_tokens (token_sha256, member_id, purpose, created_at, expires_at)
+             VALUES ($1, $2, $3, $4, $5)",
+            &[&token.hash.to_vec(), &token.member, &token.purpose, &time(token.created_at), &time(token.expires_at)],
+        )?;
+        Ok(())
+    }
+
+    fn take_token(&self, hash: &[u8; 32], purpose: &str, at: u64) -> Result<Option<TokenRow>, Error> {
+        // Taken and marked used in one statement: two apps racing on the same emailed link cannot both win.
+        let row = self.db.get()?.query_opt(
+            "UPDATE member_tokens SET used_at = $3
+             WHERE token_sha256 = $1 AND purpose = $2 AND used_at IS NULL AND expires_at > $3
+             RETURNING *",
+            &[&hash.to_vec(), &purpose, &time(at)],
+        )?;
+        row.as_ref().map(token_from).transpose()
+    }
+
+    fn totp(&self, member_id: &str) -> Result<Option<TotpRow>, Error> {
+        let row = self.db.get()?.query_opt("SELECT * FROM member_totp WHERE member_id = $1", &[&member_id])?;
+        row.as_ref().map(totp_from).transpose()
+    }
+
+    fn start_totp(&self, totp: &TotpRow) -> Result<(), Error> {
+        self.db.get()?.execute(
+            "INSERT INTO member_totp (member_id, secret, created_at) VALUES ($1, $2, $3)
+             ON CONFLICT (member_id) DO UPDATE SET secret = EXCLUDED.secret, created_at = EXCLUDED.created_at,
+               confirmed_at = NULL, last_step = NULL",
+            &[&totp.member, &totp.secret, &time(totp.created_at)],
+        )?;
+        Ok(())
+    }
+
+    fn confirm_totp(&self, member_id: &str, at: u64, step: u64) -> Result<(), Error> {
+        self.db.get()?.execute(
+            "UPDATE member_totp SET confirmed_at = $2, last_step = $3 WHERE member_id = $1",
+            &[&member_id, &time(at), &big(step)?],
+        )?;
+        Ok(())
+    }
+
+    fn totp_step_used(&self, member_id: &str, step: u64) -> Result<(), Error> {
+        self.db.get()?.execute(
+            "UPDATE member_totp SET last_step = $2 WHERE member_id = $1 AND (last_step IS NULL OR last_step < $2)",
+            &[&member_id, &big(step)?],
+        )?;
+        Ok(())
+    }
+
+    fn remove_totp(&self, member_id: &str) -> Result<(), Error> {
+        self.db.transaction(|tx| {
+            tx.execute("DELETE FROM member_recovery_codes WHERE member_id = $1", &[&member_id])?;
+            tx.execute("DELETE FROM member_totp WHERE member_id = $1", &[&member_id])?;
+            Ok(())
+        })
+    }
+
+    fn set_recovery_codes(&self, member_id: &str, hashes: &[[u8; 32]], at: u64) -> Result<(), Error> {
+        self.db.transaction(|tx| {
+            tx.execute("DELETE FROM member_recovery_codes WHERE member_id = $1", &[&member_id])?;
+            for hash in hashes {
+                tx.execute(
+                    "INSERT INTO member_recovery_codes (member_id, code_sha256, created_at) VALUES ($1, $2, $3)",
+                    &[&member_id, &hash.to_vec(), &time(at)],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    fn take_recovery_code(&self, member_id: &str, hash: &[u8; 32], at: u64) -> Result<bool, Error> {
+        let taken = self.db.get()?.execute(
+            "UPDATE member_recovery_codes SET used_at = $3
+             WHERE member_id = $1 AND code_sha256 = $2 AND used_at IS NULL",
+            &[&member_id, &hash.to_vec(), &time(at)],
+        )?;
+        Ok(taken == 1)
+    }
+
+    fn recovery_codes_left(&self, member_id: &str) -> Result<usize, Error> {
+        let row = self.db.get()?.query_one(
+            "SELECT count(*) FROM member_recovery_codes WHERE member_id = $1 AND used_at IS NULL",
+            &[&member_id],
+        )?;
+        Ok(usize::try_from(row.get::<_, i64>(0)).unwrap_or(0))
+    }
+
+    fn queue_mail(&self, to: &str, subject: &str, body: &str, at: u64) -> Result<(), Error> {
+        self.db.get()?.execute(
+            "INSERT INTO outbox_mail (to_email, subject, body, created_at) VALUES ($1, $2, $3, $4)",
+            &[&to, &subject, &body, &time(at)],
+        )?;
+        Ok(())
+    }
+
+    fn unsent_mail(&self, limit: usize) -> Result<Vec<MailRow>, Error> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.db
+            .get()?
+            .query("SELECT * FROM outbox_mail WHERE sent_at IS NULL ORDER BY mail_id LIMIT $1", &[&limit])?
+            .iter()
+            .map(mail_from)
+            .collect()
+    }
+
+    fn mail_sent(&self, id: i64, at: u64) -> Result<(), Error> {
+        self.db.get()?.execute("UPDATE outbox_mail SET sent_at = $2 WHERE mail_id = $1", &[&id, &time(at)])?;
+        Ok(())
+    }
+
+    fn recent_mail(&self, to: Option<&str>, limit: usize) -> Result<Vec<MailRow>, Error> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = match to {
+            Some(address) => self.db.get()?.query(
+                "SELECT * FROM outbox_mail WHERE to_email = $1 ORDER BY mail_id DESC LIMIT $2",
+                &[&address, &limit],
+            )?,
+            None => self.db.get()?.query("SELECT * FROM outbox_mail ORDER BY mail_id DESC LIMIT $1", &[&limit])?,
+        };
+        rows.iter().map(mail_from).collect()
+    }
+}
+
+fn token_from(row: &Row) -> Result<TokenRow, Error> {
+    let hash: Vec<u8> = row.get("token_sha256");
+    Ok(TokenRow {
+        hash: hash.try_into().map_err(|_| Error::refused("a token hash that is not 32 bytes"))?,
+        member: row.get("member_id"),
+        purpose: row.get("purpose"),
+        created_at: millis(row.get("created_at")),
+        expires_at: millis(row.get("expires_at")),
+        used_at: row.get::<_, Option<SystemTime>>("used_at").map(millis),
+    })
+}
+
+fn totp_from(row: &Row) -> Result<TotpRow, Error> {
+    Ok(TotpRow {
+        member: row.get("member_id"),
+        secret: row.get("secret"),
+        created_at: millis(row.get("created_at")),
+        confirmed_at: row.get::<_, Option<SystemTime>>("confirmed_at").map(millis),
+        last_step: row.get::<_, Option<i64>>("last_step").map(|s| unsigned(s).unwrap_or(0)),
+    })
+}
+
+fn mail_from(row: &Row) -> Result<MailRow, Error> {
+    Ok(MailRow {
+        id: row.get("mail_id"),
+        to: row.get("to_email"),
+        subject: row.get("subject"),
+        body: row.get("body"),
+        created_at: millis(row.get("created_at")),
+        sent_at: row.get::<_, Option<SystemTime>>("sent_at").map(millis),
+    })
 }
 
 fn member_from(row: &Row) -> Result<MemberRow, Error> {
@@ -400,6 +907,9 @@ fn member_from(row: &Row) -> Result<MemberRow, Error> {
         display_name: row.get("display_name"),
         created_at: millis(row.get("created_at")),
         disabled_at: row.get::<_, Option<SystemTime>>("disabled_at").map(millis),
+        email_verified_at: row.get::<_, Option<SystemTime>>("email_verified_at").map(millis),
+        failed_logins: u32::try_from(row.get::<_, i32>("failed_logins")).unwrap_or(0),
+        locked_until: row.get::<_, Option<SystemTime>>("locked_until").map(millis),
     })
 }
 
@@ -409,6 +919,8 @@ fn session_from(row: &Row) -> Result<SessionRow, Error> {
         id: row.get("session_id"),
         member: row.get("member_id"),
         account: unsigned(row.get("account_id"))?,
+        verified: row.get("verified"),
+        device: row.get("device"),
         hash: hash.try_into().map_err(|_| Error::refused("a session hash that is not 32 bytes"))?,
         created_at: millis(row.get("created_at")),
         expires_at: millis(row.get("expires_at")),

@@ -242,7 +242,7 @@ fn start_parlays(ingress: &str, feed: &str) -> (Arc<venue_parlays::service::Serv
 /// Starts an identity service of the test's own, with a fresh store, and returns where it listens. Its keys are in
 /// PostgreSQL, in a schema of the test's own, when `VENUE_TEST_DATABASE_URL` names a server, and in memory otherwise.
 fn start_identity(name: &str) -> String {
-    let settings = venue_identity::Settings { catalogue: CATALOGUE.to_string() };
+    let settings = venue_identity::Settings { catalogue: CATALOGUE.to_string(), show_mail: true };
     let storage =
         match venue_store::testing::url().and_then(|_| venue_store::testing::config(&format!("gw_identity_{name}"))) {
             Some(config) => venue_identity::Storage::Postgres { config, migrate: true },

@@ -60,6 +60,9 @@ pub struct Credential {
     /// The ID of the credential that authenticated: an API key's (`ak_`) or a member session's (`vs_`), which their
     /// prefixes tell apart. None for a dev token, which has no ID.
     pub key: Option<String>,
+    /// Which member, when a session authenticated. An API key belongs to an account rather than to a person, so it
+    /// has none, and neither does a dev token. A member's own routes are addressed with it.
+    pub member: Option<String>,
     pub permissions: Permissions,
     /// When the key expires, in milliseconds since the epoch.
     expires_at: Option<u64>,
@@ -70,7 +73,7 @@ pub struct Credential {
 impl Credential {
     /// A dev token: its account, with every permission.
     pub const fn dev_token(account: u64) -> Self {
-        Self { account, key: None, permissions: Permissions::ALL, expires_at: None, fingerprint: None }
+        Self { account, key: None, member: None, permissions: Permissions::ALL, expires_at: None, fingerprint: None }
     }
 
     /// Refuses with 403 `FORBIDDEN` unless the credential holds `permission`.
@@ -312,6 +315,7 @@ fn valid(answer: &Value, fingerprint: [u8; 32]) -> Option<Credential> {
                 .or_else(|| answer["sessionId"].as_str().filter(|id| member::is_session_id(id)))?
                 .to_string(),
         ),
+        member: answer["memberId"].as_str().map(str::to_string),
         permissions: Permissions::from_names(names).ok()?,
         expires_at: match &answer["expiresAt"] {
             Value::Null => None,
@@ -358,9 +362,23 @@ pub fn members(gateway: &Gateway, request: &Request, client: &str, notify: &Noti
             gateway.anonymous_rate(client)?;
             identity.pass_to("POST", "/v1/members", &request.body, notify)
         }
+        // Proving an address, and getting a password back. All four are reached by somebody with no session — that
+        // is the point of them — so all four are limited by where they came from, and all four answer the same
+        // whether or not the address is anybody's (interfaces/gateway/decisions.md, G-16).
+        ("POST", ["v4", "members", step @ ("verification" | "verify" | "reset" | "password")]) => {
+            gateway.anonymous_rate(client)?;
+            identity.pass_to("POST", &format!("/v1/members/{step}"), &request.body, notify)
+        }
         ("POST", ["v4", "sessions"]) => {
             gateway.anonymous_rate(client)?;
             identity.pass_to("POST", "/v1/sessions", &request.body, notify)
+        }
+        // The mail this environment would have sent. The identity service answers 404 unless it was started with
+        // --show-mail, so a venue that can really post to an address never serves it.
+        ("GET", ["v4", "mail"]) => {
+            gateway.anonymous_rate(client)?;
+            let to = request.path.split_once('?').map_or(String::new(), |(_, q)| format!("?{q}"));
+            identity.pass_to("GET", &format!("/v1/mail{to}"), &[], notify)
         }
         ("DELETE", ["v4", "sessions", "current"]) => {
             // Only the session itself may end itself, which is what holding its credential proves.
@@ -376,6 +394,42 @@ pub fn members(gateway: &Gateway, request: &Request, client: &str, notify: &Noti
                 identity.forget(token);
             }
             identity.pass_to("DELETE", &format!("/v1/sessions/{session}"), &[], notify)
+        }
+        _ => Err(ApiError::not_found("no such route")),
+    }
+}
+
+/// A member's own account: what they are, the sessions they hold elsewhere, and their second factor. Every route
+/// here is addressed by the member the session belongs to, never by one named in the request, so a session can only
+/// ever reach its own (interfaces/gateway/README.md, members and sessions).
+pub fn me(gateway: &Gateway, request: &Request, notify: &Notify) -> Result<Call, ApiError> {
+    let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
+    let identity = &gateway.identity;
+    let notify = Arc::clone(notify);
+    let credential = crate::rest::credential(gateway, request, Permissions::READ)?;
+    let member = credential
+        .member
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("these are a member's own routes, and this is an API key"))?;
+    match (request.method.as_str(), segments.as_slice()) {
+        ("GET", ["v4", "members", "me"]) => identity.pass_to("GET", &format!("/v1/members/{member}"), &[], notify),
+        ("GET", ["v4", "sessions"]) => identity.pass_to("GET", &format!("/v1/members/{member}/sessions"), &[], notify),
+        ("DELETE", ["v4", "sessions", session]) => {
+            if !member::is_session_id(session) {
+                return Err(ApiError::bad("sessionId must be vs_ and 16 lower-case hex digits"));
+            }
+            identity.pass_to("DELETE", &format!("/v1/members/{member}/sessions/{session}"), &[], notify)
+        }
+        // Starting a second factor answers a secret, confirming it answers the recovery codes, and removing it wants
+        // the password in the body: a session someone else is holding must not be able to take the factor off.
+        ("POST", ["v4", "members", "me", "totp"]) => {
+            identity.pass_to("POST", &format!("/v1/members/{member}/totp"), &[], notify)
+        }
+        ("PUT", ["v4", "members", "me", "totp"]) => {
+            identity.pass_to("PUT", &format!("/v1/members/{member}/totp"), &request.body, notify)
+        }
+        ("DELETE", ["v4", "members", "me", "totp"]) => {
+            identity.pass_to("DELETE", &format!("/v1/members/{member}/totp"), &request.body, notify)
         }
         _ => Err(ApiError::not_found("no such route")),
     }

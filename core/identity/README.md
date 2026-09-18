@@ -78,15 +78,42 @@ people in with.
   service's to do.
 - **A session** is what an app holds afterwards. Its token is kept as a SHA-256, as a key's secret is, and the
   service verifies it from memory as it verifies keys — sessions are read at start and kept current. It lasts 30
-  days, and logging out ends it.
+  days, and logging out ends it. It carries the `device` its app named, so a member can pick their own sessions out
+  of a list and end the one they do not recognise.
 - **An account** comes with the member, numbered from 100,000 so that accounts people made are told from an
   environment's own at a glance. It starts with no money.
+- **The address is proved** by a code sent to it. Until then a session may look and trade but not move money, so the
+  account cannot take a deposit before the venue has written to the address and had it answered.
+- **A second factor** is TOTP (RFC 6238), with ten recovery codes made when it is confirmed. The secret is 160 bits,
+  the codes are six digits over thirty seconds with one step of drift either way, and the step a code was accepted at
+  is written down so the same code cannot be used twice. Recovery codes are kept as hashes and are good once.
+- **Repeated failures** lock the member for fifteen minutes after five wrong passwords in a row. On the member, not
+  on the address they came from: that is what stops guessing spread over many addresses. It is short, because the
+  other side of it is that anyone who knows an email can keep its owner out for that long. Setting a new password
+  lifts it.
+- **Nothing says whether an address is a member's.** Signing up, asking for the verification message again and asking
+  for a new password all answer `{"checkYourEmail": true}`, and all three write to the address either way: the code,
+  or a note that somebody tried with an address that has no account (or already has one). A wrong password and an
+  address nobody has are refused in the same words and take the same time — a password is hashed against a dummy PHC
+  when there is no member, so the two take the same work.
 - **Personal data** lives here and nowhere else (blueprint §12): `members` holds the email, and nothing about a member
   reaches the journal, ClickHouse or Valkey. The account ID is what everything else refers to.
 
 The gateway enforces what a caller may make (a key's permissions and expiry no more than the key asking); the service
 checks only that a key is well formed and its account is in the catalogue. An operator with network access to the
 service can make the first key of an account where dev tokens are switched off.
+
+## Mail
+
+The venue writes to a member when something happens to their account: the code that proves their address, the code
+that sets a new password, a new sign-in, a password changed, a second factor added or removed, a recovery code used,
+an account locked.
+
+There is no mail provider here, so messages are queued in `outbox_mail` and a demo reads them back over
+`GET /v1/mail`, the way the treasury's fake bank stands in for a real one. **That route answers 404 unless the
+service was started with `--show-mail true`**: the messages hold the very codes they were sent to keep secret, so an
+environment that can really post to an address must never turn it on. Putting a real provider in means sending the
+unsent rows and marking them sent; nothing else changes.
 
 ## How the gateway uses it
 

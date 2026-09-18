@@ -997,7 +997,9 @@ name = "venue-identity"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "hmac",
  "serde_json",
+ "sha1",
  "sha2",
  "venue-link",
  "venue-store",
