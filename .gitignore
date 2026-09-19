@@ -29,3 +29,12 @@ adapters/fix/gradle/wrapper/gradle-wrapper.jar
 # an address of somebody's own network is theirs, not the project's (apps/retail/README.md, pointing it at a venue).
 .env.local
 .env.*.local
+
+# OpenTofu and Terraform working files. The state especially: it records everything that was made, including values
+# a provider marked sensitive, and it belongs to whoever ran the apply rather than to the project. The provider
+# directory is hundreds of megabytes of downloaded binaries.
+deploy/aws/.terraform/
+deploy/aws/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars

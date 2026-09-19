@@ -1,0 +1,43 @@
+#cloud-config
+# What a bare Ubuntu instance needs to become the node the previews run on. Runs once, on first boot; a stop and a
+# later start do not run it again, which is why nothing here is written as if it might.
+package_update: true
+packages:
+  - curl
+  - ca-certificates
+
+write_files:
+  # k3s forwards cluster DNS to the host's /etc/resolv.conf. On Ubuntu that names 127.0.0.53, systemd-resolved's
+  # stub, which from inside a pod is the pod's own loopback — so nothing external resolves anywhere in the cluster
+  # and it looks like a firewall rather than DNS. This cost an hour on the laptop cluster (deploy/README.md); here
+  # it is simply never allowed to happen.
+  - path: /var/lib/rancher/k3s/server/manifests/coredns-custom.yaml
+    permissions: "0600"
+    content: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: coredns-custom
+        namespace: kube-system
+      data:
+        external.override: |
+          forward . 169.254.169.253 1.1.1.1 {
+            policy sequential
+          }
+
+runcmd:
+  # Traefik comes with k3s and is what the chart's Ingress objects expect, so it stays. ServiceLB likewise: it is
+  # what puts :80 and :443 on the host without a cloud load balancer, and an ALB would be $16 a month to do the
+  # same for one node.
+  - |
+    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --write-kubeconfig-mode 644" sh -
+  # Reachable from a laptop: k3s writes its own address into the kubeconfig, which is the private one.
+  - |
+    until [ -f /etc/rancher/k3s/k3s.yaml ]; do sleep 2; done
+    PUBLIC=$(curl -s --max-time 5 http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
+    if [ -n "$PUBLIC" ]; then
+      sed "s#https://127.0.0.1:6443#https://$PUBLIC:6443#" /etc/rancher/k3s/k3s.yaml > /home/ubuntu/kubeconfig
+      chown ubuntu:ubuntu /home/ubuntu/kubeconfig
+      chmod 600 /home/ubuntu/kubeconfig
+    fi
+  - touch /var/lib/venue-ready
