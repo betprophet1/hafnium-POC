@@ -80,15 +80,27 @@ case "${1:-}" in
   kubeconfig)
     ip=$("$TOFU" -chdir="$HERE" output -raw address)
     mkdir -p "$HOME/.kube"
-    scp -q "ubuntu@$ip:kubeconfig" "$HOME/.kube/venue-aws"
+    # k3s writes 127.0.0.1 into its kubeconfig, which is true on the box and useless anywhere else. The address is
+    # rewritten here rather than on the instance: this end already knows it, and an instance working out its own
+    # public address needs the metadata service, a token, and to be right about both.
+    ssh "ubuntu@$ip" "sudo cat /etc/rancher/k3s/k3s.yaml" \
+      | sed "s#https://127.0.0.1:6443#https://$ip:6443#" > "$HOME/.kube/venue-aws"
     chmod 600 "$HOME/.kube/venue-aws"
     echo "written to ~/.kube/venue-aws"
     echo "use it with: export KUBECONFIG=~/.kube/venue-aws"
     ;;
 
   install)
-    echo "run with KUBECONFIG pointing at the box (venue.sh kubeconfig first)"
     : "${KUBECONFIG:?set KUBECONFIG to ~/.kube/venue-aws}"
+    # Which cluster this lands in is decided by one environment variable, and the wrong answer is somebody's running
+    # venue rather than an error. So it is checked rather than assumed: the API this kubectl talks to must be the
+    # address OpenTofu made.
+    ip=$("$TOFU" -chdir="$HERE" output -raw address)
+    server=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+    case "$server" in
+      *"$ip"*) echo "installing into $server" ;;
+      *) echo "refusing: KUBECONFIG points at $server, which is not the box at $ip" >&2; exit 1 ;;
+    esac
     kubectl cluster-info >/dev/null
     echo "== ArgoCD"
     kubectl create namespace argocd --dry-run=client -o yaml | kubectl apply -f - >/dev/null

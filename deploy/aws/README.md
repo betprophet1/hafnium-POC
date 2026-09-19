@@ -33,12 +33,16 @@ here. On a fleet running continuously, that arithmetic reverses.
 
 - An AWS account, ideally one of its own. Creating this needs permission to make IAM roles, VPCs and load balancers,
   which is close enough to administrator that a mistake or a leaked key reaches everything else in the account.
-- Credentials in a profile, never on a command line: `aws configure --profile venue`.
+- Credentials in a profile, never on a command line. Best is IAM Identity Center —
+  `aws configure sso --profile venue --use-device-code` — which leaves nothing long-lived in `~/.aws`; a plain
+  access key through `aws configure --profile venue` also works.
 - A domain, either registered in Route53 or delegated to it.
 
 ## The order things happen in
 
-1. **A budget alarm, before anything that bills.** `tofu apply -target=aws_budgets_budget.venue`
+1. **A budget alarm, before anything that bills.** In an organisation, make it once in the console of the account
+   the box lives in — that keeps billing permissions off this key entirely. `create_budget = true` makes it from
+   here instead, where the key does have them.
 2. The rest: `tofu apply`
 3. `./venue.sh install` — k3s, ArgoCD, cert-manager, and the venue chart
 4. `./venue.sh stop` when you are done for the day

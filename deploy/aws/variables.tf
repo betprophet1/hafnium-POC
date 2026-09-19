@@ -16,9 +16,19 @@ variable "monthly_budget" {
   default     = "25"
 }
 
+variable "create_budget" {
+  description = <<-EOT
+    Whether the budget alarm is made here. False by default: in an organisation it is usually set once in the
+    account that owns the others, or by hand in the console, and this key then needs no billing permissions at all.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "alert_email" {
-  description = "Where the budget alarm goes. Required: an alarm nobody receives is not an alarm."
+  description = "Where the budget alarm goes, when one is made here. An alarm nobody receives is not an alarm."
   type        = string
+  default     = ""
 }
 
 variable "instance_type" {
@@ -39,9 +49,10 @@ variable "disk_gb" {
   default     = 60
 }
 
-variable "key_name" {
-  description = "An existing EC2 key pair to reach the box with."
+variable "ssh_public_key" {
+  description = "The public half of the key this machine reaches the box with. Registered with EC2; the private half never leaves here."
   type        = string
+  default     = "~/.ssh/id_ed25519.pub"
 }
 
 variable "admin_cidrs" {

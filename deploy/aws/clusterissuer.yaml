@@ -1,0 +1,44 @@
+# Where certificates come from (deploy/aws/README.md).
+#
+# HTTP-01, not DNS-01. A DNS challenge could issue one wildcard covering every preview forever, but it would mean
+# giving cert-manager permission to write Route53 records — an AWS credential living in a cluster that also runs
+# unreviewed branch code. HTTP-01 needs no credential at all: Let's Encrypt asks for a file on port 80 and Traefik
+# serves it.
+#
+# The cost is a certificate per preview, and Let's Encrypt counts its limits against the registered domain —
+# phantu.xyz, not pmex.phantu.xyz — so previews share a weekly quota of 50 with anything else issued on that domain.
+# At an eight-hour time limit that is roughly seven previews a day before it bites. If it ever does, the answer is
+# the wildcard and the credential that comes with it.
+#
+# Staging as well as production: the staging issuer is not trusted by browsers but is barely rate-limited, which is
+# what you want while finding out whether the challenge works at all. Issue against staging first, then switch the
+# annotation to production once a certificate appears.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: charlesphan@protonmail.com
+    privateKeySecretRef:
+      name: letsencrypt-staging-account
+    solvers:
+      - http01:
+          ingress:
+            class: traefik
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: charlesphan@protonmail.com
+    privateKeySecretRef:
+      name: letsencrypt-account
+    solvers:
+      - http01:
+          ingress:
+            class: traefik

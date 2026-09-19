@@ -19,7 +19,8 @@ provider "aws" {
   default_tags {
     tags = {
       Project = "venue"
-      Purpose = "preview environments, proof of concept"
+      # No comma: budget tags allow only letters, numbers, spaces and _ . : / = + - @, and reject the rest.
+      Purpose = "preview environments - proof of concept"
       # So that everything made here can be found and destroyed together, including by hand if the state is lost.
       ManagedBy = "opentofu:deploy/aws"
     }
@@ -30,6 +31,10 @@ provider "aws" {
 # Applied before anything else: `tofu apply -target=aws_budgets_budget.venue`. A budget cannot stop spending — only
 # tell you about it — so it is worth having in place before the first thing that costs money, not after.
 resource "aws_budgets_budget" "venue" {
+  # Off by default. In an organisation the budget is usually made once, by hand or in the account that owns the
+  # others, and giving this key billing permissions it does not otherwise need is the wrong trade. Turn it on with
+  # `create_budget = true` where the key does have them.
+  count        = var.create_budget ? 1 : 0
   name         = "venue-preview-poc"
   budget_type  = "COST"
   limit_amount = var.monthly_budget
@@ -118,6 +123,13 @@ resource "aws_security_group" "venue" {
 }
 
 # ---------------------------------------------------------------------------- the instance
+# The key this machine already has, registered with EC2 so there is no key pair to create, download or lose. Only
+# the public half ever leaves here.
+resource "aws_key_pair" "venue" {
+  key_name   = "venue-preview"
+  public_key = file(pathexpand(var.ssh_public_key))
+}
+
 data "aws_ami" "ubuntu" {
   most_recent = true
   owners      = ["099720109477"] # Canonical
@@ -132,7 +144,7 @@ resource "aws_instance" "venue" {
   instance_type          = var.instance_type
   subnet_id              = data.aws_subnets.default.ids[0]
   vpc_security_group_ids = [aws_security_group.venue.id]
-  key_name               = var.key_name
+  key_name               = aws_key_pair.venue.key_name
 
   root_block_device {
     volume_size = var.disk_gb
@@ -143,21 +155,33 @@ resource "aws_instance" "venue" {
     delete_on_termination = true
   }
 
-  user_data = file("${path.module}/cloud-init.yaml")
+  user_data = templatefile("${path.module}/cloud-init.yaml", {
+    public_ip = aws_eip.venue.public_ip
+    domain    = var.domain
+  })
 
-  # So that `venue.sh stop` and a later `start` do not rebuild the machine.
   lifecycle {
-    ignore_changes = [ami]
+    # `venue.sh stop` and a later `start` must not rebuild the machine, and neither should a change to the
+    # cloud-init: it only ever runs on a first boot, so applying one to a running box would mean destroying it to
+    # no purpose. A deliberate rebuild is `tofu taint aws_instance.venue`.
+    ignore_changes = [ami, user_data]
   }
 
   tags = { Name = "venue-preview" }
 }
 
-# An address that survives a stop, so the DNS record does not have to be rewritten every morning.
+# An address that survives a stop, so the DNS record does not have to be rewritten every morning. Allocated on its
+# own rather than as a property of the instance, because the instance has to be told this address at boot — k3s
+# signs its API certificate for the addresses it is given, and one it learns about later is one the certificate
+# does not cover.
 resource "aws_eip" "venue" {
-  instance = aws_instance.venue.id
-  domain   = "vpc"
-  tags     = { Name = "venue-preview" }
+  domain = "vpc"
+  tags   = { Name = "venue-preview" }
+}
+
+resource "aws_eip_association" "venue" {
+  instance_id   = aws_instance.venue.id
+  allocation_id = aws_eip.venue.id
 }
 
 # ---------------------------------------------------------------------------- names

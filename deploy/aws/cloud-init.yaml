@@ -29,15 +29,14 @@ runcmd:
   # Traefik comes with k3s and is what the chart's Ingress objects expect, so it stays. ServiceLB likewise: it is
   # what puts :80 and :443 on the host without a cloud load balancer, and an ALB would be $16 a month to do the
   # same for one node.
+  # --tls-san: the API certificate has to cover the address and the name this box is reached by, or every kubectl
+  # from anywhere but the box itself fails to verify it. k3s will not reissue a certificate just because the list
+  # changed later, so getting it right at install is the difference between working and a repair.
   - |
-    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --write-kubeconfig-mode 644" sh -
-  # Reachable from a laptop: k3s writes its own address into the kubeconfig, which is the private one.
-  - |
-    until [ -f /etc/rancher/k3s/k3s.yaml ]; do sleep 2; done
-    PUBLIC=$(curl -s --max-time 5 http://169.254.169.254/latest/meta-data/public-ipv4 || echo "")
-    if [ -n "$PUBLIC" ]; then
-      sed "s#https://127.0.0.1:6443#https://$PUBLIC:6443#" /etc/rancher/k3s/k3s.yaml > /home/ubuntu/kubeconfig
-      chown ubuntu:ubuntu /home/ubuntu/kubeconfig
-      chmod 600 /home/ubuntu/kubeconfig
-    fi
+    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --write-kubeconfig-mode 644 --tls-san ${public_ip} --tls-san ${domain}" sh -
+  # The kubeconfig is fetched and rewritten by `venue.sh kubeconfig`, from the machine that already knows this
+  # box's address. Doing it here would mean asking the metadata service, which on this AMI needs a token first
+  # (IMDSv2) — and a version of that which forgets the token writes nothing and says nothing, which is how this was
+  # found.
+  - until [ -f /etc/rancher/k3s/k3s.yaml ]; do sleep 2; done
   - touch /var/lib/venue-ready
