@@ -64,6 +64,11 @@ spec:
               value: "pr-{{ .number }}.preview.venue.example"
             - name: ingress.tls.secretName
               value: preview-venue-tls
+            # Without this the Ingress asks for TLS and nothing ever issues a certificate: cert-manager acts on the
+            # annotation, not on the presence of a tls block. The dot in the annotation's name is escaped because
+            # Helm reads an unescaped one as another level of nesting.
+            - name: ingress.annotations.cert-manager\.io/cluster-issuer
+              value: letsencrypt
             # Without this the app is refused by the browser before it can do anything at all: the app is served
             # from its own origin and every call to this venue is cross-origin (decision G-15).
             - name: gateway.allowedOrigins

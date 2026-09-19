@@ -7,10 +7,12 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-PROFILE="${VENUE_AWS_PROFILE:-venue}"
-REGION="${VENUE_AWS_REGION:-eu-central-1}"
-AWS=(aws --profile "$PROFILE" --region "$REGION")
 TOFU="${VENUE_TOFU:-tofu}"
+HERE_FOR_OUTPUT="$(cd "$(dirname "$0")" && pwd)"
+# Whatever the deployment was actually made with, rather than a guess that has to be corrected on every command.
+PROFILE="${VENUE_AWS_PROFILE:-$("$TOFU" -chdir="$HERE_FOR_OUTPUT" output -raw profile 2>/dev/null || echo venue)}"
+REGION="${VENUE_AWS_REGION:-$("$TOFU" -chdir="$HERE_FOR_OUTPUT" output -raw region 2>/dev/null || echo eu-central-1)}"
+AWS=(aws --profile "$PROFILE" --region "$REGION")
 
 usage() {
   cat <<'EOF'
@@ -110,12 +112,24 @@ case "${1:-}" in
     echo "== cert-manager"
     kubectl apply --server-side \
       -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml >/dev/null
+    echo "== certificate issuers"
+    kubectl apply -f "$HERE/clusterissuer.yaml" >/dev/null
+    echo "== the preview machinery"
+    # The committed ApplicationSet names a placeholder domain rather than anybody's real one, so it is put in here,
+    # from the same value the DNS was built with. One source for the name, and it never reaches the repository.
+    domain=$("$TOFU" -chdir="$HERE" output -raw domain)
+    argocd="$HERE/../argocd"
+    kubectl apply -f "$argocd/project.yaml" >/dev/null
+    sed "s/preview\.venue\.example/preview.$domain/" "$argocd/applicationset.yaml" | kubectl apply -f - >/dev/null
+    kubectl apply -f "$argocd/reaper.yaml" >/dev/null
+    echo "   previews will answer on pr-<number>.preview.$domain"
     echo
     echo "still to do by hand, because each needs a secret this script will not invent:"
-    echo "  - venue-github-token  (the ApplicationSet and the reaper)"
+    echo "  - venue-github-token  (the ApplicationSet listing pull requests, and the reaper)"
     echo "  - venue-repo          (ArgoCD reading the repository)"
-    echo "  - ghcr-pull           (pulling a preview's own image)"
-    echo "  - a ClusterIssuer     (Let's Encrypt, for real certificates)"
+    echo "  - ghcr-pull           (pulling a preview's own image, in each preview namespace)"
+    echo
+    echo "until those exist the ApplicationSet will log that it cannot reach GitHub, which is expected."
     ;;
 
   destroy)
