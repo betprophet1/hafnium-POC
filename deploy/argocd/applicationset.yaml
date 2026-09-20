@@ -121,6 +121,33 @@ spec:
               value: "https://{{- $s := regexReplaceAll `[^a-z0-9]+` (lower .title) `-` | trimAll `-` | trunc 24 | trimSuffix `-` -}}pr-{{ .number }}{{ if $s }}-{{ $s }}{{ end }}.venue.example"
             - name: gateway.environments[0].live
               value: "false"
+            # How big it is, chosen by label. `deploy-env` asks for an environment; these ask for a particular
+            # kind of one, and a pull request that says nothing gets the small default.
+            #
+            # Named sizes rather than free-form values, because two of these have to move together: the engine's
+            # capacity profile decides how much memory it allocates up front, and `launch` wants about 1.5 GiB
+            # where the default limit is 512Mi. Set one without the other and the core is killed on startup by the
+            # kubelet, which reads as a crash in the branch rather than a preview asked for the wrong shape. A
+            # label cannot get that half-right.
+            #
+            #   env-throughput  the launch engine, room to run it, and the observer that measures it
+            #   env-fix         the FIX adapter, which is a second front door and a JVM
+            #
+            # These were `core.capacity`, `observer.enabled` and `fix.enabled` in preview.yaml. They live here now
+            # because a parameter beats a values file, so leaving them there would have meant editing a value that
+            # could no longer do anything.
+            - name: core.capacity
+              value: "{{ if has `env-throughput` .labels }}launch{{ else }}small{{ end }}"
+            - name: core.resources.requests.cpu
+              value: "{{ if has `env-throughput` .labels }}500m{{ else }}100m{{ end }}"
+            - name: core.resources.requests.memory
+              value: "{{ if has `env-throughput` .labels }}2Gi{{ else }}256Mi{{ end }}"
+            - name: core.resources.limits.memory
+              value: "{{ if has `env-throughput` .labels }}3Gi{{ else }}512Mi{{ end }}"
+            - name: observer.enabled
+              value: "{{ if has `env-throughput` .labels }}true{{ else }}false{{ end }}"
+            - name: fix.enabled
+              value: "{{ if has `env-fix` .labels }}true{{ else }}false{{ end }}"
             # What the environment calls itself in its metrics, so a dashboard can tell one branch from another.
             - name: metrics.labels.environment
               value: "pr-{{ .number }}"
