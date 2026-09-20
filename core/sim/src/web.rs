@@ -222,12 +222,42 @@ pub(crate) fn respond(mut stream: TcpStream, status: u16, content_type: &str, bo
     Ok(())
 }
 
+/// Whether the far end of an event stream has closed. Nothing is ever sent to the server on one of these, so a read
+/// that returns end-of-file is the client going away, and one that would block is the client still listening. The
+/// socket is put back as it was either way: the loop that calls this writes with a timeout, not without blocking.
+fn gone(stream: &TcpStream) -> bool {
+    if stream.set_nonblocking(true).is_err() {
+        return true;
+    }
+    let mut probe = [0u8; 1];
+    let verdict = match (&*stream).read(&mut probe) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted),
+    };
+    verdict || stream.set_nonblocking(false).is_err()
+}
+
 /// Server-sent events for the settlement tab: a snapshot whenever the view changes, at most five a second, and a
 /// comment every 15 s otherwise so proxies keep the connection open.
+///
+/// **It stops when the browser goes.** Writing is not enough to notice that: a `TcpStream`'s `flush` does nothing,
+/// and a write into a connection whose far end has closed is taken by the kernel and may be taken again for a long
+/// time, so the error that would end this never arrives. Left to that, every tab that ever opened the page left a
+/// thread here waking five times a second to build the whole venue as JSON and send it to nobody — two of them were
+/// found doing it on the deployed venue, between them a seventh of a core, and they never stop.
+///
+/// A client that has gone is noticed by reading instead: nothing is ever sent on this connection, so a read that
+/// says end-of-file is the browser closing it, and one that says it would block is the browser still there.
 fn events(web: &Web, mut stream: TcpStream) -> Result<(), Error> {
     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n\r\n")?;
+    // So a write to somebody who has stopped reading cannot block this thread for ever either.
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut seen = u64::MAX;
     loop {
+        if gone(&stream) {
+            return Ok(());
+        }
         let snapshot = {
             let guard = web.live.view.lock().map_err(poisoned)?;
             let (view, _) = web
