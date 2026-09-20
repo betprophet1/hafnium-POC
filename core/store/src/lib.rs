@@ -539,20 +539,39 @@ impl Database {
     /// but hashing it again after editing a file it has already applied leaves nothing to notice: `apply`, `status`
     /// and `validate` all pass. A released migration must never be edited (decisions.md, S-2), so the first build to
     /// see a version applied records what it held, and any later build that holds something else stops here.
+    ///
+    /// Nothing applied means nothing to record, and the table is deliberately *not* made then. Asking a schema how
+    /// current it is must not change it: `wait_for_schema` asks in a loop, which is how a service waits for the
+    /// migration job on a first install — where that job cannot be a Helm hook, because PostgreSQL does not exist
+    /// yet for a hook to reach (deploy/charts/venue-mini/templates/migrate.yaml), and under ArgoCD is never one at
+    /// all, because that test uses `lookup` and `lookup` is empty under `helm template`. Creating this table from
+    /// inside that loop left Atlas a schema holding a table it had not put there, which it refuses as unclean
+    /// unless given a baseline; and because the loop kept running, the schema went back to being unclean as fast as
+    /// anyone cleaned it. The service was waiting for a migration that its own waiting prevented.
     fn checked_against_this_build(&self, migrations: &[Migration], applied: &[String]) -> Result<(), Error> {
+        if applied.is_empty() {
+            return Ok(());
+        }
         let schema = self.schema().to_string();
         self.transaction(|tx| {
-            tx.batch_execute(
-                "CREATE TABLE IF NOT EXISTS venue_migration_sql (
+            // Named with its schema, not left to `search_path`. Unqualified, this landed wherever the connection
+            // happened to point: inside the service's own schema in a deployment, where the role and the schema
+            // share a name, and in `public` under the test harness, where they do not — so the guard was shared by
+            // every test schema at once and the tests exercised a different arrangement from the one that runs.
+            tx.batch_execute(&format!(
+                "CREATE TABLE IF NOT EXISTS {schema}.venue_migration_sql (
                    version text PRIMARY KEY,
                    sha256 text NOT NULL,
                    first_seen timestamptz NOT NULL DEFAULT now()
-                 )",
-            )?;
+                 )"
+            ))?;
             for version in applied {
                 let Some(m) = migrations.iter().find(|m| m.version == *version) else { continue };
                 let sum = checksum(m.sql);
-                let row = tx.query_opt("SELECT sha256 FROM venue_migration_sql WHERE version = $1", &[version])?;
+                let row = tx.query_opt(
+                    &format!("SELECT sha256 FROM {schema}.venue_migration_sql WHERE version = $1"),
+                    &[version],
+                )?;
                 match row {
                     Some(row) if row.get::<_, String>(0) == sum => {}
                     Some(_) => {
@@ -564,7 +583,7 @@ impl Database {
                     }
                     None => {
                         tx.execute(
-                            "INSERT INTO venue_migration_sql (version, sha256) VALUES ($1, $2)",
+                            &format!("INSERT INTO {schema}.venue_migration_sql (version, sha256) VALUES ($1, $2)"),
                             &[version, &sum],
                         )?;
                     }
@@ -911,6 +930,42 @@ mod tests {
             "an edited migration passed for the one that was applied"
         );
         assert!(db.wait_for_schema(&edited, "test").is_err(), "a build with an edited migration started");
+    }
+
+    #[test]
+    fn asking_an_unmigrated_schema_how_current_it_is_leaves_it_alone() {
+        let Some(config) = testing::config("store_waiting") else { return };
+        let db = Database::connect(&config).expect("a database");
+        let dir = testing::written("store_waiting", &MIGRATIONS);
+
+        // What a service does while it waits for the migration job, over and over: on a first install that job is
+        // not a hook, so the two run side by side (deploy/charts/venue-mini/templates/migrate.yaml).
+        for _ in 0..3 {
+            assert_eq!(db.schema_version(&MIGRATIONS).expect("readable"), 0, "nothing applied yet");
+        }
+
+        // Asking must not have put anything in the schema. Atlas refuses a schema holding tables it did not write
+        // unless it is given a baseline, and a service that dirties the schema it is waiting for waits for ever.
+        // This schema, which is this test's alone. The guard table is named with its schema now, so it lands here
+        // or nowhere — where before it went to `public` and was shared by every test schema at once, which is why
+        // the suite never noticed a service dirtying the schema it was waiting for.
+        let left: Vec<String> = db
+            .transaction(|tx| {
+                Ok(tx
+                    .query(
+                        "SELECT table_name FROM information_schema.tables WHERE table_schema = $1",
+                        &[&config.schema],
+                    )?
+                    .iter()
+                    .map(|r| r.get::<_, String>(0))
+                    .collect())
+            })
+            .expect("looked");
+        assert!(left.is_empty(), "asking left a table behind, which Atlas refuses as unclean: {left:?}");
+
+        // And Atlas can still do its first apply.
+        assert_eq!(db.migrate(&dir).expect("atlas applies").len(), MIGRATIONS.len());
+        db.wait_for_schema(&MIGRATIONS, "test").expect("current once applied");
     }
 
     #[test]

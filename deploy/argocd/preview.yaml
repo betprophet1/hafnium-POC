@@ -10,9 +10,10 @@
 # journal and a database left behind each time would fill the node a gigabyte at a time — which is exactly what
 # happened the first time this was run, and is why these are here.
 core:
-  # The smallest engine: 16k resting orders and about 90 MiB. A branch is reviewed, not load-tested; a branch that
-  # is about capacity says so by overriding this itself.
-  capacity: small
+  # `capacity` is not set here. A branch is reviewed, not load-tested, so the default is the smallest engine — but a
+  # branch that *is* about capacity says so with the `env-throughput` label, and the ApplicationSet sets the profile
+  # and the memory it needs together. A helm parameter beats a values file, so a capacity written here could not
+  # have been overridden by the label and would only have looked as though it could.
   storage:
     keepOnDelete: false
 postgres:
@@ -47,14 +48,10 @@ taker:
 oracle:
   enabled: true
 
-# The FIX adapter goes. It is a second front door onto the same venue, it needs a JVM, and a reviewer who wants it
-# turns it on for their own branch.
-fix:
-  enabled: false
-
-# So does the observer, which exists to watch an environment over time. Nobody watches a preview over time.
-observer:
-  enabled: false
+# The FIX adapter and the observer are not set here either, and for the same reason: the ApplicationSet decides
+# them from the labels. The FIX adapter is a second front door onto the same venue and needs a JVM, so a reviewer
+# who wants it asks with `env-fix`. The observer exists to watch an environment over time and nobody watches a
+# preview over time — unless they are measuring one, which is what `env-throughput` is for.
 
 # Mail is readable here, because there is no mail provider and the codes that prove an address have to reach
 # somebody (decision G-19). It is the same reasoning as the demo, and the same warning: never where an address could

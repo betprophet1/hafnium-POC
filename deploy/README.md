@@ -310,8 +310,20 @@ pass — which looks like a reaper that does not work, and is really two control
 prunes the namespace and leaves it gone. Re-label to bring it back. The job also comments on the request saying what
 happened, because an environment vanishing mid-review with no explanation is worse than one that never existed.
 
+**The age it measures is the last push**, not how long the environment has stood. An Application is made once and
+updated in place as the head moves, so its `creationTimestamp` answers a question nobody asked — it would take an
+environment away from somebody mid-afternoon for the crime of having started work in the morning, and keep one alive
+for a branch abandoned a week ago. The ApplicationSet records the head each environment runs as an annotation, and
+the reaper asks GitHub when that commit was made. The limit is `MAX_HOURS`, 36 by default. Push again after that and
+the environment is gone: re-label to bring it back, because a pull request nobody has labelled is one ArgoCD is not
+watching, and pushing to it changes nothing.
+
+If GitHub cannot be asked, nothing is taken down. An environment that outstays its welcome costs a node some memory;
+one taken down because an API call failed costs somebody their afternoon.
+
 The reaper compares timestamps **as strings**. RFC3339 in UTC sorts lexicographically in time order, so nothing has
-to parse a date — which matters, because the image's `date` is busybox's and cannot read RFC3339 at all.
+to parse a date — which matters, because the image's `date` is busybox's and cannot read RFC3339 at all. GitHub's
+commit dates come back in exactly that shape, which is why they can be compared without being parsed either.
 
 **The chart cannot generate its own database passwords under ArgoCD.** It makes them with `randAlphaNum` and reuses
 them by looking the Secret up in the cluster — correct under `helm install`, and impossible here, because ArgoCD
