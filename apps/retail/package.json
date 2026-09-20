@@ -32,6 +32,7 @@
   "devDependencies": {
     "@types/node": "^20.19.43",
     "@types/react": "~19.2.2",
+    "patch-package": "^8.0.0",
     "typescript": "~6.0.3"
   },
   "scripts": {
@@ -42,7 +43,8 @@
     "lint": "expo lint",
     "test": "tsc -p tsconfig.test.json && node --test build/test/*.test.js",
     "typecheck": "tsc --noEmit",
-    "build:web": "expo export --platform web"
+    "build:web": "expo export --platform web",
+    "postinstall": "patch-package"
   },
   "private": true
 }
