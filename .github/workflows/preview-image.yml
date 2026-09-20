@@ -39,6 +39,12 @@ jobs:
           # has is an image the ApplicationSet can never ask for.
           ref: ${{ github.event.pull_request.head.sha }}
 
+      # A registry path may not carry capitals and a GitHub owner may, so the owner is lower-cased here rather than
+      # interpolated directly. Expressions have no way to do this — there is no `lower()` — which is why it needs a
+      # step of its own, and why the version that only said it in a comment pushed nothing at all.
+      - name: The registry path, lower-cased
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/venue" >> "$GITHUB_ENV"
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -53,8 +59,7 @@ jobs:
           context: .
           file: deploy/images/venue-node.Dockerfile
           push: true
-          # Lower-cased: a registry path may not carry capitals, and a GitHub owner may.
-          tags: ghcr.io/${{ github.repository_owner }}/venue:${{ github.event.pull_request.head.sha }}
+          tags: ${{ env.IMAGE }}:${{ github.event.pull_request.head.sha }}
           # Cached between runs, because a release build of this workspace from cold is the slowest thing here by a
           # wide margin and most pushes change one crate.
           cache-from: type=gha
@@ -63,5 +68,4 @@ jobs:
       - name: Say what was built
         run: |
           echo "### Preview image" >> "$GITHUB_STEP_SUMMARY"
-          echo '`ghcr.io/${{ github.repository_owner }}/venue:${{ github.event.pull_request.head.sha }}`' \
-            >> "$GITHUB_STEP_SUMMARY"
+          echo '`${{ env.IMAGE }}:${{ github.event.pull_request.head.sha }}`' >> "$GITHUB_STEP_SUMMARY"
