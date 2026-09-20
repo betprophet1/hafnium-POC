@@ -231,7 +231,12 @@ fn run(args: &Args) -> Result<(), Error> {
             .map_err(|e| format!("audit log in {}: {e}", audit_dir.display()))?;
     let halves = Halves {
         public: if public {
+            // The origins go to this half too. Market data is what a page asks for first, and a browser will not
+            // let it read an answer from an origin the server has not named — so without this a front end served
+            // from anywhere else failed on its very first call, while every private route worked. The test harness
+            // gives both halves the origins, which is why no test saw it: what was wrong was the wiring here.
             let gateway = Gateway::public(Hub::new(Catalogue::load(&catalogue_file)?), limits)
+                .with_origins(origins.clone())
                 .with_metrics(metrics.half(api::Half::Public));
             Some(start_half(gateway.with_audit(audit.clone()).with_trusted_proxies(proxies.clone()), &feed))
         } else {
