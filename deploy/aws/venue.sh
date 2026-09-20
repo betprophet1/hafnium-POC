@@ -122,12 +122,13 @@ case "${1:-}" in
     kubectl apply -f "$argocd/project.yaml" >/dev/null
     sed "s/venue\\.example/$domain/" "$argocd/applicationset.yaml" | kubectl apply -f - >/dev/null
     kubectl apply -f "$argocd/reaper.yaml" >/dev/null
+    kubectl apply -f "$argocd/pull-secret.yaml" >/dev/null
     echo "   previews will answer on pr-<number>.$domain"
     echo
     echo "still to do by hand, because each needs a secret this script will not invent:"
     echo "  - venue-github-token  (the ApplicationSet listing pull requests, and the reaper)"
     echo "  - venue-repo          (ArgoCD reading the repository)"
-    echo "  - ghcr-pull           (pulling a preview's own image, in each preview namespace)"
+    echo "  - ghcr-pull           (in argocd; pull-secret.yaml copies it into each preview namespace)"
     echo
     echo "until those exist the ApplicationSet will log that it cannot reach GitHub, which is expected."
     ;;
