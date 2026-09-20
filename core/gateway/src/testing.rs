@@ -155,13 +155,16 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool, proxies: 
     let proxies = TrustedProxies::parse(proxies).expect("trusted proxies");
     let hub = || Hub::new(Catalogue::load(CATALOGUE).expect("the mini venue's catalogue"));
     let (identity_address, identity_records) = start_identity(name);
-    // Two environments, so a test can see which of them a caller is told about: the live venue, and a branch.
+    // Three environments, so a test can see which of them a caller is told about: the live venue, a branch that is
+    // somebody else's, and the venue answering. The last is the one a caller is always told about, however little
+    // else they are entitled to.
     let environments_file = std::env::temp_dir().join(format!("venue-environments-{name}-{}.json", std::process::id()));
     std::fs::write(
         &environments_file,
         r#"{"environments": [
              {"id": "prod", "label": "Live", "url": "https://venue.test", "live": true},
-             {"id": "pr-7", "label": "PR 7", "url": "https://pr-7.venue.test", "live": false}
+             {"id": "pr-7", "label": "PR 7", "url": "https://pr-7.venue.test", "live": false},
+             {"id": "here", "label": "This venue", "url": "https://here.venue.test", "live": false, "self": true}
            ]}"#,
     )
     .expect("an environments file");

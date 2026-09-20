@@ -255,6 +255,31 @@ every Application sits unsynced saying it cannot fetch the source.
 
 Then label a pull request `deploy-env` and it appears at `pr-<number>.<domain>` within a couple of minutes.
 
+### Watching one come up
+
+Four things happen in order, and knowing which one you are waiting on saves guessing at the wrong end:
+
+```sh
+gh run list --workflow "preview image" --limit 3   # 1. the image builds, tagged with the head commit
+kubectl get application -n argocd -l venue.environment=preview
+                                                   # 2. the ApplicationSet notices the label, within 120s
+kubectl get pods -n venue-pr-<number> -w           # 3. the namespace fills
+kubectl get certificate -n venue-pr-<number>       # 4. Let's Encrypt answers, usually last
+```
+
+`ImagePullBackOff` in step 3 for up to a minute is expected rather than wrong: the namespace is made by ArgoCD and
+the registry credential is copied in afterwards, on the minute (`pull-secret.yaml`). The kubelet retries on its own
+and the pod starts without anybody touching it.
+
+A preview that never reaches step 2 is almost always the label: the generator filters on it, so a pull request
+without it is invisible to ArgoCD rather than pending.
+
+**Pushing to an unlabelled pull request builds nothing**, and says so only as a skipped job. The workflow filters on
+`deploy-env` for the same reason the generator does — a release build of this workspace on every push to every
+branch would spend an afternoon of runner time a day — so a push while the label is off is skipped, correctly, and
+the head then has no image. Putting the label back is itself the trigger: the `labeled` event builds the head as it
+now stands. So the order is label, then push; or push, then label.
+
 ### The two tokens, and why it is two
 
 **Listing pull requests and reaping them** wants a fine-grained token on this repository alone
