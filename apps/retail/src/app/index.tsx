@@ -10,9 +10,10 @@
 
 import { Link, router } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, RefreshControl, ScrollView, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
+import { ActivityIndicator, Pressable, RefreshControl, ScrollView, StyleSheet, View, useWindowDimensions } from 'react-native';
 
 import { useVenue } from '@/venue/session';
+import { Text } from '@/venue/text';
 import type { Market } from '@/venue/types';
 
 // How often the list is asked for again while somebody is on this screen.

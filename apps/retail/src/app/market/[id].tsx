@@ -6,9 +6,10 @@
 
 import { useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { useVenue } from '@/venue/session';
+import { Text, TextInput } from '@/venue/text';
 import type { Book, Level, OrderAnswer, Outcome } from '@/venue/types';
 
 export default function MarketScreen() {

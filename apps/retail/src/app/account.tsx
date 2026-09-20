@@ -15,11 +15,12 @@
 
 import { Link } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
 import { VenueError } from '@/venue/types';
 import type { HeldSession } from '@/venue/types';
 import { useVenue } from '@/venue/session';
+import { Text, TextInput } from '@/venue/text';
 
 const money = (cents: number) => `$${(cents / 100).toFixed(2)}`;
 
