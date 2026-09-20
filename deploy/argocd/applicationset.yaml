@@ -87,6 +87,24 @@ spec:
               value: IfNotPresent
             - name: image.pullSecrets[0]
               value: ghcr-pull
+            # What this preview says of itself when an app asks it where it may go. Without it the route is not
+            # offered here at all, and an app that has been pointed at a preview and is then restarted asks this
+            # venue whether the session it is holding is still good, is answered 404, and throws the session away —
+            # so a reviewer would be signed out of the branch every time they closed the app (src/venue/session.tsx,
+            # the launch path). Naming itself is what makes a preview survive being put down and picked up.
+            #
+            # It names only itself. A preview runs code nobody has reviewed, and an app trusts this list enough to
+            # show its labels beside a password box; a branch that named a venue as "Live" would be asking for a
+            # live password on its own terms. Getting back to the live venue is the app's own fallback — the address
+            # it was built with — and not this venue's to offer (decision G-20).
+            - name: gateway.environments[0].id
+              value: "pr-{{ .number }}"
+            - name: gateway.environments[0].label
+              value: "Pull request {{ .number }}"
+            - name: gateway.environments[0].url
+              value: "https://pr-{{ .number }}.venue.example"
+            - name: gateway.environments[0].live
+              value: "false"
             # What the environment calls itself in its metrics, so a dashboard can tell one branch from another.
             - name: metrics.labels.environment
               value: "pr-{{ .number }}"
