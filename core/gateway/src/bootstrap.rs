@@ -67,6 +67,13 @@ struct Environment {
     /// branch; an app says so where a person can see it, which is the reason this is answered rather than guessed
     /// from the name.
     live: bool,
+    /// Whether this entry is the venue answering. Always offered when it is, to anyone, because naming yourself to
+    /// somebody already talking to you discloses nothing — the staff gate is about *other* venues' addresses.
+    ///
+    /// It is what lets an app keep a session across a restart. The app asks the venue a session belongs to whether
+    /// it is still on offer, and a test environment that could not say "yes, me" to its own members answered them
+    /// an empty list and cost them their sign-in on every launch.
+    here: bool,
 }
 
 impl Environment {
@@ -92,6 +99,9 @@ fn parse(text: &str, path: &Path) -> Result<Vec<Environment>, ApiError> {
                 // Absent means not live: a file that forgets to say cannot accidentally dress a branch up as the
                 // real venue.
                 live: e["live"].as_bool().unwrap_or(false),
+                // Absent means not this one. Only whatever writes this file may say it, and that is the deployment
+                // rather than the branch running in it.
+                here: e["self"].as_bool().unwrap_or(false),
             })
         })
         .collect::<Option<Vec<_>>>()
@@ -105,7 +115,8 @@ pub fn answer(gateway: &Gateway, request: &Request, client: &str) -> Result<Valu
     gateway.anonymous_rate(client)?;
     let environments = gateway.environments().read()?;
     let staff = staff_asking(gateway, request);
-    let offered: Vec<Value> = environments.iter().filter(|e| staff || e.live).map(Environment::json).collect();
+    let offered: Vec<Value> =
+        environments.iter().filter(|e| staff || e.live || e.here).map(Environment::json).collect();
     Ok(json!({"environments": offered}))
 }
 

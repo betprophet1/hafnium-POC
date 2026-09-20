@@ -121,6 +121,12 @@ spec:
               value: "https://{{- $s := regexReplaceAll `[^a-z0-9]+` (lower .title) `-` | trimAll `-` | trunc 24 | trimSuffix `-` -}}pr-{{ .number }}{{ if $s }}-{{ $s }}{{ end }}.venue.example"
             - name: gateway.environments[0].live
               value: "false"
+            # This entry is the venue answering, so it is named to anyone who asks it rather than only to staff.
+            # Without this a preview told its own members nothing at all — everything here is `live: false`, and
+            # the rest is staff-only — and an app asking whether the session it holds is still good was answered an
+            # empty list and threw the session away on every launch.
+            - name: gateway.environments[0].self
+              value: "true"
             # How big it is, chosen by label. `deploy-env` asks for an environment; these ask for a particular
             # kind of one, and a pull request that says nothing gets the small default.
             #

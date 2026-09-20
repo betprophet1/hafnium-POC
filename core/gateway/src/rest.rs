@@ -387,7 +387,12 @@ mod tests {
         assert_eq!(status, 200, "{seen}");
         let named: Vec<&str> =
             seen["environments"].as_array().expect("environments").iter().map(|e| e["id"].as_str().unwrap()).collect();
-        assert_eq!(named, ["prod"], "a stranger is told about the live venue and nothing else: {seen}");
+        assert_eq!(
+            named,
+            ["prod", "here"],
+            "a stranger is told about the live venue, and about this one — naming yourself to somebody already \
+             talking to you discloses nothing, and an app needs it to keep a session across a restart: {seen}"
+        );
         assert_eq!(seen["environments"][0]["live"], json!(true), "{seen}");
 
         // A member who is not one of the venue's own people is told exactly the same. Signing up cannot change it,
@@ -398,11 +403,21 @@ mod tests {
         let credential = member["session"]["credential"].as_str().expect("a credential").to_string();
         let (status, theirs) = request(&venue.address, "GET", "/v4/bootstrap", Some(&credential), None);
         assert_eq!(status, 200, "{theirs}");
-        assert_eq!(theirs["environments"].as_array().map(Vec::len), Some(1), "{theirs}");
+        assert_eq!(theirs["environments"].as_array().map(Vec::len), Some(2), "{theirs}");
+        // The regression this guards: a test environment that could not name itself to its own members answered
+        // them an empty list, and the app then threw away a perfectly good session on every launch.
+        let mine: Vec<&str> = theirs["environments"]
+            .as_array()
+            .expect("environments")
+            .iter()
+            .filter(|e| e["id"] == "here")
+            .map(|e| e["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(mine, ["here"], "a member was not told about the venue they are talking to: {theirs}");
 
         // An API key belongs to an account rather than to a person, so it is nobody's staff either.
         let (status, keyed) = request(&venue.address, "GET", "/v4/bootstrap", Some(MAKER_TOKEN), None);
-        assert_eq!((status, keyed["environments"].as_array().map(Vec::len)), (200, Some(1)), "{keyed}");
+        assert_eq!((status, keyed["environments"].as_array().map(Vec::len)), (200, Some(2)), "{keyed}");
 
         // Made staff in the records, as an operator does — there is no route for it — and the branch appears.
         venue.identity_records.set_staff("someone@example.com", true).expect("made staff");
@@ -410,7 +425,7 @@ mod tests {
         assert_eq!(status, 200, "{staff}");
         let named: Vec<&str> =
             staff["environments"].as_array().expect("environments").iter().map(|e| e["id"].as_str().unwrap()).collect();
-        assert_eq!(named, ["prod", "pr-7"], "{staff}");
+        assert_eq!(named, ["prod", "pr-7", "here"], "{staff}");
         // And a branch is never dressed up as the live venue.
         assert_eq!(staff["environments"][1]["live"], json!(false), "{staff}");
 
@@ -418,7 +433,7 @@ mod tests {
         // of the records each time rather than kept with the credential.
         venue.identity_records.set_staff("someone@example.com", false).expect("no longer staff");
         let (_, after) = request(&venue.address, "GET", "/v4/bootstrap", Some(&credential), None);
-        assert_eq!(after["environments"].as_array().map(Vec::len), Some(1), "{after}");
+        assert_eq!(after["environments"].as_array().map(Vec::len), Some(2), "{after}");
     }
 
     /// POST /v4/rfqs as the retail customer. A parlay service refuses requests as unavailable while it is catching up
