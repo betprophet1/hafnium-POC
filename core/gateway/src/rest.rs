@@ -394,6 +394,44 @@ mod tests {
     }
 
     #[test]
+    fn the_mailbox_answers_for_the_address_asked_for_and_no_other() {
+        let venue = testing::venue("mail-to");
+        let sign_up = |email: &str| {
+            let body = json!({"email": email, "password": "a good long password"}).to_string();
+            assert_eq!(request(&venue.address, "POST", "/v4/members", None, Some(&body)).0, 200);
+        };
+        // A `+` in the address, because that is how people tag one, and because a query string is where a `+` is
+        // most likely to be mangled on the way through.
+        sign_up("alice+venue@example.com");
+        sign_up("bob@example.com");
+
+        let asked = |to: &str| {
+            let (status, mail) = request(&venue.address, "GET", &format!("/v4/mail?to={to}"), None, None);
+            assert_eq!(status, 200, "{mail}");
+            mail["mail"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .map(|m| m["to"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Everything the mailbox answers is for the address that was asked for. This route takes no credential —
+        // it cannot, it is how an address is proved before anybody has one — so answering the whole outbox handed
+        // every member's codes, password resets included, to anyone who asked.
+        let hers = asked("alice%2Bvenue%40example.com");
+        assert!(!hers.is_empty(), "she has mail");
+        assert!(hers.iter().all(|to| to == "alice+venue@example.com"), "somebody else's mail came back: {hers:?}");
+
+        let his = asked("bob%40example.com");
+        assert!(!his.is_empty(), "he has mail");
+        assert!(his.iter().all(|to| to == "bob@example.com"), "somebody else's mail came back: {his:?}");
+
+        // An address nobody used has nothing, rather than everything.
+        assert!(asked("nobody%40example.com").is_empty(), "an unused address was answered somebody's mail");
+    }
+
+    #[test]
     fn the_bootstrap_names_the_live_venue_to_everyone_and_the_rest_only_to_staff() {
         let venue = testing::venue("bootstrap");
 

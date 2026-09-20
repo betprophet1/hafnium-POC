@@ -408,7 +408,16 @@ pub fn members(gateway: &Gateway, request: &Request, client: &str, notify: &Noti
         // --show-mail, so a venue that can really post to an address never serves it.
         ("GET", ["v4", "mail"]) => {
             gateway.anonymous_rate(client)?;
-            let to = request.path.split_once('?').map_or(String::new(), |(_, q)| format!("?{q}"));
+            // From `query`, which is where the parsed request keeps it: `path` is split at the `?` before it gets
+            // here, so asking `path` for one found nothing, every request forwarded an unfiltered `/v1/mail`, and
+            // this answered the whole outbox to anybody who asked. The route takes no credential — it cannot, it
+            // is how somebody proves an address before they have one — so that was every message the environment
+            // had sent, password-reset codes included, to anyone who knew the address of the venue.
+            //
+            // Passed on exactly as it arrived. The parsed request keeps query values as they came off the wire,
+            // percent-escapes and all, and the identity service decodes them — so re-encoding here would escape
+            // the escapes and an address with a `+` in it would match nothing.
+            let to = request.query.get("to").map_or(String::new(), |to| format!("?to={to}"));
             identity.pass_to("GET", &format!("/v1/mail{to}"), &[], notify)
         }
         ("DELETE", ["v4", "sessions", "current"]) => {
