@@ -2,6 +2,11 @@
 //
 // Responsive by measurement, not by platform: the list is one column on a phone and as many as the width allows on a
 // tablet or in a browser window. Nothing here asks what device it is running on.
+//
+// **The list is asked for again as it goes.** Rounds settle and new ones list while somebody is looking at the
+// screen, so a list fetched once at mount is a picture of the venue as it was when the app opened: within minutes it
+// names rounds that have finished and misses markets that have since opened. That is not a difference of opinion
+// between the app and the venue — it is the app not having asked lately.
 
 import { Link, router } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
@@ -9,6 +14,9 @@ import { ActivityIndicator, Pressable, RefreshControl, ScrollView, StyleSheet, T
 
 import { useVenue } from '@/venue/session';
 import type { Market } from '@/venue/types';
+
+// How often the list is asked for again while somebody is on this screen.
+const REFRESH_MS = 15_000;
 
 export default function Markets() {
   const { venue, member, live } = useVenue();
@@ -30,6 +38,12 @@ export default function Markets() {
 
   useEffect(() => {
     void load();
+    // Often enough that a round changing is noticed, rarely enough that it costs nothing: a round is minutes, and
+    // this is one small request. The venue offers the same thing as a stream (`markets` on the public WebSocket),
+    // which is where this should end up — pushed rather than asked for — but that wants the connection handling the
+    // private stream already has, and a list that is a few seconds old is not what was wrong here.
+    const again = setInterval(() => void load(), REFRESH_MS);
+    return () => clearInterval(again);
   }, [load]);
 
   return (
