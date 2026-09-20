@@ -63,13 +63,24 @@ variable "admin_cidrs" {
   type        = list(string)
 }
 
+variable "zone_domain" {
+  description = <<-EOT
+    The domain Route53 hosts. Usually the whole thing you own, delegated by pointing the registrar's nameservers
+    here, which then lets every name under it be managed in one place.
+  EOT
+  type        = string
+}
+
 variable "domain" {
-  description = "The name the venue answers on, with previews beneath it at *.preview.<domain>."
+  description = <<-EOT
+    The name the venue itself answers on, which must be at or below `zone_domain`. Previews are its subdomains:
+    a pull request is `pr-<number>.<domain>`.
+  EOT
   type        = string
 }
 
 variable "create_zone" {
-  description = "True to have Route53 host the zone here; false when the zone already exists and its id is given."
+  description = "True to have Route53 host `zone_domain` here; false when the zone already exists and its id is given."
   type        = bool
   default     = true
 }

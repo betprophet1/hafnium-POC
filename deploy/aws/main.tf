@@ -185,18 +185,21 @@ resource "aws_eip_association" "venue" {
 }
 
 # ---------------------------------------------------------------------------- names
+# The zone is the domain that was bought; the venue is one name inside it. Keeping them apart is what lets previews
+# be siblings of the venue rather than another label deeper.
 resource "aws_route53_zone" "venue" {
   count = var.create_zone ? 1 : 0
-  name  = var.domain
+  name  = var.zone_domain
 }
 
 locals {
   zone_id = var.create_zone ? aws_route53_zone.venue[0].zone_id : var.zone_id
 }
 
-# The venue itself, and every preview under it. The wildcard is what lets a pull request have a name without anyone
-# creating a record for it.
-resource "aws_route53_record" "apex" {
+# The venue itself, and every preview beside it. The wildcard is what lets a pull request have a name without anyone
+# creating a record for it — and it is one label below the venue, so `pr-7.pmex.example` sits next to `pmex.example`
+# rather than under a `preview.` that carries no information.
+resource "aws_route53_record" "venue" {
   zone_id = local.zone_id
   name    = var.domain
   type    = "A"
@@ -206,7 +209,7 @@ resource "aws_route53_record" "apex" {
 
 resource "aws_route53_record" "previews" {
   zone_id = local.zone_id
-  name    = "*.preview.${var.domain}"
+  name    = "*.${var.domain}"
   type    = "A"
   ttl     = 60
   records = [aws_eip.venue.public_ip]

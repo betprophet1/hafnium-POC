@@ -120,9 +120,9 @@ case "${1:-}" in
     domain=$("$TOFU" -chdir="$HERE" output -raw domain)
     argocd="$HERE/../argocd"
     kubectl apply -f "$argocd/project.yaml" >/dev/null
-    sed "s/preview\.venue\.example/preview.$domain/" "$argocd/applicationset.yaml" | kubectl apply -f - >/dev/null
+    sed "s/venue\\.example/$domain/" "$argocd/applicationset.yaml" | kubectl apply -f - >/dev/null
     kubectl apply -f "$argocd/reaper.yaml" >/dev/null
-    echo "   previews will answer on pr-<number>.preview.$domain"
+    echo "   previews will answer on pr-<number>.$domain"
     echo
     echo "still to do by hand, because each needs a secret this script will not invent:"
     echo "  - venue-github-token  (the ApplicationSet listing pull requests, and the reaper)"

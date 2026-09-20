@@ -61,7 +61,7 @@ spec:
             - name: ingress.enabled
               value: "true"
             - name: ingress.host
-              value: "pr-{{ .number }}.preview.venue.example"
+              value: "pr-{{ .number }}.venue.example"
             - name: ingress.tls.secretName
               value: preview-venue-tls
             # Without this the Ingress asks for TLS and nothing ever issues a certificate: cert-manager acts on the
