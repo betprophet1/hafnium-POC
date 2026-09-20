@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Venue, marketsOf } from "./client";
-import { BUILT_IN, fallback, readKept, stillOffered } from "./environment";
+import { BUILT_IN, fallback, readKept, stillOffered, withBuiltIn } from "./environment";
 import { openPrivateStream, higher } from "./stream";
 import type { Timers, WebSocketLike } from "./stream";
 import { VenueError } from "./types";
@@ -282,6 +282,18 @@ describe("choosing an environment", () => {
     assert.equal(stillOffered(kept, [prod]), false);
     // And one that kept the name but moved is not the same venue either.
     assert.equal(stillOffered(kept, [prod, { ...preview, url: "https://pr-7b.venue.test" }]), false);
+  });
+
+  it("always offers the way home, and never twice", () => {
+    // A preview names only itself, so without this a member who moved to one would be shown a list of one and have
+    // no way back but signing out. The built-in address is the only venue the app knows without being told.
+    assert.deepEqual(withBuiltIn([preview]), [preview, BUILT_IN]);
+    // The live venue is normally that same address under a better name; offering it twice would only raise the
+    // question of which one is which.
+    assert.deepEqual(withBuiltIn([{ ...prod, url: BUILT_IN.url }]), [{ ...prod, url: BUILT_IN.url }]);
+    assert.deepEqual(withBuiltIn([{ ...prod, url: `${BUILT_IN.url}/` }]), [{ ...prod, url: `${BUILT_IN.url}/` }]);
+    // Told nothing at all, an app still knows where it was built pointing.
+    assert.deepEqual(withBuiltIn([]), [BUILT_IN]);
   });
 
   it("always has somewhere to point", () => {

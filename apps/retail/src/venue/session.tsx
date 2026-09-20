@@ -12,7 +12,7 @@ import { Platform } from "react-native";
 import { Venue } from "./client";
 import { openPrivateStream } from "./stream";
 import type { Stream } from "./stream";
-import { BOOTSTRAP_URL, BUILT_IN, fallback, readKept, stillOffered } from "./environment";
+import { BOOTSTRAP_URL, BUILT_IN, fallback, readKept, stillOffered, withBuiltIn } from "./environment";
 import { clearSession, keptSession, loadSession, saveSession, unlockKind, unlockName } from "./storage";
 import type { Unlock } from "./storage";
 import type { About, Account, Environment, HeldSession, Member } from "./types";
@@ -194,7 +194,7 @@ export function VenueProvider({ children }: { children: ReactNode }) {
             const there = new Venue({ baseUrl: held.environment.url, credential: (held.member as Member).session.credential });
             const offered = await there.bootstrap();
             if (!cancelled && stillOffered(held, offered)) {
-              setEnvironments(offered);
+              setEnvironments(withBuiltIn(offered));
               setEnvironment(held.environment);
               await start(held.member as Member);
               if (!cancelled) setStarting(false);
@@ -213,7 +213,7 @@ export function VenueProvider({ children }: { children: ReactNode }) {
         try {
           const offered = await new Venue({ baseUrl: BOOTSTRAP_URL }).bootstrap();
           if (!cancelled && offered.length) {
-            setEnvironments(offered);
+            setEnvironments(withBuiltIn(offered));
             setEnvironment(fallback(offered));
           }
         } catch {
@@ -256,7 +256,7 @@ export function VenueProvider({ children }: { children: ReactNode }) {
     void (async () => {
       try {
         const offered = await venue.bootstrap();
-        if (!cancelled && offered.length) setEnvironments(offered);
+        if (!cancelled && offered.length) setEnvironments(withBuiltIn(offered));
       } catch {
         // Keep the list already held; it is only ever used to offer a choice.
       }

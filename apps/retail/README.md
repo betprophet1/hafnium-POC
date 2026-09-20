@@ -95,6 +95,36 @@ will not otherwise let the app read the answer; and a certificate (`ingress.tls.
 cleartext by default and Android has since 9. A simulator reaches the machine at its address on the network; an
 Android emulator reaches its host as `10.0.2.2`; neither can use `127.0.0.1`, which is the device itself.
 
+## Against the venue on AWS
+
+The deployed venue is `https://pmex.hafnium.ltd`, with a certificate a phone will accept, so nothing here needs a
+cleartext exception or an address on somebody's network:
+
+```sh
+echo 'EXPO_PUBLIC_VENUE_URL=https://pmex.hafnium.ltd' > .env.local
+```
+
+`EXPO_PUBLIC_*` is read at bundle time, not at launch, so a build made before that file existed keeps pointing where
+it was built — change it and build again rather than restarting the app.
+
+A **development build** is what a phone needs, not Expo Go: the session is kept behind the device's own lock and
+that is a native module. With the Android SDK installed and the phone plugged in, `npx expo run:android`; on a Mac
+with Xcode and the phone trusted, `npx expo run:ios --device`. Both prebuild `/android` and `/ios`, which the
+repository ignores on purpose — they are generated, and a change made in them is lost the next time.
+
+### Moving to a pull request's venue
+
+The account screen lists the other venues this one named, and moving to one signs the session out — it belongs to the
+venue that issued it and there is nothing to carry across (decision G-20). Two things decide whether anything is
+listed:
+
+- The **live venue must name the preview**, in `gateway.environments`. It is not discovered; somebody says so.
+- The member asking must be **one of the venue's own people**: `venue-identity staff --email ADDRESS`, run against
+  the identity service. There is no route for this, by design — it is not something a venue hands out over HTTP.
+
+Anyone else is told about the live venue only, and sees no chooser at all. A preview names itself and nothing else,
+so the way back is the address the app was built with rather than a claim made by unreviewed code.
+
 ## What it does not do yet
 
 Deposits (the venue's own page does them), parlays, settlement, market search, price history, push notifications, and

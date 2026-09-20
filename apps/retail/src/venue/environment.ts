@@ -59,3 +59,19 @@ export function fallback(environments: Environment[]): Environment {
 export function stillOffered(kept: Kept, environments: Environment[]): boolean {
   return environments.some((e) => e.id === kept.environment.id && e.url === kept.environment.url);
 }
+
+/** The list to offer a member, which is what a venue said plus the address the app was built with.
+ *
+ * A preview names only itself — it runs code nobody has reviewed, and a branch that named a venue "Live" would be
+ * asking for a live password on its own terms — so an app pointed at one would otherwise be shown a list of one and
+ * have no way back but signing out and starting again. The built-in address is the one environment the app knows
+ * without being told, so it is the honest way home, and it is added here rather than trusted from any venue's answer.
+ *
+ * Deduplicated by address, not by id: the live venue is normally the built-in address under a better name, and
+ * offering it twice would only invite the question of which one is which. */
+export function withBuiltIn(environments: Environment[]): Environment[] {
+  // A trailing slash is the same venue written differently, and the chart and the build-time variable are written by
+  // different hands; without this the live venue would appear twice under two names, which reads as a bug.
+  const same = (url: string) => url.replace(/\/+$/, "") === BUILT_IN.url.replace(/\/+$/, "");
+  return environments.some((e) => same(e.url)) ? environments : [...environments, BUILT_IN];
+}
