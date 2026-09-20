@@ -7,8 +7,15 @@
 # generator, and ArgoCD then removes the Application itself, prunes the namespace, and leaves it removed. Re-label a
 # pull request and it comes back.
 #
-# The age it measures is the Application's, not the pull request's: a branch that has been open for a month but only
-# got an environment this morning has had that environment for a morning.
+# **The age it measures is the last push, not the environment's.** An Application is made once and updated in place
+# as the head moves, so its creationTimestamp says when the branch first got an environment and never moves again —
+# which would take an environment away from somebody in the middle of working on it, and leave one standing for a
+# branch nobody has touched since. The head commit's date is what actually tracks the work, and the ApplicationSet
+# already records which head an environment is running as an annotation, so it is there to be asked about.
+#
+# GitHub is asked rather than the cluster because nothing in the cluster knows when a commit was made. If it cannot
+# be asked, nothing is taken down: an environment that outstays its welcome costs a node some memory, and one taken
+# down because an API call failed costs somebody their afternoon.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -32,7 +39,7 @@ spec:
               image: alpine/k8s:1.31.1
               env:
                 - name: MAX_HOURS
-                  value: "8"
+                  value: "36"
                 - name: GITHUB_TOKEN
                   valueFrom:
                     secretKeyRef:
@@ -48,18 +55,33 @@ spec:
                   # this image's `date` is busybox's and cannot read RFC3339 at all. Both busybox and GNU can format
                   # an epoch (`-d @seconds`), and that is all this needs.
                   cutoff=$(date -u -d "@$(( $(date -u +%s) - MAX_HOURS * 3600 ))" +%Y-%m-%dT%H:%M:%SZ)
-                  echo "taking down preview environments made before $cutoff"
-                  # Every preview environment ArgoCD is holding, with the number of the request it belongs to.
+                  echo "taking down preview environments whose last push was before $cutoff"
+                  # Every preview environment ArgoCD is holding: the request it belongs to, and the head it is running.
                   kubectl get applications.argoproj.io -n argocd \
                     -l venue.environment=preview \
-                    -o jsonpath='{range .items[*]}{.metadata.labels.venue\.pull-request}{" "}{.metadata.creationTimestamp}{"\n"}{end}' \
-                    | while read -r number made; do
+                    -o jsonpath='{range .items[*]}{.metadata.labels.venue\.pull-request}{" "}{.metadata.annotations.venue\.head-sha}{"\n"}{end}' \
+                    | while read -r number sha; do
                         [ -n "$number" ] || continue
-                        if [ ! "$made" \< "$cutoff" ]; then
-                          echo "pr $number: made $made, leaving it"
+                        if [ -z "$sha" ]; then
+                          echo "pr $number: no head recorded, leaving it"
                           continue
                         fi
-                        echo "pr $number: made $made, taking the label off"
+                        # When that commit was made. The committer date rather than the author's, because a rebase
+                        # or an amend is somebody working on this branch and should keep its environment alive.
+                        made=$(curl -sS -f \
+                          -H "Authorization: Bearer $GITHUB_TOKEN" \
+                          -H "Accept: application/vnd.github+json" \
+                          "https://api.github.com/repos/$REPO/commits/$sha" 2>/dev/null \
+                          | jq -r '.commit.committer.date // empty')
+                        if [ -z "$made" ]; then
+                          echo "pr $number: could not ask GitHub about $sha, leaving it"
+                          continue
+                        fi
+                        if [ ! "$made" \< "$cutoff" ]; then
+                          echo "pr $number: last push $made, leaving it"
+                          continue
+                        fi
+                        echo "pr $number: last push $made, taking the label off"
                         # ArgoCD sees the pull request stop matching the generator on its next pass and removes the
                         # environment itself. Nothing here deletes an Application: see the note at the top.
                         curl -sS -X DELETE \
@@ -71,7 +93,7 @@ spec:
                         curl -sS -X POST \
                           -H "Authorization: Bearer $GITHUB_TOKEN" \
                           -H "Accept: application/vnd.github+json" \
-                          -d "{\"body\": \"The preview environment for this pull request has been up since ${made} and has been taken down to make room. Add the \`deploy-env\` label to bring it back.\"}" \
+                          -d "{\"body\": \"The preview environment for this pull request has been taken down to make room: its last push was ${made}, more than ${MAX_HOURS} hours ago. Add the \`deploy-env\` label to bring it back — pushing again does not, because a pull request nobody has labelled is one ArgoCD is not watching.\"}" \
                           "https://api.github.com/repos/$REPO/issues/$number/comments" >/dev/null
                       done
 ---

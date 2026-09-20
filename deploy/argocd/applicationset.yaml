@@ -43,8 +43,10 @@ spec:
         venue.environment: preview
         venue.pull-request: "{{ .number }}"
       annotations:
-        # What the reaper reads. It is the branch's head when the environment was made, so a pull request that is
-        # still being pushed to keeps its environment: see the CronJob.
+        # What the reaper reads to decide how old an environment is. It is the head the environment is *currently*
+        # running — this Application is updated in place as the branch moves — so asking GitHub when that commit was
+        # made gives the last push, and a branch still being worked on keeps its environment. The Application's own
+        # creationTimestamp cannot say that: it is stamped once and never moves again.
         venue.head-sha: "{{ .head_sha }}"
     spec:
       project: venue-previews
@@ -60,8 +62,22 @@ spec:
             # people (interface 1 README, choosing an environment).
             - name: ingress.enabled
               value: "true"
+            # The number and a little of the title, because `pr-4` and `pr-7` are the same address to anyone
+            # reading them in a chat window. The title is slugged here rather than used as it is: a DNS label may
+            # hold only letters, digits and hyphens (RFC 1123), and a pull request may be called anything at all.
+            # ArgoCD offers `branch_slug` but no `title_slug`, so this does it — lower-case, every run of anything
+            # else collapsed to one hyphen, trimmed, cut to 24 characters, and trimmed again in case the cut landed
+            # on one.
+            #
+            # The hyphen before the slug lives inside the condition rather than in the text, because a title made
+            # only of punctuation slugs to nothing and `pr-7-.venue.example` is not a name. That one falls back to
+            # `pr-7` and still works.
+            #
+            # Renaming a pull request therefore moves its environment: a new name, a new certificate, and the old
+            # address stops answering. That is the cost of a readable one, and it is paid by the person who renames
+            # it rather than by everyone else reading numbers.
             - name: ingress.host
-              value: "pr-{{ .number }}.venue.example"
+              value: "{{- $s := regexReplaceAll `[^a-z0-9]+` (lower .title) `-` | trimAll `-` | trunc 24 | trimSuffix `-` -}}pr-{{ .number }}{{ if $s }}-{{ $s }}{{ end }}.venue.example"
             - name: ingress.tls.secretName
               value: preview-venue-tls
             # Without this the Ingress asks for TLS and nothing ever issues a certificate: cert-manager acts on the
@@ -102,7 +118,7 @@ spec:
             - name: gateway.environments[0].label
               value: "Pull request {{ .number }}"
             - name: gateway.environments[0].url
-              value: "https://pr-{{ .number }}.venue.example"
+              value: "https://{{- $s := regexReplaceAll `[^a-z0-9]+` (lower .title) `-` | trimAll `-` | trunc 24 | trimSuffix `-` -}}pr-{{ .number }}{{ if $s }}-{{ $s }}{{ end }}.venue.example"
             - name: gateway.environments[0].live
               value: "false"
             # What the environment calls itself in its metrics, so a dashboard can tell one branch from another.
