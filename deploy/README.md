@@ -246,15 +246,37 @@ kubectl create namespace argocd
 # --server-side, not a plain apply: the ApplicationSet CRD is larger than the 256 KiB annotation a client-side apply
 # writes, and a plain apply fails with "metadata.annotations: Too long".
 kubectl apply --server-side -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
-kubectl create secret generic venue-github-token -n argocd --from-literal=token=<a token that may read PRs and write labels>
+kubectl create secret generic venue-github-token -n argocd --from-literal=token=<the fine-grained token below>
 kubectl apply -f deploy/argocd/
 ```
 
 ArgoCD also needs to be able to read the repository — a deploy key on it, added as a `repo` secret in `argocd` — or
 every Application sits unsynced saying it cannot fetch the source.
 
-Then label a pull request `deploy-env` and it appears at `pr-<number>.preview.venue.example` within a couple of
-minutes.
+Then label a pull request `deploy-env` and it appears at `pr-<number>.<domain>` within a couple of minutes.
+
+### The two tokens, and why it is two
+
+**Listing pull requests and reaping them** wants a fine-grained token on this repository alone
+(`github.com/settings/personal-access-tokens/new`): Metadata read, which is compulsory; Contents read, so ArgoCD can
+fetch the chart; Pull requests read and write; and Issues read and write. The last is not belt and braces — labels
+and comments on a pull request are Issues API endpoints (`DELETE /repos/:repo/issues/:n/labels/deploy-env` and
+`POST .../comments`, `reaper.yaml`), and which of the two permissions GitHub actually demands for a pull request has
+moved about. If it ever refuses, the response says what it wanted in the `X-Accepted-GitHub-Permissions` header,
+which settles it in one request rather than by reading.
+
+**Pulling the image** cannot use that token at all. GitHub Packages states plainly that it "only supports
+authentication using a personal access token (classic)", so `ghcr-pull` needs a classic token
+(`github.com/settings/tokens/new`) with `read:packages` and nothing else.
+
+That is a constraint rather than a design, but the separation it forces is the right shape anyway. `ghcr-pull` is
+copied into the namespace of every preview, where any pod can read it; the ApplicationSet's token can read the
+source of the whole repository. Those two should not be the same string, and this way they cannot be. Give the
+classic token `read:packages` only — a classic token's scopes are account-wide, so `write:packages` there would let
+anything in any preview namespace publish images as you.
+
+Nothing needs a token to *push* the image: the workflow uses the `GITHUB_TOKEN` Actions hands it
+(`.github/workflows/preview-image.yml`).
 
 **Environments are opt-in on purpose.** A full venue asks for about 1150m of CPU and 3.1 GiB of memory, so a node
 with six cores and 15 GiB holds three or four beside everything else. Giving one to every open branch fills the
