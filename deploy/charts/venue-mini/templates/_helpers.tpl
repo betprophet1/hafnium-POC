@@ -40,6 +40,22 @@ imagePullSecrets:
 {{- end }}
 {{- end -}}
 
+{{/*
+Where a pod may run. Empty by default, so a cluster of one node is unaffected and nothing here has to know whether
+there is more than one. A node kept for previews is a taint on the node and these two values in preview.yaml: the
+taint stops anything else landing there, and the toleration is what lets a preview past it.
+*/}}
+{{- define "venue-mini.scheduling" -}}
+{{- with .Values.scheduling.nodeSelector }}
+nodeSelector:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .Values.scheduling.tolerations }}
+tolerations:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end -}}
+
 {{- define "venue-mini.podSecurity" -}}
 runAsNonRoot: true
 runAsUser: 10001
@@ -64,6 +80,7 @@ forwards to; a public one only follows the feed. Each pod of a split gateway wri
 {{- $name := include "venue-mini.fullname" $ }}
 {{- $core := printf "%s-core" $name -}}
 {{- include "venue-mini.imagePullSecrets" $ | trim | nindent 0 }}
+{{- include "venue-mini.scheduling" $ | trim | nindent 0 }}
 securityContext:
   {{- include "venue-mini.podSecurity" $ | nindent 2 }}
 # A stopping gateway first drains (preStop), then gets SIGTERM, which ends it at once: its sessions close, and their

@@ -24,6 +24,7 @@ usage: venue.sh <command>
   ssh        a shell on it
   kubeconfig fetch its kubeconfig to ~/.kube/venue-aws
   install    ArgoCD, cert-manager and the preview machinery, on a running box
+  previews   the node preview environments run on: up | down | join | status
   destroy    tear everything down, disk included
 EOF
 }
@@ -131,6 +132,74 @@ case "${1:-}" in
     echo "  - ghcr-pull           (in argocd; pull-secret.yaml copies it into each preview namespace)"
     echo
     echo "until those exist the ApplicationSet will log that it cannot reach GitHub, which is expected."
+    ;;
+
+  previews)
+    # The machine preview environments run on, so one asking for a large engine cannot take CPU from the venue
+    # people are looking at. It is a k3s agent, tainted when it joins, and `preview.yaml` is the only thing that
+    # tolerates the taint.
+    node_ip() { "$TOFU" -chdir="$HERE" output -raw preview_node 2>/dev/null; }
+    case "${2:-}" in
+      up)
+        "$TOFU" -chdir="$HERE" apply -var preview_node=true -auto-approve
+        ip=$(node_ip)
+        [ -n "$ip" ] || { echo "no preview node address; did the apply finish?" >&2; exit 1; }
+        echo "waiting for ssh on $ip"
+        for _ in $(seq 1 60); do
+          ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "ubuntu@$ip" true 2>/dev/null && break
+          sleep 5
+        done
+        exec "$0" previews join
+        ;;
+
+      join)
+        # The token is read from the server and handed straight to the agent. It is never written to a file here,
+        # never put in the instance's user_data — which the metadata service would then serve to anything on the
+        # box — and never into the Terraform state.
+        server=$("$TOFU" -chdir="$HERE" output -raw address)
+        ip=$(node_ip)
+        [ -n "$ip" ] || { echo "there is no preview node: venue.sh previews up" >&2; exit 1; }
+        token=$(ssh -o ConnectTimeout=10 "ubuntu@$server" "sudo cat /var/lib/rancher/k3s/server/node-token")
+        [ -n "$token" ] || { echo "could not read the server's node token" >&2; exit 1; }
+        # Tainted, so nothing lands here that has not asked for it, and labelled, so preview.yaml can ask.
+        ssh -o ConnectTimeout=10 "ubuntu@$ip" \
+          "curl -sfL https://get.k3s.io | K3S_URL=https://$server:6443 K3S_TOKEN='$token' \
+             INSTALL_K3S_EXEC='agent --node-label venue.role=preview --node-taint preview=true:NoSchedule' sh -" \
+          >/dev/null 2>&1
+        echo "joined; waiting for the node to be ready"
+        for _ in $(seq 1 60); do
+          if kubectl get nodes -l venue.role=preview --no-headers 2>/dev/null | grep -q " Ready"; then
+            kubectl get nodes -L venue.role
+            exit 0
+          fi
+          sleep 5
+        done
+        echo "the node did not become ready; ssh to it and look at k3s-agent" >&2
+        exit 1
+        ;;
+
+      down)
+        ip=$(node_ip)
+        [ -n "$ip" ] || { echo "there is no preview node"; exit 0; }
+        id=$("${AWS[@]}" ec2 describe-instances --filters "Name=ip-address,Values=$ip" \
+          --query "Reservations[].Instances[?State.Name=='running'].InstanceId" --output text)
+        [ -n "$id" ] || { echo "the preview node is not running"; exit 0; }
+        "${AWS[@]}" ec2 stop-instances --instance-ids "$id" >/dev/null
+        echo "stopping the preview node — previews will not schedule until it is started again, which is the point"
+        ;;
+
+      status)
+        ip=$(node_ip)
+        if [ -z "$ip" ]; then
+          echo "no preview node: everything shares the server's machine"
+        else
+          echo "preview node at $ip"
+          kubectl get nodes -L venue.role 2>/dev/null
+        fi
+        ;;
+
+      *) echo "usage: venue.sh previews up | down | join | status" >&2; exit 1 ;;
+    esac
     ;;
 
   destroy)

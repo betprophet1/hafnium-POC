@@ -2,6 +2,15 @@
 # It runs the core, the demo markets, synthetic traders, the dummy oracle and a web page. The gateway and the
 # environment manifest join as they are built.
 
+# Where the pods may run. Empty means anywhere, which is right for one node and for a cluster nobody has divided up.
+#
+# A node kept for preview environments is a taint on the node and these two here: the taint is what stops anything
+# else landing on it, and the toleration is what lets a preview past the taint. Both are needed — a nodeSelector
+# alone would send previews to that node without stopping the live venue following them there.
+scheduling:
+  nodeSelector: {}
+  tolerations: []
+
 image:
   # One image holds venue-node, venue-gateway and venue-sim, each run under tini.
   repository: venue
@@ -206,6 +215,10 @@ gateway:
     fsync: true
     storage:
       size: 1Gi
+      # Whether the audit volume outlives the release. True everywhere that matters, for the same reason as the
+      # journal: an audit log is evidence. A preview sets it false, because its namespace is thrown away with its
+      # pull request and these are a gigabyte a pod (deploy/argocd/preview.yaml).
+      keepOnDelete: true
       # Empty uses the cluster's default class (k3d: local-path).
       className: ""
   # The public half (market data) and the private half (orders, accounts, transfers, requests for quote, keys) served

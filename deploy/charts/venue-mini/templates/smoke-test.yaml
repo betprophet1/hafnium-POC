@@ -23,6 +23,7 @@ metadata:
 spec:
   restartPolicy: Never
   {{- include "venue-mini.imagePullSecrets" . | trim | nindent 2 }}
+  {{- include "venue-mini.scheduling" . | trim | nindent 2 }}
   securityContext:
     {{- include "venue-mini.podSecurity" . | nindent 4 }}
   containers:

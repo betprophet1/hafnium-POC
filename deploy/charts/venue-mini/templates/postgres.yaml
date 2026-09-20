@@ -73,6 +73,7 @@ spec:
         {{- include "venue-mini.labels" . | nindent 8 }}
         app.kubernetes.io/component: postgres
     spec:
+      {{- include "venue-mini.scheduling" . | trim | nindent 6 }}
       # The image's postgres user (alpine: 70).
       securityContext:
         runAsNonRoot: true

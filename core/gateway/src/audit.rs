@@ -1056,7 +1056,7 @@ mod tests {
 #[cfg(test)]
 mod recorded {
     use super::verify;
-    use crate::testing::{self, eventually, MAKER_TOKEN, MARKET};
+    use crate::testing::{self, eventually, MAKER_TOKEN, MARKET, RETAIL_TOKEN};
     use serde_json::{json, Value};
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -1353,18 +1353,35 @@ mod recorded {
         find(dir, "its reply", |r| {
             is(r, "ws-frame", "out") && r["msg"].as_str().is_some_and(|m| m.contains("\"o1\"") && m.contains("reply"))
         });
+        // Cross it deliberately rather than waiting for one of the venue's bots to do it. An execution needs a
+        // counterparty, and leaving that to whichever bot happened to be running made this test a race with them:
+        // it failed three times under a loaded `./check` and passed alone every time, which is what a race looks
+        // like from the outside. Retail sells into the resting buy, and the fill is then this test's own doing.
+        let mut crossing = order("x1");
+        crossing["action"] = json!("sell");
+        assert_eq!(
+            request(&venue.address, "POST", "/v4/orders", Some(RETAIL_TOKEN), &crossing.to_string()),
+            200,
+            "the crossing sell was refused, so no execution could follow"
+        );
+
         // What the engine did is recorded by reference to the journal: what the frame was, the input it was rendered
         // from, and the hash of the bytes the client was sent (interfaces/audit/README.md).
         let execution = streamed(&mut private, "execution");
+        let sent: Value = serde_json::from_str(&execution).expect("JSON");
+        // The record of *this* frame, found by the connection it went out on and the sequence it carries. Matching
+        // on "an out frame of type execution" was the flake: the venue's bots trade as well, so the first such
+        // record in the log is not necessarily the frame this session just read, and the test then compared one
+        // execution's length against another's. It held while the machine was quiet and the two coincided.
         let referenced = find(dir, "the execution streamed to the session", |r| {
-            is(r, "ws-frame", "out") && r["type"] == "execution"
+            is(r, "ws-frame", "out")
+                && r["type"] == "execution"
+                && r["conn"] == conn
+                && r["sequence"] == sent["execution"]["sequence"]
         });
         assert!(referenced.get("msg").is_none(), "a frame from the journal was written in full: {referenced}");
         assert_eq!(referenced["length"], execution.len(), "{referenced}");
         assert_eq!(referenced["sha256"], super::sha256_hex(execution.as_bytes()), "{referenced}");
-        let sent: Value = serde_json::from_str(&execution).expect("JSON");
-        // An execution carries its sequence inside the execution itself; the record says the same input.
-        assert_eq!(referenced["sequence"], sent["execution"]["sequence"], "{referenced}");
         drop(private);
         find(dir, "the session's end", |r| r["kind"] == "ws-close" && r["conn"] == conn);
 

@@ -113,6 +113,31 @@ resource "aws_security_group" "venue" {
     cidr_blocks = var.admin_cidrs
   }
 
+  # Between the machines in this group, and nowhere else. A second node has to reach the API to join, the kubelets
+  # have to reach each other for logs and exec, and flannel carries the pod network over VXLAN. `self` is what keeps
+  # this to the cluster's own machines: a CIDR here would mean anything in the default VPC.
+  ingress {
+    description = "kubernetes api between nodes"
+    from_port   = 6443
+    to_port     = 6443
+    protocol    = "tcp"
+    self        = true
+  }
+  ingress {
+    description = "kubelet"
+    from_port   = 10250
+    to_port     = 10250
+    protocol    = "tcp"
+    self        = true
+  }
+  ingress {
+    description = "flannel vxlan"
+    from_port   = 8472
+    to_port     = 8472
+    protocol    = "udp"
+    self        = true
+  }
+
   egress {
     description = "anywhere"
     from_port   = 0
@@ -218,4 +243,35 @@ resource "aws_route53_record" "previews" {
   type    = "A"
   ttl     = 60
   records = [aws_eip.venue.public_ip]
+}
+
+# ---------------------------------------------------------------- the preview node
+# A second machine for preview environments, so one asking for a large engine cannot take CPU from the venue people
+# are looking at. It joins as a k3s agent and is tainted, so only a pod that tolerates the taint lands on it.
+#
+# It carries no cloud-init on purpose. An agent needs the server's node token to join, and the only ways to get it
+# in here would be to write it into user_data — which the instance metadata then hands to anything running on the
+# box — or to read it in Terraform, which writes it into the state file. `venue.sh previews join` reads it over SSH
+# at the moment it is needed and it goes no further than that command.
+resource "aws_instance" "preview" {
+  count                  = var.preview_node ? 1 : 0
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.preview_instance_type
+  subnet_id              = data.aws_subnets.default.ids[0]
+  vpc_security_group_ids = [aws_security_group.venue.id]
+  key_name               = aws_key_pair.venue.key_name
+
+  root_block_device {
+    volume_size = var.preview_disk_gb
+    volume_type = "gp3"
+    encrypted   = true
+    # Nothing on this machine outlives it: the environments are rebuilt from their pull requests.
+    delete_on_termination = true
+  }
+
+  lifecycle {
+    ignore_changes = [ami]
+  }
+
+  tags = { Name = "venue-preview-node" }
 }

@@ -45,6 +45,7 @@ spec:
         app.kubernetes.io/component: core
     spec:
       {{- include "venue-mini.imagePullSecrets" . | trim | nindent 6 }}
+      {{- include "venue-mini.scheduling" . | trim | nindent 6 }}
       securityContext:
         {{- include "venue-mini.podSecurity" . | nindent 8 }}
       terminationGracePeriodSeconds: 10
