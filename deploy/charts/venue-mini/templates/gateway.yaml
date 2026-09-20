@@ -1,3 +1,19 @@
+{{- if .Values.gateway.environments }}
+# The venues an app may point itself at. A ConfigMap rather than a flag, because the gateway re-reads this file on
+# every request: environments come and go with pull requests, and a gateway that had to restart to notice one would
+# restart more often than it served anyone (core/gateway/src/bootstrap.rs).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "venue-mini.fullname" . }}-environments
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+data:
+  environments.json: |
+    {{ toJson (dict "environments" .Values.gateway.environments) }}
+---
+{{- end }}
 {{- $name := include "venue-mini.fullname" . }}
 {{- $core := printf "%s-core" $name }}
 {{- if not .Values.gateway.split.enabled }}
@@ -62,6 +78,11 @@ spec:
         - name: catalogue
           configMap:
             name: {{ $name }}-catalogue
+        {{- if $.Values.gateway.environments }}
+        - name: environments
+          configMap:
+            name: {{ $name }}-environments
+        {{- end }}
         - name: audit
           persistentVolumeClaim:
             claimName: {{ $name }}-gateway-audit
@@ -123,6 +144,11 @@ spec:
         - name: catalogue
           configMap:
             name: {{ $name }}-catalogue
+        {{- if $.Values.gateway.environments }}
+        - name: environments
+          configMap:
+            name: {{ $name }}-environments
+        {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: audit

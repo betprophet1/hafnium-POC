@@ -180,6 +180,23 @@ gateway:
   # served from somewhere other than this ingress — a development server, say. Empty allows only a page the venue
   # serves itself, which is what the demo page is.
   allowedOrigins: ""
+  # The venues an app may point itself at, served as GET /v4/bootstrap (interfaces/gateway/README.md, choosing an
+  # environment). Empty means the route is not offered at all and an app stays where it was built pointing.
+  #
+  # Exactly one entry should say `live: true`: the venue whose money is real. Everything else is a copy running a
+  # branch, and an app says so where a person can see it. Only a member the records mark as staff is told about the
+  # ones that are not live.
+  #
+  #   environments:
+  #     - id: prod
+  #       label: Live
+  #       url: https://venue.example
+  #       live: true
+  #     - id: pr-7
+  #       label: "PR 7: fees"
+  #       url: https://pr-7.venue.example
+  #       live: false
+  environments: []
   perSecond: 200
   burst: 400
   logonsPerMinute: 30

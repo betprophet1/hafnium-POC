@@ -89,6 +89,10 @@ containers:
         value: "{{ $core }}:7102"
       - name: VENUE_CATALOGUE
         value: /catalogue/markets.json
+      {{- if $.Values.gateway.environments }}
+      - name: VENUE_ENVIRONMENTS
+        value: /etc/venue/environments/environments.json
+      {{- end }}
       {{- if ne .serve "public" }}
       {{- if $.Values.treasury.enabled }}
       - name: VENUE_TREASURY
@@ -167,6 +171,10 @@ containers:
         mountPath: /catalogue
       - name: audit
         mountPath: /var/lib/gateway-audit
+      {{- if $.Values.gateway.environments }}
+      - name: environments
+        mountPath: /etc/venue/environments
+      {{- end }}
 {{- end -}}
 
 {{/*
