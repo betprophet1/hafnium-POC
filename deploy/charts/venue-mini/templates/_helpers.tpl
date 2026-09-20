@@ -46,11 +46,15 @@ there is more than one. A node kept for previews is a taint on the node and thes
 taint stops anything else landing there, and the toleration is what lets a preview past it.
 */}}
 {{- define "venue-mini.scheduling" -}}
-{{- with .Values.scheduling.nodeSelector }}
+{{- /* `default dict` because a release made before this key existed has no `scheduling` at all, and an upgrade with
+       --reuse-values gives the chart that release's values rather than these defaults. Reaching through the nil
+       would fail every such upgrade, which is how this was found: on the live venue, upgrading it. */ -}}
+{{- $s := .Values.scheduling | default dict }}
+{{- with $s.nodeSelector }}
 nodeSelector:
   {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with .Values.scheduling.tolerations }}
+{{- with $s.tolerations }}
 tolerations:
   {{- toYaml . | nindent 2 }}
 {{- end }}
