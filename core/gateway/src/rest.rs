@@ -429,6 +429,13 @@ mod tests {
 
         // An address nobody used has nothing, rather than everything.
         assert!(asked("nobody%40example.com").is_empty(), "an unused address was answered somebody's mail");
+
+        // And not saying whose is refused rather than answered with the outbox, which is what it did: the filter
+        // was optional there, and this route is reachable by anyone.
+        let (status, all) = request(&venue.address, "GET", "/v4/mail", None, None);
+        assert_eq!(status, 400, "the whole outbox was handed over: {all}");
+        let (status, empty) = request(&venue.address, "GET", "/v4/mail?to=", None, None);
+        assert_eq!(status, 400, "an empty address is not an address: {empty}");
     }
 
     #[test]

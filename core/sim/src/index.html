@@ -1256,7 +1256,11 @@ async function refreshMember() {
 
 async function refreshMail() {
   try {
-    memberMail = (await memberCall('/v4/mail', null, 'GET')).mail || [];
+    // This member's mailbox, not the venue's. The route takes no credential — it is how the code that proves an
+    // address is read before there is a session to prove it with — so what it is asked for is all that decides
+    // what it answers.
+    const box = '/v4/mail?to=' + encodeURIComponent(member && member.email ? member.email : '');
+    memberMail = (await memberCall(box, null, 'GET')).mail || [];
   } catch (e) {
     // A venue that can really post to an address does not serve this, which is the point.
     memberMail = [];

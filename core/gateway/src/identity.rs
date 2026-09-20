@@ -417,8 +417,16 @@ pub fn members(gateway: &Gateway, request: &Request, client: &str, notify: &Noti
             // Passed on exactly as it arrived. The parsed request keeps query values as they came off the wire,
             // percent-escapes and all, and the identity service decodes them — so re-encoding here would escape
             // the escapes and an address with a `+` in it would match nothing.
-            let to = request.query.get("to").map_or(String::new(), |to| format!("?to={to}"));
-            identity.pass_to("GET", &format!("/v1/mail{to}"), &[], notify)
+            // Whose mailbox must be said. Left out, the service behind this answers every message the environment
+            // has sent, and this route takes no credential, so that was the whole outbox — password-reset codes
+            // included — to anyone who asked. Asking for one address is not an access control either; it is the
+            // difference between having to know an address and being handed everybody's.
+            let to = request
+                .query
+                .get("to")
+                .filter(|to| !to.is_empty())
+                .ok_or_else(|| ApiError::bad("say whose mailbox: /v4/mail?to=<address>"))?;
+            identity.pass_to("GET", &format!("/v1/mail?to={to}"), &[], notify)
         }
         ("DELETE", ["v4", "sessions", "current"]) => {
             // Only the session itself may end itself, which is what holding its credential proves.
