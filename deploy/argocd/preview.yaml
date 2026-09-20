@@ -67,6 +67,9 @@ identity:
 # that runs.
 gateway:
   split:
+    # Said explicitly: the chart's default is a single gateway, so naming the halves' replicas without this turned
+    # the split off while the paragraph above said it was on — a preview reviewed the wrong shape, quietly.
+    enabled: true
     public:
       replicas: 1
     private:
