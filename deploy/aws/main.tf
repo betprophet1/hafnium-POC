@@ -197,8 +197,13 @@ locals {
 }
 
 # The venue itself, and every preview beside it. The wildcard is what lets a pull request have a name without anyone
-# creating a record for it — and it is one label below the venue, so `pr-7.pmex.example` sits next to `pmex.example`
-# rather than under a `preview.` that carries no information.
+# creating a record for it, and previews sit one label below the venue — `pr-7.pmex.example` next to `pmex.example`
+# rather than under a `preview.` that carries no information `pr-7` does not.
+#
+# That is a choice about names and nothing more. A DNS wildcard matches a name with one label below it or several
+# (RFC 4592), so `*.pmex.example` answers for `a.b.pmex.example` too, and a deeper preview would have resolved
+# perfectly well. Certificates are where depth bites — an X.509 wildcard really does cover exactly one label — but
+# previews take a certificate per host over HTTP-01, so that does not bind here either.
 resource "aws_route53_record" "venue" {
   zone_id = local.zone_id
   name    = var.domain

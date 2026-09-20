@@ -354,7 +354,33 @@ the first time these environments were run:
 **Finding an environment from the app** is `GET /v4/bootstrap` (interface 1 README, choosing an environment). The
 live venue names the previews only to members its records mark as staff, and `--environments` points the gateway at
 the file listing them — a ConfigMap, read afresh on every request, so environments coming and going needs no
-restart.
+restart. Where nothing is named the route is not offered at all, which is a 404 and not an error.
+
+Naming one is a value, so it is an upgrade and not an edit — and it wants a file rather than `--set`:
+
+```sh
+cat > environments.yaml <<'YAML'
+gateway:
+  environments:
+    - { id: prod,  label: Live,               url: https://pmex.example,      live: true }
+    - { id: pr-7,  label: "Pull request 7",   url: https://pr-7.pmex.example, live: false }
+YAML
+helm upgrade venue deploy/charts/venue-mini --reuse-values -f environments.yaml
+venue-identity staff --email somebody@example.com
+```
+
+**A file replaces the list; `--set` does not.** `--set gateway.environments[0].id=...` merges into the list already
+there, by index, so the entries past the ones you name survive — which means a preview stays advertised after its
+pull request is gone, and no amount of setting the entries you do want will take it off. Keep the list in a file and
+pass the whole thing each time. (`helm template -f a.yaml -f b.yaml` shows both behaviours in a second, if the
+distinction ever looks like a detail.)
+
+**A preview names only itself.** Its ApplicationSet gives it one entry, its own, so an app pointed at it recognises
+the session it is holding across a restart — the app asks the venue a session belongs to whether it is still good,
+and a preview that named nothing would answer 404 and cost the reviewer their sign-in every launch. It names no other
+venue because it runs code nobody has reviewed and an app puts these labels beside a password box: a branch that
+called some address "Live" would be asking for a live password on its own terms. The way back is the address the app
+was built with, which the app adds to every list itself (`apps/retail/src/venue/environment.ts`, `withBuiltIn`).
 
 ## Databases
 
