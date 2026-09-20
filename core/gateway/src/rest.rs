@@ -345,7 +345,12 @@ mod tests {
 
         // Until the address is proved a member may trade but not move money, and proving it needs only the code
         // that was sent there.
-        let deposit = json!({"amountCents": 100, "reference": "d1"}).to_string();
+        // A deposit as the contract spells it. The gateway hands the body to the treasury as it stands, so these
+        // are the treasury's own field names — the shape this test used before named none of them and would have
+        // been refused for its body whatever account it came from.
+        let deposit =
+            json!({"clientTransferId": "d1", "kind": "deposit", "amountCents": 100, "method": "dummy_instant"})
+                .to_string();
         let (status, refused) = request(&venue.address, "POST", "/v4/transfers", Some(&credential), Some(&deposit));
         assert_eq!(status, 403, "no transfers before the address is proved: {refused}");
         let token = code(&venue.address, "someone@example.com");
@@ -366,15 +371,25 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
         assert_ne!(moved["error"]["code"], json!("FORBIDDEN"), "the same session may move money now: {moved}");
-        // And then it fails for the next reason along, which is a gap rather than a rule: the treasury knows only the
-        // accounts the catalogue names, and a member's was made at sign-up, so it has no ledger to move money in
-        // (interfaces/gateway/README.md, members and sessions). Asserted so that the day an account made at sign-up
-        // reaches the treasury, this test fails and says so, instead of a weaker `is not FORBIDDEN` quietly passing
-        // either way — which is what it did, and why this gap went unnoticed.
+        // And it goes through. A member's account is made at sign-up and is in no catalogue, so the treasury used
+        // to refuse to know it at all; it now opens one on the first deposit, which is how a customer appears at a
+        // venue that did not have them listed in advance. The money is recorded as any other deposit is — whose it
+        // is, how much, by which method, and every state it passed through — rather than granted behind the
+        // ledger's back.
         assert_eq!(
-            moved["error"]["code"],
-            json!("NOT_FOUND"),
-            "a member still cannot deposit, for want of a ledger rather than a permission: {moved}"
+            (&moved["kind"], &moved["amountCents"], &moved["method"]),
+            (&json!("deposit"), &json!(100), &json!("dummy_instant")),
+            "a member's deposit is a deposit like any other: {moved}"
+        );
+        assert!(moved["transferId"].as_str().is_some_and(|id| !id.is_empty()), "it has an id: {moved}");
+
+        // And having deposited, the account is one the treasury knows: it can read its own transfers back.
+        let (status, listed) = request(&venue.address, "GET", "/v4/transfers", Some(&credential), None);
+        assert_eq!(status, 200, "{listed}");
+        assert_eq!(
+            listed["transfers"].as_array().map(|t| t.len()),
+            Some(1),
+            "the deposit it just made, and nothing else: {listed}"
         );
     }
 

@@ -365,8 +365,17 @@ impl Treasury {
         Ok(())
     }
 
-    fn known(&self, account: u64) -> Result<(), Refusal> {
-        if self.config.accounts.contains_key(&account) {
+    /// Whether the treasury may act for this account: one the catalogue named, or one it has already made a
+    /// transfer for.
+    ///
+    /// An account the catalogue never named first appears by depositing (see `request`), and is known from then on
+    /// — which is what lets its transfers be read back and withdrawn from afterwards. Asked of `by_client`, which
+    /// is keyed by account and restored from the records, so this costs a lookup and keeps no second list that
+    /// could disagree with them.
+    fn known(&self, inner: &Inner, account: u64) -> Result<(), Refusal> {
+        let transacted =
+            inner.by_client.range((account, String::new())..).next().is_some_and(|((a, _), _)| *a == account);
+        if self.config.accounts.contains_key(&account) || transacted {
             Ok(())
         } else {
             Err(Refusal::not_found("no such account"))
@@ -376,7 +385,6 @@ impl Treasury {
     /// POST: a new transfer, or the one this client transfer ID already made. Returns its ID; the caller may wait
     /// for it to get past its quick stages (`wait_quick`) before answering.
     pub fn request(&self, account: u64, body: &Value, now: u64) -> Result<u64, Refusal> {
-        self.known(account)?;
         let fields = body.as_object().ok_or_else(|| Refusal::bad("the body must be a JSON object"))?;
         const FIELDS: [&str; 4] = ["clientTransferId", "kind", "amountCents", "method"];
         if let Some(k) = fields.keys().find(|k| !FIELDS.contains(&k.as_str())) {
@@ -397,6 +405,16 @@ impl Treasury {
             .filter(|a| (1..=max).contains(a))
             .ok_or_else(|| Refusal::bad(format!("amountCents must be an integer from 1 to {max}")))?;
         let mut inner = locked(&self.inner);
+        // A deposit is how an account the catalogue never named first appears. The member exists, the sequencer
+        // group already knows the account — it refuses their orders for want of a sleeve, not for want of an
+        // account — and this is the money arriving, recorded like any other deposit: whose it is, how much, by
+        // which method, and every state it passed through.
+        //
+        // A withdrawal is not. Nothing can be taken out of an account that has never had anything put in, and
+        // refusing here is what stops a mistyped account number opening one and being paid.
+        if kind == Kind::Withdrawal {
+            self.known(&inner, account)?;
+        }
         self.fresh(&mut inner).map_err(|e| {
             eprintln!("treasury: {e}");
             Refusal::unavailable("the treasury's records are unavailable; nothing was done")
@@ -495,8 +513,8 @@ impl Treasury {
 
     /// One of the account's transfers, as a client sees it.
     pub fn get(&self, account: u64, id: u64) -> Result<Value, Refusal> {
-        self.known(account)?;
         let inner = locked(&self.inner);
+        self.known(&inner, account)?;
         inner
             .transfers
             .get(&id)
@@ -507,8 +525,8 @@ impl Treasury {
 
     /// The account's newest transfers, newest first.
     pub fn list(&self, account: u64, limit: usize) -> Result<Value, Refusal> {
-        self.known(account)?;
         let inner = locked(&self.inner);
+        self.known(&inner, account)?;
         let transfers: Vec<Value> = inner
             .transfers
             .values()
@@ -1019,6 +1037,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_account_the_catalogue_never_named_appears_by_depositing_and_cannot_withdraw_before_it_has() {
+        let records = Memory::default();
+        let treasury = open(&records);
+        // A member's account: made at sign-up, in no catalogue, and so unknown here until it puts money in.
+        const MEMBER: u64 = 100_002;
+
+        // Nothing can be taken out of an account that has never had anything put in. This is what stops a mistyped
+        // account number opening one and being paid out of the omnibus.
+        let out = body("w1", "withdrawal", 100, "dummy_instant");
+        assert_eq!(
+            treasury.request(MEMBER, &out, 2_000).unwrap_err().code,
+            "NOT_FOUND",
+            "an account nobody has funded was allowed to withdraw"
+        );
+        assert!(treasury.list(MEMBER, 10).is_err(), "nor read back transfers it does not have");
+
+        // A deposit opens it, and is recorded as any other deposit is.
+        let id = treasury.request(MEMBER, &body("d1", "deposit", 100, "dummy_instant"), 2_000).expect("deposited");
+        let made = treasury.get(MEMBER, id).expect("its own transfer");
+        assert_eq!((&made["kind"], &made["amountCents"]), (&json!("deposit"), &json!(100)), "{made}");
+
+        // And from then on it is an account the treasury knows: it can be read back, and withdrawn from — refused
+        // now for want of money rather than for want of an account, which is a different answer.
+        assert_eq!(treasury.list(MEMBER, 10).expect("listed")["transfers"].as_array().map(Vec::len), Some(1));
+        let refused = treasury.request(MEMBER, &body("w2", "withdrawal", 100_000, "dummy_instant"), 2_000);
+        assert_ne!(
+            refused.as_ref().err().map(|e| e.code),
+            Some("NOT_FOUND"),
+            "having deposited, the account is known: {refused:?}"
+        );
+
+        // The catalogue's own accounts are unaffected.
+        assert!(treasury.request(ACCOUNT, &body("d2", "deposit", 100, "dummy_instant"), 2_000).is_ok());
+    }
+
+    #[test]
     fn malformed_requests_create_nothing() {
         let p = Memory::default();
         let treasury = open(&p);
@@ -1032,7 +1086,12 @@ pub(crate) mod tests {
         let mut extra = body("x", "deposit", 1, "dummy_bank");
         extra["note"] = json!("hi");
         assert_eq!(refused(extra), Err(400));
-        assert_eq!(treasury.request(99, &body("x", "deposit", 1, "dummy_bank"), 1_000).map_err(|r| r.status), Err(404));
+        // A withdrawal names an account that must already exist. A deposit no longer does — that is how an account
+        // the catalogue never named opens — so the refusal this asserts is the one that is left.
+        assert_eq!(
+            treasury.request(99, &body("x", "withdrawal", 1, "dummy_bank"), 1_000).map_err(|r| r.status),
+            Err(404)
+        );
         assert_eq!(treasury.list(ACCOUNT, 10).expect("a list")["transfers"], json!([]));
     }
 
