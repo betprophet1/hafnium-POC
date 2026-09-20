@@ -38,6 +38,7 @@ spec:
     spec:
       restartPolicy: OnFailure
       {{- include "venue-mini.imagePullSecrets" . | trim | nindent 6 }}
+      {{- include "venue-mini.scheduling" . | trim | nindent 6 }}
       securityContext:
         {{- include "venue-mini.podSecurity" . | nindent 8 }}
       containers:
@@ -99,6 +100,7 @@ spec:
         app.kubernetes.io/component: web
     spec:
       {{- include "venue-mini.imagePullSecrets" . | trim | nindent 6 }}
+      {{- include "venue-mini.scheduling" . | trim | nindent 6 }}
       securityContext:
         {{- include "venue-mini.podSecurity" . | nindent 8 }}
       containers:
@@ -170,6 +172,7 @@ spec:
         app.kubernetes.io/component: {{ $bot }}
     spec:
       {{- include "venue-mini.imagePullSecrets" $ | trim | nindent 6 }}
+      {{- include "venue-mini.scheduling" $ | trim | nindent 6 }}
       securityContext:
         {{- include "venue-mini.podSecurity" $ | nindent 8 }}
       containers:

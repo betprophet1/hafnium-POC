@@ -90,3 +90,39 @@ variable "zone_id" {
   type        = string
   default     = ""
 }
+
+variable "preview_node" {
+  description = <<-EOT
+    Whether a second machine is made for preview environments to run on.
+
+    False by default, and worth understanding before turning on. With it, previews run where the live venue is not:
+    a preview asking for the launch engine cannot take CPU from the venue people are looking at, which is the whole
+    reason for it. Without it, everything shares one box, and on a t3.large one small preview is already most of it.
+
+    The node is tainted when it joins, so nothing lands there that has not asked to, and `preview.yaml` is what asks.
+    That also means previews will not schedule at all while it is stopped — deliberately, because the alternative is
+    them quietly moving back on top of the venue.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "preview_instance_type" {
+  description = <<-EOT
+    The preview node. Bigger than the server, because this is where the environments actually run:
+
+      t3.large    2 vCPU,  8 GiB  — two small previews
+      t3.xlarge   4 vCPU, 16 GiB  — four or five, or one asking for the launch engine
+
+    The smaller by default: the budget alarm here is set at $25 a month and an xlarge left running is over four
+    times that on its own. Raise it for an afternoon of throughput work and put it back.
+  EOT
+  type        = string
+  default     = "t3.large"
+}
+
+variable "preview_disk_gb" {
+  description = "Root volume on the preview node. Every preview pulls its own image, so this is mostly images."
+  type        = number
+  default     = 80
+}

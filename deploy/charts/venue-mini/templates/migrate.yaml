@@ -30,6 +30,7 @@ spec:
     spec:
       restartPolicy: OnFailure
       {{- include "venue-mini.imagePullSecrets" . | trim | nindent 6 }}
+      {{- include "venue-mini.scheduling" . | trim | nindent 6 }}
       securityContext:
         {{- include "venue-mini.podSecurity" . | nindent 8 }}
       {{- if .Values.postgres.enabled }}

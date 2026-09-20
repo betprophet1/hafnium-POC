@@ -126,8 +126,11 @@ spec:
   # Scaling down keeps the audit volumes of the pods it removes: the audit log is kept, not a cache. A pod of the same
   # name, when the half scales up again, takes its volume back and seals the file its predecessor left open.
   persistentVolumeClaimRetentionPolicy:
+    # Scaling a half away never discards its audit: the volume waits for a pod of that name to come back and seal
+    # the file it left open. Deleting the release is where the values decide, and they keep it by default — an
+    # audit log is evidence, and one thrown away by accident cannot be recovered.
     whenScaled: Retain
-    whenDeleted: Retain
+    whenDeleted: {{ ternary "Retain" "Delete" $.Values.gateway.audit.storage.keepOnDelete }}
   selector:
     matchLabels:
       {{- include "venue-mini.selector" (dict "ctx" $ "component" "gateway") | nindent 6 }}

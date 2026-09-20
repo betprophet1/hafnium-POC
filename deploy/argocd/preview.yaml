@@ -63,6 +63,12 @@ identity:
 # a reviewer is looking at, and two small pods cost less than the surprise of reviewing a shape that is not the one
 # that runs.
 gateway:
+  # The audit volumes go with the environment too. They were the one kind left behind: the journal and the database
+  # were already set to go, and a gigabyte a gateway pod stayed on the node after every pull request. Found by
+  # taking an environment down and looking at what was still there.
+  audit:
+    storage:
+      keepOnDelete: false
   split:
     # Said explicitly: the chart's default is a single gateway, so naming the halves' replicas without this turned
     # the split off while the paragraph above said it was on — a preview reviewed the wrong shape, quietly.
@@ -71,3 +77,17 @@ gateway:
       replicas: 1
     private:
       replicas: 1
+
+# A preview tolerates the preview node's taint, and names no node selector.
+#
+# The taint is what protects the live venue: nothing that has not asked for that node lands on it, and the venue
+# has not asked. The toleration is a preview asking. What is deliberately *not* here is a `nodeSelector` pinning
+# previews to that node — it would read as tidier and would mean that stopping the node, or never making one, left
+# every preview Pending with no scheduler event anybody would think to look for. Without it a preview still runs
+# when there is no preview node, on whatever room the server has, which is what happens today; and when there is
+# one, it is where the room is, so that is where the scheduler puts them.
+scheduling:
+  tolerations:
+    - key: preview
+      operator: Exists
+      effect: NoSchedule

@@ -41,3 +41,8 @@ output "region" {
   description = "Where it runs, so the scripts need not be told that twice either."
   value       = var.region
 }
+
+output "preview_node" {
+  description = "The preview node's address, when there is one. Empty means previews share the server's machine."
+  value       = var.preview_node ? aws_instance.preview[0].public_ip : ""
+}
