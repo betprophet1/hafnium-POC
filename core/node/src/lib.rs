@@ -13,3 +13,4 @@ pub mod load;
 pub mod metrics;
 pub mod node;
 pub mod sequencer;
+pub mod snapshots;

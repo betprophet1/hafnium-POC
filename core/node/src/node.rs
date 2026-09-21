@@ -119,7 +119,7 @@ impl ResultSink for Sink<'_> {
     }
 }
 
-fn apply(
+pub(crate) fn apply(
     engine: &mut Engine<'_>,
     input: &[u8],
     results: &mut BufWriter<File>,
