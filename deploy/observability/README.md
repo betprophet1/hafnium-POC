@@ -137,7 +137,9 @@ capacity headroom), *Gateways* (connections, sessions, REST by route, WebSocket 
 turns, outbound backlog, feed lag, audit writer, upstream calls, logs), *Core and journal* (inputs by type, journal
 append and fsync, feed subscribers and backlog, capacity used against limits), *FIX adapter*, *Kubernetes resources*
 (CPU, memory, restarts, volumes), *Services* (treasury, identity, parlays and the oracle as the gateway and the journal
-see them, with placeholders for their own metrics, which come next), and *Latency (per hop)*. Folder **Business**:
+see them, with placeholders for their own metrics, which come next), *Latency (per hop)*, and *Environments* (every
+environment in the cluster at once: when each was live, how it was sized, what it is using, and preview namespaces
+nothing is left running in). Folder **Business**:
 *Trading* (volume, notional, fills, top markets, order-to-trade ratio, rejections and cancels), *Market quality*
 (spread, depth at the touch, time two-sided), *Fees and rebates*, *Lifecycle* (markets and events by state, listing and
 resolution rates, the oracle's cadence as the journal saw it).
@@ -148,6 +150,17 @@ Operational timings on the system dashboards (event loop turns, journal fsync) a
 quote.
 
 Dashboards are files in the chart; Grafana shows them read-only. Change the JSON and upgrade the release.
+
+*Environments* is drawn from the **absence** of series as much as their presence: a row on its timeline ends when an
+environment's core stops being scraped, which is how a reaped preview shows up. That makes it the one dashboard that
+is wrong by default on a long-lived cluster, because this stack keeps two days of metrics on an `emptyDir` — an
+environment Prometheus has forgotten and one it never saw look exactly alike, and every restart forgets everything.
+`values/prometheus-history.yaml` gives Prometheus a disk and fifteen days instead:
+
+    KPS_VALUES=/tmp/grafana.yaml:deploy/observability/values/prometheus-history.yaml deploy/observability/install.sh
+
+Each of those variables takes several files separated by colons, as `PATH` does, applied left to right — the settings
+that vary between clusters are not one subject, and a release only gets one variable.
 
 ## Alerts
 

@@ -12,8 +12,10 @@
 #   OBSERVABILITY_LOKI=0      skip Loki (logs go to a Loki elsewhere: set Alloy's LOKI_WRITE_URL)
 #   OBSERVABILITY_ALLOY=0     skip Alloy (logs collected some other way)
 #   KPS_VALUES, LOKI_VALUES, ALLOY_VALUES, VENUE_OBSERVABILITY_VALUES
-#                             an extra values file for that release, applied after the repository's own: an
-#                             environment's remote write, receivers, data source URLs or exposure
+#                             extra values files for that release, applied after the repository's own: an
+#                             environment's remote write, receivers, data source URLs, retention or exposure.
+#                             Several are separated by colons as in PATH, and the last to set a key wins it:
+#                             KPS_VALUES=/tmp/grafana.yaml:deploy/observability/values/prometheus-history.yaml
 #   HELM_TIMEOUT              per release (default 10m)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -24,11 +26,34 @@ source "$HERE/versions.env"
 NS="${OBSERVABILITY_NAMESPACE:-monitoring}"
 TIMEOUT="${HELM_TIMEOUT:-10m}"
 
+# The extra values for a release, as `--values` arguments: one path, or several separated by colons as in PATH.
+# Several because the settings that vary between clusters are not one subject — exposure, retention and remote write
+# are decided separately and belong in separate files — and a release only gets one of these variables. Helm applies
+# them left to right after the repository's own, so the last file to set a key wins it.
 extra() {
-  if [[ -n "${1:-}" ]]; then
-    printf -- '--values\n%s\n' "$1"
-  fi
+  local paths="${1:-}" path
+  while [[ -n "$paths" ]]; do
+    path="${paths%%:*}"
+    if [[ "$path" == "$paths" ]]; then paths=""; else paths="${paths#*:}"; fi
+    [[ -n "$path" ]] && printf -- '--values\n%s\n' "$path"
+  done
 }
+
+# Said before anything is installed, because `mapfile < <(extra ...)` cannot fail the script from inside a process
+# substitution: a values file named but missing would otherwise be left out silently and the release would come up
+# without it, which is the one outcome worse than stopping.
+missing=""
+for paths in "${KPS_VALUES:-}" "${LOKI_VALUES:-}" "${ALLOY_VALUES:-}" "${VENUE_OBSERVABILITY_VALUES:-}"; do
+  while [[ -n "$paths" ]]; do
+    path="${paths%%:*}"
+    if [[ "$path" == "$paths" ]]; then paths=""; else paths="${paths#*:}"; fi
+    [[ -n "$path" && ! -f "$path" ]] && missing="$missing  $path"$'\n'
+  done
+done
+if [[ -n "$missing" ]]; then
+  printf 'no values file at:\n%s' "$missing" >&2
+  exit 1
+fi
 
 step() { printf '\n== %s\n' "$*"; }
 
