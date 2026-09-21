@@ -1,0 +1,45 @@
+# The retail app served as static files on a hostname of its own.
+#
+# It talks to no service in this cluster. The browser calls the venue directly, from whatever origin this is served
+# on, which is why that origin has to be in the gateway's `gateway.allowedOrigins` (decision G-15) — the two settings
+# belong together and are in different charts, so changing the host here means changing it there.
+
+image:
+  repository: ghcr.io/lordnacho/venue-app
+  # The commit the app was exported from. No `latest`: which app is running is a thing to be able to say, and a tag
+  # that moves makes "it works for me" unanswerable.
+  tag: ""
+  pullPolicy: IfNotPresent
+  # The registry credential, as the previews use (deploy/argocd/pull-secret.yaml).
+  pullSecrets: []
+
+replicaCount: 1
+
+# Small: this serves a few megabytes of static files to a handful of people.
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+service:
+  port: 80
+
+ingress:
+  enabled: true
+  className: traefik
+  # The hostname the demo is at. **Whatever is set here must also be an allowed origin on the gateway**, or the page
+  # loads and then cannot fetch anything — which looks like the venue being down rather than a setting being wrong.
+  host: ""
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+  tls:
+    enabled: true
+    secretName: venue-app-tls
+
+# Where the pods may run. A demo page is not what the preview node is for, so by default this goes wherever there is
+# room, which on a one-node cluster is the one node.
+scheduling:
+  nodeSelector: {}
+  tolerations: []

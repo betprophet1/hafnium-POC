@@ -1,0 +1,82 @@
+# Builds the retail app as a web page and pushes it, so the demo at app.<domain> can be moved forward by bumping a
+# tag rather than by somebody exporting a bundle from their laptop.
+#
+# Separate from `preview image` because it answers a different question. That one builds the venue a pull request
+# will run; this one builds the app anybody can open, from `main`, after review. They also have nothing in common to
+# build: one is a release build of a Rust workspace, the other is a Metro export.
+name: app image
+
+on:
+  push:
+    branches: [main]
+    # Only when the app or the way it is packaged actually changed. The venue's Rust crates move far more often than
+    # this does, and an export per merge would push identical images all day.
+    paths:
+      - "apps/retail/**"
+      - "deploy/images/venue-app.Dockerfile"
+      - "deploy/images/venue-app.nginx.conf"
+      - ".github/workflows/app-image.yml"
+  # For rebuilding against a different venue, or after changing nothing but wanting the image again.
+  workflow_dispatch:
+    inputs:
+      venue_url:
+        description: The venue the bundle is built to talk to.
+        required: true
+        default: https://pmex.hafnium.ltd
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: app-image
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A registry path may not carry capitals and a GitHub owner may. The same step the venue image needs, for the
+      # same reason: there is no `lower()` in an expression.
+      - name: The registry path, lower-cased
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/venue-app" >> "$GITHUB_ENV"
+
+      # `EXPO_PUBLIC_*` is inlined into the bundle at export, so the venue an image talks to is decided here and not
+      # on the pod. A push builds against the live venue; a manual run may say otherwise.
+      - name: The venue this bundle will talk to
+        run: echo "VENUE_URL=${{ inputs.venue_url || 'https://pmex.hafnium.ltd' }}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/images/venue-app.Dockerfile
+          push: true
+          build-args: VENUE_URL=${{ env.VENUE_URL }}
+          # The commit, and nothing that moves: which app is being served is a thing to be able to say. Deploying is
+          # then `--set image.tag=<sha>`, and rolling back is the same command with an older one.
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Say what was built, and how to put it up
+        run: |
+          {
+            echo "### App image"
+            echo '`${{ env.IMAGE }}:${{ github.sha }}`, built against `${{ env.VENUE_URL }}`'
+            echo
+            echo '```'
+            echo 'helm upgrade --install venue-app deploy/charts/venue-app -n venue \'
+            echo '  --set image.tag=${{ github.sha }} --set ingress.host=app.<domain>'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
