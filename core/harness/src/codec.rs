@@ -29,6 +29,7 @@ pub fn encode(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
         Some("TimeTick") => encode_time_tick(v, buf),
         Some("EngineStarted") => encode_engine_started(v, buf),
         Some("SeedSet") => encode_seed_set(v, buf),
+        Some("Snapshot") => encode_snapshot(v, buf),
         Some("ActivateProtocol") => encode_activate_protocol(v, buf),
         Some("SleeveAdjust") => encode_sleeve_adjust(v, buf),
         Some("DefineTickTable") => encode_define_tick_table(v, buf),
@@ -85,6 +86,7 @@ pub fn decode(buf: &[u8]) -> Result<Value, String> {
         time_tick_codec::SBE_TEMPLATE_ID => decode_time_tick(header, buf),
         engine_started_codec::SBE_TEMPLATE_ID => decode_engine_started(header, buf),
         seed_set_codec::SBE_TEMPLATE_ID => decode_seed_set(header, buf),
+        snapshot_codec::SBE_TEMPLATE_ID => decode_snapshot(header, buf),
         activate_protocol_codec::SBE_TEMPLATE_ID => decode_activate_protocol(header, buf),
         sleeve_adjust_codec::SBE_TEMPLATE_ID => decode_sleeve_adjust(header, buf),
         define_tick_table_codec::SBE_TEMPLATE_ID => decode_define_tick_table(header, buf),
@@ -819,6 +821,44 @@ fn decode_seed_set<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: &'a [u8])
     m.insert("purpose".into(), json!(dec.purpose().to_string()));
     m.insert("seedHigh".into(), json!(dec.seed_high()));
     m.insert("seedLow".into(), json!(dec.seed_low()));
+    let _ = &mut dec;
+    Ok(Value::Object(m))
+}
+
+fn encode_snapshot(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
+    let mut enc = snapshot_codec::SnapshotEncoder::default().wrap(WriteBuf::new(buf), message_header_codec::ENCODED_LENGTH);
+    enc = enc.header(0).parent().map_err(sbe_err)?;
+    let cv = &v["record"];
+    let mut c = enc.record_encoder();
+    c.sequence(ju(cv, "sequence") as u64);
+    c.sequenced_at(ju(cv, "sequencedAt") as u64);
+    c.sequencer_group(ju(cv, "sequencerGroup") as u16);
+    enc = c.parent().map_err(sbe_err)?;
+    enc.node_id(ju(v, "nodeId") as u16);
+    enc.protocol_version(ju(v, "protocolVersion") as u16);
+    enc.state_version(ju(v, "stateVersion") as u16);
+    enc.binary_hash_zero_padded(js(v, "binaryHash").as_bytes());
+    enc.state(js(v, "state").as_bytes());
+    Ok(enc.get_limit())
+}
+
+fn decode_snapshot<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: &'a [u8]) -> Result<Value, String> {
+    let mut m = Map::new();
+    m.insert("msg".into(), json!("Snapshot"));
+    let mut dec = snapshot_codec::SnapshotDecoder::default().header(header, 0);
+    let mut c = dec.record_decoder();
+    let mut cm = Map::new();
+    cm.insert("sequence".into(), json!(c.sequence()));
+    cm.insert("sequencedAt".into(), json!(c.sequenced_at()));
+    cm.insert("sequencerGroup".into(), json!(c.sequencer_group()));
+    dec = c.parent().map_err(sbe_err)?;
+    m.insert("record".into(), Value::Object(cm));
+    m.insert("nodeId".into(), json!(dec.node_id()));
+    m.insert("protocolVersion".into(), json!(dec.protocol_version()));
+    m.insert("stateVersion".into(), json!(dec.state_version()));
+    m.insert("binaryHash".into(), json!(bytes_str(&dec.binary_hash())));
+    let (offset, len) = dec.state_decoder();
+    m.insert("state".into(), json!(String::from_utf8_lossy(&buf[offset..offset + len])));
     let _ = &mut dec;
     Ok(Value::Object(m))
 }

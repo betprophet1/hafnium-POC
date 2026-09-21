@@ -363,6 +363,28 @@
     <field name="seedLow" id="4" type="Seed"/>
   </sbe:message>
 
+  <!-- A snapshot of the engine's state after the input named by `record.sequence`, written between inputs by an
+       engine replaying the journal and never by the one serving traffic (spec E-20.1, E-20.10). It is not an input:
+       the engine does not apply it, its sequence is that of the input it follows rather than one of its own, and a
+       reader with no use for it skips it by template id. Its presence is what lets the journal before it be archived
+       and cut, because recovery can begin here instead of at sequence 1.
+
+       `state` is the canonical encoding of spec §20: logical state only, every keyed table ascending by key, books
+       walked by tick and then in queue order, no slot numbers and no table sizes. Two engines the specification
+       cannot tell apart produce identical bytes here (E-20.2), which is the property the whole scheme rests on.
+
+       The encoding is versioned separately from this schema. A snapshot is a description of one release's state,
+       and a reader that does not implement `stateVersion` must refuse the snapshot rather than guess at it; the
+       journal it sits in is still readable, and replaying from an earlier point is always available. -->
+  <sbe:message name="Snapshot" id="53" description="The engine's canonical state after this sequence (spec §20)">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="nodeId" id="2" type="NodeId"/>
+    <field name="protocolVersion" id="3" type="ProtocolVersion"/>
+    <field name="stateVersion" id="4" type="ProtocolVersion"/>
+    <field name="binaryHash" id="5" type="BinaryHash"/>
+    <data name="state" id="6" type="varDataEncoding"/>
+  </sbe:message>
+
   <!-- ===== Service commands (interfaces 14 and 25); each yields one CommandApplied ===== -->
 
   <sbe:message name="ActivateProtocol" id="80" description="Deploy dark, activate by event: behaviour changes at this log position on every replica">

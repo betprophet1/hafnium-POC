@@ -35,6 +35,7 @@ make this document executable.
 17. Sequencer obligations
 18. Fail-stop
 19. Not in v0
+20. Canonical snapshots
 
 ---
 
@@ -674,12 +675,117 @@ levels they admit, so storage a release frees (E-8.4) must be reusable by any la
 
 These are required eventually and deliberately absent from v0, so that nothing is half-specified:
 
-- `TransferOut` and `TransferIn`: their state encoding belongs to the snapshot specification (work package
-  WP-9). Until then the engine rejects both with `INVALID_COMMAND`.
-- Canonical snapshot encoding and the snapshot-equivalence property.
+- `TransferOut` and `TransferIn`: the event-state encoding they carry (§20 specifies the snapshot encoding
+  they are a slice of, but not which events may move or what the destination group does with them). Until
+  then the engine rejects both with `INVALID_COMMAND`.
 - RFQ requests, quotes and acceptances (blueprint §2).
 - Risk-group margining and floor advances across separate mints (blueprint §8).
 - Designated-maker allocation privileges, split FIFO and top-order allocation.
 - Quote lifespans, per-event notional caps, move-based halts, maximum GTC lifetime.
 - Dormant book paging (blueprint §10), which must not change any result when added.
 - Order-level (L3) market data.
+
+---
+
+## 20. Canonical snapshots
+
+A snapshot is the engine's state written out so that another engine can be put into that state and carry on.
+It exists so that recovery, and a reader joining the feed, need not replay from the first input: replay from
+genesis stops being practical within weeks (blueprint §4), and a journal that can never be cut can never be
+archived (§12).
+
+**E-20.1** A snapshot is taken **between inputs**, never during one. The state it describes is the state after
+the input named by its `lastSequence` and before any later input. An engine that has fail-stopped (§18) must not
+be snapshotted: its state is the state at which processing stopped, and nothing may continue from it.
+
+**E-20.2** A snapshot is **logical, not physical**. It carries what the rules of this specification observe, and
+nothing about how an implementation arranged it. In particular it carries no slab slot, no pool offset, no free
+list, no hash-table position, no ring-buffer head, no heap permutation and no table capacity. Two engines that
+this specification cannot tell apart must produce byte-identical snapshots, whatever their histories.
+
+**E-20.3 Contents.** A snapshot carries exactly the state of E-3.1, and the following, which E-3.1 leaves to an
+implementation but which is observable through E-3.3:
+
+| State | Contents |
+|---|---|
+| Fee accounting | `unitSerial`; per account `feesUnit` and `feesCharged` |
+
+`unitSerial` numbers the units of work an engine has completed, so that fees charged in one unit are not counted
+against the available-cash floor of the next (E-3.3). An account's `feesCharged` is read only when its `feesUnit`
+equals the current `unitSerial`. Carrying the accounts without the serial would leave a stale `feesUnit` able to
+collide with the restored numbering, and the floor would then be computed from fees charged in a unit that this
+engine never ran. An encoder may instead write `feesUnit` and `feesCharged` as their initial values for every
+account and `unitSerial` as zero, since a snapshot is taken between units and no account's fees are then in
+force; it must do one or the other, and the same one every time.
+
+**E-20.4 Order.** Every keyed table is written ascending by key: tick tables by `tickTableId`, events by
+`eventId`, instruments by `instrumentId`, orders by `orderId`, accounts by `accountId`, holdings by
+`(accountId, instrumentId)`, event cash by `(accountId, eventId)`, order groups by `(accountId, clientOrderGroup)`,
+maker settings and counters by `(accountId, eventId)`, duplicates by `(accountId, clientOrderId)`, commands by
+`commandId`. Fee overrides are written by `(accountId, priority, overrideId)`. Within a tick table, rows are
+written in their given order, which is the order that defines them.
+
+Books are written per instrument in `instrumentId` order, within an instrument `BUY` before `SELL`, within a side
+by tick ascending, and within a tick **in queue order, head first** — the order in which the orders would match.
+This is the only place where the order of a snapshot carries information that no key could: time priority is
+state, and losing it would change every later fill.
+
+The release queue (E-8.4) is written in the order events will be released, which is the order they resolved.
+
+**E-20.5 Entries at their initial value are not written.** E-3.2 says an account exists from its first mention and
+that until then every field has its initial value; an account whose every field holds its initial value is
+therefore indistinguishable from one never mentioned, and writing it would make two engines this specification
+cannot tell apart produce different bytes. The same holds for every other keyed table. A decoder creates an entry
+when it reads one, and answers for any other key exactly as it answers for a key never mentioned.
+
+**E-20.6 What a decoder rebuilds.** A snapshot does not carry state that is determined by what it does carry. A
+decoder recomputes, and must arrive at: each account's `reserved` (the sum of its orders' `reserved`), each
+level's quantity and order count, each book's occupancy, the group's and each account's resting-order counts, and
+the carried counts that E-6.5 keeps against `maxEvents`, `maxInstruments` and `maxPriceLevels`. An implementation
+that cannot recompute one of these from the snapshot's contents has found a gap in E-20.3 rather than a reason to
+add a field.
+
+**E-20.7 Capacity is not carried, and the omission is safe in one direction only.** Table sizes are an
+implementation's, not this specification's (D-30), and a snapshot is restored into an engine whose tables may be
+larger, smaller or differently shaped. Nor does a snapshot carry the residue that a running engine accumulates:
+records in the duplicate and command windows whose entries have already gone, GTD records for orders no longer
+resting, and fee overrides that have expired. All of these are invisible to every rule in this specification
+except one — `FailStop::Capacity` (E-18.3) — because they occupy room until something reclaims them.
+
+A restored engine therefore holds **no residue at all**, and so has at least as much room as the engine the
+snapshot was taken from. Restoring can postpone a capacity fail-stop; it cannot bring one forward. This is what
+makes E-20.2 sound rather than merely convenient, and it is why the equivalence property below is stated for runs
+that do not fail-stop on capacity: within that regime the two runs agree exactly, and outside it the restored run
+is the one that survives longer.
+
+**E-20.8 Restoring.** An engine restored from a snapshot has `lastSequence` and `now` from the snapshot, and is
+in every other respect as if it had replayed every input up to that sequence. E-4.1 then applies unchanged: the
+next input's `record.sequence` must equal `lastSequence + 1`. A restored engine is not a fresh engine, and the
+initial values of E-3.1 describe only an engine that has been given no snapshot.
+
+An engine must refuse a snapshot it cannot honour: one whose `protocolVersion` it does not implement, or whose
+contents do not fit its tables. Refusing is not a fail-stop — nothing has been processed — and an operator may
+retry with a larger engine.
+
+**E-20.9 The equivalence property.** For a journal, a sequence `N` and a later sequence `M`, let *direct* be a
+fresh engine that applies every input from 1 to `M`, and *restored* be a fresh engine given the snapshot that
+*direct* would take after `N`, which then applies every input from `N+1` to `M`. Provided neither run fail-stops,
+and neither would fail-stop on capacity (E-20.7):
+
+- the results the two engines emit for inputs `N+1` to `M` are byte-identical, in the same order; and
+- the snapshots the two engines take after `M` are byte-identical.
+
+This holds for any `N`, and whatever table sizes, hash seeds or prior churn *restored* was built with. The second
+half is what makes the property worth testing: equal results could be produced by two engines whose state had
+already diverged in a way no input had yet reached.
+
+**E-20.10 Who takes a snapshot.** A snapshot is taken by an engine replaying the journal, never by the engine
+serving traffic (blueprint §4): the hot path does not pause to serialise itself. Because replay is deterministic,
+a snapshot taken this way is the same snapshot the serving engine would have taken, which E-20.9 is the statement
+of.
+
+**E-20.11 Snapshots carry no personal data**, because engine state carries none: an account is an identifier, and
+the mapping from it to a person lives only in the accounts database (blueprint §12). A snapshot may therefore be
+moved, copied and restored wherever the journal may go, and a test environment restored from one holds no more
+personal data than the journal it came from. What may not be copied into a test environment is the accounts
+database, which is where the mapping is and which no snapshot touches.
