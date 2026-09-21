@@ -31,6 +31,9 @@ export type Market = {
   label: string;
   title: string;
   state: string;
+  /** What kind of market it is. `parlay` is one the venue listed to answer a request for quote, and it cannot be a
+   * leg of another: a parlay of parlays is refused (core/parlays/src/rules.rs, canonical). */
+  class: string;
   /** Set once the market has resolved, and then the book is gone. */
   outcome?: string | null;
 };
@@ -117,6 +120,67 @@ export type OrderRequest = {
   outcome: Outcome;
   price: { tick: number };
   quantity: number;
+  /** Left out, the order rests until it is cancelled. `IOC` is what taking a quote wants: fill against what is
+   * there now and cancel the rest, rather than leaving a resting order behind when the quote has already gone. */
+  timeInForce?: "GTC" | "IOC" | "FOK";
+};
+
+/** One leg of a parlay, as the app asks for it: a market and which way it has to go. */
+export type ParlayLegInput = { instrumentId: string; outcome: Outcome };
+
+/** One leg of a parlay, as the venue names it back, with the words a person reads. */
+export type ParlayLeg = {
+  eventId: string;
+  instrumentId: string;
+  outcome: Outcome;
+  /** The event's title, e.g. "Who wins the final?". */
+  title: string;
+  /** The market's label within that event, e.g. "Team A". */
+  label: string;
+};
+
+/** A request for quote: legs, how many contracts, and how long anyone has to answer it.
+ *
+ * `instrumentId` is the parlay the venue listed for these legs, which is a market like any other — the quotes are
+ * real sell orders resting on its book, and taking one is an ordinary buy. */
+export type Rfq = {
+  requestId: string;
+  instrumentId: string;
+  eventId: string;
+  legs: ParlayLeg[];
+  quantity: number;
+  /** Contracts trade in multiples of this, and a request is for at least one multiple. */
+  lotStep: number;
+  openedAt: string;
+  expiresAt: string;
+  /** Only on the answer to making a request: whether this request is what listed the parlay. */
+  listed?: boolean;
+  /** Only on the answer to making a request: how many responders it reached. Zero means nobody was listening, so
+   * no quote is coming however long the window runs. */
+  responders?: number;
+};
+
+/** A firm quote: a sell order resting on the parlay's book, which the requester may take at that price. */
+export type Quote = {
+  requestId: string;
+  orderId: string;
+  instrumentId: string;
+  price: Price;
+  /** Contracts still available. Falls as it is filled. */
+  quantity: number;
+  /** Contracts already bought, by anyone. */
+  filled: number;
+  /** When the quote lapses. Null means it rests until the responder cancels it. */
+  expiresAt?: string | null;
+  state: "open" | "filled" | "expired" | "cancelled";
+};
+
+/** A request with the quotes that have come in for it, from GET /v4/rfqs/{requestId}. */
+export type RfqStatus = Rfq & {
+  listed: boolean;
+  /** Whether the window is still running. Once false no new quote will arrive. */
+  open: boolean;
+  quotes: Quote[];
 };
 
 /** What the venue answered an order with. A rejected order is an answer, not an error: the venue took the request

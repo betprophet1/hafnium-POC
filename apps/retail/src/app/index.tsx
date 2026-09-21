@@ -61,6 +61,9 @@ export default function Markets() {
       }>
       <View style={styles.bar}>
         <Text style={styles.status}>{member ? `${member.email}${live ? ' · live' : ' · connecting'}` : 'Not signed in'}</Text>
+        <Link href="/parlays" style={styles.link}>
+          Parlays
+        </Link>
         <Link href="/account" style={styles.link}>
           {member ? 'Account' : 'Sign in'}
         </Link>

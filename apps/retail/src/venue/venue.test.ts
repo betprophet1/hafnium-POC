@@ -5,6 +5,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Venue, marketsOf } from "./client";
+import {
+  byEvent,
+  filledContracts,
+  legsOk,
+  money,
+  offerable,
+  payoutCents,
+  quantityOk,
+  secondsUntil,
+} from "./parlay";
 import { BUILT_IN, fallback, readKept, stillOffered, withBuiltIn } from "./environment";
 import { openPrivateStream, higher } from "./stream";
 import type { Timers, WebSocketLike } from "./stream";
@@ -181,7 +191,7 @@ describe("the venue client", () => {
       {
         eventId: "1000001",
         title: "Will it rain in London tomorrow?",
-        markets: [{ instrumentId: "100000100", label: "Rain", state: "OPEN" }],
+        markets: [{ instrumentId: "100000100", label: "Rain", class: "binary", state: "OPEN" }],
       },
     ]);
     assert.deepEqual(markets, [
@@ -191,9 +201,132 @@ describe("the venue client", () => {
         label: "Rain",
         title: "Will it rain in London tomorrow?",
         state: "OPEN",
+        class: "binary",
         outcome: null,
       },
     ]);
+  });
+
+  // A venue that does not send `class` is older than parlays, so nothing it lists is one. Calling such a market
+  // binary keeps it offerable as a leg; the alternative, guessing "parlay", would hide every market on that venue.
+  it("calls a market binary when the venue did not say what kind it is", () => {
+    const markets = marketsOf([
+      {
+        eventId: "1000001",
+        title: "Will it rain in London tomorrow?",
+        markets: [{ instrumentId: "100000100", label: "Rain", state: "OPEN" }],
+      },
+    ]);
+    assert.equal(markets[0].class, "binary");
+  });
+
+  it("asks for quotes on a parlay, then reads what came back for it", async () => {
+    const rfq = {
+      requestId: "r7x",
+      instrumentId: "4503599627370496",
+      eventId: "4503599627370496",
+      legs: [
+        { eventId: "1000001", instrumentId: "100000100", outcome: "yes", title: "Rain?", label: "Rain" },
+        { eventId: "1000002", instrumentId: "100000200", outcome: "no", title: "Snow?", label: "Snow" },
+      ],
+      quantity: 20,
+      lotStep: 10,
+      openedAt: "2026-09-21T12:00:00Z",
+      expiresAt: "2026-09-21T12:00:30Z",
+      listed: true,
+      responders: 2,
+    };
+    const quote = {
+      requestId: "r7x",
+      orderId: "900001",
+      instrumentId: "4503599627370496",
+      price: { tick: 40, cents: "4", probability: "0.0400", american: "+2400" },
+      quantity: 20,
+      filled: 0,
+      expiresAt: "2026-09-21T12:00:25Z",
+      state: "open",
+    };
+    const { doFetch, asked } = fetchStub([
+      { status: 200, body: rfq },
+      { status: 200, body: { ...rfq, open: true, quotes: [quote] } },
+    ]);
+    const venue = new Venue({ baseUrl: "https://venue.test", credential: "vs_x.aa", fetch: doFetch });
+
+    const opened = await venue.requestQuote(
+      [
+        { instrumentId: "100000100", outcome: "yes" },
+        { instrumentId: "100000200", outcome: "no" },
+      ],
+      20,
+    );
+    assert.equal(opened.requestId, "r7x");
+    assert.equal(opened.responders, 2);
+
+    const status = await venue.rfq(opened.requestId);
+    assert.equal(status.open, true);
+    assert.equal(status.quotes[0].price.cents, "4");
+
+    // The legs go as the venue words them — `outcome`, not a boolean — and the request is named by the path, never
+    // in the body, which the gateway refuses.
+    assert.equal(asked[0].method, "POST");
+    assert.equal(asked[0].url, "https://venue.test/v4/rfqs");
+    assert.deepEqual(asked[0].body, {
+      legs: [
+        { instrumentId: "100000100", outcome: "yes" },
+        { instrumentId: "100000200", outcome: "no" },
+      ],
+      quantity: 20,
+    });
+    assert.equal(asked[1].method, "GET");
+    assert.equal(asked[1].url, "https://venue.test/v4/rfqs/r7x");
+    assert.equal(asked[1].auth, "Bearer vs_x.aa");
+  });
+
+  it("gives back the venue's own words when a request for quote is refused", async () => {
+    const { doFetch } = fetchStub([
+      {
+        status: 400,
+        body: { error: { code: "BAD_REQUEST", message: "a request is for at least 10 contracts" } },
+      },
+    ]);
+    const venue = new Venue({ baseUrl: "https://venue.test", credential: "vs_x.aa", fetch: doFetch });
+    await assert.rejects(
+      () => venue.requestQuote([{ instrumentId: "100000100", outcome: "yes" }], 1),
+      (e: unknown) => {
+        assert.ok(e instanceof VenueError);
+        assert.equal(e.code, "BAD_REQUEST");
+        assert.equal(e.message, "a request is for at least 10 contracts");
+        return true;
+      },
+    );
+  });
+
+  // Taking a quote is an ordinary buy, and IOC is the part that matters: a resting order left on a parlay nobody is
+  // quoting any more is not what somebody who pressed "buy at 4¢" asked for.
+  it("takes a quote as an immediate-or-cancel buy of YES at the quote's tick", async () => {
+    const { doFetch, asked } = fetchStub([
+      { status: 200, body: { status: "filled", orderId: "900002", sequence: "42", executions: [] } },
+    ]);
+    const venue = new Venue({ baseUrl: "https://venue.test", credential: "vs_x.aa", fetch: doFetch });
+    await venue.placeOrder({
+      clientOrderId: "parlay-abc",
+      instrumentId: "4503599627370496",
+      action: "buy",
+      outcome: "yes",
+      price: { tick: 40 },
+      quantity: 20,
+      timeInForce: "IOC",
+    });
+    assert.equal(asked[0].url, "https://venue.test/v4/orders");
+    assert.deepEqual(asked[0].body, {
+      clientOrderId: "parlay-abc",
+      instrumentId: "4503599627370496",
+      action: "buy",
+      outcome: "yes",
+      price: { tick: 40 },
+      quantity: 20,
+      timeInForce: "IOC",
+    });
   });
 });
 
@@ -377,5 +510,87 @@ describe("the private stream", () => {
     assert.equal(higher("9", "10"), "10", "ten comes after nine");
     assert.equal(higher("10", "9"), "10");
     assert.equal(higher("100000000000000002", "100000000000000010"), "100000000000000010");
+  });
+});
+
+describe("building a parlay", () => {
+  const market = (eventId: string, instrumentId: string, label: string, kind = "binary", state = "open") => ({
+    instrumentId,
+    eventId,
+    label,
+    title: `Event ${eventId}`,
+    state,
+    class: kind,
+    outcome: null,
+  });
+
+  it("offers only markets that are trading, and never a parlay as a leg of another", () => {
+    const markets = [
+      market("1", "101", "Rain"),
+      market("1", "102", "No rain", "binary", "halted"),
+      market("2", "201", "Arsenal"),
+      // The venue lists one of these for every request; picking it as a leg is refused, so it is not shown.
+      market("9", "901", "Parlay: Rain and Arsenal", "parlay"),
+    ];
+    assert.deepEqual(
+      offerable(markets).map((m) => m.instrumentId),
+      ["101", "201"],
+    );
+  });
+
+  it("groups the markets under their event, which is what stops two legs on one", () => {
+    const grouped = byEvent([market("1", "101", "Rain"), market("2", "201", "Arsenal"), market("1", "102", "Snow")]);
+    assert.deepEqual(
+      grouped.map((g) => [g.eventId, g.markets.length]),
+      [
+        ["1", 2],
+        ["2", 1],
+      ],
+    );
+  });
+
+  it("knows which leg counts and quantities the venue would take", () => {
+    assert.equal(legsOk(1), false, "a parlay of one is just a market");
+    assert.equal(legsOk(2), true);
+    assert.equal(legsOk(6), true);
+    assert.equal(legsOk(7), false);
+    assert.equal(quantityOk(10), true);
+    assert.equal(quantityOk(20), true);
+    assert.equal(quantityOk(15), false, "off the lot step");
+    assert.equal(quantityOk(0), false);
+    assert.equal(quantityOk(1.5), false);
+    assert.equal(quantityOk(Number.NaN), false, "an empty box is not a quantity");
+  });
+
+  // The wire carries an `accepted` execution beside each `fill`, and an order that filled completely still answers
+  // `accepted` rather than `filled`. Counting anything but the fills gets this wrong in both directions.
+  it("counts contracts from the fills, not from the status or every execution", () => {
+    const answer = {
+      status: "accepted",
+      orderId: "900002",
+      sequence: "34",
+      executions: [
+        { type: "accepted", orderId: "900002", instrumentId: "45", quantity: 20, remaining: 20, sequence: "34" },
+        { type: "fill", orderId: "900002", instrumentId: "45", quantity: 20, remaining: 0, sequence: "34" },
+      ],
+    };
+    assert.equal(filledContracts(answer), 20);
+    assert.equal(filledContracts({ ...answer, executions: [] }), 0, "the quote had already gone");
+  });
+
+  // A contract pays a dollar. The price paid for it — fractions of a cent, for a long parlay — is not the payout,
+  // and saying so would be wrong by orders of magnitude.
+  it("pays a dollar a contract, whatever the contract cost", () => {
+    assert.equal(payoutCents(20), 2000);
+    assert.equal(money(payoutCents(20)), "$20.00");
+    assert.equal(money(payoutCents(1)), "$1.00");
+  });
+
+  it("counts a window down, and says nothing is left rather than a negative number", () => {
+    const now = Date.parse("2026-09-21T12:00:00Z");
+    assert.equal(secondsUntil("2026-09-21T12:00:30Z", now), 30);
+    assert.equal(secondsUntil("2026-09-21T11:59:30Z", now), 0, "already over");
+    assert.equal(secondsUntil(null, now), 0, "a quote that rests until cancelled");
+    assert.equal(secondsUntil("not a time", now), 0);
   });
 });

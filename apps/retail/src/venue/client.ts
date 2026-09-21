@@ -16,6 +16,9 @@ import type {
   Member,
   OrderAnswer,
   OrderRequest,
+  ParlayLegInput,
+  Rfq,
+  RfqStatus,
   TotpStart,
 } from "./types";
 
@@ -165,6 +168,21 @@ export class Venue {
     return this.call<unknown>("DELETE", `/v4/orders/${orderId}`);
   }
 
+  /** Asks for quotes on a parlay of these legs: two to six of them, one per event, each on an open market.
+   *
+   * The answer names the parlay the venue listed for the legs and says how many responders the request reached.
+   * Nothing is bought here and nothing is owed — a request is an invitation, and `responders: 0` means nobody was
+   * listening, so no quote is coming however long the window runs. */
+  async requestQuote(legs: ParlayLegInput[], quantity: number): Promise<Rfq> {
+    return this.call<Rfq>("POST", "/v4/rfqs", { legs, quantity });
+  }
+
+  /** A request and the quotes standing against it now. Asked for again while the window is open: quotes arrive
+   * over the private stream too, but this app reads the book by asking, as the market screen does. */
+  async rfq(requestId: string): Promise<RfqStatus> {
+    return this.call<RfqStatus>("GET", `/v4/rfqs/${requestId}`);
+  }
+
   /** A deposit through the treasury's fake bank, which is how a test environment gets money into an account. */
   async deposit(cents: number, method: string): Promise<unknown> {
     return this.call<unknown>("POST", "/v4/transfers", { direction: "deposit", amountCents: cents, method });
@@ -222,7 +240,7 @@ function safeJson(text: string): unknown {
 type EventAnswer = {
   eventId: string;
   title: string;
-  markets: { instrumentId: string; label: string; state: string; outcome?: string | null }[];
+  markets: { instrumentId: string; label: string; class?: string; state: string; outcome?: string | null }[];
 };
 
 export function marketsOf(events: EventAnswer[]): Market[] {
@@ -235,6 +253,9 @@ export function marketsOf(events: EventAnswer[]): Market[] {
         label: market.label,
         title: event.title,
         state: market.state,
+        // The API makes `class` required, but an older venue may not send it; "binary" is the ordinary kind and the
+        // only consequence of guessing it here is that such a market stays offerable as a parlay leg.
+        class: market.class ?? "binary",
         outcome: market.outcome ?? null,
       });
     }
