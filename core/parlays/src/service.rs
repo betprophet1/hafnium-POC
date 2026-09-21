@@ -315,6 +315,8 @@ pub fn start(catalogue: Catalogue, config: &Config) -> Result<Arc<Service>, Erro
                 // view, which is the one way this could be worse than what it replaces.
                 state.last_unit_ns = 0;
                 state.in_flight.clear();
+                // The view was just discarded, so everything is wanted again.
+                0
             },
             |unit| follower.on_unit(&unit),
         );

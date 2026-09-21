@@ -100,8 +100,12 @@ fn frames_of(path: &Path) -> Result<Vec<Value>, Error> {
     }
 }
 
-/// Follows a node's feed for ever. `on_connect` runs before every connection's backlog, so a reader can start over.
-pub fn follow(addr: &str, on_connect: impl FnMut(), on_unit: impl FnMut(Unit)) -> ! {
+/// Follows a node's feed for ever.
+///
+/// `on_connect` runs before every connection's backlog and answers with the last sequence this reader already
+/// holds — zero to be sent everything, which is what a reader that starts over each time returns. Answering
+/// honestly is what makes a reconnect cost what was missed rather than the whole journal.
+pub fn follow(addr: &str, on_connect: impl FnMut() -> u64, on_unit: impl FnMut(Unit)) -> ! {
     follow_reporting(addr, on_connect, on_unit, |e| eprintln!("feed {addr}: {e}"))
 }
 
@@ -109,16 +113,21 @@ pub fn follow(addr: &str, on_connect: impl FnMut(), on_unit: impl FnMut(Unit)) -
 /// process that logs in its own format.
 pub fn follow_reporting(
     addr: &str,
-    mut on_connect: impl FnMut(),
+    mut on_connect: impl FnMut() -> u64,
     mut on_unit: impl FnMut(Unit),
     mut on_error: impl FnMut(&str),
 ) -> ! {
     loop {
         match TcpStream::connect(addr) {
-            Ok(stream) => {
-                on_connect();
-                if let Err(e) = read_units(stream, &mut on_unit) {
-                    on_error(&format!("{e}; reconnecting"));
+            Ok(mut stream) => {
+                let resume_from = on_connect();
+                match stream.write_all(&resume_from.to_le_bytes()).and_then(|()| stream.flush()) {
+                    Ok(()) => {
+                        if let Err(e) = read_units(stream, &mut on_unit) {
+                            on_error(&format!("{e}; reconnecting"));
+                        }
+                    }
+                    Err(e) => on_error(&format!("{e}; reconnecting")),
                 }
             }
             Err(e) => on_error(&format!("{e}; retrying")),

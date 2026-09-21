@@ -321,14 +321,28 @@ fn publish(subscribers: &mut Vec<Live>, metrics: &NodeMetrics, input: &[u8], res
 /// Sends a subscriber the journal and result log up to the given lengths, pairing each input with its results by
 /// sequence number, then every live unit. The lengths were taken, and the live channel registered, at one point
 /// in the main loop, so nothing is missed or repeated.
+///
+/// A subscriber opens by saying where it has got to: eight little-endian bytes, the last sequence it holds, or
+/// zero for everything. A reader that reconnects after a moment's network trouble then costs what it missed
+/// rather than the whole journal, which is the difference between a reconnect that is free and one that grows
+/// without bound as the venue runs.
+///
+/// The backlog is still *read* in full — the result log is walked in step with the journal, so the pairing has to
+/// see every frame — but only what follows the subscriber's position is sent.
 fn serve_subscriber(
-    stream: TcpStream,
+    mut stream: TcpStream,
     journal: (&Path, u64),
     results: (&Path, u64),
     live: Receiver<Unit>,
     progress: &Subscriber,
 ) -> Result<(), Error> {
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    // A subscriber that says nothing is one that has gone; the timeout is what stops its thread waiting for ever.
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut position = [0u8; 8];
+    stream.read_exact(&mut position)?;
+    let resume_from = u64::from_le_bytes(position);
+    stream.set_read_timeout(None)?;
     let mut out = BufWriter::new(stream);
     let mut inputs = BufReader::new(File::open(journal.0)?.take(journal.1));
     let mut outputs = BufReader::new(File::open(results.0)?.take(results.1));
@@ -344,7 +358,8 @@ fn serve_subscriber(
             write_frame(&mut batch, &result[..m])?;
             pending = read_frame(&mut outputs, &mut result)?;
         }
-        if !quiet(&input[..n], &batch) {
+        // Read in full, sent from where the subscriber left off.
+        if sequence > resume_from && !quiet(&input[..n], &batch) {
             out.write_all(&unit(&input[..n], &batch)?)?;
         }
     }

@@ -323,6 +323,10 @@ fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
             || {
                 follower.hub().restart();
                 follower.metrics.feed_connected();
+                // `restart` throws the view away, so this gateway asks for the journal from the beginning. It is
+                // the reader with most to gain from answering otherwise — its view is rebuilt on every reconnect,
+                // and that cost grows with the journal — but carrying a view across a reconnect is its own change.
+                0
             },
             |unit| {
                 let record = &unit.input["record"];
