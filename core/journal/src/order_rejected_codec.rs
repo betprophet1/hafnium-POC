@@ -238,7 +238,9 @@ pub mod encoder {
             };
             self
         }
+
     }
+
 } // end encoder
 
 pub mod decoder {
@@ -282,7 +284,13 @@ pub mod decoder {
     }
 
     impl<'a> OrderRejectedDecoder<'a> {
-        pub fn wrap(mut self, buf: ReadBuf<'a>, offset: usize, acting_block_length: u16, acting_version: u16) -> Self {
+        pub fn wrap(
+            mut self,
+            buf: ReadBuf<'a>,
+            offset: usize,
+            acting_block_length: u16,
+            acting_version: u16,
+        ) -> Self {
             let limit = offset + acting_block_length as usize;
             self.buf = buf;
             self.initial_offset = offset;
@@ -360,5 +368,8 @@ pub mod decoder {
                 Some(value)
             }
         }
+
     }
+
 } // end decoder
+

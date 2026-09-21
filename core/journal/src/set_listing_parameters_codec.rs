@@ -212,7 +212,9 @@ pub mod encoder {
             self.get_buf_mut().put_u32_at(offset, value);
             self
         }
+
     }
+
 } // end encoder
 
 pub mod decoder {
@@ -256,7 +258,13 @@ pub mod decoder {
     }
 
     impl<'a> SetListingParametersDecoder<'a> {
-        pub fn wrap(mut self, buf: ReadBuf<'a>, offset: usize, acting_block_length: u16, acting_version: u16) -> Self {
+        pub fn wrap(
+            mut self,
+            buf: ReadBuf<'a>,
+            offset: usize,
+            acting_block_length: u16,
+            acting_version: u16,
+        ) -> Self {
             let limit = offset + acting_block_length as usize;
             self.buf = buf;
             self.initial_offset = offset;
@@ -326,5 +334,8 @@ pub mod decoder {
         pub fn max_price_levels(&self) -> u32 {
             self.get_buf().get_u32_at(self.offset + 46)
         }
+
     }
+
 } // end decoder
+

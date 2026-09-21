@@ -176,7 +176,9 @@ pub mod encoder {
             self.get_buf_mut().put_u16_at(offset, value);
             self
         }
+
     }
+
 } // end encoder
 
 pub mod decoder {
@@ -220,7 +222,13 @@ pub mod decoder {
     }
 
     impl<'a> TransferOutDecoder<'a> {
-        pub fn wrap(mut self, buf: ReadBuf<'a>, offset: usize, acting_block_length: u16, acting_version: u16) -> Self {
+        pub fn wrap(
+            mut self,
+            buf: ReadBuf<'a>,
+            offset: usize,
+            acting_block_length: u16,
+            acting_version: u16,
+        ) -> Self {
             let limit = offset + acting_block_length as usize;
             self.buf = buf;
             self.initial_offset = offset;
@@ -274,5 +282,8 @@ pub mod decoder {
         pub fn destination_group(&self) -> u16 {
             self.get_buf().get_u16_at(self.offset + 42)
         }
+
     }
+
 } // end decoder
+
