@@ -20,7 +20,7 @@ npm run build:web               # a static site in dist/
 | | |
 |---|---|
 | `src/venue/` | The venue, in TypeScript and nothing else: the REST client, the private stream, the types and where a session is kept. No React. This is what `npm test` tests, and what a different front end would keep if the screens were thrown away. |
-| `src/app/` | The screens, as Expo Router's files: `index` (markets), `market/[id]` (book and ticket), `account` (sign in, balances, resting orders). |
+| `src/app/` | The screens, as Expo Router's files: `index` (markets), `market/[id]` (book and ticket), `account` (sign in, balances, resting orders), `parlays` (picking legs, asking for quotes, taking one). |
 | `src/venue/storage.ts` and `storage.web.ts` | The one real difference between the platforms: a phone keeps the session in the keychain or keystore (`expo-secure-store`), behind the phone's own lock, and a browser keeps it in `localStorage`, because a browser has neither a keychain nor a reader. The bundler picks the file; nothing else in the app knows, and `unlockKind()` answers `"none"` on the web so the screens simply do not offer it. |
 
 Responsiveness is measured, not guessed: the markets list is one column on a phone and as many as fit a wide window,
@@ -127,8 +127,13 @@ so the way back is the address the app was built with rather than a claim made b
 
 ## What it does not do yet
 
-Deposits (the venue's own page does them), parlays, settlement, market search, price history, push notifications, and
+Deposits (the venue's own page does them), settlement, market search, price history, push notifications, and
 anything a store would ask for before it listed a real-money app.
+
+The parlay screen asks for its quotes rather than being sent them. Quotes reach a private session over the stream as
+they are attached, but the stream here only logs in and heartbeats — there is no way to send an op on it — so the
+screen asks again every two seconds while a request's window is open, as the market screen does with the book. When
+the stream grows a send path, `subscribeRfqs` is what this should use instead.
 
 The codes that prove an address and set a password arrive by mail, and a test venue has no mail provider: the
 messages sit in the identity service's outbox and the venue's own page lists them (`GET /v4/mail`, on only where the

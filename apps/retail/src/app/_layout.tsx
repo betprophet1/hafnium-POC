@@ -15,6 +15,7 @@ export default function RootLayout() {
           <Stack.Screen name="index" options={{ title: 'Markets' }} />
           <Stack.Screen name="market/[id]" options={{ title: 'Market' }} />
           <Stack.Screen name="account" options={{ title: 'Account' }} />
+          <Stack.Screen name="parlays" options={{ title: 'Parlays' }} />
         </Stack>
       </ThemeProvider>
     </VenueProvider>

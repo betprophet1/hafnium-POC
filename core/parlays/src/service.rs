@@ -135,6 +135,9 @@ struct Request {
 struct State {
     view: View,
     caught_up: bool,
+    /// When the last unit arrived, by the wall clock, or 0 before any has. A feed that has gone quiet and a feed
+    /// that is behind look the same from `caught_up` alone; this is what separates them (`ready`).
+    last_unit_ns: u64,
     requests: BTreeMap<String, Request>,
     /// The request each open quote's order answers.
     by_order: BTreeMap<u64, String>,
@@ -151,6 +154,31 @@ struct State {
 type Update = (u64, Option<u64>, Option<u64>, Option<&'static str>, u64);
 
 impl State {
+    /// Whether the view is current enough to answer from: caught up with the feed, or at the head of a feed that has
+    /// gone quiet.
+    ///
+    /// The second half is the fix to a deadlock, and it is worth saying why it is not just a weakened `caught_up`.
+    /// The feed carries commands and nothing else — no heartbeat, no tick — so `caught_up`, which is worked out from
+    /// the age of a unit as that unit arrives, stops being recomputed the moment the venue goes quiet. Start this
+    /// service more than `CAUGHT_UP_NANOS` after a venue was last traded and the only units it will ever see are the
+    /// replayed ones, already too old to count as current, with nothing behind them. It then refuses every request
+    /// for as long as nobody trades — and nobody can trade a parlay, because that is what it is refusing. Waiting
+    /// cannot mend it: the next unit would, and there is no next unit. Every idle venue starts this way.
+    ///
+    /// Silence is read as being at the head rather than behind it only because the alternative reading — a sequencer
+    /// wedged with its socket still open — cannot be told apart from silence here, and is the less costly of the two
+    /// to get wrong. Nothing is being sequenced during a wedge, so a quote offered against a stale view is one whose
+    /// orders cannot fill either; they wait for the wedge to clear and are then checked by the engine, which is the
+    /// authority on the book in any case. A dropped feed is a different matter and is handled where it happens, by
+    /// clearing `last_unit_ns` along with the view.
+    ///
+    /// **Acting is still gated on `caught_up` alone** (`on_unit`). Answering that a parlay may be quoted is a claim
+    /// about what is listed; halting or closing one is a move made on the venue's behalf, and making that move on a
+    /// picture of the past would take down a parlay that is fine now. Only the first of those is relaxed here.
+    fn current(&self) -> bool {
+        self.caught_up || (self.last_unit_ns != 0 && wall_ns().saturating_sub(self.last_unit_ns) >= CAUGHT_UP_NANOS)
+    }
+
     /// The requests still open that `account` may answer and `filter` selects, oldest first: never the account's own.
     fn open_for(&self, account: u64, filter: &Filter) -> Vec<(&String, &Request)> {
         let mut open: Vec<(&String, &Request)> = self
@@ -282,6 +310,10 @@ pub fn start(catalogue: Catalogue, config: &Config) -> Result<Arc<Service>, Erro
                 let mut state = locked(&follower.state);
                 state.view = View::default();
                 state.caught_up = false;
+                // The view has just been thrown away, so there is no last unit any more. Leaving the old stamp here
+                // would make `current` read a dropped feed as a quiet one two seconds later and answer from an empty
+                // view, which is the one way this could be worse than what it replaces.
+                state.last_unit_ns = 0;
                 state.in_flight.clear();
             },
             |unit| follower.on_unit(&unit),
@@ -308,7 +340,8 @@ impl Service {
             let mut state = locked(&self.state);
             state.view.apply(unit);
             let sequenced_at = unit.input["record"]["sequencedAt"].as_u64().unwrap_or(0);
-            state.caught_up = wall_ns().saturating_sub(sequenced_at) < CAUGHT_UP_NANOS;
+            state.last_unit_ns = wall_ns();
+            state.caught_up = state.last_unit_ns.saturating_sub(sequenced_at) < CAUGHT_UP_NANOS;
             let news = state.track_quotes(&unit.results);
             let (now, sequence) = (state.view.now, state.view.sequence);
             state.requests.retain(|_, r| {
@@ -557,9 +590,9 @@ impl Service {
         locked(&self.approvals).health()
     }
 
-    /// Whether the service has caught up with the feed and can open requests.
+    /// Whether the service is far enough along to answer requests. See `State::current`.
     pub fn ready(&self) -> bool {
-        locked(&self.state).caught_up
+        locked(&self.state).current()
     }
 
     fn call(&self, call: &Value) -> Result<Value, Failure> {
@@ -619,7 +652,7 @@ impl Service {
             .collect();
         let (legs, parlay, inputs) = {
             let state = locked(&self.state);
-            if !state.caught_up {
+            if !state.current() {
                 return Err(unavailable("the parlay service is catching up with the feed"));
             }
             let legs = rules::canonical(&state.view, &wanted).map_err(|r| match r {
@@ -822,5 +855,29 @@ mod tests {
         );
         // A restarted service has forgotten every request: nothing to catch up with, and nothing wrongly offered.
         assert!(State::default().open_for(10, &Filter::default()).is_empty());
+    }
+
+    /// A venue nobody is trading must not look the same as a feed this service is behind on. It is the same feed
+    /// either way — one with no heartbeat on it — so the two are told apart by how long it has been since a unit
+    /// arrived, and being at the head of a quiet feed counts as current.
+    #[test]
+    fn a_quiet_feed_is_told_apart_from_one_the_service_is_behind_on() {
+        let old = wall_ns() - CAUGHT_UP_NANOS * 2;
+
+        assert!(!State::default().current(), "nothing has arrived yet: the view is empty, not current");
+
+        let behind = State { caught_up: false, last_unit_ns: wall_ns(), ..State::default() };
+        assert!(!behind.current(), "a unit just arrived carrying an old timestamp: there is a backlog, so wait");
+
+        let quiet = State { caught_up: false, last_unit_ns: old, ..State::default() };
+        assert!(quiet.current(), "the last unit is long past and no other came: this is the head of a quiet venue");
+
+        let trading = State { caught_up: true, last_unit_ns: wall_ns(), ..State::default() };
+        assert!(trading.current(), "keeping up with a busy feed");
+
+        // What the feed thread leaves behind when the connection drops (`follow`'s on_connect). Without the cleared
+        // stamp this would turn into "quiet" two seconds later and answer from a view that had just been discarded.
+        let dropped = State { caught_up: false, last_unit_ns: 0, ..State::default() };
+        assert!(!dropped.current(), "a dropped feed is not a quiet one");
     }
 }

@@ -1,0 +1,37 @@
+# Prometheus keeping its data on a disk, and keeping it for weeks rather than days.
+#
+#   KPS_VALUES=deploy/observability/values/prometheus-history.yaml deploy/observability/install.sh
+#
+# The base values file is sized for a laptop: two days of retention on an `emptyDir`, which is the right default for
+# a cluster that is thrown away at the end of the afternoon. On a cluster that stays up it has two consequences that
+# are easy to miss, because nothing breaks — the graphs simply have no past:
+#
+#   - `emptyDir` lives and dies with the pod. Every restart, eviction, node reboot or `helm upgrade` that rolls
+#     Prometheus starts the history again from nothing.
+#   - two days is shorter than the preview reaper's own clock (36 hours from the last push, deploy/argocd/reaper.yaml)
+#     by less than a day, so an environment's whole life is only just inside the window, and anything you want to ask
+#     the morning after — when did it go, was it reaped or did it fail — is already gone.
+#
+# The "Environments" dashboard is the one that suffers most: it is drawn from the *absence* of series, so a Prometheus
+# that has forgotten an environment and one that never saw it look exactly alike.
+#
+# **This does not make the data durable in the way a managed service would.** `local-path` is a directory on the node,
+# so the history survives the pod but not the node; if the node is replaced, it goes with it. That is the trade this
+# file makes deliberately — a node-local directory costs nothing on a disk already paid for, where an EBS volume per
+# environment is a line on the bill. For history that must outlive the cluster, send it somewhere that is not the
+# cluster: the base values file has a commented `remoteWrite` block for exactly that.
+prometheus:
+  prometheusSpec:
+    # Comfortably past the reaper's 36 hours, so a preview's whole life and the gap after it are both on the graph.
+    retention: 15d
+    # The size limit is the one that actually binds, and it must stay under the volume with room to spare: Prometheus
+    # enforces it by deleting whole blocks after the fact, so the disk is always a little ahead of the limit.
+    retentionSize: 6GB
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          # Whatever the cluster's default is. On k3s that is `local-path`, the same one Loki's claim uses.
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 8Gi
