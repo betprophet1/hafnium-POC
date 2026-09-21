@@ -14,6 +14,7 @@ import {
   payoutCents,
   quantityOk,
   secondsUntil,
+  stillTrading,
 } from "./parlay";
 import { BUILT_IN, fallback, readKept, stillOffered, withBuiltIn } from "./environment";
 import { openPrivateStream, higher } from "./stream";
@@ -592,5 +593,50 @@ describe("building a parlay", () => {
     assert.equal(secondsUntil("2026-09-21T11:59:30Z", now), 0, "already over");
     assert.equal(secondsUntil(null, now), 0, "a quote that rests until cancelled");
     assert.equal(secondsUntil("not a time", now), 0);
+  });
+});
+
+describe("a ticket that outlives its round", () => {
+  const market = (eventId: string, instrumentId: string, label: string, kind = "binary", state = "open") => ({
+    instrumentId,
+    eventId,
+    label,
+    title: `Event ${eventId}`,
+    state,
+    class: kind,
+    outcome: null,
+  });
+  const pick = (instrumentId: string) => ({
+    instrumentId,
+    outcome: "yes" as const,
+    title: "Event",
+    label: "Label",
+  });
+
+  // This is what actually went wrong in use: rounds roll every couple of minutes, the screen held the list it had
+  // loaded on open, and the request went out naming a market that had closed. The venue takes it and no responder
+  // can price it, so it reads as a quote that never comes rather than as a mistake.
+  it("drops a leg whose market has stopped trading", () => {
+    const picks = new Map([
+      ["1", pick("101")],
+      ["2", pick("201")],
+    ]);
+    const now = [market("1", "101", "Rain"), market("2", "201", "Arsenal", "binary", "closed")];
+    const kept = stillTrading(picks, now);
+    assert.deepEqual([...kept.keys()], ["1"]);
+  });
+
+  it("drops a leg whose market has gone from the list entirely, as a finished round does", () => {
+    const picks = new Map([["2", pick("201")]]);
+    assert.equal(stillTrading(picks, [market("1", "101", "Rain")]).size, 0);
+  });
+
+  it("keeps every leg while the round is still trading", () => {
+    const picks = new Map([
+      ["1", pick("101")],
+      ["2", pick("201")],
+    ]);
+    const now = [market("1", "101", "Rain"), market("2", "201", "Arsenal")];
+    assert.equal(stillTrading(picks, now).size, 2);
   });
 });

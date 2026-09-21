@@ -17,6 +17,7 @@ import { ActivityIndicator, Pressable, RefreshControl, ScrollView, StyleSheet, V
 
 import {
   LOT_STEP,
+  MARKETS_REFRESH_MS,
   MAX_LEGS,
   MIN_LEGS,
   byEvent,
@@ -27,6 +28,7 @@ import {
   payoutCents,
   quantityOk,
   secondsUntil,
+  stillTrading,
   type Pick,
 } from '@/venue/parlay';
 import { useVenue } from '@/venue/session';
@@ -44,20 +46,36 @@ export default function ParlaysScreen() {
   const [sending, setSending] = useState(false);
   const [taking, setTaking] = useState<string | null>(null);
   const [answer, setAnswer] = useState<OrderAnswer | null>(null);
+  // Legs taken off the ticket because their market stopped trading, so that it is said rather than just happening.
+  const [dropped, setDropped] = useState(0);
   // A clock the countdowns read, so they tick without anything being asked for again.
   const [now, setNow] = useState(() => Date.now());
 
   const load = useCallback(async () => {
     try {
-      setMarkets(await venue.markets());
+      const fresh = await venue.markets();
+      setMarkets(fresh);
+      // A leg that has stopped trading is dropped rather than carried: the venue would refuse the request, and a
+      // request built on a market whose book has gone is one no responder can price.
+      setPicks((current) => {
+        const kept = stillTrading(current, fresh);
+        if (kept.size !== current.size) {
+          setDropped(current.size - kept.size);
+        }
+        return kept.size === current.size ? current : kept;
+      });
       setFailed(null);
     } catch (e) {
       setFailed(message(e));
     }
   }, [venue]);
 
+  // Asked for again as it goes, because rounds roll while somebody is choosing: the round on the screen when this
+  // opened is often not the round that is trading by the time they press the button.
   useEffect(() => {
     void load();
+    const again = setInterval(() => void load(), MARKETS_REFRESH_MS);
+    return () => clearInterval(again);
   }, [load]);
 
   useEffect(() => {
@@ -89,6 +107,7 @@ export default function ParlaysScreen() {
   const enoughLegs = legsOk(chosen.length);
 
   const pick = (eventId: string, market: Market, outcome: Outcome) => {
+    setDropped(0);
     setPicks((current) => {
       const next = new Map(current);
       const had = next.get(eventId);
@@ -151,6 +170,7 @@ export default function ParlaysScreen() {
 
   const clear = () => {
     setPicks(new Map());
+    setDropped(0);
     setRfq(null);
     setNote(null);
     setAnswer(null);
@@ -208,6 +228,12 @@ export default function ParlaysScreen() {
             {leg.title} · {leg.label} {leg.outcome.toUpperCase()}
           </Text>
         ))}
+        {dropped > 0 ? (
+          <Text style={styles.failed}>
+            {dropped === 1 ? 'A leg stopped trading and was taken off' : `${dropped} legs stopped trading and were taken off`}
+            : that round has finished. Pick again from the markets above.
+          </Text>
+        ) : null}
         {!enoughLegs && chosen.length > 0 ? (
           <Text style={styles.note}>
             {chosen.length < MIN_LEGS

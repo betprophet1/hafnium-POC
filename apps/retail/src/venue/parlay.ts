@@ -45,6 +45,28 @@ export function byEvent(markets: Market[]): { eventId: string; title: string; ma
   return [...events.values()];
 }
 
+/** How often the market list is asked for again while somebody is building a parlay.
+ *
+ * Faster than the markets screen's fifteen seconds, because a stale list costs more here. There it means a card
+ * shows the wrong state for a moment; here it means a leg is picked that has already stopped trading, and the
+ * request is either refused or — worse, because it looks like nothing — accepted and never quoted, since no
+ * responder can price a leg whose book has gone. */
+export const MARKETS_REFRESH_MS = 5_000;
+
+/** The picks that are still worth keeping, given the markets as they are now.
+ *
+ * Rounds roll every few minutes: the market picked a moment ago may have closed, and its event may have been
+ * replaced by the next round with new instrument IDs. Dropping those is the honest thing to do — the alternative
+ * is a ticket that looks ready and cannot be filled. */
+export function stillTrading(picks: Map<string, Pick>, markets: Market[]): Map<string, Pick> {
+  const live = new Set(offerable(markets).map((m) => m.instrumentId));
+  const kept = new Map<string, Pick>();
+  for (const [eventId, pick] of picks) {
+    if (live.has(pick.instrumentId)) kept.set(eventId, pick);
+  }
+  return kept;
+}
+
 /** How many contracts an order actually bought.
  *
  * Counted from the fills, which is not the same as reading `status`: an order that filled completely still answers
