@@ -87,8 +87,21 @@ spec:
               value: letsencrypt
             # Without this the app is refused by the browser before it can do anything at all: the app is served
             # from its own origin and every call to this venue is cross-origin (decision G-15).
+            #
+            # The development origins are here because pointing a local app at a preview is most of what a preview
+            # is for: `EXPO_PUBLIC_VENUE_URL=https://pr-7-something.<domain>` against a browser on port 8081, which
+            # is what `expo start --web` serves on. The live venue has allowed them since it was first exposed, so
+            # leaving them off here made a preview *stricter than production* — the one direction that teaches the
+            # wrong lesson, because the app works against prod and fails against the environment built to test it.
+            # Nothing is reachable through them that the credential in the browser could not already reach.
+            #
+            # **The commas are escaped, and must be.** A parameter here becomes `helm --set`, which reads a comma as
+            # the separator between one key=value and the next. `allowedOrigins` is itself a comma-separated string,
+            # so an unescaped list does not merely arrive mangled — the whole parameter is dropped and the gateway
+            # renders with no `VENUE_ALLOWED_ORIGINS` at all, which is *fewer* origins than before, silently. A
+            # single-quoted scalar is what keeps the backslashes: YAML rejects `\,` inside double quotes.
             - name: gateway.allowedOrigins
-              value: "https://app.venue.example"
+              value: 'https://app.venue.example\,http://localhost:8081\,http://127.0.0.1:8081'
             # The image built from this very commit, and the credential to pull it with. Without these a preview
             # deploys the branch's chart against whatever image is already on the node: healthy, convincing and
             # testing the wrong binary. The workflow in .github/workflows/preview-image.yml puts it there, tagged
