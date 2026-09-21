@@ -176,3 +176,13 @@ spec:
           # The migrate job is a pre-upgrade hook and the chart's own; leaving its history behind fills the namespace
           # with completed pods for no one's benefit.
           - PruneLast=true
+        # The comment above says a namespace left behind is worth less than nothing, and `prune` does not take one
+        # away: a namespace made by `CreateNamespace` is not among the Application's resources, so nothing prunes
+        # it. The pods go, the volumes go, and an empty namespace stays — one for every pull request that ever had
+        # an environment, each still holding the registry credential copied into it.
+        #
+        # This label is how they are found again. Without it, anything cleaning up would be guessing from a name
+        # which namespaces were ArgoCD's to delete, and `venue` is one character away from `venue-pr-1`.
+        managedNamespaceMetadata:
+          labels:
+            venue.environment: preview

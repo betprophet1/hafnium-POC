@@ -124,6 +124,7 @@ case "${1:-}" in
     sed "s/venue\\.example/$domain/" "$argocd/applicationset.yaml" | kubectl apply -f - >/dev/null
     kubectl apply -f "$argocd/reaper.yaml" >/dev/null
     kubectl apply -f "$argocd/pull-secret.yaml" >/dev/null
+    kubectl apply -f "$argocd/namespace-cleanup.yaml" >/dev/null
     echo "   previews will answer on pr-<number>.$domain"
     echo
     echo "still to do by hand, because each needs a secret this script will not invent:"

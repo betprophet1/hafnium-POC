@@ -1,0 +1,35 @@
+# Grafana on a hostname, for a cluster where looking at it through a port-forward is not wanted.
+#
+#   sed 's/venue\.example/<your domain>/' deploy/observability/values/grafana-ingress.yaml > /tmp/grafana.yaml
+#   KPS_VALUES=/tmp/grafana.yaml deploy/observability/install.sh
+#
+# **This puts a login box on the internet.** What is behind it can query everything the venue emits and read every
+# log the cluster collects, so it is a deliberate choice rather than a default: the stack exposes nothing unless
+# something like this file says to. The password is the one the chart generated into the Secret `grafana` and keeps
+# across upgrades — it is long and random, which is the only thing standing in front of this:
+#
+#   kubectl -n monitoring get secret grafana -o jsonpath='{.data.admin-password}' | base64 -d
+#
+# Sign-up and anonymous access are off in the stack's own values, so the only way in is that password. If this is
+# going to stay exposed, put an identity provider in front of it (grafana.ini auth.generic_oauth) rather than
+# relying on one shared login for ever.
+grafana:
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    annotations:
+      # The same issuer the venue's own ingress uses, so this gets a real certificate the same way.
+      cert-manager.io/cluster-issuer: letsencrypt
+    hosts:
+      - grafana.venue.example
+    path: /
+    pathType: Prefix
+    tls:
+      - secretName: grafana-tls
+        hosts:
+          - grafana.venue.example
+  # Grafana builds absolute URLs from this — for redirects after login, and for the links in an alert. Left unset it
+  # guesses from the request, which works until something in front of it rewrites a header.
+  grafana.ini:
+    server:
+      root_url: https://grafana.venue.example

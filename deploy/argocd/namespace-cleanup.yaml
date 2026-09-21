@@ -1,0 +1,112 @@
+# Takes away a preview's namespace once nothing owns it.
+#
+# `prune` does not. A namespace made by `CreateNamespace=true` is not one of the Application's resources, so when
+# the Application goes the pods and the volumes go with it and the namespace stays — empty, for ever, one for every
+# pull request that ever had an environment, each still holding the registry credential that was copied into it.
+# One is nothing; a year of them is hundreds of namespaces and hundreds of stale credentials.
+#
+# **What makes this safe to give a delete to.** Deleting namespaces is the most dangerous thing anything here does,
+# and `venue` is one character from `venue-pr-1`. So a namespace has to pass three tests before this touches it:
+#
+#   - it carries `venue.environment=preview`, which only ArgoCD puts there (`managedNamespaceMetadata` in
+#     applicationset.yaml) — a name alone would be a guess
+#   - its name still matches `venue-pr-<number>`, so a label copied somewhere odd is not enough on its own
+#   - no Application of that name exists, which is what "nothing owns it" means
+#
+# The last one is the real test and the other two are there in case it is ever wrong. A namespace whose Application
+# is merely unhealthy still has one, so it is left alone; this waits for ArgoCD to have let go.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: venue-namespace-cleanup
+  namespace: argocd
+spec:
+  # Every ten minutes. A namespace nobody owns costs nothing by the minute, so this is about tidiness rather than
+  # urgency; the reaper takes an environment down on a much longer clock than this runs.
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: venue-namespace-cleanup
+          containers:
+            - name: cleanup
+              image: alpine/k8s:1.31.1
+              command: ["/bin/sh", "-euo", "pipefail", "-c"]
+              args:
+                - |
+                  # `|| true` because no leftovers is the ordinary state: grep exits 1 when it matches nothing, and
+                  # under pipefail that would fail the job on a tidy cluster.
+                  kubectl get namespace -l venue.environment=preview -o name \
+                    | sed 's|^namespace/||' \
+                    | { grep -E '^venue-pr-[0-9]+$' || true; } \
+                    | while read -r ns; do
+                        number="${ns#venue-pr-}"
+                        if kubectl get application -n argocd "venue-pr-$number" >/dev/null 2>&1; then
+                          echo "$ns: still has an Application, leaving it"
+                          continue
+                        fi
+                        echo "$ns: nothing owns it, taking it away"
+                        kubectl delete namespace "$ns" --wait=false
+                      done
+                  echo "done"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: venue-namespace-cleanup
+  namespace: argocd
+---
+# Namespaces must be listed cluster-wide to be found and deleted where they are; Applications are read in `argocd`
+# only, and only read. Nothing else is granted: this cannot make a namespace, change one, or touch what is inside
+# one — it can only take away an empty one that ArgoCD has let go of.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: venue-namespace-cleanup
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: venue-namespace-cleanup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: venue-namespace-cleanup
+subjects:
+  - kind: ServiceAccount
+    name: venue-namespace-cleanup
+    namespace: argocd
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: venue-namespace-cleanup
+  namespace: argocd
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: venue-namespace-cleanup
+  namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: venue-namespace-cleanup
+subjects:
+  - kind: ServiceAccount
+    name: venue-namespace-cleanup
+    namespace: argocd
