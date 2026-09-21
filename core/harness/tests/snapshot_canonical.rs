@@ -15,6 +15,7 @@
 //! test and it arrives with the decoder.
 
 use serde_json::{json, Value};
+use venue_engine::snapshot::{Refused, STATE_VERSION};
 use venue_engine::state::Capacities;
 use venue_engine::{Engine, EngineConfig, FailStop};
 use venue_harness::codec;
@@ -31,13 +32,36 @@ struct Venue<'a> {
 }
 
 impl Venue<'_> {
+    /// Applies an input and insists it was taken.
+    ///
+    /// `apply` returning `Ok` means only that the engine did not fail-stop: a refused command and a rejected order
+    /// are ordinary results. Letting those through is how every test in this file once passed against a venue that
+    /// had never come into existence — a tick table refused for an out-of-range complement, and with it the
+    /// instrument, the market and every order. An empty engine encodes and restores perfectly.
     fn send(&mut self, after: u64, mut input: Value) -> Result<(), FailStop> {
         self.sequence += 1;
         self.at += after;
         input["record"] = json!({"sequence": self.sequence, "sequencedAt": self.at, "sequencerGroup": 1});
         let mut buf = vec![0u8; 1 << 16];
         let len = codec::encode(&input, &mut buf).expect("the input encodes");
-        self.engine.apply(&buf[..len], &mut Collect::default())
+        let mut sink = Collect::default();
+        let outcome = self.engine.apply(&buf[..len], &mut sink);
+        if outcome.is_ok() {
+            for raw in &sink.0 {
+                let result = codec::decode(raw).expect("a result decodes");
+                let refused = match result["msg"].as_str() {
+                    Some("OrderRejected") => result["reason"].as_str().map(str::to_string),
+                    Some("CommandApplied") if result["outcome"].as_str() != Some("APPLIED") => {
+                        Some(format!("{}", result["outcome"]))
+                    }
+                    _ => None,
+                };
+                if let Some(reason) = refused {
+                    panic!("the venue refused {}: {reason}", input["msg"]);
+                }
+            }
+        }
+        outcome
     }
 
     fn snapshot(&mut self) -> Vec<u8> {
@@ -53,13 +77,12 @@ fn venue(owned: &mut OwnedMemory, seed: u64) -> Venue<'_> {
     Venue { engine: Engine::new(config, owned.memory()).expect("an engine"), sequence: 0, at: START }
 }
 
-/// A venue with two events, four markets and a book on each, plus the state that hides in corners: fee overrides,
-/// rule limits, an order group, a maker setting, closed-only accounts, a GTD order and spent client order IDs.
-fn build(v: &mut Venue<'_>) {
+/// Everything an order needs to exist: the ladder, the events, the markets and the money.
+fn setup(v: &mut Venue<'_>) {
     let table = json!({"msg": "DefineTickTable", "commandId": "t1", "tickTableId": 1,
-                       "ticks": [{"tick": 0, "numerator": 1, "denominator": 100, "complement": 98},
-                                 {"tick": 1, "numerator": 2, "denominator": 100, "complement": 97},
-                                 {"tick": 2, "numerator": 50, "denominator": 100, "complement": 49}]});
+                       "ticks": [{"tick": 0, "numerator": 25, "denominator": 100, "complement": 2},
+                                 {"tick": 1, "numerator": 50, "denominator": 100, "complement": 1},
+                                 {"tick": 2, "numerator": 75, "denominator": 100, "complement": 0}]});
     v.send(1, table).expect("a tick table");
 
     for (event, instruments) in [(10u64, [100u64, 101]), (20, [200, 201])] {
@@ -117,7 +140,10 @@ fn build(v: &mut Venue<'_>) {
                      "maxContractsFilledPerWindow": 5, "windowMillis": 1000}),
     )
     .expect("maker protection");
+}
 
+/// The orders that stay, and the state that hides in corners around them.
+fn orders(v: &mut Venue<'_>) {
     // Orders at several ticks, on both sides, in an order that gives the queues something to preserve.
     let mut n = 0;
     for (account, instrument, side, tick) in [
@@ -156,6 +182,12 @@ fn build(v: &mut Venue<'_>) {
     v.send(SECOND, json!({"msg": "TimeTick"})).expect("a tick");
 }
 
+/// A venue, with no churn: what most of these tests want.
+fn build(v: &mut Venue<'_>) {
+    setup(v);
+    orders(v);
+}
+
 /// The same venue, built into engines with different seeds and different tables, snapshots identically.
 #[test]
 fn a_snapshot_does_not_depend_on_how_the_maps_are_laid_out() {
@@ -175,7 +207,7 @@ fn a_snapshot_does_not_depend_on_how_the_maps_are_laid_out() {
         holdings: 2_048,
         ..Capacities::small()
     });
-    let mut two = venue(&mut other, 0xd1ffe5eed);
+    let mut two = venue(&mut other, 0x_d1ff_e5ee);
     build(&mut two);
     let second = two.snapshot();
 
@@ -228,4 +260,115 @@ fn a_snapshot_that_does_not_fit_is_refused() {
     build(&mut v);
     let mut tiny = [0u8; 8];
     assert_eq!(v.engine.snapshot(&mut tiny), Err(FailStop::Capacity), "a short buffer was written past");
+}
+
+/// Churn: orders placed and cancelled, so the order free list is permuted and later orders land in reused slots.
+/// Without it, an engine fed inputs fills its slab ascending and a restored engine's slabs come out identical by
+/// accident rather than by the encoding — which is exactly how the test above passed a deliberately leaked slot
+/// number.
+fn churn(v: &mut Venue<'_>) {
+    // Order IDs are assigned by the exchange: the group in the high bits, then a counter from 1 (E-2.8).
+    let id = |n: u64| (1u64 << 48) + n;
+    let mut placed = 0u64;
+    for round in 0..6u64 {
+        v.send(
+            1,
+            json!({"msg": "NewOrder", "accountId": 1, "clientOrderId": format!("churn{round}"),
+                   "instrumentId": 100, "side": "BUY", "tick": 2, "quantity": 1}),
+        )
+        .expect("a churn order rests");
+        placed += 1;
+        v.send(1, json!({"msg": "CancelOrder", "accountId": 1, "instrumentId": 100, "orderId": id(placed)}))
+            .expect("the churn order is cancelled");
+    }
+}
+
+/// E-20.9, the half a decoder makes reachable: a snapshot restored into an engine built differently, and laid out
+/// differently, describes the same venue — so snapshotting it again gives the same bytes.
+///
+/// This is the test the encoder alone could not have. A restored engine rebuilds every slab from the encoding, so
+/// its slots, its free list and its pool offsets are its own.
+#[test]
+fn a_snapshot_restored_into_a_different_engine_describes_the_same_venue() {
+    let mut source = OwnedMemory::new(&Capacities::small());
+    let mut one = venue(&mut source, 0x5eed);
+    setup(&mut one);
+    churn(&mut one);
+    orders(&mut one);
+    let first = one.snapshot();
+
+    let mut other = OwnedMemory::new(&Capacities {
+        orders: 4_096,
+        duplicates: 1_024,
+        commands: 512,
+        accounts: 512,
+        holdings: 2_048,
+        ..Capacities::small()
+    });
+    let config = EngineConfig { sequencer_group: 1, binary_hash: [0; 32], table_seed: 0x_d1ff_e5ee };
+    let mut restored = Engine::new(config, other.memory()).expect("an engine");
+    restored.restore(STATE_VERSION, &first).expect("the snapshot restores");
+
+    let mut out = vec![0u8; 1 << 20];
+    let len = restored.snapshot(&mut out).expect("the restored engine snapshots");
+    out.truncate(len);
+    assert_eq!(first, out, "a restored engine described a different venue from the one it was given");
+}
+
+/// A restored engine carries on where the snapshot left off: E-4.1 wants the next sequence, not sequence 1.
+#[test]
+fn a_restored_engine_carries_on_from_the_sequence_it_was_given() {
+    let mut source = OwnedMemory::new(&Capacities::small());
+    let mut one = venue(&mut source, 0x5eed);
+    build(&mut one);
+    let taken = one.snapshot();
+    let at = one.sequence;
+    let when = one.at;
+
+    let mut other = OwnedMemory::new(&Capacities::small());
+    let config = EngineConfig { sequencer_group: 1, binary_hash: [0; 32], table_seed: 0x5eed };
+    let mut engine = Engine::new(config, other.memory()).expect("an engine");
+    engine.restore(STATE_VERSION, &taken).expect("the snapshot restores");
+    assert_eq!(engine.position().0, at, "the restored engine is not at the snapshot's sequence");
+
+    // The same input applied to both must leave them describing the same venue.
+    let mut two = Venue { engine, sequence: at, at: when };
+    one.send(SECOND, json!({"msg": "TimeTick"})).expect("a tick on the original");
+    two.send(SECOND, json!({"msg": "TimeTick"})).expect("a tick on the restored");
+    assert_eq!(one.snapshot(), two.snapshot(), "the two diverged on the first input after the snapshot");
+}
+
+/// A snapshot is restored into a fresh engine, never over the top of state already there (E-20.8).
+#[test]
+fn a_used_engine_refuses_a_snapshot() {
+    let mut source = OwnedMemory::new(&Capacities::small());
+    let mut one = venue(&mut source, 0x5eed);
+    build(&mut one);
+    let taken = one.snapshot();
+    assert_eq!(one.engine.restore(STATE_VERSION, &taken), Err(Refused::NotFresh));
+}
+
+/// An encoding this build does not implement is refused rather than guessed at (E-20.8).
+#[test]
+fn an_unknown_state_version_is_refused() {
+    let mut owned = OwnedMemory::new(&Capacities::small());
+    let config = EngineConfig { sequencer_group: 1, binary_hash: [0; 32], table_seed: 0x5eed };
+    let mut engine = Engine::new(config, owned.memory()).expect("an engine");
+    let next = STATE_VERSION + 1;
+    assert_eq!(engine.restore(next, &[]), Err(Refused::Version(next)));
+}
+
+/// Bytes that stop part-way are refused, not half-applied.
+#[test]
+fn a_truncated_snapshot_is_refused() {
+    let mut source = OwnedMemory::new(&Capacities::small());
+    let mut one = venue(&mut source, 0x5eed);
+    build(&mut one);
+    let taken = one.snapshot();
+
+    let mut owned = OwnedMemory::new(&Capacities::small());
+    let config = EngineConfig { sequencer_group: 1, binary_hash: [0; 32], table_seed: 0x5eed };
+    let mut engine = Engine::new(config, owned.memory()).expect("an engine");
+    let short = &taken[..taken.len() / 2];
+    assert!(matches!(engine.restore(STATE_VERSION, short), Err(Refused::Truncated | Refused::Malformed)));
 }

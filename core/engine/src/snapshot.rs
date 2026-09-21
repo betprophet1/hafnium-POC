@@ -21,9 +21,18 @@
 //! and leaving it out runs the safe way round: a restored engine has more room than the one it came from, never
 //! less (E-20.7, D-31).
 
+use crate::emit::{AtEventStart, MarketState, Side};
 use crate::fixed::FixedMap;
-use crate::state::{Instrument, TickTable, NONE};
+use crate::state::{
+    Account, Duplicate, Event, FeeOverride, FeeRates, Holding, Instrument, Level, MakerSetting, Order, OrderGroup,
+    RuleLimits, TickRow, TickTable, WindowCounter, NONE,
+};
 use crate::{Engine, FailStop};
+use venue_journal::allocation_policy::AllocationPolicy;
+use venue_journal::instrument_class::InstrumentClass;
+use venue_journal::self_match_prevention::SelfMatchPrevention;
+use venue_journal::time_in_force::TimeInForce;
+use venue_journal::venue_mode::VenueMode;
 
 /// The encoding this module writes, carried in `Snapshot.stateVersion`. A reader that does not implement it must
 /// refuse the snapshot rather than guess at it; the journal around it stays readable either way.
@@ -145,9 +154,10 @@ impl Engine<'_> {
         self.write_tick_tables(&mut w)?;
         self.write_events(&mut w)?;
         self.write_releases(&mut w)?;
-        self.write_instruments_and_books(&mut w)?;
-        self.write_orders(&mut w)?;
+        self.write_instruments(&mut w)?;
         self.write_accounts(&mut w)?;
+        self.write_orders(&mut w)?;
+        self.write_books(&mut w)?;
         self.write_holdings(&mut w)?;
         self.write_event_cash(&mut w)?;
         self.write_order_groups(&mut w)?;
@@ -261,10 +271,10 @@ impl Engine<'_> {
         Ok(())
     }
 
-    /// Instruments ascending by ID, each followed by its book: `BUY` before `SELL`, ticks ascending, and the
-    /// orders at a tick in queue order, head first — the order in which they would match (E-20.4).
-    fn write_instruments_and_books(&mut self, w: &mut Writer<'_>) -> Result<(), FailStop> {
-        let Self { instrument_index, instruments, levels, orders, tick_tables, scratch, .. } = self;
+    /// Instruments ascending by ID. Their books follow later, once the orders they name exist: see
+    /// [`Self::write_books`].
+    fn write_instruments(&mut self, w: &mut Writer<'_>) -> Result<(), FailStop> {
+        let Self { instrument_index, instruments, tick_tables, scratch, .. } = self;
         let mut n = 0;
         instrument_index.for_each(|&id, &slot| {
             scratch[n] = (id, u64::from(slot));
@@ -283,7 +293,25 @@ impl Engine<'_> {
             w.u64(inst.mask)?;
             w.u32(inst.position_limit)?;
             w.u8(inst.market_state as u8)?;
+        }
+        Ok(())
+    }
 
+    /// Each instrument's book, in the same instrument order: `BUY` before `SELL`, ticks ascending, and the orders
+    /// at a tick in queue order, head first — the order in which they would match.
+    ///
+    /// Written after the orders, not with the instruments, because a book names orders and a decoder reading one
+    /// has to have them already. Time priority is the one ordering here that no key can carry (E-20.4).
+    fn write_books(&mut self, w: &mut Writer<'_>) -> Result<(), FailStop> {
+        let Self { instrument_index, instruments, levels, orders, scratch, .. } = self;
+        let mut n = 0;
+        instrument_index.for_each(|&id, &slot| {
+            scratch[n] = (id, u64::from(slot));
+            n += 1;
+        });
+        scratch[..n].sort_unstable();
+        for &(_, slot) in scratch[..n].iter() {
+            let inst: &Instrument = instruments.get(slot as usize).ok_or(FailStop::Inconsistent)?;
             let ticks = usize::from(inst.table.len);
             for side in 0..2u8 {
                 // Count the occupied ticks first: the count precedes the entries, and a level is occupied when it
@@ -609,6 +637,605 @@ impl Engine<'_> {
             w.i32(o.taker_rate_micros)?;
             w.opt_u64(o.expires_at)?;
         }
+        Ok(())
+    }
+}
+
+/// Why a snapshot was refused.
+///
+/// Refusing is not a fail-stop (E-20.8): nothing has been processed, the engine is untouched, and an operator may
+/// try again with a larger engine or an older release. This is deliberately not a `FailStop` — a fail-stop says the
+/// venue has reached a state it must not continue from, and declining to read a file is not that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// The engine has already processed something. A snapshot is restored into a fresh engine, never over the top
+    /// of state that is already there.
+    NotFresh,
+    /// The bytes ran out part-way.
+    Truncated,
+    /// A value the encoding cannot hold, or a reference to something the snapshot does not contain.
+    Malformed,
+    /// An encoding this build does not implement (E-20.8). The journal around it is still readable.
+    Version(u16),
+    /// The contents do not fit this engine's tables.
+    TooLarge,
+}
+
+/// Reads what [`Writer`] wrote, refusing to run past the end.
+struct Reader<'b> {
+    buf: &'b [u8],
+    at: usize,
+}
+
+impl<'b> Reader<'b> {
+    fn new(buf: &'b [u8]) -> Self {
+        Self { buf, at: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'b [u8], Refused> {
+        let end = self.at.checked_add(n).ok_or(Refused::Truncated)?;
+        let got = self.buf.get(self.at..end).ok_or(Refused::Truncated)?;
+        self.at = end;
+        Ok(got)
+    }
+
+    fn u8(&mut self) -> Result<u8, Refused> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn bool(&mut self) -> Result<bool, Refused> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Refused::Malformed),
+        }
+    }
+
+    fn u16(&mut self) -> Result<u16, Refused> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().map_err(|_| Refused::Truncated)?))
+    }
+
+    fn u32(&mut self) -> Result<u32, Refused> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().map_err(|_| Refused::Truncated)?))
+    }
+
+    fn u64(&mut self) -> Result<u64, Refused> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().map_err(|_| Refused::Truncated)?))
+    }
+
+    fn i32(&mut self) -> Result<i32, Refused> {
+        Ok(i32::from_le_bytes(self.take(4)?.try_into().map_err(|_| Refused::Truncated)?))
+    }
+
+    fn i64(&mut self) -> Result<i64, Refused> {
+        Ok(i64::from_le_bytes(self.take(8)?.try_into().map_err(|_| Refused::Truncated)?))
+    }
+
+    fn opt_u64(&mut self) -> Result<Option<u64>, Refused> {
+        if self.bool()? {
+            Ok(Some(self.u64()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn opt_i64(&mut self) -> Result<Option<i64>, Refused> {
+        if self.bool()? {
+            Ok(Some(self.i64()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn opt_u32(&mut self) -> Result<Option<u32>, Refused> {
+        if self.bool()? {
+            Ok(Some(self.u32()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn count(&mut self) -> Result<usize, Refused> {
+        Ok(self.u32()? as usize)
+    }
+
+    fn limits(&mut self) -> Result<Option<RuleLimits>, Refused> {
+        if !self.bool()? {
+            return Ok(None);
+        }
+        Ok(Some(RuleLimits {
+            max_resting_orders: self.u32()?,
+            max_new_orders_per_second: self.u32()?,
+            max_order_to_trade_ratio_milli: self.u32()?,
+            ratio_free_orders_per_second: self.u32()?,
+        }))
+    }
+}
+
+/// An enum the encoding must round-trip: an unknown byte is a malformed snapshot rather than a null value, because
+/// the engine's own generated codecs answer `NullVal` for anything they do not know and that would restore a venue
+/// into a state no command could have put it in.
+fn known<T: Copy + PartialEq>(v: T, null: T) -> Result<T, Refused> {
+    if v == null {
+        Err(Refused::Malformed)
+    } else {
+        Ok(v)
+    }
+}
+
+impl Engine<'_> {
+    /// Puts this engine into the state a snapshot describes.
+    ///
+    /// The engine must be fresh. Everything a running engine carries beyond the state — which slot an order sits
+    /// in, where a book's levels are in the pool, which way round a hash table happens to be — is rebuilt here from
+    /// the contents, so a restored engine's layout is its own and has nothing to do with the layout of the engine
+    /// the snapshot was taken from. That is the point: it is what makes a snapshot a description of the venue.
+    ///
+    /// Derived state is recomputed rather than read (E-20.6): reserved totals, level aggregates, occupancy bitmaps,
+    /// resting counts and the carried counts E-6.5 keeps. A snapshot that cannot produce them has a gap in it.
+    pub fn restore(&mut self, state_version: u16, bytes: &[u8]) -> Result<(), Refused> {
+        if state_version != STATE_VERSION {
+            return Err(Refused::Version(state_version));
+        }
+        if self.last_sequence != 0 || self.now != 0 || self.accounts_used != 0 || self.instruments_used != 0 {
+            return Err(Refused::NotFresh);
+        }
+        let mut r = Reader::new(bytes);
+        self.read_scalars(&mut r)?;
+        self.read_tick_tables(&mut r)?;
+        self.read_events(&mut r)?;
+        self.read_releases(&mut r)?;
+        self.read_instruments(&mut r)?;
+        self.read_accounts(&mut r)?;
+        self.read_orders(&mut r)?;
+        self.read_books(&mut r)?;
+        self.read_holdings(&mut r)?;
+        self.read_event_cash(&mut r)?;
+        self.read_order_groups(&mut r)?;
+        self.read_maker(&mut r)?;
+        self.read_duplicates(&mut r)?;
+        self.read_commands(&mut r)?;
+        self.read_gtd(&mut r)?;
+        self.read_fee_overrides(&mut r)?;
+        if r.at != bytes.len() {
+            return Err(Refused::Malformed);
+        }
+        Ok(())
+    }
+
+    fn read_scalars(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        self.last_sequence = r.u64()?;
+        self.now = r.u64()?;
+        self.protocol_version = r.u16()?;
+        self.venue_mode = known(VenueMode::from(r.u8()?), VenueMode::NullVal)?;
+        self.active_order_limit = r.u32()?;
+        self.client_order_id_window_seconds = r.u32()?;
+        self.settled_retention_seconds = r.u32()?;
+        self.max_events = r.u32()?;
+        self.max_instruments = r.u32()?;
+        self.max_price_levels = r.u32()?;
+        self.next_order = r.u64()?;
+        self.next_trade = r.u64()?;
+        self.unit_serial = r.u64()?;
+        self.fee_schedule = FeeRates { maker_micros: r.i32()?, taker_micros: r.i32()? };
+        self.default_limits = r.limits()?;
+        Ok(())
+    }
+
+    fn read_tick_tables(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        for _ in 0..r.count()? {
+            let id = r.u32()?;
+            let len = r.u16()?;
+            let start = self.tick_rows_used;
+            let end = start.checked_add(usize::from(len)).ok_or(Refused::Malformed)?;
+            if end > self.tick_rows.len() {
+                return Err(Refused::TooLarge);
+            }
+            for row in start..end {
+                self.tick_rows[row] = TickRow { numerator: r.u32()?, denominator: r.u32()?, complement: r.u16()? };
+            }
+            self.tick_rows_used = end;
+            let table = TickTable { start: u32::try_from(start).map_err(|_| Refused::TooLarge)?, len };
+            self.tick_tables.insert(id, table).map_err(|_| Refused::TooLarge)?;
+        }
+        Ok(())
+    }
+
+    fn read_events(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        for _ in 0..r.count()? {
+            let id = r.u64()?;
+            let event = Event {
+                state_count: r.u8()?,
+                scheduled_start: r.u64()?,
+                started: r.bool()?,
+                suspended: r.bool()?,
+                ended: r.bool()?,
+                resolved: r.bool()?,
+                resolved_at: r.u64()?,
+                collateral: r.i64()?,
+                next_release: None,
+                first_instrument: NONE,
+                instrument_count: 0,
+            };
+            self.events.insert(id, event).map_err(|_| Refused::TooLarge)?;
+        }
+        Ok(())
+    }
+
+    /// The releases, in the order they will happen (E-8.4). The chain is rebuilt in the order it was written
+    /// rather than sorted, because that order is the state.
+    fn read_releases(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        let mut previous: Option<u64> = None;
+        for _ in 0..r.count()? {
+            let id = r.u64()?;
+            if !self.events.contains(&id) {
+                return Err(Refused::Malformed);
+            }
+            match previous {
+                None => self.release_head = Some(id),
+                Some(before) => {
+                    self.events.get_mut(&before).ok_or(Refused::Malformed)?.next_release = Some(id);
+                }
+            }
+            previous = Some(id);
+        }
+        self.release_tail = previous;
+        Ok(())
+    }
+
+    fn read_instruments(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        for _ in 0..r.count()? {
+            let id = r.u64()?;
+            let event_id = r.u64()?;
+            let class = known(InstrumentClass::from(r.u8()?), InstrumentClass::NullVal)?;
+            let table_id = r.u32()?;
+            let lot_step = r.u32()?;
+            let policy = known(AllocationPolicy::from(r.u8()?), AllocationPolicy::NullVal)?;
+            let mask = r.u64()?;
+            let position_limit = r.u32()?;
+            let market_state = known(MarketState::from(r.u8()?), MarketState::NullVal)?;
+            let table = *self.tick_tables.get(&table_id).ok_or(Refused::Malformed)?;
+
+            let per_side = usize::from(table.len);
+            let words = per_side.div_ceil(64);
+            let (levels_start, bits_start) = (self.levels_used, self.level_bits_used);
+            if levels_start + 2 * per_side > self.levels.len() || bits_start + 2 * words > self.level_bits.len() {
+                return Err(Refused::TooLarge);
+            }
+            let slot = self.instruments_used;
+            if slot >= self.instruments.len() {
+                return Err(Refused::TooLarge);
+            }
+            for l in &mut self.levels[levels_start..levels_start + 2 * per_side] {
+                *l = Level { quantity: 0, count: 0, head: NONE, tail: NONE };
+            }
+            for w in &mut self.level_bits[bits_start..bits_start + 2 * words] {
+                *w = 0;
+            }
+            self.instruments[slot] = Instrument {
+                in_use: true,
+                id,
+                event_id,
+                class,
+                table,
+                lot_step,
+                policy,
+                mask,
+                position_limit,
+                market_state,
+                next_in_event: NONE,
+                levels_start: u32::try_from(levels_start).map_err(|_| Refused::TooLarge)?,
+                bits_start: u32::try_from(bits_start).map_err(|_| Refused::TooLarge)?,
+            };
+            self.instruments_used = slot + 1;
+            self.levels_used = levels_start + 2 * per_side;
+            self.level_bits_used = bits_start + 2 * words;
+            // What E-6.5 counts against the listing limits, recomputed rather than carried (E-20.6).
+            self.instruments_carried += 1;
+            self.levels_carried += 2 * per_side;
+            self.level_bits_carried += 2 * words;
+            let slot32 = u32::try_from(slot).map_err(|_| Refused::TooLarge)?;
+            self.instrument_index.insert(id, slot32).map_err(|_| Refused::TooLarge)?;
+
+            // Append to the event's chain. Instruments arrive ascending by ID, which is the order the chain is
+            // kept in, so appending keeps it without a sort.
+            let event = self.events.get_mut(&event_id).ok_or(Refused::Malformed)?;
+            event.instrument_count = event.instrument_count.checked_add(1).ok_or(Refused::Malformed)?;
+            let mut at = event.first_instrument;
+            if at == NONE {
+                event.first_instrument = slot32;
+            } else {
+                while self.instruments[at as usize].next_in_event != NONE {
+                    at = self.instruments[at as usize].next_in_event;
+                }
+                self.instruments[at as usize].next_in_event = slot32;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_accounts(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        for _ in 0..r.count()? {
+            let id = r.u64()?;
+            let slot = self.accounts_used;
+            if slot >= self.accounts.len() {
+                return Err(Refused::TooLarge);
+            }
+            self.accounts[slot] = Account {
+                id,
+                balance: r.i64()?,
+                // Recomputed from the orders below (E-20.6).
+                reserved: 0,
+                closed_only: r.bool()?,
+                self_match_prevention: known(SelfMatchPrevention::from(r.u8()?), SelfMatchPrevention::NullVal)?,
+                second: r.opt_u64()?,
+                new_orders_in_second: r.u32()?,
+                fills_in_second: r.u32()?,
+                limits: r.limits()?,
+                first_order: NONE,
+                resting_orders: 0,
+                fees_charged: r.i64()?,
+                fees_unit: r.u64()?,
+            };
+            self.accounts_used = slot + 1;
+            self.account_index
+                .insert(id, u32::try_from(slot).map_err(|_| Refused::TooLarge)?)
+                .map_err(|_| Refused::TooLarge)?;
+        }
+        Ok(())
+    }
+
+    /// The orders, each into a slot of this engine's choosing. Their queues are rebuilt from the books that
+    /// follow; here they are only made to exist, indexed, and hung on their account's list — which is kept in no
+    /// useful order by design, so any order will do.
+    fn read_orders(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        for _ in 0..r.count()? {
+            let id = r.u64()?;
+            let account_id = r.u64()?;
+            let session_id = r.u64()?;
+            let client_order_id: [u8; 32] = r.take(32)?.try_into().map_err(|_| Refused::Truncated)?;
+            let instrument_id = r.u64()?;
+            let side = known(Side::from(r.u8()?), Side::NullVal)?;
+            let tick = r.u16()?;
+            let remaining = r.u32()?;
+            let time_in_force = known(TimeInForce::from(r.u8()?), TimeInForce::NullVal)?;
+            let expires_at = r.opt_u64()?;
+            let at_event_start = known(AtEventStart::from(r.u8()?), AtEventStart::NullVal)?;
+            let post_only = r.bool()?;
+            let reduce_only = r.bool()?;
+            let spend_cap_remaining = r.opt_i64()?;
+            let group = r.opt_u32()?;
+            let accepted_at = r.u64()?;
+            let lock = r.u32()?;
+            let reserved = r.i64()?;
+
+            let account_slot = *self.account_index.get(&account_id).ok_or(Refused::Malformed)?;
+            let instrument_slot = *self.instrument_index.get(&instrument_id).ok_or(Refused::Malformed)?;
+            let slot = self.free_order;
+            if slot == NONE {
+                return Err(Refused::TooLarge);
+            }
+            self.free_order = self.orders[slot as usize].account_next;
+
+            let first = self.accounts[account_slot as usize].first_order;
+            self.orders[slot as usize] = Order {
+                in_use: true,
+                id,
+                account_id,
+                account_slot,
+                session_id,
+                client_order_id,
+                instrument_slot,
+                side,
+                tick,
+                remaining,
+                time_in_force,
+                expires_at,
+                at_event_start,
+                post_only,
+                reduce_only,
+                spend_cap_remaining,
+                group,
+                accepted_at,
+                lock,
+                reserved,
+                prev: NONE,
+                next: NONE,
+                account_prev: NONE,
+                account_next: first,
+            };
+            if first != NONE {
+                self.orders[first as usize].account_prev = slot;
+            }
+            let account = &mut self.accounts[account_slot as usize];
+            account.first_order = slot;
+            account.resting_orders += 1;
+            // E-3.1: an account's reserved is always the sum of its orders' (E-20.6).
+            account.reserved = account.reserved.checked_add(reserved).ok_or(Refused::Malformed)?;
+            self.resting_orders += 1;
+            self.order_index.insert(id, slot).map_err(|_| Refused::TooLarge)?;
+        }
+        Ok(())
+    }
+
+    /// The queues, which is where an order's time priority comes back. The level's aggregates and the occupancy
+    /// bitmap are counted as the queue is walked rather than read (E-20.6).
+    fn read_books(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        for slot in 0..self.instruments_used {
+            let inst = self.instruments[slot];
+            let ticks = usize::from(inst.table.len);
+            let words = inst.words_per_side();
+            for side in 0..2usize {
+                let base = inst.levels_start as usize + side * ticks;
+                for _ in 0..r.count()? {
+                    let tick = usize::from(r.u16()?);
+                    if tick >= ticks {
+                        return Err(Refused::Malformed);
+                    }
+                    let mut previous = NONE;
+                    let (mut quantity, mut count) = (0u64, 0u32);
+                    for _ in 0..r.count()? {
+                        let id = r.u64()?;
+                        let order = *self.order_index.get(&id).ok_or(Refused::Malformed)?;
+                        let o = &mut self.orders[order as usize];
+                        // A book may only name its own orders, on its own side, at its own tick.
+                        if o.instrument_slot as usize != slot
+                            || usize::from(o.tick) != tick
+                            || (o.side as u8 as usize) != side
+                            || o.prev != NONE
+                            || o.next != NONE
+                        {
+                            return Err(Refused::Malformed);
+                        }
+                        o.prev = previous;
+                        quantity = quantity.checked_add(u64::from(o.remaining)).ok_or(Refused::Malformed)?;
+                        count = count.checked_add(1).ok_or(Refused::Malformed)?;
+                        if previous == NONE {
+                            self.levels[base + tick].head = order;
+                        } else {
+                            self.orders[previous as usize].next = order;
+                        }
+                        previous = order;
+                    }
+                    if previous == NONE {
+                        // A level was named with nothing in it; the encoder only writes occupied ones.
+                        return Err(Refused::Malformed);
+                    }
+                    let level = &mut self.levels[base + tick];
+                    level.tail = previous;
+                    level.quantity = quantity;
+                    level.count = count;
+                    let word = inst.bits_start as usize + side * words + tick / 64;
+                    self.level_bits[word] |= 1u64 << (tick % 64);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_holdings(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        for _ in 0..r.count()? {
+            let key = (r.u64()?, r.u64()?);
+            let holding = Holding { position: r.i64()?, yes_locked: r.i64()?, no_locked: r.i64()? };
+            self.holdings.insert(key, holding).map_err(|_| Refused::TooLarge)?;
+        }
+        Ok(())
+    }
+
+    fn read_event_cash(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        for _ in 0..r.count()? {
+            let key = (r.u64()?, r.u64()?);
+            let cents = r.i64()?;
+            self.event_cash.insert(key, cents).map_err(|_| Refused::TooLarge)?;
+        }
+        Ok(())
+    }
+
+    fn read_order_groups(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        for _ in 0..r.count()? {
+            let key = (r.u64()?, r.u32()?);
+            let group = OrderGroup {
+                threshold: r.u32()?,
+                window_millis: r.u32()?,
+                count: r.u64()?,
+                window_start: r.opt_u64()?,
+                triggered: r.bool()?,
+            };
+            self.order_groups.insert(key, group).map_err(|_| Refused::TooLarge)?;
+        }
+        Ok(())
+    }
+
+    fn read_maker(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        for _ in 0..r.count()? {
+            let key = (r.u64()?, r.u64()?);
+            let setting = MakerSetting { threshold: r.u32()?, window_millis: r.u32()? };
+            self.maker_settings.insert(key, setting).map_err(|_| Refused::TooLarge)?;
+        }
+        for _ in 0..r.count()? {
+            let key = (r.u64()?, r.u64()?);
+            let counter = WindowCounter { count: r.u64()?, window_start: r.opt_u64()? };
+            self.maker_counters.insert(key, counter).map_err(|_| Refused::TooLarge)?;
+        }
+        Ok(())
+    }
+
+    /// The client-order-ID window, and the expiry records that index it rebuilt from it.
+    ///
+    /// The records were not written: they carry entries that have already gone, which is the engine's residue and
+    /// not the venue's state (E-20.7). Rebuilt they are sorted by expiry, which is what the queue form means, so a
+    /// restored engine is in queue mode with nothing stranded — `expiry_heap_until` is `None` by construction.
+    fn read_duplicates(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        let n = r.count()?;
+        if n > self.expiry.len() {
+            return Err(Refused::TooLarge);
+        }
+        for i in 0..n {
+            let account = r.u64()?;
+            let client_order_id: [u8; 32] = r.take(32)?.try_into().map_err(|_| Refused::Truncated)?;
+            let expires_at = r.u64()?;
+            let order_id = r.opt_u64()?;
+            let key = (account, client_order_id);
+            self.duplicates.insert(key, Duplicate { expires_at, order_id }).map_err(|_| Refused::TooLarge)?;
+            self.expiry[i] = (expires_at, key);
+            self.expiry_latest = self.expiry_latest.max(expires_at);
+        }
+        self.expiry[..n].sort_unstable();
+        self.expiry_head = 0;
+        self.expiry_len = n;
+        self.expiry_heap_until = None;
+        Ok(())
+    }
+
+    fn read_commands(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        let n = r.count()?;
+        if n > self.command_expiry.len() {
+            return Err(Refused::TooLarge);
+        }
+        for i in 0..n {
+            let id: [u8; 16] = r.take(16)?.try_into().map_err(|_| Refused::Truncated)?;
+            let expires_at = r.u64()?;
+            self.commands.insert(id, expires_at).map_err(|_| Refused::TooLarge)?;
+            self.command_expiry[i] = (expires_at, id);
+        }
+        self.command_expiry[..n].sort_unstable();
+        self.command_expiry_head = 0;
+        self.command_expiry_len = n;
+        Ok(())
+    }
+
+    /// The GTD expiries. Sorted is already a min-heap, which is the form the engine keeps them in.
+    fn read_gtd(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        let n = r.count()?;
+        if n > self.gtd.len() {
+            return Err(Refused::TooLarge);
+        }
+        for i in 0..n {
+            self.gtd[i] = (r.u64()?, r.u64()?);
+        }
+        self.gtd[..n].sort_unstable();
+        self.gtd_len = n;
+        Ok(())
+    }
+
+    fn read_fee_overrides(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
+        let n = r.count()?;
+        if n > self.fee_overrides.len() {
+            return Err(Refused::TooLarge);
+        }
+        for i in 0..n {
+            self.fee_overrides[i] = FeeOverride {
+                account_id: r.u64()?,
+                priority: r.u32()?,
+                id: r.u64()?,
+                instrument_id: r.u64()?,
+                event_id: r.u64()?,
+                maker_rate_micros: r.i32()?,
+                taker_rate_micros: r.i32()?,
+                expires_at: r.opt_u64()?,
+            };
+        }
+        self.fee_overrides_len = n;
         Ok(())
     }
 }
