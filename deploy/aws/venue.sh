@@ -156,15 +156,24 @@ case "${1:-}" in
       join)
         # The token is read from the server and handed straight to the agent. It is never written to a file here,
         # never put in the instance's user_data — which the metadata service would then serve to anything on the
-        # box — and never into the Terraform state.
+        # box — and never into the Terraform state. It is fed to the far end on **stdin** rather than interpolated
+        # into the command, because a command line is world-readable in `ps` for as long as it runs: the care taken
+        # everywhere else was undone by the one place the token was easiest to put.
         server=$("$TOFU" -chdir="$HERE" output -raw address)
+        # The API is reached on the private address. The security group opens 6443 between the cluster's own
+        # machines with `self = true`, which matches traffic from the group and so only over private addresses; an
+        # agent pointed at the public one leaves through the internet gateway, comes back as an ordinary internet
+        # client, matches nothing, and retries "failed to get CA certs" for ever. SSH still uses the public one.
+        api=$("$TOFU" -chdir="$HERE" output -raw private_address)
         ip=$(node_ip)
         [ -n "$ip" ] || { echo "there is no preview node: venue.sh previews up" >&2; exit 1; }
+        [ -n "$api" ] || { echo "no private address for the server; is the Terraform output there?" >&2; exit 1; }
         token=$(ssh -o ConnectTimeout=10 "ubuntu@$server" "sudo cat /var/lib/rancher/k3s/server/node-token")
         [ -n "$token" ] || { echo "could not read the server's node token" >&2; exit 1; }
         # Tainted, so nothing lands here that has not asked for it, and labelled, so preview.yaml can ask.
-        ssh -o ConnectTimeout=10 "ubuntu@$ip" \
-          "curl -sfL https://get.k3s.io | K3S_URL=https://$server:6443 K3S_TOKEN='$token' \
+        printf '%s\n' "$token" | ssh -o ConnectTimeout=10 "ubuntu@$ip" \
+          "read -r K3S_TOKEN; export K3S_TOKEN; \
+           curl -sfL https://get.k3s.io | K3S_URL=https://$api:6443 \
              INSTALL_K3S_EXEC='agent --node-label venue.role=preview --node-taint preview=true:NoSchedule' sh -" \
           >/dev/null 2>&1
         echo "joined; waiting for the node to be ready"
