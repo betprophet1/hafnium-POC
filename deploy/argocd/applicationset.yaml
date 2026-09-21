@@ -155,9 +155,12 @@ spec:
             - name: fix.enabled
               value: "{{ if has `env-fix` .labels }}true{{ else }}false{{ end }}"
             # What the environment calls itself in its metrics, so a dashboard can tell one branch from another.
-            - name: metrics.labels.environment
+            # The names are `metrics.env` and `metrics.profile`, which is what the chart reads — these were
+            # `metrics.labels.*` for a while, which Helm took without complaint into a corner of the values nothing
+            # looks at, so every preview reported itself as the chart's default and they were all the same series.
+            - name: metrics.env
               value: "pr-{{ .number }}"
-            - name: metrics.labels.profile
+            - name: metrics.profile
               value: preview
       destination:
         server: https://kubernetes.default.svc
