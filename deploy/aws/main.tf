@@ -170,6 +170,9 @@ resource "aws_instance" "venue" {
   subnet_id              = data.aws_subnets.default.ids[0]
   vpc_security_group_ids = [aws_security_group.venue.id]
   key_name               = aws_key_pair.venue.key_name
+  # So the shipper needs no keys of its own. Associating a profile is an in-place change: the instance keeps
+  # running, and without an archive there is no profile and nothing to associate.
+  iam_instance_profile = var.archive ? aws_iam_instance_profile.archive[0].name : null
 
   root_block_device {
     volume_size = var.disk_gb
@@ -260,6 +263,8 @@ resource "aws_instance" "preview" {
   subnet_id              = data.aws_subnets.default.ids[0]
   vpc_security_group_ids = [aws_security_group.venue.id]
   key_name               = aws_key_pair.venue.key_name
+  # Previews write audit logs too, and a preview node fills up faster than the server does.
+  iam_instance_profile = var.archive ? aws_iam_instance_profile.archive[0].name : null
 
   root_block_device {
     volume_size = var.preview_disk_gb
@@ -274,4 +279,139 @@ resource "aws_instance" "preview" {
   }
 
   tags = { Name = "venue-preview-node" }
+}
+
+# ── The archive ───────────────────────────────────────────────────────────────────────────────────────────────
+#
+# Where closed audit files go when they leave a node's disk (interface 29). `interfaces/tools/audit_ship.py` puts
+# them here and removes them from the volume that a gateway would otherwise fill.
+#
+# Deletable by default. `archive_immutable` is the other choice and is deliberately one flag, because Object Lock
+# is fixed when a bucket is made: turning it on makes a new bucket rather than changing this one.
+
+resource "aws_s3_bucket" "archive" {
+  count  = var.archive ? 1 : 0
+  bucket = "${replace(var.domain, ".", "-")}-venue-archive"
+
+  # Fixed at creation and nowhere else. `true` here is what makes the lock configuration below possible at all;
+  # it does not by itself lock anything, which the retention rule does.
+  object_lock_enabled = var.archive_immutable
+}
+
+# Object Lock requires it, and without the lock it is what stops a bad upload overwriting a good record.
+resource "aws_s3_bucket_versioning" "archive" {
+  count  = var.archive ? 1 : 0
+  bucket = aws_s3_bucket.archive[0].id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "archive" {
+  count                   = var.archive ? 1 : 0
+  bucket                  = aws_s3_bucket.archive[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "archive" {
+  count  = var.archive ? 1 : 0
+  bucket = aws_s3_bucket.archive[0].id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# The bucket's own default, so an object is locked whether or not whoever wrote it remembered to ask. The tool can
+# set a longer retention on a particular object; neither it nor anyone else can set a shorter one.
+resource "aws_s3_bucket_object_lock_configuration" "archive" {
+  count  = var.archive && var.archive_immutable ? 1 : 0
+  bucket = aws_s3_bucket.archive[0].id
+  rule {
+    default_retention {
+      mode = "COMPLIANCE"
+      days = var.archive_retain_days
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "archive" {
+  count      = var.archive ? 1 : 0
+  bucket     = aws_s3_bucket.archive[0].id
+  depends_on = [aws_s3_bucket_versioning.archive]
+
+  rule {
+    id     = "cool-then-expire"
+    status = "Enabled"
+    filter {}
+
+    dynamic "transition" {
+      for_each = var.archive_glacier_days > 0 ? [1] : []
+      content {
+        days          = var.archive_glacier_days
+        storage_class = "GLACIER_IR"
+      }
+    }
+
+    # Only where objects may be deleted at all. Under compliance-mode Object Lock a rule like this is refused for
+    # anything still within its retention, which is the lock doing its job.
+    dynamic "expiration" {
+      for_each = !var.archive_immutable && var.archive_expire_days > 0 ? [1] : []
+      content {
+        days = var.archive_expire_days
+      }
+    }
+
+    # The manifest is uploaded whole after every run, so without this its old versions accumulate for ever. Under
+    # a lock they are evidence and are kept.
+    dynamic "noncurrent_version_expiration" {
+      for_each = var.archive_immutable ? [] : [1]
+      content {
+        noncurrent_days = 30
+      }
+    }
+  }
+}
+
+# What the nodes may do with it: put an object, read one back to check it arrived, and list. Never delete — the
+# tool removes files from the node's disk, never from the archive, and an instance that cannot delete is one that
+# cannot be made to.
+resource "aws_iam_role" "archive" {
+  count = var.archive ? 1 : 0
+  name  = "${replace(var.domain, ".", "-")}-venue-archive"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole" }]
+  })
+}
+
+resource "aws_iam_role_policy" "archive" {
+  count = var.archive ? 1 : 0
+  name  = "archive-write"
+  role  = aws_iam_role.archive[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:PutObjectRetention", "s3:GetObject", "s3:GetObjectVersion"]
+        Resource = "${aws_s3_bucket.archive[0].arn}/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket", "s3:GetBucketObjectLockConfiguration"]
+        Resource = aws_s3_bucket.archive[0].arn
+      },
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "archive" {
+  count = var.archive ? 1 : 0
+  name  = "${replace(var.domain, ".", "-")}-venue-archive"
+  role  = aws_iam_role.archive[0].name
 }

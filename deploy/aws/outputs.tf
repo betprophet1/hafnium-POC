@@ -46,3 +46,11 @@ output "preview_node" {
   description = "The preview node's address, when there is one. Empty means previews share the server's machine."
   value       = var.preview_node ? aws_instance.preview[0].public_ip : ""
 }
+
+output "archive" {
+  description = <<-EOT
+    The archive bucket, and whether it can be deleted from. `audit_ship.py --to s3://<this>` takes closed audit
+    files there. Empty when no archive was made.
+  EOT
+  value       = var.archive ? "s3://${aws_s3_bucket.archive[0].id}${var.archive_immutable ? " (immutable: compliance-mode Object Lock)" : " (deletable)"}" : ""
+}

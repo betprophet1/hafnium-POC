@@ -126,3 +126,65 @@ variable "preview_disk_gb" {
   type        = number
   default     = 80
 }
+
+variable "archive" {
+  description = <<-EOT
+    Whether the archive bucket is made: where closed audit files go when they leave a node's disk
+    (interfaces/audit/README.md, interface 29). Without it there is nowhere to put them and they stay until the
+    volume is full, which stops the gateway that writes them.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "archive_immutable" {
+  description = <<-EOT
+    Whether the archive is made immutable: compliance-mode Object Lock, which no one — the account's root user
+    included — can delete or shorten before its retention expires. Blueprint §12 asks for it on the records a
+    regulator may call for.
+
+    **False by default, and that is a choice about what this venue is.** Most environments hold nothing a
+    regulator will ever ask about, §12 says as much ("test environments never hold a regulatory record"), and a
+    bucket that cannot be emptied is a bill that cannot be stopped: five gigabytes a day per environment, locked
+    for five years, with no way to delete a mistake and no way to delete the bucket either, because it cannot be
+    emptied to be removed.
+
+    **It cannot be turned on later for the same bucket.** Object Lock is fixed when a bucket is made. Turning this
+    on therefore makes a *new* bucket, and moving what is already archived across is a copy somebody has to do and
+    check. What this flag is for is that the decision is one line and a `tofu apply` when counsel asks for it,
+    rather than a design change.
+
+    Retention only ever lengthens (§12): five years to start, extended later if the contracts turn out to be
+    swaps. There is no shortening it, so the shorter starting point is the correctable one.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "archive_retain_days" {
+  description = "How long an archived object is locked for, when the archive is immutable. 1826 is five years."
+  type        = number
+  default     = 1826
+}
+
+variable "archive_expire_days" {
+  description = <<-EOT
+    How long an archived object is kept when the archive is *not* immutable, 0 to keep it for ever. This is the
+    whole point of a deletable archive: a demo's audit logs are evidence of nothing and should cost nothing a
+    month later.
+  EOT
+  type        = number
+  default     = 90
+}
+
+variable "archive_glacier_days" {
+  description = <<-EOT
+    Days before an archived object moves to Glacier Instant Retrieval, 0 to leave everything in standard storage.
+
+    Instant Retrieval and not the cheaper classes: §12 requires a regulatory record to be readily accessible for
+    the whole retention, and a class with a multi-hour restore is not that. It is about a fifth the price of
+    standard and reads back in milliseconds.
+  EOT
+  type        = number
+  default     = 30
+}
