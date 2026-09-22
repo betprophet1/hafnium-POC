@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Take closed audit files to object storage and off the disk they were written on (interfaces/audit/README.md).
 
-  audit_ship.py --dir DIR --to s3://BUCKET/PREFIX [--retain-until DATE] [--keep] [--dry-run]
+  audit_ship.py --dir DIR --to s3://BUCKET/PREFIX [--retain-years N] [--keep] [--dry-run]
   audit_ship.py --dir DIR --to /some/directory              a destination on disk, for a demo or a test
   audit_ship.py --self-test                                 check the tool against files it writes
 
@@ -92,10 +92,22 @@ def digest(path):
 class Destination:
     """Somewhere to put an object and read it back. A directory or a bucket; the difference is two commands."""
 
-    def __init__(self, where, retain_until=None):
+    def __init__(self, where, retain_years=None):
         self.where = where.rstrip("/")
-        self.retain_until = retain_until
+        self.retain_years = retain_years
         self.s3 = where.startswith("s3://")
+
+    def retain_until(self):
+        """When an object written now stops being immutable, or None to write it deletable.
+
+        Counted from the upload rather than fixed once, so a job that runs every day does not hand every object
+        the same expiry and slowly shorten the retention of the newest. A retention only ever lengthens (§12), so
+        a date that drifts forward is correctable and one that drifts back could not be applied at all.
+        """
+        if not self.retain_years:
+            return None
+        at = datetime.now(timezone.utc)
+        return at.replace(year=at.year + self.retain_years).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def key(self, day, name):
         return f"audit/{day}/{name}"
@@ -108,9 +120,12 @@ class Destination:
             return
         args = ["aws", "s3api", "put-object", "--bucket", self.bucket(), "--key", self.prefixed(key),
                 "--body", str(path), "--checksum-algorithm", "SHA256"]
-        if self.retain_until:
-            # Compliance mode is the bucket's, not this tool's: it can set a retention but never shorten one.
-            args += ["--object-lock-mode", "COMPLIANCE", "--object-lock-retain-until-date", self.retain_until]
+        until = self.retain_until()
+        if until:
+            # Per object, because one bucket holds environments whose records matter and environments whose
+            # records do not. A bucket-wide default would lock a preview's audit log for as long as a production
+            # one's, and no one — the account's root user included — could undo it.
+            args += ["--object-lock-mode", "COMPLIANCE", "--object-lock-retain-until-date", until]
         subprocess.run(args, check=True, capture_output=True)
 
     def fetch(self, key, into):
@@ -281,7 +296,9 @@ def main():
     parser = argparse.ArgumentParser(add_help=True, description=__doc__)
     parser.add_argument("--dir")
     parser.add_argument("--to")
-    parser.add_argument("--retain-until", help="ISO 8601; the bucket's Object Lock is what enforces it")
+    parser.add_argument("--retain-years", type=int,
+                        help="make what is written immutable for this many years (compliance-mode Object Lock). "
+                             "Left out, objects are written deletable, which is what a test environment wants.")
     parser.add_argument("--keep", action="store_true", help="upload but leave the files where they are")
     parser.add_argument("--dry-run", action="store_true", help="say what would be taken and take nothing")
     parser.add_argument("--self-test", action="store_true")
@@ -292,7 +309,7 @@ def main():
     if not args.dir or not args.to:
         parser.error("--dir and --to are both needed")
 
-    taken, skipped, problems = ship(args.dir, Destination(args.to, args.retain_until), args.keep, args.dry_run)
+    taken, skipped, problems = ship(args.dir, Destination(args.to, args.retain_years), args.keep, args.dry_run)
     for line in taken:
         print(f"took {line}")
     for line in skipped:

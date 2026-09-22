@@ -292,10 +292,6 @@ resource "aws_instance" "preview" {
 resource "aws_s3_bucket" "archive" {
   count  = var.archive ? 1 : 0
   bucket = "${replace(var.domain, ".", "-")}-venue-archive"
-
-  # Fixed at creation and nowhere else. `true` here is what makes the lock configuration below possible at all;
-  # it does not by itself lock anything, which the retention rule does.
-  object_lock_enabled = var.archive_immutable
 }
 
 # Object Lock requires it, and without the lock it is what stops a bad upload overwriting a good record.
@@ -326,17 +322,23 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "archive" {
   }
 }
 
-# The bucket's own default, so an object is locked whether or not whoever wrote it remembered to ask. The tool can
-# set a longer retention on a particular object; neither it nor anyone else can set a shorter one.
+# Able to lock, locking nothing.
+#
+# Object Lock on a bucket is a capability, not a policy: with no default retention every object stays deletable
+# until a particular upload asks for otherwise, and `audit_ship.py --retain-years` is what asks. Production's
+# records are therefore immutable and a preview's are not, in the same bucket, decided per object at the moment it
+# is written.
+#
+# The alternative — a bucket-wide default retention — would lock *everything* the day it was turned on, including
+# every preview environment's audit log, at five gigabytes a day each, for five years, with no way to delete a
+# mistake and no way to delete the bucket either, since it cannot be emptied in order to be removed.
+#
+# Enabled here rather than on the bucket resource because that argument is fixed at creation: setting it there
+# would replace the bucket and everything already in it. This enables the lock on the bucket as it stands.
 resource "aws_s3_bucket_object_lock_configuration" "archive" {
-  count  = var.archive && var.archive_immutable ? 1 : 0
-  bucket = aws_s3_bucket.archive[0].id
-  rule {
-    default_retention {
-      mode = "COMPLIANCE"
-      days = var.archive_retain_days
-    }
-  }
+  count      = var.archive ? 1 : 0
+  bucket     = aws_s3_bucket.archive[0].id
+  depends_on = [aws_s3_bucket_versioning.archive]
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "archive" {
@@ -357,22 +359,19 @@ resource "aws_s3_bucket_lifecycle_configuration" "archive" {
       }
     }
 
-    # Only where objects may be deleted at all. Under compliance-mode Object Lock a rule like this is refused for
-    # anything still within its retention, which is the lock doing its job.
+    # Expiry and the lock do not argue: a lifecycle rule skips an object still inside its retention, so this
+    # removes a preview's audit log after ninety days and leaves a locked one exactly where it is.
     dynamic "expiration" {
-      for_each = !var.archive_immutable && var.archive_expire_days > 0 ? [1] : []
+      for_each = var.archive_expire_days > 0 ? [1] : []
       content {
         days = var.archive_expire_days
       }
     }
 
-    # The manifest is uploaded whole after every run, so without this its old versions accumulate for ever. Under
-    # a lock they are evidence and are kept.
-    dynamic "noncurrent_version_expiration" {
-      for_each = var.archive_immutable ? [] : [1]
-      content {
-        noncurrent_days = 30
-      }
+    # The manifest is uploaded whole after every run, so without this its old versions accumulate for ever. A
+    # locked version is skipped here too.
+    noncurrent_version_expiration {
+      noncurrent_days = 30
     }
   }
 }

@@ -288,11 +288,22 @@ sequence leaves nothing behind to show it ever existed.
 locally and uploaded whole after each run, so the archive holds every version of it and the chain never depends on
 appending to an object.
 
-**Compliance-mode Object Lock is the bucket's job, not this tool's** (blueprint §12). The tool passes a
-retain-until date when told one and otherwise writes plainly; the guarantee that nobody — the root user included —
-can delete or shorten a retention comes from how the bucket was made. Blueprint §12 also rules out the archive
-classes with a multi-hour restore for the five-year window, because "readily accessible" means throughout it;
-Glacier Instant Retrieval qualifies and Deep Archive does not.
+**Which records are immutable is decided per object, not per bucket.** `--retain-years N` writes with
+compliance-mode Object Lock, which nobody — the account's root user included — can delete or shorten before it
+expires (blueprint §12). Left out, objects are written deletable and a lifecycle rule removes them.
+
+That is per object because one bucket holds environments whose records matter and environments whose records do
+not. A bucket-wide default retention would lock a preview's audit log for as long as a production one's, at five
+gigabytes a day, for five years, with no way to delete a mistake and no way to delete the bucket either, since it
+cannot be emptied in order to be removed. Expiry and the lock do not argue: a lifecycle rule skips an object still
+inside its retention.
+
+The retention is counted from the upload rather than fixed once, so a job running daily does not hand every object
+the same expiry and slowly shorten the newest one's. A retention only ever lengthens, so a date drifting forward
+is correctable; one drifting back could not be applied at all.
+
+Blueprint §12 also rules out the archive classes with a multi-hour restore for the five-year window, because
+"readily accessible" means throughout it; Glacier Instant Retrieval qualifies and Deep Archive does not.
 
 **Nothing is deleted until it is somewhere else.** Each file is verified, hashed, uploaded, read back and compared
 against the hash, and only then removed. `--keep` skips the removal, for a first run somebody wants to watch.
