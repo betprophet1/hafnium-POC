@@ -213,6 +213,32 @@ gateway:
   # on as production has it; the demo's traffic is light.
   audit:
     fsync: true
+    # Taking closed files to object storage and off this volume (interfaces/audit/README.md, interface 29). Without
+    # it the volume grows until it is full, and a gateway that cannot write its audit log does not run — so on a
+    # venue left running this is what keeps it up, not housekeeping.
+    #
+    # A sidecar rather than a job of its own because the volume is ReadWriteOnce and belongs to this pod: a sidecar
+    # is in the right place by construction, and a split gateway's every pod ships its own volume without anything
+    # having to work out which is which.
+    archive:
+      enabled: false
+      # Where they go: `s3://bucket` or a path. The bucket is `deploy/aws` (`archive`), and its name is that
+      # deployment's `archive` output.
+      to: ""
+      # Which venue these are from. It names a prefix, so one environment's records stay answerable separately
+      # from another's; `metrics.env` is the same name the metrics carry.
+      environment: ""
+      # **Whether these are records somebody may have to produce.** False everywhere by default, and that is the
+      # safe direction: true writes them under `audit/kept/`, where no lifecycle rule expires them, and locks them
+      # immutable for `retainYears` — which nobody, the account's root user included, can undo. A demo's audit log
+      # locked for five years is a bill that cannot be stopped.
+      keepRecords: false
+      retainYears: 5
+      everySeconds: 3600
+      image:
+        repository: ghcr.io/lordnacho/venue-archive
+        tag: ""
+        pullPolicy: IfNotPresent
     storage:
       size: 1Gi
       # Whether the audit volume outlives the release. True everywhere that matters, for the same reason as the
