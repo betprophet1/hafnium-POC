@@ -14,6 +14,8 @@ through ArgoCD. There is no compose file; the laptop runs the same chart.
 | `charts/venue-mini/templates/gateway.yaml` | Also the gateway's audit log volume (`/var/lib/gateway-audit`, `gateway.audit` in values): every request and answer, in the format of `interfaces/audit/`. Nothing ships it to retained storage yet. With `gateway.split.enabled`, the public and private halves as StatefulSets of their own (several gateways, below) |
 | `charts/venue-mini/templates/ingress.yaml` | With `ingress.enabled`, the page and the gateway under one host name, routed by path to the halves (below) |
 | `charts/venue-mini/templates/fix.yaml` | With `fix.enabled`, the FIX adapter in front of the gateway's private half, its data and audit volumes, its Service and network policy (below) |
+| `images/venue-app.Dockerfile`, `images/venue-app.nginx.conf` | The image `venue-app`: the retail app (`apps/retail`) exported for the web and served by nginx, for the demo at `app.<domain>` |
+| `charts/venue-app/` | That page on a hostname of its own: a Deployment, a Service and an Ingress, and nothing else — it talks to no service in the cluster |
 | `laptop.sh` | `up`, `web`, `expose`, `scale`, `restart` and `down` for a local k3d cluster, its API on loopback |
 
 ## On a laptop
@@ -521,6 +523,38 @@ database with backoff, saying what it cannot reach. Deleting the PostgreSQL pod 
 
 Earlier versions kept these records in files on volumes; `venue-treasury import --ledger`, `venue-identity import
 --file` and `venue-parlays import --responders` move them into empty databases (the oracle's cases were in memory).
+
+## The app on the web
+
+The retail app (`apps/retail`) exported as static files and served on a hostname of its own, so a demo is a link
+rather than an install. The same codebase as the phone app; what differs is that nobody has to be trusted with a
+build of it.
+
+```sh
+# Built from the repository root. The venue is baked into the bundle, not read at runtime.
+docker build -f deploy/images/venue-app.Dockerfile --build-arg VENUE_URL=https://<domain> -t venue-app:dev .
+
+helm upgrade --install venue-app deploy/charts/venue-app -n venue \
+  --set image.tag=<commit> --set ingress.host=app.<domain>
+```
+
+On `main`, `.github/workflows/app-image.yml` does the building and pushes `ghcr.io/<owner>/venue-app:<commit>`, so
+putting a new version up is `--set image.tag=<commit>` and rolling one back is the same command with an older one.
+
+**Two things about this are easy to get wrong, and both fail the same way — a page that loads and then fetches
+nothing.**
+
+- **The venue's address is compiled in.** Expo inlines every `EXPO_PUBLIC_*` variable when it exports, so there is
+  no environment variable on the pod to change afterwards: an image points at the venue it was built against. A
+  build that says nothing points at `127.0.0.1:8080`, which is right on a laptop and useless in a browser anywhere
+  else, so the Dockerfile refuses to build without `VENUE_URL`. A visitor is not stuck with it, though — the app
+  asks `GET /v4/bootstrap` for the venues it may point itself at, so the built-in address is where it starts.
+- **The host must be an allowed origin on the gateway.** The page is served from `app.<domain>` and every call it
+  makes to `<domain>` is cross-origin, so the gateway refuses them all unless `gateway.allowedOrigins` names it
+  (decision G-15). The two settings live in different charts and have to be changed together.
+
+Wildcard DNS already covers `app.<domain>` if previews do, and cert-manager issues the certificate from the same
+issuer as everything else.
 
 ## Observability
 

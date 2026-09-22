@@ -1,0 +1,6 @@
+apiVersion: v2
+name: venue-app
+description: The retail app as a web page on a hostname of its own, for a demo that needs no install (deploy/README.md, the app on the web).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
