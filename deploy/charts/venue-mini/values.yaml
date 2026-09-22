@@ -217,9 +217,9 @@ gateway:
     # it the volume grows until it is full, and a gateway that cannot write its audit log does not run — so on a
     # venue left running this is what keeps it up, not housekeeping.
     #
-    # A sidecar rather than a job of its own because the volume is ReadWriteOnce and belongs to this pod: a sidecar
-    # is in the right place by construction, and a split gateway's every pod ships its own volume without anything
-    # having to work out which is which.
+    # A CronJob of its own, not a sidecar on the gateway: ReadWriteOnce binds a volume to one node rather than one
+    # pod, so a job scheduled onto the node the volume is affine to mounts it alongside the gateway. A sidecar that
+    # cannot start makes the gateway's pod unready, and shipping log files is not worth that.
     archive:
       enabled: false
       # Where they go: `s3://bucket` or a path. The bucket is `deploy/aws` (`archive`), and its name is that
@@ -234,11 +234,18 @@ gateway:
       # locked for five years is a bill that cannot be stopped.
       keepRecords: false
       retainYears: 5
-      everySeconds: 3600
+      # Hourly, off the hour: a file is only shippable once it is closed, so this is how long a closed file waits,
+      # not how much is kept. Which region the bucket is in — the CLI is given no credentials and no config file.
+      schedule: "17 * * * *"
+      region: eu-central-1
       image:
         repository: ghcr.io/lordnacho/venue-archive
         tag: ""
         pullPolicy: IfNotPresent
+        # What to pull it with, where that registry is not open. Its own, not the release-wide `image.pullSecrets`:
+        # setting that puts a pull secret on every venue pod and rolls the release to turn archiving on. Falls back
+        # to the release-wide list when empty.
+        pullSecrets: []
     storage:
       size: 1Gi
       # Whether the audit volume outlives the release. True everywhere that matters, for the same reason as the

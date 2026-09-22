@@ -196,47 +196,6 @@ containers:
       - name: environments
         mountPath: /etc/venue/environments
       {{- end }}
-  {{- with $.Values.gateway.audit.archive }}
-  {{- if .enabled }}
-  {{- if not .to }}{{ fail "gateway.audit.archive.to: say where closed audit files go, or the volume fills" }}{{ end }}
-  {{- if not .environment }}{{ fail "gateway.audit.archive.environment: names the prefix one venue's records live under" }}{{ end }}
-  # Takes closed files to object storage and off this volume. It removes nothing until it is somewhere else and
-  # has been read back and compared, and it never touches a file from today — the next segment number for a day is
-  # worked out from what is still here.
-  - name: archive
-    image: "{{ .image.repository }}:{{ .image.tag | default $.Chart.AppVersion }}"
-    imagePullPolicy: {{ .image.pullPolicy }}
-    command: ["/bin/sh", "-c"]
-    args:
-      - |
-        while true; do
-          python3 /opt/venue/audit_ship.py \
-            --dir /var/lib/gateway-audit \
-            --to {{ .to | quote }} \
-            --environment {{ .environment | quote }} \
-            {{ if .keepRecords }}--keep-records --retain-years {{ .retainYears }}{{ end }} || true
-          sleep {{ .everySeconds }}
-        done
-    env:
-      # No credentials: on a node with an instance role the CLI reads it from the metadata service, which is why
-      # the instance has one and why its metadata hop limit must let a container ask.
-      - name: AWS_REGION
-        value: {{ $.Values.gateway.audit.archive.region | default "eu-central-1" | quote }}
-      - name: HOME
-        value: /tmp
-    resources:
-      requests:
-        cpu: 10m
-        memory: 32Mi
-      limits:
-        memory: 256Mi
-    securityContext:
-      {{- include "venue-mini.containerSecurity" $ | nindent 6 }}
-    volumeMounts:
-      - name: audit
-        mountPath: /var/lib/gateway-audit
-  {{- end }}
-  {{- end }}
 {{- end -}}
 
 {{/*
