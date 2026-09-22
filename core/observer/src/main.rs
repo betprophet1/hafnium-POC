@@ -104,7 +104,10 @@ fn run(flags: &BTreeMap<String, String>) -> Result<(), Error> {
             || {
                 state.lock().unwrap_or_else(PoisonError::into_inner).view = View::default();
                 *reconnecting.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                // A fresh projection, so everything is wanted again.
+                0
             },
+            || {},
             |unit| {
                 if std::mem::take(&mut *reconnect.lock().unwrap_or_else(PoisonError::into_inner)) {
                     derived.reconnected();

@@ -244,5 +244,60 @@ it. The verifier prints the first line that breaks any of these, and whether the
 
 The chain shows that a file has not been altered or cut short in the middle, and a `close` record that it was not cut
 short at the end. It does not show who wrote it: anyone able to rewrite a whole file can rewrite its chain. That is
-what the archive's signed, chained manifests and compliance-mode object lock are for, once a shipper takes closed
-files there; none of that is built yet.
+what the archive's signed, chained manifests and compliance-mode object lock are for.
+
+## Taking files to the archive (interface 29)
+
+`interfaces/tools/audit_ship.py` takes closed files to object storage and removes them from the disk they were
+written on. Without it a gateway's audit volume grows until it is full, and a gateway that cannot write its audit
+log does not run — so this is not housekeeping, it is what keeps the venue up.
+
+**What is taken, and when.** A file is ready when its last line is a `close` record, which is the format's own
+promise: nothing is ever appended after one, and the file verifies alone. It is taken only if it also verifies,
+because shipping a file that does not is archiving a problem rather than a record.
+
+**Only days that are over.** A file whose date is today is never taken, even when closed. The next segment number
+for a day is worked out from the files still on that disk, so removing today's `0000` would have the next process
+of that instance open `0000` again — a different file with a name the archive already holds. Yesterday's files
+cannot collide, because no process will open that day again.
+
+**Object keys** are `audit/<YYYY-MM-DD>/<file name>`, the date first so that a lifecycle rule and a person looking
+for a day both find what they want without listing everything. The file name is the one it had, so an object and a
+local file are the same thing under the same name.
+
+**The manifest is an audit log of the archive.** One line per object taken, in the format above — `ts`, `n`,
+`component` `archive`, `kind` `archived`, and `prev` chaining each line to the one before — so the tool that
+verifies an audit log verifies the manifest too, and nothing new has to be trusted to read it. Beyond the common
+fields each line carries:
+
+| Field | |
+|---|---|
+| `file` | The name it had on disk, which is also the leaf of its key |
+| `key` | Where it was put |
+| `sha256` | Of the file's bytes, before upload; what the archive is checked against afterwards |
+| `bytes` | Its length |
+| `records` | How many lines it held |
+| `after` | The `after` of the file's own `open` record: the previous file of that component and instance, and the hash of its `close` line |
+
+That last field is why the manifest is worth having rather than just a listing. Each file verifies alone, and
+`after` is the only thing that says which file came before it — so copying it into the manifest keeps the chain
+*between* files once the files themselves are somewhere else. Without it, a file removed from the middle of a
+sequence leaves nothing behind to show it ever existed.
+
+**The manifest is kept beside the files and shipped with them**, as `audit-archive.jsonl`. It is appended to
+locally and uploaded whole after each run, so the archive holds every version of it and the chain never depends on
+appending to an object.
+
+**Compliance-mode Object Lock is the bucket's job, not this tool's** (blueprint §12). The tool passes a
+retain-until date when told one and otherwise writes plainly; the guarantee that nobody — the root user included —
+can delete or shorten a retention comes from how the bucket was made. Blueprint §12 also rules out the archive
+classes with a multi-hour restore for the five-year window, because "readily accessible" means throughout it;
+Glacier Instant Retrieval qualifies and Deep Archive does not.
+
+**Nothing is deleted until it is somewhere else.** Each file is verified, hashed, uploaded, read back and compared
+against the hash, and only then removed. `--keep` skips the removal, for a first run somebody wants to watch.
+
+**Not yet built: the signature and the hold register.** Blueprint §12 wants each manifest signed, and a hold
+register that every deletion consults first (interface 30). The manifest has the shape for a `sig` field and the
+tool has the place to ask, and until both exist this is a chained manifest rather than a signed one, and a legal
+hold is a thing an operator has to know about rather than something the tool enforces.

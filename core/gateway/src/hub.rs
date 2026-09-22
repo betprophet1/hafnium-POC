@@ -285,6 +285,23 @@ impl Hub {
         self.last_sequence = 0;
     }
 
+    /// Before a connection's backlog when this gateway means to carry on: what it keeps is the view, and what it
+    /// answers is the sequence that view has reached.
+    ///
+    /// Nothing else has to be undone, and the one mechanism that might have needed it turns out to prefer this.
+    /// `accepted` remembers orders the node acknowledged before the feed delivered them, keyed by the sequence
+    /// they were accepted at, and entries are forgotten once `last_sequence` passes them. `restart` sets that to
+    /// zero so they survive a replay from the beginning; resuming leaves it where it was, which is already
+    /// consistent with the entries still held.
+    ///
+    /// Safe because the feed is unit-atomic: a connection that drops part-way through a unit never delivers it,
+    /// so the view always stands at a unit boundary — the one this answers with.
+    pub fn resume(&mut self) -> u64 {
+        self.connected = true;
+        self.last_unit = None;
+        self.last_sequence
+    }
+
     /// The feed has caught up: its last input is recent, or nothing has arrived for a moment.
     pub fn ready(&self) -> bool {
         self.connected

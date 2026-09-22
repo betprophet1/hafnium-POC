@@ -520,10 +520,15 @@ impl Live {
             wire::follow(
                 &addr,
                 || {
+                    // Starts over, so it asks for everything. A view that could be carried across a reconnect
+                    // would answer with the sequence it holds instead.
                     if let Ok(mut v) = me.view.lock() {
                         *v = View::default();
                     }
+                    0
                 },
+                // Asks for everything every time, so it is never told to start over.
+                || {},
                 |unit| {
                     if let Ok(mut v) = me.view.lock() {
                         v.apply(&unit);

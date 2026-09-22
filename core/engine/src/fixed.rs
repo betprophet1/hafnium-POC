@@ -181,6 +181,24 @@ impl<'a, K: MapKey, V> FixedMap<'a, K, V> {
     }
 
     /// Visits every entry, in storage order. Never use the order for anything observable.
+    /// Visits every entry with the slot it occupies, in storage order. For a caller that must order entries by a
+    /// key too large to copy into the engine's scratch — the snapshot's duplicates, whose key is an account and a
+    /// 32-byte client order ID (E-20.4). It gathers slots, sorts them by the key each names through [`Self::at`],
+    /// and so never holds a key at all.
+    pub fn for_each_slot(&self, mut f: impl FnMut(usize, &K, &V)) {
+        for (slot, entry) in self.slots.iter().enumerate() {
+            if let Some((k, v)) = entry {
+                f(slot, k, v);
+            }
+        }
+    }
+
+    /// The entry a slot holds, for a caller that gathered slots with [`Self::for_each_slot`]. A slot number is
+    /// meaningful only between those two calls: anything that inserts or removes may move an entry.
+    pub fn at(&self, slot: usize) -> Option<(&K, &V)> {
+        self.slots.get(slot).and_then(Option::as_ref).map(|(k, v)| (k, v))
+    }
+
     pub fn for_each(&self, mut f: impl FnMut(&K, &V)) {
         for (k, v) in self.slots.iter().flatten() {
             f(k, v);

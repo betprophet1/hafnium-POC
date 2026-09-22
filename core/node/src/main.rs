@@ -10,6 +10,7 @@ use std::time::Duration;
 use venue_harness::codec;
 use venue_node::frames::{read_frame, write_frame, MAX_FRAME};
 use venue_node::node::{self, Config, Error};
+use venue_node::snapshots;
 
 const USAGE: &str = "usage:
   venue-node serve [--listen ADDR] [--feed ADDR] [--data DIR] [--group N] [--node-id N] [--tick-ms N] [--fsync]
@@ -17,6 +18,12 @@ const USAGE: &str = "usage:
   venue-node send ADDR [INPUTS]            JSON inputs (an array, or one per line; stdin without a file);
                                            prints each result as a JSON line
   venue-node replay JOURNAL RESULTS        runs a journal through a fresh engine and writes its result log
+  venue-node snapshot JOURNAL OUT [--at N] replays a journal and writes the state after input N, or after the
+                                           last input, as a Snapshot frame (spec §20)
+  venue-node replay-from SNAPSHOT JOURNAL RESULTS [--snapshot-out FILE]
+                                           restores a snapshot and replays only what follows it, writing the
+                                           result log for those inputs; the results must equal the tail of a
+                                           replay from genesis (E-20.9)
   venue-node dump FILE                     prints a journal or result log as JSON lines
   venue-node import VECTORS JOURNAL        writes a compiled scenario's inputs, as stamped, as a journal
   venue-node bench JOURNAL [--runs N]      times every input of a journal through a fresh engine; build it with
@@ -48,6 +55,8 @@ fn main() -> ExitCode {
         (Some("replay"), 3) => {
             node::replay(Path::new(&args[1]), Path::new(&args[2])).map(|n| eprintln!("replayed {n} inputs"))
         }
+        (Some("snapshot"), 3 | 5) => snapshot(&args[1..]),
+        (Some("replay-from"), 4 | 6) => replay_from(&args[1..]),
         (Some("dump"), 2) => dump(&args[1]),
         (Some("import"), 3) => import(&args[1], &args[2]),
         (Some("bench"), 2 | 4) => bench(&args[1..]),
@@ -150,6 +159,31 @@ fn send(addr: &str, file: Option<&String>) -> Result<(), Error> {
             }
         }
     }
+    Ok(())
+}
+
+/// `snapshot JOURNAL OUT [--at N]`. Taken by this replaying engine and never by a serving one (D-32).
+fn snapshot(args: &[String]) -> Result<(), node::Error> {
+    let at = match args.get(2).map(String::as_str) {
+        None => None,
+        Some("--at") => Some(args[3].parse::<u64>().map_err(|e| format!("--at: {e}"))?),
+        Some(other) => return Err(format!("unknown argument {other}").into()),
+    };
+    let (sequence, bytes) = snapshots::take(Path::new(&args[0]), Path::new(&args[1]), at)?;
+    eprintln!("snapshot at sequence {sequence}, {bytes} bytes of state");
+    Ok(())
+}
+
+/// `replay-from SNAPSHOT JOURNAL RESULTS [--snapshot-out FILE]`.
+fn replay_from(args: &[String]) -> Result<(), node::Error> {
+    let finish = match args.get(3).map(String::as_str) {
+        None => None,
+        Some("--snapshot-out") => Some(PathBuf::from(&args[4])),
+        Some(other) => return Err(format!("unknown argument {other}").into()),
+    };
+    let (at, applied) =
+        snapshots::replay_from(Path::new(&args[0]), Path::new(&args[1]), Path::new(&args[2]), finish.as_deref())?;
+    eprintln!("restored at sequence {at}, replayed {applied} inputs after it");
     Ok(())
 }
 

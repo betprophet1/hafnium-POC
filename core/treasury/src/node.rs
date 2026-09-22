@@ -37,6 +37,7 @@ impl Node {
         thread::spawn(move || {
             wire::follow(
                 &feed,
+                || 0,
                 || {},
                 |unit| {
                     let sequence = unit.input["record"]["sequence"].as_u64().unwrap_or(0);

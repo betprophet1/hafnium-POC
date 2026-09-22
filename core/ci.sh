@@ -22,6 +22,7 @@ fi
 echo "core/journal matches interfaces/sbe/venue-journal.xml"
 python3 "$ROOT/interfaces/tools/catalogue.py" check
 python3 "$ROOT/interfaces/tools/audit_verify.py" --self-test
+python3 "$ROOT/interfaces/tools/audit_ship.py" --self-test
 
 step "Reference model: normative scenarios and random sequences"
 python3 "$ROOT/spec/engine/reference/run_scenarios.py"

@@ -119,7 +119,7 @@ impl ResultSink for Sink<'_> {
     }
 }
 
-fn apply(
+pub(crate) fn apply(
     engine: &mut Engine<'_>,
     input: &[u8],
     results: &mut BufWriter<File>,
@@ -318,17 +318,52 @@ fn publish(subscribers: &mut Vec<Live>, metrics: &NodeMetrics, input: &[u8], res
     Ok(())
 }
 
+/// The sequence of the last input in a journal's first `length` bytes. Read by walking the frames, which is what
+/// the subscriber's thread is about to do anyway; journals are opened and read here, never held open.
+fn last_sequence(path: &Path, length: u64) -> Result<u64, Error> {
+    let mut reader = BufReader::new(File::open(path)?.take(length));
+    let (mut buf, mut last) = (Vec::new(), 0u64);
+    while let Some(n) = read_frame(&mut reader, &mut buf)? {
+        if n >= 16 {
+            last = u64_at(&buf[..n], 8);
+        }
+    }
+    Ok(last)
+}
+
 /// Sends a subscriber the journal and result log up to the given lengths, pairing each input with its results by
 /// sequence number, then every live unit. The lengths were taken, and the live channel registered, at one point
 /// in the main loop, so nothing is missed or repeated.
+///
+/// A subscriber opens by saying where it has got to: eight little-endian bytes, the last sequence it holds, or
+/// zero for everything. A reader that reconnects after a moment's network trouble then costs what it missed
+/// rather than the whole journal, which is the difference between a reconnect that is free and one that grows
+/// without bound as the venue runs.
+///
+/// The backlog is still *read* in full — the result log is walked in step with the journal, so the pairing has to
+/// see every frame — but only what follows the subscriber's position is sent.
 fn serve_subscriber(
-    stream: TcpStream,
+    mut stream: TcpStream,
     journal: (&Path, u64),
     results: (&Path, u64),
     live: Receiver<Unit>,
     progress: &Subscriber,
 ) -> Result<(), Error> {
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    // A subscriber that says nothing is one that has gone; the timeout is what stops its thread waiting for ever.
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut position = [0u8; 8];
+    stream.read_exact(&mut position)?;
+    let asked_for = u64::from_le_bytes(position);
+    stream.set_read_timeout(None)?;
+
+    // Whether the node can honour it. A reader that asks for a sequence this journal has never reached is one
+    // whose node was replaced under it — a fresh data directory, or another group's — and sending it the tail
+    // would leave it with a view built on a history that never happened. It is sent everything instead, and told
+    // so, because a reader that kept its view has to be able to throw it away.
+    let last = last_sequence(journal.0, journal.1)?;
+    let resume_from = if asked_for > 0 && asked_for <= last { asked_for } else { 0 };
+    stream.write_all(&[u8::from(resume_from > 0)])?;
     let mut out = BufWriter::new(stream);
     let mut inputs = BufReader::new(File::open(journal.0)?.take(journal.1));
     let mut outputs = BufReader::new(File::open(results.0)?.take(results.1));
@@ -344,7 +379,8 @@ fn serve_subscriber(
             write_frame(&mut batch, &result[..m])?;
             pending = read_frame(&mut outputs, &mut result)?;
         }
-        if !quiet(&input[..n], &batch) {
+        // Read in full, sent from where the subscriber left off.
+        if sequence > resume_from && !quiet(&input[..n], &batch) {
             out.write_all(&unit(&input[..n], &batch)?)?;
         }
     }

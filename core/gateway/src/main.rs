@@ -321,8 +321,18 @@ fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
         wire::follow_reporting(
             &feed,
             || {
-                follower.hub().restart();
+                // Carries on where it left off. This is the reader with most to gain from it: its view used to be
+                // rebuilt from the first input on every reconnect, so a moment's network trouble cost the whole
+                // journal, and that cost grew for as long as the venue ran.
+                let at = follower.hub().resume();
                 follower.metrics.feed_connected();
+                at
+            },
+            || {
+                // The node cannot honour that position — a different journal under the same address — so whatever
+                // this gateway kept is a view of a history that never happened.
+                log::warn("the feed is starting over; the view is being thrown away", &[("half", &half)]);
+                follower.hub().restart();
             },
             |unit| {
                 let record = &unit.input["record"];
