@@ -12,10 +12,12 @@ and compared; `--keep` skips the removal entirely.
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,6 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from audit_verify import FORMAT, ZEROS, verify  # noqa: E402  (a sibling tool, not a package)
 
 MANIFEST = "audit-archive.jsonl"
+# What S3 accepts in a single PutObject. Only the locked path is bound by it; everything else is uploaded in parts.
+SINGLE_PUT = 5 * 1024 ** 3
+
+
+class TooBig(Exception):
+    """A file that cannot be written the way its retention requires."""
 
 
 def today():
@@ -45,11 +53,34 @@ def day_of(name):
     return parts[2]
 
 
+def last_line(path, window=1 << 16):
+    """A file's last non-empty line, read from the end.
+
+    Audit files reach gigabytes and the last line is all that is wanted, so the file is never read whole: seek to
+    the end, take a block, and widen only if no newline is in it — which bounds the read by the length of one
+    record rather than the size of the file.
+    """
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        while True:
+            block = min(window, size)
+            f.seek(size - block)
+            data = f.read(block).rstrip(b"\n")
+            if not data:
+                return b""
+            cut = data.rfind(b"\n")
+            if cut != -1:
+                return data[cut + 1:]
+            if block >= size:
+                return data
+            window *= 2
+
+
 def closed(path):
     """Whether a file's last line is its close record. The format promises nothing is ever appended after one."""
     try:
-        lines = path.read_bytes().rstrip(b"\n").split(b"\n")
-        return json.loads(lines[-1]).get("kind") == "close"
+        return json.loads(last_line(path)).get("kind") == "close"
     except (OSError, ValueError, IndexError):
         return False
 
@@ -130,15 +161,30 @@ class Destination:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, target)
             return
-        args = ["aws", "s3api", "put-object", "--bucket", self.bucket(), "--key", self.prefixed(key),
-                "--body", str(path), "--checksum-algorithm", "SHA256"]
         until = self.retain_until()
         if until:
             # Per object, because one bucket holds environments whose records matter and environments whose
             # records do not. A bucket-wide default would lock a preview's audit log for as long as a production
             # one's, and no one — the account's root user included — could undo it.
-            args += ["--object-lock-mode", "COMPLIANCE", "--object-lock-retain-until-date", until]
-        subprocess.run(args, check=True, capture_output=True)
+            #
+            # Whole, in one request, because that is the only way the object is born locked: a retention applied
+            # after an upload leaves a window in which the object can still be deleted, which is the one thing a
+            # locked object exists to prevent. The cost is S3's limit on a single PUT, and a file past it cannot be
+            # shipped this way at all — say so rather than let the CLI fail with its own wording.
+            if path.stat().st_size > SINGLE_PUT:
+                raise TooBig(f"{path.name} is {path.stat().st_size} bytes; a locked object is written in one "
+                             f"request and S3 refuses one over {SINGLE_PUT}. It needs segmenting before it can "
+                             f"be kept.")
+            subprocess.run(["aws", "s3api", "put-object", "--bucket", self.bucket(), "--key", self.prefixed(key),
+                            "--body", str(path), "--checksum-algorithm", "SHA256",
+                            "--object-lock-mode", "COMPLIANCE", "--object-lock-retain-until-date", until],
+                           check=True, capture_output=True)
+            return
+        # Nothing to lock, so the upload may be split into parts — which it has to be, because an audit file that
+        # nothing has been shipping grows past what one request may carry. `s3 cp` does that by itself; `put-object`
+        # cannot. What was written is checked by reading it back and comparing, as it is for every other object.
+        subprocess.run(["aws", "s3", "cp", str(path), f"s3://{self.bucket()}/{self.prefixed(key)}",
+                        "--only-show-errors"], check=True, capture_output=True)
 
     def fetch(self, key, into):
         if not self.s3:
@@ -202,15 +248,29 @@ def ship(directory, destination, keep=False, dry_run=False, day=None):
             skipped.append(f"{path.name} -> {key} ({sha[:12]}…, would not be removed)")
             continue
 
-        destination.put(path, key)
-        # Read back before anything is removed: an upload that was refused, truncated or silently rewritten must
-        # not be the reason a file stops existing here.
-        with tempfile.TemporaryDirectory() as tmp:
-            back = Path(tmp) / path.name
-            destination.fetch(key, back)
-            if digest(back) != sha:
-                problems.append(f"{path.name}: what came back from {key} is not what was sent")
-                continue
+        # One file that cannot be shipped is that file's problem. It used to be every file's: an upload that failed
+        # raised through the loop and the run ended there, so a single unshippable file left the whole backlog on
+        # the disk — with the volume filling, which is the condition this exists to relieve.
+        try:
+            destination.put(path, key)
+            # Read back before anything is removed: an upload that was refused, truncated or silently rewritten
+            # must not be the reason a file stops existing here.
+            with tempfile.TemporaryDirectory() as tmp:
+                back = Path(tmp) / path.name
+                destination.fetch(key, back)
+                if digest(back) != sha:
+                    problems.append(f"{path.name}: what came back from {key} is not what was sent")
+                    continue
+        except TooBig as e:
+            problems.append(str(e))
+            continue
+        except subprocess.CalledProcessError as e:
+            detail = (e.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+            problems.append(f"{path.name}: {' '.join(detail[-2:]) if detail else e}")
+            continue
+        except OSError as e:
+            problems.append(f"{path.name}: {e}")
+            continue
 
         head = opening(path)
         manifest_line(directory, {
@@ -298,6 +358,77 @@ def self_test():
         taken, _, problems = ship(work, destination, day="2026-09-21")
         if any("2026-09-18" in line for line in taken) or not unclosed.exists():
             failures.append("a file with no close record was taken; it may still be being written")
+
+        # `closed()` asks one question of a file that may be gigabytes, so it reads from the end. Reading the whole
+        # file to see its last line is what OOM-killed this on the live gateway's 5.8 GB backlog.
+        probe = Path(work) / "tail-probe"
+        for content, want, what in ((b'{"kind":"close"}\n', b'{"kind":"close"}', "a trailing newline"),
+                                    (b'{"kind":"close"}', b'{"kind":"close"}', "no trailing newline"),
+                                    (b'a\n{"kind":"close"}\n\n\n', b'{"kind":"close"}', "several trailing newlines"),
+                                    (b"", b"", "an empty file")):
+            probe.write_bytes(content)
+            if last_line(probe) != want:
+                failures.append(f"last_line with {what}: got {last_line(probe)!r}, wanted {want!r}")
+
+        # A record longer than the first window: the read has to widen, and widening is the part with the bug in it.
+        long_record = b'{"kind":"close","pad":"' + b"y" * (1 << 18) + b'"}'
+        probe.write_bytes(b"first\n" + long_record + b"\n")
+        if last_line(probe, window=1 << 12) != long_record:
+            failures.append("last_line did not widen its window for a record longer than it")
+        if not closed(probe):
+            failures.append("closed() missed a close record that was longer than one read")
+
+        # And it must cost the tail, not the file.
+        big = Path(work) / "big"
+        big.write_bytes(b'{"kind":"pad"}\n' * 400_000 + b'{"kind":"close"}\n')
+        size = big.stat().st_size
+        tracemalloc.start()
+        got = closed(big)
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        if not got:
+            failures.append("closed() did not find the close record of a large file")
+        if peak > size // 8:
+            failures.append(f"closed() on {size} bytes peaked at {peak}: it is reading the file whole")
+        probe.unlink()
+        big.unlink()
+
+        # Which request each kind of object goes up with. The commands are recorded rather than run, because the
+        # branch is the whole point and a self-test may not write 5 GiB to find out.
+        sample = write(work, "gateway.gw-0.2026-09-19.0000.jsonl",
+                       [dict(opened, file="gateway.gw-0.2026-09-19.0000.jsonl"),
+                        {"kind": "close", "reason": "rotate", "records": 1}])
+        calls, real_run, real_limit = [], subprocess.run, globals()["SINGLE_PUT"]
+
+        def record(args, **kwargs):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        try:
+            subprocess.run = record
+            Destination("s3://b", "e").put(sample, "k")
+            if not calls or calls[-1][:3] != ["aws", "s3", "cp"]:
+                failures.append(f"a transient object is not uploaded in parts: {calls[-1][:4] if calls else None}")
+
+            Destination("s3://b", "e", keep_records=True).put(sample, "k")
+            if calls[-1][:3] != ["aws", "s3api", "put-object"] or "--object-lock-mode" not in calls[-1]:
+                failures.append(f"a kept object is not written whole and locked: {calls[-1][:4]}")
+
+            # Past what one request may carry, a locked object must be refused rather than half-written.
+            globals()["SINGLE_PUT"] = 1
+            try:
+                Destination("s3://b", "e", keep_records=True).put(sample, "k")
+                failures.append("a locked object past the single-request limit was not refused")
+            except TooBig:
+                pass
+            # The same file unlocked is not affected by that limit at all.
+            Destination("s3://b", "e").put(sample, "k")
+            if calls[-1][:3] != ["aws", "s3", "cp"]:
+                failures.append("the single-request limit was applied to an object that is uploaded in parts")
+        finally:
+            subprocess.run = real_run
+            globals()["SINGLE_PUT"] = real_limit
+        sample.unlink()
 
     for failure in failures:
         print(f"self-test: {failure}", file=sys.stderr)

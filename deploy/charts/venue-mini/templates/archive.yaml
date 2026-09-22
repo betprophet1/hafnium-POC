@@ -98,9 +98,13 @@ spec:
               resources:
                 requests:
                   cpu: 10m
-                  memory: 32Mi
+                  memory: 64Mi
+                # The shipper itself reads a line at a time whatever the file's size, so this is headroom for the
+                # AWS CLI underneath it: a Python interpreter plus the part buffers a multipart upload keeps in
+                # flight. 256Mi was what the first run was given, and an OOM kill is indistinguishable from the
+                # job simply failing.
                 limits:
-                  memory: 256Mi
+                  memory: 512Mi
               securityContext:
                 {{- include "venue-mini.containerSecurity" $ | nindent 16 }}
               volumeMounts:
