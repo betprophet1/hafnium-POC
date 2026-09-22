@@ -8,6 +8,19 @@ output "ssh" {
   value       = "ssh ubuntu@${aws_eip.venue.public_ip}"
 }
 
+output "private_address" {
+  description = <<-EOT
+    The server's address inside the VPC, which is how another node in this cluster must reach its API.
+
+    Not interchangeable with `address`. The security group opens 6443 between the cluster's own machines with
+    `self = true`, and that matches only traffic arriving from the group — which is what happens over private
+    addresses. A node dialling the *public* address leaves through the internet gateway and comes back as an
+    ordinary internet client, matching nothing, and the agent then retries `failed to get CA certs` until somebody
+    goes and looks at its journal.
+  EOT
+  value       = aws_instance.venue.private_ip
+}
+
 output "instance_id" {
   description = "What venue.sh stops and starts."
   value       = aws_instance.venue.id

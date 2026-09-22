@@ -100,8 +100,12 @@ variable "preview_node" {
     reason for it. Without it, everything shares one box, and on a t3.large one small preview is already most of it.
 
     The node is tainted when it joins, so nothing lands there that has not asked to, and `preview.yaml` is what asks.
-    That also means previews will not schedule at all while it is stopped — deliberately, because the alternative is
-    them quietly moving back on top of the venue.
+
+    What it does not do is keep previews off the server: `preview.yaml` carries a toleration and deliberately no
+    nodeSelector, so with this node stopped, or never made, a preview runs wherever there is room — which is on top
+    of the live venue. That is the documented choice (see the comment in preview.yaml: a nodeSelector would leave
+    every preview Pending with no event anybody would think to look for), but it does mean turning this off is not
+    a way to stop previews running. Not labelling a pull request is.
   EOT
   type        = bool
   default     = false
