@@ -9,6 +9,7 @@ import hashlib
 import json
 import sys
 import tempfile
+import tracemalloc
 from pathlib import Path
 
 ZEROS = "0" * 64
@@ -18,56 +19,63 @@ FORMATS = ("venue-audit/1", FORMAT)
 
 
 def verify(path, require_closed=False):
-    """(ok, message) for one file. The message names the first broken line, counted from 1, or summarises the file."""
-    data = Path(path).read_bytes()
-    if not data:
-        return False, f"{path}: empty: a file always starts with its open record"
-    lines = data.split(b"\n")
-    if lines[-1] == b"":
-        lines.pop()
-    else:
-        return False, f"{path}: line {len(lines)}: cut off part-way (no newline)"
+    """(ok, message) for one file. The message names the first broken line, counted from 1, or summarises the file.
+
+    A line at a time, holding only that line. These files reach gigabytes — the live gateway's largest was 5.8 GB
+    before anything shipped them — and reading one whole and splitting it holds the file twice over. That OOM-killed
+    the shipper the first time it met a real backlog, which is the one moment it has to work: the files are only
+    that size because nothing had been taking them away.
+    """
     prev = ZEROS
     closed = False
     header = None
-    for number, raw in enumerate(lines):
-        where = f"{path}: line {number + 1}"
-        if closed:
-            return False, f"{where}: a record after the close record"
-        try:
-            record = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            return False, f"{where}: not a JSON object: {e}"
-        if not isinstance(record, dict):
-            return False, f"{where}: not a JSON object"
-        if record.get("prev") != prev:
-            return False, f"{where}: prev {record.get('prev')!r} is not the hash of the line before ({prev})"
-        if record.get("n") != number:
-            return False, f"{where}: n is {record.get('n')!r}, expected {number}"
-        for field in ("ts", "component", "instance", "kind"):
-            if not isinstance(record.get(field), str):
-                return False, f"{where}: {field} missing"
-        if number == 0:
-            if record["kind"] != "open" or record.get("format") not in FORMATS:
-                return False, f"{where}: the first record must be an open record of a known format"
-            if record.get("file") != Path(path).name:
-                return False, f"{where}: the open record names {record.get('file')!r}, not this file"
-            header = (record["component"], record["instance"])
-        elif (record["component"], record["instance"]) != header:
-            return False, f"{where}: component or instance differs from the open record"
-        elif record["kind"] == "open":
-            return False, f"{where}: a second open record"
-        broken = reference_broken(record)
-        if broken:
-            return False, f"{where}: {broken}"
-        if record["kind"] == "close":
-            if record.get("records") != number:
-                return False, f"{where}: the close record counts {record.get('records')!r} lines, not {number}"
-            closed = True
-        prev = hashlib.sha256(raw).hexdigest()
+    count = 0
+    with open(path, "rb") as handle:
+        for number, line in enumerate(handle):
+            count = number + 1
+            where = f"{path}: line {count}"
+            # Only a file's last line can lack its newline, so this is the cut-off-part-way check.
+            if not line.endswith(b"\n"):
+                return False, f"{where}: cut off part-way (no newline)"
+            raw = line[:-1]
+            if closed:
+                return False, f"{where}: a record after the close record"
+            try:
+                record = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                return False, f"{where}: not a JSON object: {e}"
+            if not isinstance(record, dict):
+                return False, f"{where}: not a JSON object"
+            if record.get("prev") != prev:
+                return False, f"{where}: prev {record.get('prev')!r} is not the hash of the line before ({prev})"
+            if record.get("n") != number:
+                return False, f"{where}: n is {record.get('n')!r}, expected {number}"
+            for field in ("ts", "component", "instance", "kind"):
+                if not isinstance(record.get(field), str):
+                    return False, f"{where}: {field} missing"
+            if number == 0:
+                if record["kind"] != "open" or record.get("format") not in FORMATS:
+                    return False, f"{where}: the first record must be an open record of a known format"
+                if record.get("file") != Path(path).name:
+                    return False, f"{where}: the open record names {record.get('file')!r}, not this file"
+                header = (record["component"], record["instance"])
+            elif (record["component"], record["instance"]) != header:
+                return False, f"{where}: component or instance differs from the open record"
+            elif record["kind"] == "open":
+                return False, f"{where}: a second open record"
+            broken = reference_broken(record)
+            if broken:
+                return False, f"{where}: {broken}"
+            if record["kind"] == "close":
+                if record.get("records") != number:
+                    return False, f"{where}: the close record counts {record.get('records')!r} lines, not {number}"
+                closed = True
+            prev = hashlib.sha256(raw).hexdigest()
+    if count == 0:
+        return False, f"{path}: empty: a file always starts with its open record"
     if require_closed and not closed:
-        return False, f"{path}: line {len(lines)}: not closed"
-    return True, f"{path}: ok, {len(lines)} records, {'closed' if closed else 'open'}"
+        return False, f"{path}: line {count}: not closed"
+    return True, f"{path}: ok, {count} records, {'closed' if closed else 'open'}"
 
 
 def reference_broken(record):
@@ -133,6 +141,30 @@ def self_test():
                 lines.append(line(dict(r), prev) + b"\n")
                 prev = hashlib.sha256(lines[-1][:-1]).hexdigest()
             check(lines, False, False, what)
+
+        # Verifying a big file must cost a line, not a file. Reading it whole and splitting it held the file twice
+        # over, and the live gateway's largest was 5.8 GB — the shipper was OOM-killed by the first real backlog it
+        # met. Measured rather than left to inspection, so a rewrite that slurps fails here and not in production.
+        name = "gateway.big.2026-09-17.0000.jsonl"
+        path = Path(tmp) / name
+        prev, filler = ZEROS, "x" * 256
+        with path.open("wb") as f:
+            for n in range(40_000):
+                record = dict(base, n=n, prev=prev, pad=filler,
+                              **({"kind": "open", "format": FORMAT, "file": name} if n == 0
+                                 else {"kind": "ws-frame", "dir": "in", "msg": "{}"}))
+                line = json.dumps(record, separators=(",", ":")).encode()
+                f.write(line + b"\n")
+                prev = hashlib.sha256(line).hexdigest()
+        size = path.stat().st_size
+        tracemalloc.start()
+        ok, message = verify(path)
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        if not ok:
+            sys.exit(f"self-test failed: a large intact file: {message}")
+        if peak > size // 8:
+            sys.exit(f"self-test failed: verifying {size} bytes peaked at {peak}: it is reading the file whole")
     print("audit_verify self-test: ok")
 
 

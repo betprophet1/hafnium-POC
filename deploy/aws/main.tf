@@ -350,6 +350,19 @@ resource "aws_s3_bucket_lifecycle_configuration" "archive" {
   # never touch the live venue has to be written against a prefix the live venue is not under, which is why the
   # shipper puts records it keeps under `audit/kept/` and the rest under `audit/transient/`.
 
+  # The parts of an upload that failed part-way. They belong to no object, so they appear in no listing and in no
+  # size the console shows, and they are charged for until something removes them. The shipper may abort its own,
+  # but it cannot abort one belonging to a run that was killed — which, on a job that ships gigabytes, is the case
+  # that happens. Whole-bucket on purpose: an orphaned part is never wanted, under any prefix.
+  rule {
+    id     = "abandoned-uploads-go"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+
   # A preview's audit log is evidence of nothing a month later.
   rule {
     id     = "transient-cools-then-goes"
@@ -415,13 +428,16 @@ resource "aws_iam_role_policy" "archive" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["s3:PutObject", "s3:PutObjectRetention", "s3:GetObject", "s3:GetObjectVersion"]
+        Effect = "Allow"
+        # An audit file outgrows what one request may carry, so an unlocked object is uploaded in parts. Aborting
+        # is part of uploading: without it a failed upload leaves its parts behind, invisible in a listing and
+        # charged for until something removes them.
+        Action   = ["s3:PutObject", "s3:PutObjectRetention", "s3:GetObject", "s3:GetObjectVersion", "s3:AbortMultipartUpload"]
         Resource = "${aws_s3_bucket.archive[0].arn}/*"
       },
       {
         Effect   = "Allow"
-        Action   = ["s3:ListBucket", "s3:GetBucketObjectLockConfiguration"]
+        Action   = ["s3:ListBucket", "s3:GetBucketObjectLockConfiguration", "s3:ListBucketMultipartUploads"]
         Resource = aws_s3_bucket.archive[0].arn
       },
     ]
