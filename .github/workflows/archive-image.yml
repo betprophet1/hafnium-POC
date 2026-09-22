@@ -1,4 +1,4 @@
-# Builds the audit shipper's image, so the sidecar that keeps a gateway's audit volume from filling has something
+# Builds the audit shipper's image, so the CronJob that keeps a gateway's audit volume from filling has something
 # to run. Tiny and slow-moving: alpine, python3, the aws CLI and two files.
 name: archive image
 

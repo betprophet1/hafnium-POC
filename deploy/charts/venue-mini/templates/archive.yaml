@@ -1,0 +1,118 @@
+{{- if .Values.gateway.audit.archive.enabled }}
+{{- $name := include "venue-mini.fullname" . }}
+{{- $a := .Values.gateway.audit.archive }}
+{{- if not $a.to }}{{ fail "gateway.audit.archive.to: say where closed audit files go, or the volume fills" }}{{ end }}
+{{- if not $a.environment }}{{ fail "gateway.audit.archive.environment: names the prefix one venue's records live under" }}{{ end }}
+{{- /*
+Every audit volume this release writes, and a job for each. Not split: one claim of a fixed name. Split: one claim
+per pod, named by the StatefulSet's volumeClaimTemplate, so the replica counts are read here rather than guessed.
+*/ -}}
+{{- $volumes := list }}
+{{- if not .Values.gateway.split.enabled }}
+{{- $volumes = append $volumes (dict "claim" (printf "%s-gateway-audit" $name) "suffix" "") }}
+{{- else }}
+{{- range $half := list "public" "private" }}
+{{- range $i := until (int (index $.Values.gateway.split $half "replicas")) }}
+{{- $volumes = append $volumes (dict "claim" (printf "audit-%s-gateway-%s-%d" $name $half $i) "suffix" (printf "-%s-%d" $half $i)) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- range $v := $volumes }}
+---
+# Takes closed audit files to object storage and off the gateway's volume (interfaces/audit/README.md, interface 29).
+# Without it the volume grows until it is full, and a gateway that cannot write its audit log does not run — so on a
+# venue left running this is what keeps it up, not housekeeping.
+#
+# A job of its own rather than a sidecar on the gateway, though the volume is ReadWriteOnce and belongs to that pod.
+# ReadWriteOnce binds a volume to one *node*, not one pod, and the volume is node-affine, so the scheduler puts this
+# pod exactly where the gateway already is and both mount it. What a sidecar buys — being in the right place by
+# construction — it charges for by being in the blast radius by construction: a container that cannot start makes its
+# pod unready whatever it was for, and with the gateway's Recreate strategy the working pod is already gone. Shipping
+# log files is not worth the gateway's availability. Here the worst a broken shipper does is fail its own job.
+#
+# Two writers on one volume is safe by the format, not by luck: the gateway only ever appends to today's file, and
+# the shipper only ever reads and unlinks files that carry a `close` record. Neither touches what the other holds.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}-archive{{ $v.suffix }}
+  labels:
+    {{- include "venue-mini.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: archive
+spec:
+  schedule: {{ $a.schedule | quote }}
+  # Never two shippers on one volume: the second would work out the same next segment number as the first.
+  concurrencyPolicy: Forbid
+  # A run missed while the node was down is not worth catching up on — the next one ships whatever accumulated.
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 1
+  # Kept, because a shipper that stopped shipping is only visible in what it said when it failed.
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            {{- include "venue-mini.labels" $ | nindent 12 }}
+            app.kubernetes.io/component: archive
+        spec:
+          restartPolicy: OnFailure
+          {{- /* This image comes from its own registry and is pulled by nothing else, so it gets its own secret
+                 rather than the release-wide one: adding that would put a pull secret on every venue pod and roll
+                 the whole release to turn archiving on. Falls back to the release-wide list when unset. */ -}}
+          {{- with ($a.image.pullSecrets | default $.Values.image.pullSecrets) }}
+          imagePullSecrets:
+            {{- range . }}
+            - name: {{ . | quote }}
+            {{- end }}
+          {{- end }}
+          {{- include "venue-mini.scheduling" $ | nindent 10 }}
+          securityContext:
+            {{- include "venue-mini.podSecurity" $ | nindent 12 }}
+          containers:
+            - name: archive
+              image: "{{ $a.image.repository }}:{{ $a.image.tag | default $.Chart.AppVersion }}"
+              imagePullPolicy: {{ $a.image.pullPolicy }}
+              args:
+                - --dir
+                - /var/lib/gateway-audit
+                - --to
+                - {{ $a.to | quote }}
+                - --environment
+                - {{ $a.environment | quote }}
+                {{- if $a.keepRecords }}
+                - --keep-records
+                - --retain-years
+                - {{ $a.retainYears | quote }}
+                {{- end }}
+              env:
+                # No credentials: on a node with an instance role the CLI reads it from the metadata service, which
+                # is why the instance has one and why its metadata hop limit must let a container ask.
+                - name: AWS_REGION
+                  value: {{ $a.region | quote }}
+                # The CLI writes its cache under HOME, and the root filesystem is read-only.
+                - name: HOME
+                  value: /tmp
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  memory: 256Mi
+              securityContext:
+                {{- include "venue-mini.containerSecurity" $ | nindent 16 }}
+              volumeMounts:
+                - name: audit
+                  mountPath: /var/lib/gateway-audit
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: audit
+              persistentVolumeClaim:
+                claimName: {{ $v.claim }}
+            - name: tmp
+              emptyDir: {}
+{{- end }}
+{{- end }}
