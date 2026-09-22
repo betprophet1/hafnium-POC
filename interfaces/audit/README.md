@@ -261,9 +261,20 @@ for a day is worked out from the files still on that disk, so removing today's `
 of that instance open `0000` again — a different file with a name the archive already holds. Yesterday's files
 cannot collide, because no process will open that day again.
 
-**Object keys** are `audit/<YYYY-MM-DD>/<file name>`, the date first so that a lifecycle rule and a person looking
-for a day both find what they want without listing everything. The file name is the one it had, so an object and a
+**Object keys** are `audit/<kept|transient>/<environment>/<YYYY-MM-DD>/<file name>`.
+
+Whether the records are kept comes first because **a lifecycle rule can only select by prefix, and there is no
+"everything except"**. An expiry that must never touch the live venue therefore has to be written against a prefix
+the live venue is not under. With the class first, one rule expires a preview's audit log after ninety days and
+another leaves the venue's alone for ever, and neither can reach the other's objects however anyone edits them.
+
+The environment next, because it is how somebody looking for one venue's day finds it and how one environment's
+records stay answerable separately from another's. Then the day, then the name it had on disk, so an object and a
 local file are the same thing under the same name.
+
+`--keep-records` is what puts a run under `audit/kept/`, and the same flag is what locks its objects. One decision
+rather than two that can disagree: a record worth locking is a record worth keeping, and a lifecycle rule that
+expired what a lock protects would be refused anyway.
 
 **The manifest is an audit log of the archive.** One line per object taken, in the format above — `ts`, `n`,
 `component` `archive`, `kind` `archived`, and `prev` chaining each line to the one before — so the tool that
@@ -284,9 +295,10 @@ That last field is why the manifest is worth having rather than just a listing. 
 *between* files once the files themselves are somewhere else. Without it, a file removed from the middle of a
 sequence leaves nothing behind to show it ever existed.
 
-**The manifest is kept beside the files and shipped with them**, as `audit-archive.jsonl`. It is appended to
-locally and uploaded whole after each run, so the archive holds every version of it and the chain never depends on
-appending to an object.
+**The manifest is kept beside the files and shipped with them**, as `audit-archive.jsonl` under the same
+environment's prefix. It is appended to locally and uploaded whole after each run, so the archive holds every
+version of it and the chain never depends on appending to an object — and when the run is one that keeps records,
+the manifest is locked along with them, which is what it is for.
 
 **Which records are immutable is decided per object, not per bucket.** `--retain-years N` writes with
 compliance-mode Object Lock, which nobody — the account's root user included — can delete or shorten before it

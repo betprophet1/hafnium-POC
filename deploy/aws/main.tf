@@ -346,10 +346,17 @@ resource "aws_s3_bucket_lifecycle_configuration" "archive" {
   bucket     = aws_s3_bucket.archive[0].id
   depends_on = [aws_s3_bucket_versioning.archive]
 
+  # Two rules, because a lifecycle rule selects by prefix and there is no "everything except". An expiry that must
+  # never touch the live venue has to be written against a prefix the live venue is not under, which is why the
+  # shipper puts records it keeps under `audit/kept/` and the rest under `audit/transient/`.
+
+  # A preview's audit log is evidence of nothing a month later.
   rule {
-    id     = "cool-then-expire"
+    id     = "transient-cools-then-goes"
     status = "Enabled"
-    filter {}
+    filter {
+      prefix = "audit/transient/"
+    }
 
     dynamic "transition" {
       for_each = var.archive_glacier_days > 0 ? [1] : []
@@ -358,20 +365,32 @@ resource "aws_s3_bucket_lifecycle_configuration" "archive" {
         storage_class = "GLACIER_IR"
       }
     }
-
-    # Expiry and the lock do not argue: a lifecycle rule skips an object still inside its retention, so this
-    # removes a preview's audit log after ninety days and leaves a locked one exactly where it is.
     dynamic "expiration" {
       for_each = var.archive_expire_days > 0 ? [1] : []
       content {
         days = var.archive_expire_days
       }
     }
-
-    # The manifest is uploaded whole after every run, so without this its old versions accumulate for ever. A
-    # locked version is skipped here too.
     noncurrent_version_expiration {
       noncurrent_days = 30
+    }
+  }
+
+  # Records somebody may have to produce. They cool and they stay. Nothing here expires them, and an object the
+  # shipper locked could not be expired anyway — a lifecycle rule skips anything inside its retention.
+  rule {
+    id     = "kept-cools-and-stays"
+    status = "Enabled"
+    filter {
+      prefix = "audit/kept/"
+    }
+
+    dynamic "transition" {
+      for_each = var.archive_glacier_days > 0 ? [1] : []
+      content {
+        days          = var.archive_glacier_days
+        storage_class = "GLACIER_IR"
+      }
     }
   }
 }
