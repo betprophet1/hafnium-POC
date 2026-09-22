@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Take closed audit files to object storage and off the disk they were written on (interfaces/audit/README.md).
 
-  audit_ship.py --dir DIR --to s3://BUCKET/PREFIX [--retain-until DATE] [--keep] [--dry-run]
-  audit_ship.py --dir DIR --to /some/directory              a destination on disk, for a demo or a test
-  audit_ship.py --self-test                                 check the tool against files it writes
+  audit_ship.py --dir DIR --to s3://BUCKET --environment NAME [--keep-records [--retain-years N]]
+  audit_ship.py --dir DIR --to /some/directory --environment NAME    on disk, for a demo or a test
+  audit_ship.py --self-test                                          check the tool against files it writes
 
 A gateway that cannot write its audit log does not run, and its volume grows until it is full, so this is what
 keeps the venue up rather than housekeeping. Nothing is removed until it is somewhere else and has been read back
@@ -92,13 +92,37 @@ def digest(path):
 class Destination:
     """Somewhere to put an object and read it back. A directory or a bucket; the difference is two commands."""
 
-    def __init__(self, where, retain_until=None):
+    def __init__(self, where, environment, keep_records=False, retain_years=5):
         self.where = where.rstrip("/")
-        self.retain_until = retain_until
+        self.environment = environment
+        self.keep_records = keep_records
+        self.retain_years = retain_years if keep_records else None
         self.s3 = where.startswith("s3://")
 
+    def retain_until(self):
+        """When an object written now stops being immutable, or None to write it deletable.
+
+        Counted from the upload rather than fixed once, so a job that runs every day does not hand every object
+        the same expiry and slowly shorten the retention of the newest. A retention only ever lengthens (§12), so
+        a date that drifts forward is correctable and one that drifts back could not be applied at all.
+        """
+        if not self.retain_years:
+            return None
+        at = datetime.now(timezone.utc)
+        return at.replace(year=at.year + self.retain_years).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     def key(self, day, name):
-        return f"audit/{day}/{name}"
+        """Where an object goes: whether its records are kept, then which environment, then the day.
+
+        Kept and transient are separate prefixes rather than a label because a lifecycle rule can only select by
+        prefix, and there is no "everything except" — so an expiry that must not touch production has to be
+        written against a prefix production is not under. Putting the class first is what lets one rule expire a
+        preview's audit log after ninety days and another leave the venue's alone for ever.
+
+        The environment next, because it is how somebody looking for a particular venue's day finds it, and
+        because it keeps one environment's records answerable separately from another's.
+        """
+        return f"audit/{'kept' if self.keep_records else 'transient'}/{self.environment}/{day}/{name}"
 
     def put(self, path, key):
         if not self.s3:
@@ -108,9 +132,12 @@ class Destination:
             return
         args = ["aws", "s3api", "put-object", "--bucket", self.bucket(), "--key", self.prefixed(key),
                 "--body", str(path), "--checksum-algorithm", "SHA256"]
-        if self.retain_until:
-            # Compliance mode is the bucket's, not this tool's: it can set a retention but never shorten one.
-            args += ["--object-lock-mode", "COMPLIANCE", "--object-lock-retain-until-date", self.retain_until]
+        until = self.retain_until()
+        if until:
+            # Per object, because one bucket holds environments whose records matter and environments whose
+            # records do not. A bucket-wide default would lock a preview's audit log for as long as a production
+            # one's, and no one — the account's root user included — could undo it.
+            args += ["--object-lock-mode", "COMPLIANCE", "--object-lock-retain-until-date", until]
         subprocess.run(args, check=True, capture_output=True)
 
     def fetch(self, key, into):
@@ -202,7 +229,7 @@ def ship(directory, destination, keep=False, dry_run=False, day=None):
     # appending to an object.
     local = Path(directory) / MANIFEST
     if taken and not dry_run and local.exists():
-        destination.put(local, f"audit/{MANIFEST}")
+        destination.put(local, destination.key("", MANIFEST).replace("//", "/"))
     return taken, skipped, problems
 
 
@@ -229,7 +256,7 @@ def self_test():
         write(work, old, [opened, {"kind": "close", "reason": "rotate", "records": 1}])
         write(work, current, [dict(opened, file=current), {"kind": "close", "reason": "rotate", "records": 1}])
         # Closed, ours, but from today: must be left alone.
-        destination = Destination(store)
+        destination = Destination(store, "selftest")
         taken, _, problems = ship(work, destination, day="2026-09-21")
 
         if problems:
@@ -240,7 +267,7 @@ def self_test():
             failures.append("a shipped file was left on disk")
         if not (Path(work) / current).exists():
             failures.append("today's file was taken; the next segment could collide with it")
-        if not (Path(store) / "audit" / "2026-09-20" / old).exists():
+        if not (Path(store) / "audit" / "transient" / "selftest" / "2026-09-20" / old).exists():
             failures.append("the object is not where the key says")
 
         manifest = Path(work) / MANIFEST
@@ -281,7 +308,13 @@ def main():
     parser = argparse.ArgumentParser(add_help=True, description=__doc__)
     parser.add_argument("--dir")
     parser.add_argument("--to")
-    parser.add_argument("--retain-until", help="ISO 8601; the bucket's Object Lock is what enforces it")
+    parser.add_argument("--environment", help="which venue these are from: prod, pr-4. Names the prefix.")
+    parser.add_argument("--keep-records", action="store_true",
+                        help="these are records somebody may have to produce: written under audit/kept/, where no "
+                             "lifecycle rule expires them, and locked immutable. Without it they go under "
+                             "audit/transient/ and are expired, which is what a demo or a preview wants.")
+    parser.add_argument("--retain-years", type=int, default=5,
+                        help="how long --keep-records locks for (default 5). A retention only ever lengthens.")
     parser.add_argument("--keep", action="store_true", help="upload but leave the files where they are")
     parser.add_argument("--dry-run", action="store_true", help="say what would be taken and take nothing")
     parser.add_argument("--self-test", action="store_true")
@@ -289,10 +322,13 @@ def main():
 
     if args.self_test:
         return self_test()
-    if not args.dir or not args.to:
-        parser.error("--dir and --to are both needed")
+    if not args.dir or not args.to or not args.environment:
+        parser.error("--dir, --to and --environment are all needed")
+    if "/" in args.environment:
+        parser.error("--environment names one venue and becomes part of a key: no slashes")
 
-    taken, skipped, problems = ship(args.dir, Destination(args.to, args.retain_until), args.keep, args.dry_run)
+    destination = Destination(args.to, args.environment, args.keep_records, args.retain_years)
+    taken, skipped, problems = ship(args.dir, destination, args.keep, args.dry_run)
     for line in taken:
         print(f"took {line}")
     for line in skipped:

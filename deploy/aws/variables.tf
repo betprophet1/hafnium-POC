@@ -130,3 +130,41 @@ variable "preview_disk_gb" {
   type        = number
   default     = 80
 }
+
+variable "archive" {
+  description = <<-EOT
+    Whether the archive bucket is made: where closed audit files go when they leave a node's disk
+    (interfaces/audit/README.md, interface 29). Without it there is nowhere to put them and they stay until the
+    volume is full, which stops the gateway that writes them.
+
+    **Which of them are immutable is not settled here.** The bucket is made able to lock objects and locks none:
+    Object Lock without a default retention leaves every object deletable until something asks for otherwise, and
+    the shipper asks per object (`audit_ship.py --retain-years`). So one bucket holds a production environment's
+    records under a five-year compliance lock and a preview's under a ninety-day expiry, and turning the first on
+    is a flag on a job rather than a new bucket and a copy somebody has to verify.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "archive_expire_days" {
+  description = <<-EOT
+    How long an archived object is kept when the archive is *not* immutable, 0 to keep it for ever. This is the
+    whole point of a deletable archive: a demo's audit logs are evidence of nothing and should cost nothing a
+    month later.
+  EOT
+  type        = number
+  default     = 90
+}
+
+variable "archive_glacier_days" {
+  description = <<-EOT
+    Days before an archived object moves to Glacier Instant Retrieval, 0 to leave everything in standard storage.
+
+    Instant Retrieval and not the cheaper classes: §12 requires a regulatory record to be readily accessible for
+    the whole retention, and a class with a multi-hour restore is not that. It is about a fifth the price of
+    standard and reads back in milliseconds.
+  EOT
+  type        = number
+  default     = 30
+}

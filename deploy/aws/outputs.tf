@@ -59,3 +59,11 @@ output "preview_node" {
   description = "The preview node's address, when there is one. Empty means previews share the server's machine."
   value       = var.preview_node ? aws_instance.preview[0].public_ip : ""
 }
+
+output "archive" {
+  description = <<-EOT
+    The archive bucket. `audit_ship.py --to s3://<this>` takes closed audit files there, and
+    `--retain-years 5` is what makes the ones it writes immutable. Empty when no archive was made.
+  EOT
+  value       = var.archive ? "s3://${aws_s3_bucket.archive[0].id}" : ""
+}

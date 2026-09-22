@@ -170,6 +170,9 @@ resource "aws_instance" "venue" {
   subnet_id              = data.aws_subnets.default.ids[0]
   vpc_security_group_ids = [aws_security_group.venue.id]
   key_name               = aws_key_pair.venue.key_name
+  # So the shipper needs no keys of its own. Associating a profile is an in-place change: the instance keeps
+  # running, and without an archive there is no profile and nothing to associate.
+  iam_instance_profile = var.archive ? aws_iam_instance_profile.archive[0].name : null
 
   root_block_device {
     volume_size = var.disk_gb
@@ -260,6 +263,8 @@ resource "aws_instance" "preview" {
   subnet_id              = data.aws_subnets.default.ids[0]
   vpc_security_group_ids = [aws_security_group.venue.id]
   key_name               = aws_key_pair.venue.key_name
+  # Previews write audit logs too, and a preview node fills up faster than the server does.
+  iam_instance_profile = var.archive ? aws_iam_instance_profile.archive[0].name : null
 
   root_block_device {
     volume_size = var.preview_disk_gb
@@ -274,4 +279,157 @@ resource "aws_instance" "preview" {
   }
 
   tags = { Name = "venue-preview-node" }
+}
+
+# ── The archive ───────────────────────────────────────────────────────────────────────────────────────────────
+#
+# Where closed audit files go when they leave a node's disk (interface 29). `interfaces/tools/audit_ship.py` puts
+# them here and removes them from the volume that a gateway would otherwise fill.
+#
+# Deletable by default. `archive_immutable` is the other choice and is deliberately one flag, because Object Lock
+# is fixed when a bucket is made: turning it on makes a new bucket rather than changing this one.
+
+resource "aws_s3_bucket" "archive" {
+  count  = var.archive ? 1 : 0
+  bucket = "${replace(var.domain, ".", "-")}-venue-archive"
+}
+
+# Object Lock requires it, and without the lock it is what stops a bad upload overwriting a good record.
+resource "aws_s3_bucket_versioning" "archive" {
+  count  = var.archive ? 1 : 0
+  bucket = aws_s3_bucket.archive[0].id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "archive" {
+  count                   = var.archive ? 1 : 0
+  bucket                  = aws_s3_bucket.archive[0].id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "archive" {
+  count  = var.archive ? 1 : 0
+  bucket = aws_s3_bucket.archive[0].id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# Able to lock, locking nothing.
+#
+# Object Lock on a bucket is a capability, not a policy: with no default retention every object stays deletable
+# until a particular upload asks for otherwise, and `audit_ship.py --retain-years` is what asks. Production's
+# records are therefore immutable and a preview's are not, in the same bucket, decided per object at the moment it
+# is written.
+#
+# The alternative — a bucket-wide default retention — would lock *everything* the day it was turned on, including
+# every preview environment's audit log, at five gigabytes a day each, for five years, with no way to delete a
+# mistake and no way to delete the bucket either, since it cannot be emptied in order to be removed.
+#
+# Enabled here rather than on the bucket resource because that argument is fixed at creation: setting it there
+# would replace the bucket and everything already in it. This enables the lock on the bucket as it stands.
+resource "aws_s3_bucket_object_lock_configuration" "archive" {
+  count      = var.archive ? 1 : 0
+  bucket     = aws_s3_bucket.archive[0].id
+  depends_on = [aws_s3_bucket_versioning.archive]
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "archive" {
+  count      = var.archive ? 1 : 0
+  bucket     = aws_s3_bucket.archive[0].id
+  depends_on = [aws_s3_bucket_versioning.archive]
+
+  # Two rules, because a lifecycle rule selects by prefix and there is no "everything except". An expiry that must
+  # never touch the live venue has to be written against a prefix the live venue is not under, which is why the
+  # shipper puts records it keeps under `audit/kept/` and the rest under `audit/transient/`.
+
+  # A preview's audit log is evidence of nothing a month later.
+  rule {
+    id     = "transient-cools-then-goes"
+    status = "Enabled"
+    filter {
+      prefix = "audit/transient/"
+    }
+
+    dynamic "transition" {
+      for_each = var.archive_glacier_days > 0 ? [1] : []
+      content {
+        days          = var.archive_glacier_days
+        storage_class = "GLACIER_IR"
+      }
+    }
+    dynamic "expiration" {
+      for_each = var.archive_expire_days > 0 ? [1] : []
+      content {
+        days = var.archive_expire_days
+      }
+    }
+    noncurrent_version_expiration {
+      noncurrent_days = 30
+    }
+  }
+
+  # Records somebody may have to produce. They cool and they stay. Nothing here expires them, and an object the
+  # shipper locked could not be expired anyway — a lifecycle rule skips anything inside its retention.
+  rule {
+    id     = "kept-cools-and-stays"
+    status = "Enabled"
+    filter {
+      prefix = "audit/kept/"
+    }
+
+    dynamic "transition" {
+      for_each = var.archive_glacier_days > 0 ? [1] : []
+      content {
+        days          = var.archive_glacier_days
+        storage_class = "GLACIER_IR"
+      }
+    }
+  }
+}
+
+# What the nodes may do with it: put an object, read one back to check it arrived, and list. Never delete — the
+# tool removes files from the node's disk, never from the archive, and an instance that cannot delete is one that
+# cannot be made to.
+resource "aws_iam_role" "archive" {
+  count = var.archive ? 1 : 0
+  name  = "${replace(var.domain, ".", "-")}-venue-archive"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole" }]
+  })
+}
+
+resource "aws_iam_role_policy" "archive" {
+  count = var.archive ? 1 : 0
+  name  = "archive-write"
+  role  = aws_iam_role.archive[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:PutObject", "s3:PutObjectRetention", "s3:GetObject", "s3:GetObjectVersion"]
+        Resource = "${aws_s3_bucket.archive[0].arn}/*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket", "s3:GetBucketObjectLockConfiguration"]
+        Resource = aws_s3_bucket.archive[0].arn
+      },
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "archive" {
+  count = var.archive ? 1 : 0
+  name  = "${replace(var.domain, ".", "-")}-venue-archive"
+  role  = aws_iam_role.archive[0].name
 }
