@@ -318,6 +318,19 @@ fn publish(subscribers: &mut Vec<Live>, metrics: &NodeMetrics, input: &[u8], res
     Ok(())
 }
 
+/// The sequence of the last input in a journal's first `length` bytes. Read by walking the frames, which is what
+/// the subscriber's thread is about to do anyway; journals are opened and read here, never held open.
+fn last_sequence(path: &Path, length: u64) -> Result<u64, Error> {
+    let mut reader = BufReader::new(File::open(path)?.take(length));
+    let (mut buf, mut last) = (Vec::new(), 0u64);
+    while let Some(n) = read_frame(&mut reader, &mut buf)? {
+        if n >= 16 {
+            last = u64_at(&buf[..n], 8);
+        }
+    }
+    Ok(last)
+}
+
 /// Sends a subscriber the journal and result log up to the given lengths, pairing each input with its results by
 /// sequence number, then every live unit. The lengths were taken, and the live channel registered, at one point
 /// in the main loop, so nothing is missed or repeated.
@@ -341,8 +354,16 @@ fn serve_subscriber(
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut position = [0u8; 8];
     stream.read_exact(&mut position)?;
-    let resume_from = u64::from_le_bytes(position);
+    let asked_for = u64::from_le_bytes(position);
     stream.set_read_timeout(None)?;
+
+    // Whether the node can honour it. A reader that asks for a sequence this journal has never reached is one
+    // whose node was replaced under it — a fresh data directory, or another group's — and sending it the tail
+    // would leave it with a view built on a history that never happened. It is sent everything instead, and told
+    // so, because a reader that kept its view has to be able to throw it away.
+    let last = last_sequence(journal.0, journal.1)?;
+    let resume_from = if asked_for > 0 && asked_for <= last { asked_for } else { 0 };
+    stream.write_all(&[u8::from(resume_from > 0)])?;
     let mut out = BufWriter::new(stream);
     let mut inputs = BufReader::new(File::open(journal.0)?.take(journal.1));
     let mut outputs = BufReader::new(File::open(results.0)?.take(results.1));

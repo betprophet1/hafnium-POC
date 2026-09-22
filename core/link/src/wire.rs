@@ -105,8 +105,12 @@ fn frames_of(path: &Path) -> Result<Vec<Value>, Error> {
 /// `on_connect` runs before every connection's backlog and answers with the last sequence this reader already
 /// holds — zero to be sent everything, which is what a reader that starts over each time returns. Answering
 /// honestly is what makes a reconnect cost what was missed rather than the whole journal.
-pub fn follow(addr: &str, on_connect: impl FnMut() -> u64, on_unit: impl FnMut(Unit)) -> ! {
-    follow_reporting(addr, on_connect, on_unit, |e| eprintln!("feed {addr}: {e}"))
+///
+/// `on_reset` runs when the node is about to send the backlog from the beginning although this reader asked to
+/// resume: its node was replaced, and whatever it kept is a view of a history that never happened. A reader that
+/// always asks for everything never sees it.
+pub fn follow(addr: &str, on_connect: impl FnMut() -> u64, on_reset: impl FnMut(), on_unit: impl FnMut(Unit)) -> ! {
+    follow_reporting(addr, on_connect, on_reset, on_unit, |e| eprintln!("feed {addr}: {e}"))
 }
 
 /// As `follow`, telling `on_error` why each connection ended or could not be made (with what happens next), for a
@@ -114,6 +118,7 @@ pub fn follow(addr: &str, on_connect: impl FnMut() -> u64, on_unit: impl FnMut(U
 pub fn follow_reporting(
     addr: &str,
     mut on_connect: impl FnMut() -> u64,
+    mut on_reset: impl FnMut(),
     mut on_unit: impl FnMut(Unit),
     mut on_error: impl FnMut(&str),
 ) -> ! {
@@ -121,8 +126,11 @@ pub fn follow_reporting(
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
                 let resume_from = on_connect();
-                match stream.write_all(&resume_from.to_le_bytes()).and_then(|()| stream.flush()) {
-                    Ok(()) => {
+                match open(&mut stream, resume_from) {
+                    Ok(resuming) => {
+                        if resume_from > 0 && !resuming {
+                            on_reset();
+                        }
                         if let Err(e) = read_units(stream, &mut on_unit) {
                             on_error(&format!("{e}; reconnecting"));
                         }
@@ -134,6 +142,15 @@ pub fn follow_reporting(
         }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// Opens a subscription: says where this reader has got to, and reads back whether the node is honouring it.
+fn open(stream: &mut TcpStream, resume_from: u64) -> Result<bool, Error> {
+    stream.write_all(&resume_from.to_le_bytes())?;
+    stream.flush()?;
+    let mut answer = [0u8; 1];
+    stream.read_exact(&mut answer)?;
+    Ok(answer[0] != 0)
 }
 
 fn read_units(stream: TcpStream, on_unit: &mut impl FnMut(Unit)) -> Result<(), Error> {

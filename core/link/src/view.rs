@@ -527,6 +527,8 @@ impl Live {
                     }
                     0
                 },
+                // Asks for everything every time, so it is never told to start over.
+                || {},
                 |unit| {
                     if let Ok(mut v) = me.view.lock() {
                         v.apply(&unit);

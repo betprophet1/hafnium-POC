@@ -318,6 +318,7 @@ pub fn start(catalogue: Catalogue, config: &Config) -> Result<Arc<Service>, Erro
                 // The view was just discarded, so everything is wanted again.
                 0
             },
+            || {},
             |unit| follower.on_unit(&unit),
         );
     });

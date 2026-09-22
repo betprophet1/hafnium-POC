@@ -107,6 +107,7 @@ fn run(flags: &BTreeMap<String, String>) -> Result<(), Error> {
                 // A fresh projection, so everything is wanted again.
                 0
             },
+            || {},
             |unit| {
                 if std::mem::take(&mut *reconnect.lock().unwrap_or_else(PoisonError::into_inner)) {
                     derived.reconnected();

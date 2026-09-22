@@ -38,6 +38,7 @@ impl Node {
             wire::follow(
                 &feed,
                 || 0,
+                || {},
                 |unit| {
                     let sequence = unit.input["record"]["sequence"].as_u64().unwrap_or(0);
                     let mut journal = journal.lock().unwrap_or_else(PoisonError::into_inner);

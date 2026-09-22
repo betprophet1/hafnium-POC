@@ -59,6 +59,10 @@ fn sequences(feed: SocketAddr, resume_from: u64) -> Vec<u64> {
     let mut stream = TcpStream::connect(feed).expect("the feed accepts");
     stream.write_all(&resume_from.to_le_bytes()).expect("the position is sent");
     stream.flush().expect("flushed");
+    // The node answers whether it is honouring the position before any unit.
+    let mut answer = [0u8; 1];
+    stream.read_exact(&mut answer).expect("the node answers");
+    assert_eq!(answer[0] != 0, resume_from > 0, "the node did not do what it said with {resume_from}");
     stream.set_read_timeout(Some(Duration::from_millis(1500))).expect("a read timeout");
 
     let mut bytes = Vec::new();
@@ -122,4 +126,36 @@ fn a_subscriber_at_zero_is_sent_the_whole_backlog() {
     let everything = sequences(feed, 0);
     assert!(everything.len() > 4);
     assert_eq!(everything.first().copied(), Some(1), "the backlog did not start at the first input");
+}
+
+/// Asking for a sequence the journal has never reached is a reader whose node was replaced under it — a fresh
+/// data directory, or another group's. It is sent everything and told so, because a reader that kept a view has
+/// to be able to throw it away. Sending it the tail instead would leave it with a view of a history that never
+/// happened, and nothing would say so.
+#[test]
+fn a_position_the_journal_never_reached_is_refused_and_the_backlog_starts_over() {
+    let (feed, _dir) = node();
+    let everything = sequences(feed, 0);
+    let last = *everything.last().expect("the fixture has inputs");
+
+    let mut stream = TcpStream::connect(feed).expect("the feed accepts");
+    stream.write_all(&(last + 1_000).to_le_bytes()).expect("the position is sent");
+    stream.flush().expect("flushed");
+    let mut answer = [0u8; 1];
+    stream.read_exact(&mut answer).expect("the node answers");
+    assert_eq!(answer[0], 0, "the node claimed to honour a position it cannot have");
+
+    // And what follows really is the whole backlog.
+    stream.set_read_timeout(Some(Duration::from_millis(1500))).expect("a read timeout");
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while let Ok(n) = stream.read(&mut chunk) {
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+    assert!(!bytes.is_empty(), "nothing was sent at all");
+    let first = u64::from_le_bytes(bytes[12..20].try_into().expect("a sequence"));
+    assert_eq!(first, 1, "the backlog did not start at the first input");
 }
