@@ -12,7 +12,8 @@ Production puts the engine behind Aeron Cluster instead (WP-10). This node never
 - **Journal (interface 11).** `DATA/journal.sbe`. Each input is appended and flushed, `fsync`ed too with `--fsync`,
   before the engine sees it.
 - **Result log (interface 20).** `DATA/results.sbe`. Regenerated from the journal at every start, so it always
-  equals a replay.
+  equals a replay. Written durably: flushed, and `fsync`ed too with `--fsync`, before the next input is committed
+  — the same discipline the journal already has, and for the same reason (below, Snapshots).
 - **Recovery.** At start the journal is replayed through a fresh engine. A torn final frame left by a crash is
   cut off.
 - **Fail-stop (spec §18).** The process exits. Restarting replays the journal and stops at the same input,
@@ -48,13 +49,23 @@ only what follows it — the single-journal-file version of `replay-from` (which
 file of its own). Both are checked against a full replay from genesis for the same journal, byte for byte
 (E-20.9): `core/node/tests/snapshot_replay.rs`, `core/node/tests/embedded_snapshot.rs`.
 
-**Not yet wired into `serve`'s own recovery.** `serve` still always replays from sequence 1, embedded snapshot or
-not (harmlessly skipping it either way). Making startup use the latest one instead needs the result log to
-survive a restart rather than being rebuilt by replaying from genesis every time — today's `File::create` on
-`results.sbe` throws away exactly what a snapshot-based recovery would need to already be there for whatever
-`serve` chose not to re-derive. That is a durability problem of its own (results are flushed on a timer, not
-fsynced per input the way the journal is, so a preserved file cannot simply be trusted after a crash) rather than
-a small addition to this, and is the next piece of the capacity brief.
+**Result log durability.** The result log used to be flushed once a tick rather than per input, so a crash could
+lose results a client had already been told about, and a preserved copy could never be trusted after one: nothing
+records how many results one input produced (`ResultHeader` carries `inputSequence` and `resultIndex`, not a
+count), so a group cut short by a crash still ends on a whole, well-formed frame. `commit` now flushes (and
+`--fsync`s) the result log the same way it already does the journal, before the next input is committed —
+`core/node/tests/result_log_durability.rs` checks a result is on disk before the client that caused it is told
+so, not only once a tick later. `trusted_results`/`repair_results` read a result log back and say how far it can
+be trusted: every group but the last is confirmed complete, because a different sequence following it is only
+possible once E-4.1 has moved past it; the last group is never trusted, since nothing distinguishes one a crash
+cut short from one nothing has followed yet.
+
+**Not yet wired into `serve`'s own recovery.** `serve` still always truncates `results.sbe` and rebuilds it whole
+by replaying from sequence 1 at every start, embedded snapshot or not (harmlessly skipping one either way). What
+durability buys is a result log a restart could trust instead of throwing away — `serve` doesn't do that yet:
+choosing between "trust the preserved file up to `repair_results`'s answer, then replay only the tail" and
+today's full rebuild, and picking where to resume the engine from (an embedded snapshot at or before that point,
+or genesis) are still to be connected. That is the next piece of the capacity brief.
 
 ## Commands
 
