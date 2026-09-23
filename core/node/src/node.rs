@@ -206,6 +206,58 @@ pub fn replay(journal: &Path, results: &Path) -> Result<u64, Error> {
     Ok(inputs)
 }
 
+/// The sequence a result log's results are trusted through, and how many bytes of it to keep — everything up to,
+/// but not including, the last group of results found, whatever it names. `None` when nothing is trusted at all:
+/// the file does not exist, is empty, or holds only the one group nothing follows.
+///
+/// A result carries `resultHeader.inputSequence` and `resultIndex` (`interfaces/sbe/venue-journal.xml`), never a
+/// count of how many results its input produced. So a crash between two results of the same input leaves the
+/// file ending on a whole, well-formed frame — `read_frame` sees nothing wrong with it — but short of what a
+/// fresh replay of that input would produce, and nothing in the bytes says so. The only group this can ever rule
+/// out is the last one: once a *different* sequence follows a group, that group is confirmed complete, because
+/// nothing may be journaled and applied out of order (E-4.1). The last group is never trusted, complete or not,
+/// the same way `run_journal`'s repair never trusts a journal's last frame without a whole one closing it.
+pub fn trusted_results(path: &Path) -> Result<Option<(u64, u64)>, Error> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    let (mut offset, mut group, mut confirmed) = (0u64, None, None);
+    loop {
+        let start = offset;
+        match read_frame(&mut reader, &mut buf) {
+            Ok(Some(n)) => {
+                let sequence = u64_at(&buf[..n], 8);
+                if group.is_some_and(|g| g != sequence) {
+                    confirmed = Some((group.expect("checked Some above"), start));
+                }
+                group = Some(sequence);
+                offset = start + 4 + n as u64;
+            }
+            Ok(None) => break,
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(confirmed)
+}
+
+/// Truncates a result log to what `trusted_results` says is trusted, and returns the sequence it is trusted
+/// through — `None` when nothing was, in which case the file is left exactly as it was (a caller that wants an
+/// empty result log asks for that itself; this only ever removes an unconfirmed tail).
+pub fn repair_results(path: &Path) -> Result<Option<u64>, Error> {
+    let Some((sequence, length)) = trusted_results(path)? else { return Ok(None) };
+    let file = OpenOptions::new().write(true).open(path)?;
+    if file.metadata()?.len() != length {
+        file.set_len(length)?;
+        log::warn("result log cut to its last confirmed group", &[("results", &path.display()), ("bytes", &length)]);
+    }
+    Ok(Some(sequence))
+}
+
 /// Stamps, journals and applies inputs, in that order.
 struct Pipeline {
     sequencer: Sequencer,
@@ -232,7 +284,17 @@ impl Pipeline {
         };
         self.metrics.journaled(input, sequence, at, appended.duration_since(started), synced);
         self.out.clear();
-        apply(engine, input, &mut self.results, Some(&mut self.out))
+        apply(engine, input, &mut self.results, Some(&mut self.out))?;
+        // Durable before the next input is committed, the same way the journal already is: a crash between two
+        // inputs must never leave one with results only partly on disk, because nothing marks a result group done
+        // (interfaces/sbe/venue-journal.xml, ResultHeader — resultIndex counts from 0, it does not say how many
+        // there will be), so a torn group cannot be told from a complete one by its bytes alone. `trusted_results`
+        // is what a restart checks this against; this is what makes its answer mean something.
+        self.results.flush()?;
+        if self.fsync {
+            self.results.get_ref().sync_data()?;
+        }
+        Ok(())
     }
 }
 
@@ -543,11 +605,132 @@ pub fn serve(config: &Config) -> Result<(), Error> {
         let now = monotonic();
         if now >= next_tick {
             let mut tick = sequencer::time_tick();
+            // `commit` already flushes (and syncs) `results` on its own now; nothing left to do here.
             pipeline.commit(&mut engine, &mut tick)?;
             publish(&mut subscribers, &metrics, &tick, &pipeline.out)?;
-            pipeline.results.flush()?;
             metrics.subscribers(subscribers.iter().map(|(_, progress)| progress.as_ref()));
             next_tick = (next_tick + config.tick).max(now);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("venue-node-results-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    /// A result frame carrying nothing but a sequence, at the offset every result and every input shares.
+    fn fake_result(sequence: u64) -> Vec<u8> {
+        let mut frame = vec![0u8; 16];
+        frame[8..16].copy_from_slice(&sequence.to_le_bytes());
+        frame
+    }
+
+    fn write_results(path: &Path, groups: &[u64]) {
+        let mut file = BufWriter::new(File::create(path).expect("created"));
+        for &sequence in groups {
+            write_frame(&mut file, &fake_result(sequence)).expect("written");
+        }
+        file.flush().expect("flushed");
+    }
+
+    #[test]
+    fn an_empty_or_missing_result_log_trusts_nothing() {
+        let dir = dir("empty");
+        let path = dir.join("missing.sbe");
+        assert_eq!(trusted_results(&path).expect("checked"), None);
+        write_results(&path, &[]);
+        assert_eq!(trusted_results(&path).expect("checked"), None);
+    }
+
+    #[test]
+    fn a_single_group_with_nothing_after_it_is_never_trusted() {
+        let dir = dir("single");
+        let path = dir.join("results.sbe");
+        // Three results, all for the one input: nothing confirms the group is done.
+        write_results(&path, &[5, 5, 5]);
+        assert_eq!(trusted_results(&path).expect("checked"), None);
+    }
+
+    #[test]
+    fn a_group_is_trusted_once_a_different_sequence_follows_it() {
+        let dir = dir("two-groups");
+        let path = dir.join("results.sbe");
+        write_results(&path, &[5, 5, 6, 6, 6]);
+        let (sequence, length) = trusted_results(&path).expect("checked").expect("a confirmed group");
+        assert_eq!(sequence, 5, "the confirmed group is the one a later sequence followed, not the later one");
+        // Length is the byte offset of the first frame of the (unconfirmed) sequence-6 group: two 16-byte frames,
+        // each carrying 4 bytes of length prefix.
+        assert_eq!(length, 2 * (4 + 16));
+    }
+
+    #[test]
+    fn only_the_last_group_is_ever_discarded() {
+        let dir = dir("three-groups");
+        let path = dir.join("results.sbe");
+        write_results(&path, &[5, 6, 6, 7]);
+        let (sequence, _) = trusted_results(&path).expect("checked").expect("a confirmed group");
+        assert_eq!(sequence, 6, "a confirmed group other than the last one was not trusted");
+    }
+
+    #[test]
+    fn a_torn_final_frame_is_folded_into_the_same_discarded_group() {
+        let dir = dir("torn");
+        let path = dir.join("results.sbe");
+        write_results(&path, &[5, 5, 6]);
+        // Cut off partway through what would be a second sequence-6 result: a whole frame (5,5) then a torn one.
+        let mut whole = fs::read(&path).expect("read");
+        whole.push(0); // a length prefix, started but not finished
+        fs::write(&path, &whole).expect("written");
+        let (sequence, _) = trusted_results(&path).expect("checked").expect("a confirmed group");
+        assert_eq!(sequence, 5, "a torn frame after the last confirmed group changed which group that was");
+    }
+
+    #[test]
+    fn repair_truncates_to_what_is_trusted_and_reports_it() {
+        let dir = dir("repair");
+        let path = dir.join("results.sbe");
+        write_results(&path, &[5, 5, 6, 6, 6]);
+        let before = fs::metadata(&path).expect("stat").len();
+        let sequence = repair_results(&path).expect("repaired").expect("something was trusted");
+        assert_eq!(sequence, 5);
+        let after = fs::metadata(&path).expect("stat").len();
+        assert_eq!(after, 2 * (4 + 16), "the untrusted sequence-6 group was not cut");
+        assert!(after < before, "repair did not shrink the file");
+    }
+
+    /// Not idempotent, and deliberately so: nothing in the bytes distinguishes a group that is the last one
+    /// because a crash cut it short from one that is the last one because nothing has been appended since a
+    /// clean repair. A second repair call with nothing written in between no longer trusts the very group the
+    /// first one just confirmed — `repair_results` never destroys what it does not trust (only what it does, and
+    /// only the untrusted part), so the file is left exactly as the first repair left it, just no longer vouched
+    /// for. This is why a caller repairs once, at start, and only ever appends after that; it never repairs again
+    /// without new results in between.
+    #[test]
+    fn repairing_twice_with_nothing_appended_in_between_stops_trusting_further() {
+        let dir = dir("repair-twice");
+        let path = dir.join("results.sbe");
+        write_results(&path, &[5, 5, 6, 6, 6]);
+        assert_eq!(repair_results(&path).expect("repaired"), Some(5));
+        let after_first = fs::metadata(&path).expect("stat").len();
+        assert_eq!(repair_results(&path).expect("repaired"), None, "a solitary group was still trusted");
+        assert_eq!(fs::metadata(&path).expect("stat").len(), after_first, "an untrusted repair destroyed data");
+    }
+
+    #[test]
+    fn repair_of_a_fully_trusted_or_empty_log_touches_nothing() {
+        let dir = dir("nothing-to-repair");
+        let path = dir.join("results.sbe");
+        assert_eq!(repair_results(&path).expect("repaired"), None, "a missing file was reported as trusted");
+        write_results(&path, &[5, 5, 5]);
+        let before = fs::metadata(&path).expect("stat").len();
+        assert_eq!(repair_results(&path).expect("repaired"), None, "an unconfirmed single group was trusted");
+        assert_eq!(fs::metadata(&path).expect("stat").len(), before, "repair touched a file it did not trust any of");
     }
 }
