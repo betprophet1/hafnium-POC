@@ -43,6 +43,10 @@ const IDLE: Duration = Duration::from_secs(1);
 /// The exit status of a gateway whose audit log failed: EX_IOERR.
 pub const EXIT_IO_ERROR: i32 = 74;
 const MICROS_PER_DAY: u64 = 86_400_000_000;
+/// The most a segment holds before it is rotated early, mid-day. Well under S3's 5 GiB single-object limit
+/// (`interfaces/tools/audit_ship.py`, `SINGLE_PUT`), which a day of unbounded traffic can otherwise reach
+/// (interfaces/audit/README.md, Rotation).
+const MAX_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Wall-clock microseconds since the epoch, for audit timestamps only. The workspace bans clocks because the engine's
 /// only clock is the journal; an audit timestamp says when the edge saw something, and nothing reads it back.
@@ -462,6 +466,8 @@ struct Writer {
     name: String,
     day: u64,
     next: u64,
+    /// Bytes written to the open file so far, to catch it growing past `MAX_SEGMENT_BYTES` (`rotate_if_too_big`).
+    bytes: u64,
     prev: String,
     /// The line being written, kept from record to record so no record allocates for its own bytes.
     line: Vec<u8>,
@@ -511,6 +517,7 @@ impl Writer {
             name,
             day: micros / MICROS_PER_DAY,
             next: 0,
+            bytes: 0,
             prev: ZEROS.to_string(),
             line: Vec::new(),
             _lock: lock,
@@ -562,9 +569,11 @@ impl Writer {
         }
     }
 
-    /// Appends one record, first rotating if it belongs to a later day than the file.
+    /// Appends one record, first rotating if it belongs to a later day than the file, or if the file has grown
+    /// large enough that it should not grow further.
     fn append(&mut self, micros: u64, kind: &str, fields: &Fields) -> io::Result<()> {
         self.rotate_if_past_midnight(micros)?;
+        self.rotate_if_too_big(micros)?;
         self.write_line(micros, kind, fields)
     }
 
@@ -578,11 +587,13 @@ impl Writer {
         push_line(&mut line, &head, fields);
         let digest = Sha256::digest(&line);
         line.push(b'\n');
+        let len = line.len() as u64;
         let written = self.file.write_all(&line);
         self.line = line;
         written?;
         push_hex(&mut self.prev, digest.as_slice());
         self.next += 1;
+        self.bytes += len;
         Ok(())
     }
 
@@ -608,12 +619,28 @@ impl Writer {
         Ok(())
     }
 
+    /// Rotates mid-day once the open file has grown past `MAX_SEGMENT_BYTES`, the same way a day boundary does: a
+    /// `close` record (`reason: rotate`) and the next segment of the same day. Still dated today, so still not taken
+    /// to the archive until the day is over (interfaces/audit/README.md, "Only days that are over") — this bounds
+    /// how big any one file gets, it does not ship it any sooner.
+    fn rotate_if_too_big(&mut self, micros: u64) -> io::Result<()> {
+        if self.bytes >= MAX_SEGMENT_BYTES {
+            let closed = self.name.clone();
+            self.metrics.rotations.inc();
+            self.close(micros, "rotate")?;
+            let last = self.prev.clone();
+            self.open_file(micros, Some(json!({"file": closed, "last": last})))?;
+        }
+        Ok(())
+    }
+
     fn open_file(&mut self, micros: u64, after: Option<Value>) -> io::Result<()> {
         let day = micros / MICROS_PER_DAY;
         let (file, name) = create_file(&self.dir, &self.component, &self.instance, day)?;
         (self.file, self.name) = (BufWriter::with_capacity(BUFFER, file), name);
         self.day = day;
         self.next = 0;
+        self.bytes = 0;
         self.prev = ZEROS.to_string();
         self.begin(micros, after)
     }
@@ -885,6 +912,32 @@ mod tests {
             fs::read_to_string(&files[0]).expect("read").lines().last().map(str::to_string).expect("a line");
         assert_eq!(second[0]["after"], json!({"file": names[0], "last": sha256_hex(close_line.as_bytes())}));
         assert_eq!(second[1]["msg"], "after midnight");
+    }
+
+    /// A segment that grows past `MAX_SEGMENT_BYTES` rotates the same way a day boundary does — a `close` record
+    /// (`reason: rotate`) and the next segment of the same day — without waiting for midnight.
+    #[test]
+    fn a_segment_past_the_size_limit_rotates_mid_day_like_a_new_day_would() {
+        let dir = dir("size-rotate");
+        let mut writer = Writer::open(&dir, COMPONENT, "test", false, LATE - 100_000).expect("opened");
+        writer.append(LATE - 99_000, "ws-frame", &fields("before the limit")).expect("written");
+        writer.bytes = MAX_SEGMENT_BYTES;
+        writer.append(LATE - 98_000, "ws-frame", &fields("past the limit")).expect("written");
+        writer.close(LATE - 97_000, "shutdown").expect("closed");
+        let files = files(&dir);
+        let names: Vec<_> = files.iter().filter_map(|p| p.file_name()?.to_str()).collect();
+        assert_eq!(names, ["gateway.test.2026-09-17.0000.jsonl", "gateway.test.2026-09-17.0001.jsonl"]);
+        assert_eq!(files.iter().map(|f| verify(f)).collect::<Vec<_>>(), [Ok(true), Ok(true)]);
+        let (first, second) = (lines(&files[0]), lines(&files[1]));
+        assert_eq!(
+            first.iter().map(|r| r["kind"].as_str().unwrap_or("")).collect::<Vec<_>>(),
+            ["open", "ws-frame", "close"]
+        );
+        assert_eq!((first[2]["reason"].as_str(), first[2]["records"].as_u64()), (Some("rotate"), Some(2)));
+        let close_line =
+            fs::read_to_string(&files[0]).expect("read").lines().last().map(str::to_string).expect("a line");
+        assert_eq!(second[0]["after"], json!({"file": names[0], "last": sha256_hex(close_line.as_bytes())}));
+        assert_eq!(second[1]["msg"], "past the limit");
     }
 
     #[test]
