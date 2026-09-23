@@ -33,6 +33,29 @@ the input is journaled (E-17.4 without a quorum). Sequencer events and anything 
 the connection and are not journaled. The ingress is for tools, bots and a development gateway; it has no
 authentication and must never face a network anyone else can reach.
 
+## Snapshots (spec §20)
+
+A snapshot is the engine's logical state, taken by a replaying engine and never by the one serving traffic
+(E-20.10): the hot path does not pause to serialise itself. `venue-node snapshot JOURNAL OUT [--at N]` writes one
+to a file of its own; `venue-node embed-snapshot JOURNAL [--at N]` writes the same frame into the journal itself
+instead (`Snapshot`, template 53), which is what D-32 asks for — a journal with no snapshot in it can never be
+cut, because recovery has nowhere to begin but sequence 1. A `Snapshot` frame is not an input: every reader that
+walks a journal frame by frame (a full replay, recovery, a subscriber's backlog) skips it by template id, exactly
+as it skips one embedded earlier when computing a later one.
+
+`venue-node recover JOURNAL RESULTS [--snapshot-out FILE]` restores from the latest embedded snapshot and replays
+only what follows it — the single-journal-file version of `replay-from` (which does the same from a snapshot
+file of its own). Both are checked against a full replay from genesis for the same journal, byte for byte
+(E-20.9): `core/node/tests/snapshot_replay.rs`, `core/node/tests/embedded_snapshot.rs`.
+
+**Not yet wired into `serve`'s own recovery.** `serve` still always replays from sequence 1, embedded snapshot or
+not (harmlessly skipping it either way). Making startup use the latest one instead needs the result log to
+survive a restart rather than being rebuilt by replaying from genesis every time — today's `File::create` on
+`results.sbe` throws away exactly what a snapshot-based recovery would need to already be there for whatever
+`serve` chose not to re-derive. That is a durability problem of its own (results are flushed on a timer, not
+fsynced per input the way the journal is, so a preserved file cannot simply be trusted after a crash) rather than
+a small addition to this, and is the next piece of the capacity brief.
+
 ## Commands
 
 ```sh
@@ -40,6 +63,9 @@ venue-node serve --data ./venue-data --listen 127.0.0.1:7101
 venue-node send 127.0.0.1:7101 inputs.json      # JSON inputs in the harness codec's format; results as JSON lines
 venue-node dump ./venue-data/journal.sbe        # a journal or result log as JSON lines
 venue-node replay ./venue-data/journal.sbe out.sbe && cmp out.sbe ./venue-data/results.sbe
+venue-node snapshot ./venue-data/journal.sbe snap.sbe
+venue-node embed-snapshot ./venue-data/journal.sbe   # only while nothing has it open (no `serve` running)
+venue-node recover ./venue-data/journal.sbe tail.results.sbe
 venue-node import core/target/differential/fuzz-90000.json golden.journal
 ```
 

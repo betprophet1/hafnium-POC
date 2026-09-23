@@ -15,6 +15,14 @@ pub fn write_frame(w: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     w.write_all(bytes)
 }
 
+/// A frame's template id, read without decoding it: every SBE message header carries it at this fixed offset.
+/// What lets a reader recognise a `Snapshot` frame (template 53) among inputs without a full decode — it is not
+/// one (interfaces/sbe/venue-journal.xml, Snapshot), and every reader that walks a journal frame by frame skips
+/// it by this same check rather than trying to apply or pair it like an input.
+pub fn template_of(frame: &[u8]) -> Option<u16> {
+    frame.get(2..4).map(|b| u16::from_le_bytes(b.try_into().unwrap_or_default()))
+}
+
 /// Reads one frame into `buf` and returns its length, or `None` at a clean end of stream. A stream that ends
 /// inside a frame is an `UnexpectedEof` error: a torn write.
 pub fn read_frame(r: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<Option<usize>> {

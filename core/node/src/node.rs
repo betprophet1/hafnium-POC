@@ -8,7 +8,7 @@
 //! The feed is a development stand-in for interface 12: a reader receives every input with its results, from the
 //! start of the journal, then live.
 
-use crate::frames::{read_frame, write_frame};
+use crate::frames::{read_frame, template_of, write_frame};
 use crate::metrics::{NodeMetrics, Subscriber};
 use crate::sequencer::{self, Sequencer};
 use sha2::{Digest, Sha256};
@@ -26,8 +26,17 @@ use venue_engine::frame::{self, Kind};
 use venue_engine::state::Capacities;
 use venue_engine::{Engine, EngineConfig, ResultSink};
 use venue_harness::memory::OwnedMemory;
+use venue_journal::snapshot_codec::SBE_TEMPLATE_ID as SNAPSHOT;
 use venue_journal::time_tick_codec::SBE_TEMPLATE_ID as TIME_TICK;
 use venue_telemetry::log;
+
+/// A `Snapshot` frame (template 53) is not an input: it is written into the journal between inputs, but the
+/// engine does not apply it and its `record.sequence` names the input it follows rather than one of its own
+/// (interfaces/sbe/venue-journal.xml, Snapshot). Every reader that walks a journal frame by frame — recovery, a
+/// full replay, a subscriber's backlog — skips it by this check instead.
+pub(crate) fn is_snapshot(frame: &[u8]) -> bool {
+    template_of(frame) == Some(SNAPSHOT)
+}
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -133,8 +142,9 @@ pub(crate) fn apply(
     outcome.map_err(|stop| format!("engine fail-stop {stop:?} at input {} (spec §18)", engine.position().0).into())
 }
 
-/// Runs every frame of a journal through `engine`, writing results. A torn final frame, left by a crash mid-write,
-/// is reported and, when `repair` is set, cut off. Returns the number of inputs applied.
+/// Runs every frame of a journal through `engine`, writing results. A `Snapshot` frame is not an input and is
+/// skipped rather than applied. A torn final frame, left by a crash mid-write, is reported and, when `repair` is
+/// set, cut off. Returns the number of inputs applied.
 fn run_journal(
     engine: &mut Engine<'_>,
     path: &Path,
@@ -148,9 +158,11 @@ fn run_journal(
     loop {
         match read_frame(&mut reader, &mut buf) {
             Ok(Some(n)) => {
-                apply(engine, &buf[..n], results, None)?;
+                if !is_snapshot(&buf[..n]) {
+                    apply(engine, &buf[..n], results, None)?;
+                    inputs += 1;
+                }
                 good += 4 + n as u64;
-                inputs += 1;
             }
             Ok(None) => break,
             Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
@@ -370,6 +382,10 @@ fn serve_subscriber(
     let (mut input, mut result, mut batch) = (Vec::new(), Vec::new(), Vec::new());
     let mut pending = read_frame(&mut outputs, &mut result)?;
     while let Some(n) = read_frame(&mut inputs, &mut input)? {
+        // Not an input, and paired with nothing: a subscriber with no use for it never sees it.
+        if is_snapshot(&input[..n]) {
+            continue;
+        }
         let sequence = u64_at(&input, 8);
         batch.clear();
         while let Some(m) = pending {

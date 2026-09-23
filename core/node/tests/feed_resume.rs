@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use venue_node::node::{serve, Config};
+use venue_node::snapshots::embed;
 
 fn free_port() -> SocketAddr {
     TcpListener::bind("127.0.0.1:0").expect("a port").local_addr().expect("its address")
@@ -19,14 +20,22 @@ fn free_port() -> SocketAddr {
 
 /// A node serving the committed journal fixture, recovered from disk rather than traded into existence.
 fn node() -> (SocketAddr, PathBuf) {
+    node_with(|_| {})
+}
+
+/// The same, but `prepare` runs against the copied journal before the node starts serving it — for a test that
+/// wants a `Snapshot` frame already embedded (`embed`) in what the node recovers from and serves.
+fn node_with(prepare: impl FnOnce(&Path)) -> (SocketAddr, PathBuf) {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interfaces/audit/recorded");
     // `Instant::now` is disallowed in this crate, and a clock is not what makes a directory name unique anyway.
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let nth = NEXT.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("venue-feed-resume-{}-{nth}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("a data directory");
-    std::fs::copy(fixture.join("journal.sbe"), dir.join("journal.sbe")).expect("the journal copies");
+    let journal = dir.join("journal.sbe");
+    std::fs::copy(fixture.join("journal.sbe"), &journal).expect("the journal copies");
     std::fs::copy(fixture.join("capacity"), dir.join("capacity")).expect("the capacity copies");
+    prepare(&journal);
 
     let (listen, feed) = (free_port(), free_port());
     let config = Config {
@@ -158,4 +167,20 @@ fn a_position_the_journal_never_reached_is_refused_and_the_backlog_starts_over()
     assert!(!bytes.is_empty(), "nothing was sent at all");
     let first = u64::from_le_bytes(bytes[12..20].try_into().expect("a sequence"));
     assert_eq!(first, 1, "the backlog did not start at the first input");
+}
+
+/// A `Snapshot` frame embedded in the journal is not an input: a subscriber with no use for it never sees it, in
+/// the backlog a fresh recovery reads or in what a running node goes on to serve. What a subscriber is sent is
+/// exactly what it would have been sent had nothing ever been embedded.
+#[test]
+fn an_embedded_snapshot_is_not_sent_to_a_subscriber() {
+    let (plain_feed, _plain_dir) = node();
+    let plain = sequences(plain_feed, 0);
+    assert!(plain.len() > 4, "the fixture journal is too short to cut: {} units", plain.len());
+
+    let (feed, _dir) = node_with(|journal| {
+        embed(journal, None).expect("a snapshot embeds");
+    });
+    let everything = sequences(feed, 0);
+    assert_eq!(everything, plain, "an embedded Snapshot frame changed what a subscriber is sent");
 }
