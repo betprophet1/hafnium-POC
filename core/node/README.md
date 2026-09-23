@@ -14,8 +14,10 @@ Production puts the engine behind Aeron Cluster instead (WP-10). This node never
 - **Result log (interface 20).** `DATA/results.sbe`. Regenerated from the journal at every start, so it always
   equals a replay. Written durably: flushed, and `fsync`ed too with `--fsync`, before the next input is committed
   — the same discipline the journal already has, and for the same reason (below, Snapshots).
-- **Recovery.** At start the journal is replayed through a fresh engine. A torn final frame left by a crash is
-  cut off.
+- **Recovery.** At start, the latest embedded snapshot is used when the preserved result log already covers it —
+  otherwise (no snapshot, or the result log doesn't yet reach one that exists) the journal is replayed through a
+  fresh engine from sequence 1, exactly as before there were snapshots. A torn final frame left by a crash is
+  cut off either way (below, Snapshots).
 - **Fail-stop (spec §18).** The process exits. Restarting replays the journal and stops at the same input,
   which is what E-18.2 requires; recovery is an operator decision.
 
@@ -60,12 +62,19 @@ be trusted: every group but the last is confirmed complete, because a different 
 possible once E-4.1 has moved past it; the last group is never trusted, since nothing distinguishes one a crash
 cut short from one nothing has followed yet.
 
-**Not yet wired into `serve`'s own recovery.** `serve` still always truncates `results.sbe` and rebuilds it whole
-by replaying from sequence 1 at every start, embedded snapshot or not (harmlessly skipping one either way). What
-durability buys is a result log a restart could trust instead of throwing away — `serve` doesn't do that yet:
-choosing between "trust the preserved file up to `repair_results`'s answer, then replay only the tail" and
-today's full rebuild, and picking where to resume the engine from (an embedded snapshot at or before that point,
-or genesis) are still to be connected. That is the next piece of the capacity brief.
+**Wired into `serve`'s own recovery.** `choose_recovery` (`core/node/src/node.rs`) decides once at start: a
+snapshot is only used when the preserved result log's trusted point (`repair_results`) reaches **at least** its
+own sequence — a snapshot found but not yet covered by a trusted result log falls back to genesis, because using
+it without also re-deriving the results it covers would leave a gap in `results.sbe` a subscriber's backlog
+cannot fill for those sequences, and re-deriving them defeats what the snapshot was for. Taking the snapshot's
+path restores the engine from it, replays anything already trusted but not yet reflected in the engine's memory
+into a throwaway sink (advancing state without rewriting durable results), then replays only the genuinely new
+tail for real, appended to the *preserved* result log rather than a fresh one.
+`core/node/tests/wired_recovery.rs` checks a node recovering this way is indistinguishable from one that
+recovered from genesis, both in what a subscriber's backlog receives and in the result log's own bytes.
+
+Cutting the journal once recovery no longer needs everything before a snapshot, and shipping what is cut to
+object storage, are not built yet — this only proves the journal *can* be cut safely; nothing does.
 
 ## Commands
 

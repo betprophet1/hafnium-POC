@@ -167,7 +167,7 @@ fn group_of(journal: &Path) -> Result<u16, Error> {
 
 /// Decodes a `Snapshot` frame and restores its state into `engine`. Returns the sequence it describes — the
 /// input it follows, not one of its own (interfaces/sbe/venue-journal.xml, Snapshot).
-fn restore_into(engine: &mut Engine<'_>, frame: &[u8]) -> Result<u64, Error> {
+pub(crate) fn restore_into(engine: &mut Engine<'_>, frame: &[u8]) -> Result<u64, Error> {
     if template_of(frame) != Some(SNAPSHOT) {
         return Err("that frame is not a Snapshot (template 53)".into());
     }
