@@ -15,7 +15,7 @@ use crate::snapshots;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{self, BufReader, BufWriter, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -37,6 +37,25 @@ use venue_telemetry::log;
 /// full replay, a subscriber's backlog — skips it by this check instead.
 pub(crate) fn is_snapshot(frame: &[u8]) -> bool {
     template_of(frame) == Some(SNAPSHOT)
+}
+
+/// Whether `journal`'s first real input is still sequence 1 — `false` once `cut` has ever removed it. A genesis
+/// replay of a cut journal would fail-stop confusingly on whatever input it did keep (E-4.1: the engine expects
+/// sequence 1 next); this is what lets a caller refuse clearly instead. Skips past any `Snapshot` frame to find
+/// that first real input rather than assuming it is the very first frame in the file — `cut` keeps every frame's
+/// original relative order, and a snapshot embedded after later inputs already existed can physically sit *after*
+/// them (§3.7), so it is not reliably the first frame even in a cut journal. An empty journal, or one with nothing
+/// but a snapshot in it, counts as starting at genesis — there is no input in it to contradict that.
+fn starts_at_genesis(journal: &Path) -> Result<bool, Error> {
+    let mut reader = BufReader::new(File::open(journal)?);
+    let mut buf = Vec::new();
+    while let Some(n) = read_frame(&mut reader, &mut buf)? {
+        if is_snapshot(&buf[..n]) {
+            continue;
+        }
+        return Ok(u64_at(&buf[..n], 8) == 1);
+    }
+    Ok(true)
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -201,7 +220,17 @@ fn run_journal(
 
 /// Runs a journal through a fresh engine and writes its result log. Replaying one journal always yields the
 /// same result log, byte for byte, on any build with the same profile (blueprint §16).
+///
+/// Refuses a journal `cut` has already shortened: a fresh engine expects sequence 1 first (E-4.1), and a cut
+/// journal starts with a `Snapshot` frame instead — `recover`, not `replay`, is what such a journal is read with.
 pub fn replay(journal: &Path, results: &Path) -> Result<u64, Error> {
+    if !starts_at_genesis(journal)? {
+        return Err(format!(
+            "{} has been cut and no longer starts at sequence 1; use recover, not replay",
+            journal.display()
+        )
+        .into());
+    }
     let group = {
         let mut reader = BufReader::new(File::open(journal)?);
         let mut buf = Vec::new();
@@ -271,6 +300,119 @@ pub fn repair_results(path: &Path) -> Result<Option<u64>, Error> {
         log::warn("result log cut to its last confirmed group", &[("results", &path.display()), ("bytes", &length)]);
     }
     Ok(Some(sequence))
+}
+
+/// Rewrites `path` to keep only the bytes from `start` onward, durably and atomically: copied to a sibling temp
+/// file, `fsync`ed, then renamed over the original. A crash mid-rewrite leaves the original exactly as it was —
+/// nothing is replaced until its replacement is already durable, the same principle the audit shipper's "nothing
+/// deleted until it is verified in place" rests on (interfaces/audit/README.md). Returns how many bytes were
+/// removed; `start: 0` is a no-op, since there is nothing to cut. Correct for a result log, whose frames are
+/// always written in increasing sequence order — a single cut point is all it ever needs. Not correct for a
+/// journal (see `rewrite_journal_cut`): `embed` appends wherever the file currently ends, not necessarily right
+/// after the sequence it describes, so a single "keep from this byte onward" point can silently drop later,
+/// higher-sequence inputs that physically sit *before* it.
+fn rewrite_from(path: &Path, start: u64) -> Result<u64, Error> {
+    if start == 0 {
+        return Ok(0);
+    }
+    let temp = path.with_extension("cut-tmp");
+    {
+        let mut input = File::open(path)?;
+        input.seek(SeekFrom::Start(start))?;
+        let mut output = File::create(&temp)?;
+        io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+    }
+    fs::rename(&temp, path)?;
+    Ok(start)
+}
+
+/// The byte offset in a result log where the first result for a sequence after `at` begins. Everything before it
+/// — every result for a sequence at or before `at` — is safe to drop once a `Snapshot` for `at` exists and this
+/// result log is already trusted at least that far, which `cut` checks before ever calling this.
+fn results_cut_offset(results: &Path, at: u64) -> Result<u64, Error> {
+    let mut reader = BufReader::new(File::open(results)?);
+    let mut buf = Vec::new();
+    let mut offset = 0u64;
+    while let Some(n) = read_frame(&mut reader, &mut buf)? {
+        if u64_at(&buf[..n], 8) > at {
+            return Ok(offset);
+        }
+        offset += 4 + n as u64;
+    }
+    Ok(offset)
+}
+
+/// Rewrites `journal`, durably and atomically (same discipline as `rewrite_from`), to keep only the `Snapshot`
+/// frame at `at` and whatever has a sequence greater than `at` — in their original relative order, wherever in
+/// the file each one actually sits. A single byte offset is not enough to cut a journal correctly: `embed`
+/// appends wherever the file currently ends, so a snapshot for an earlier sequence, embedded after later inputs
+/// were already journaled, physically sits *after* them — filtering by sequence, frame by frame, is what
+/// `replay_tail` already does for the same reason (§3.7), and cutting needs the same discipline, not a shortcut.
+/// Any *other*, now-superseded `Snapshot` frame is dropped too. Returns how many bytes were removed.
+fn rewrite_journal_cut(journal: &Path, at: u64) -> Result<u64, Error> {
+    let before = journal.metadata()?.len();
+    let temp = journal.with_extension("cut-tmp");
+    let mut kept = 0u64;
+    {
+        let mut reader = BufReader::new(File::open(journal)?);
+        let mut output = BufWriter::new(File::create(&temp)?);
+        let mut buf = Vec::new();
+        while let Some(n) = read_frame(&mut reader, &mut buf)? {
+            let sequence = u64_at(&buf[..n], 8);
+            let keep = if is_snapshot(&buf[..n]) { sequence == at } else { sequence > at };
+            if keep {
+                write_frame(&mut output, &buf[..n])?;
+                kept += 4 + n as u64;
+            }
+        }
+        output.flush()?;
+        output.get_ref().sync_all()?;
+    }
+    fs::rename(&temp, journal)?;
+    Ok(before.saturating_sub(kept))
+}
+
+/// Cuts a journal, and its result log with it, to start at the latest embedded snapshot — removing everything
+/// D-32 says a snapshot is what makes removable. Refuses unless the result log is already trusted through at
+/// least the snapshot's own sequence (`repair_results`, which this calls first and whose own repair happens
+/// regardless of the outcome): cutting past what it actually covers would permanently lose the ability to
+/// reconstruct those results, since the journal bytes a full replay would need are exactly what this removes.
+///
+/// Rewrites both files whole rather than truncating in place — `journal.sbe` has no way to drop bytes from its
+/// *front* the way `repair_results` drops an unconfirmed *tail*. For a journal no live `serve` has open, the same
+/// caveat `embed` carries: there is no lock on it today.
+///
+/// Returns the sequence cut to, and how many bytes were removed from the journal and from the result log.
+pub fn cut(journal: &Path, results: &Path) -> Result<(u64, u64, u64), Error> {
+    let Some((at, _)) = snapshots::latest(journal)? else {
+        return Err(
+            format!("{} has no embedded snapshot to cut to (venue-node embed-snapshot)", journal.display()).into()
+        );
+    };
+    match repair_results(results)? {
+        Some(trusted) if trusted >= at => {}
+        Some(trusted) => {
+            return Err(format!(
+                "the result log is only trusted through {trusted}, before the snapshot at {at}: run the node so \
+                 it catches up, or embed a snapshot at or before {trusted}"
+            )
+            .into())
+        }
+        None => return Err(format!("the result log has nothing trusted yet, so cutting to {at} would lose it").into()),
+    }
+    let journal_removed = rewrite_journal_cut(journal, at)?;
+    let results_removed = rewrite_from(results, results_cut_offset(results, at)?)?;
+    log::info(
+        "journal cut",
+        &[
+            ("journal", &journal.display()),
+            ("at", &at),
+            ("journal_bytes_removed", &journal_removed),
+            ("results_bytes_removed", &results_removed),
+        ],
+    );
+    Ok((at, journal_removed, results_removed))
 }
 
 /// Stamps, journals and applies inputs, in that order.
@@ -487,6 +629,7 @@ fn serve_subscriber(
 }
 
 /// How `serve` recovers, decided once at start and never revisited during the run.
+#[derive(Debug)]
 enum Recovery {
     /// No usable snapshot: a fresh engine replays the whole journal, and `results.sbe` is rebuilt from nothing,
     /// exactly as before PR #14/#15.
@@ -502,10 +645,12 @@ enum Recovery {
 ///
 /// A snapshot only helps when the result log already trustworthily covers **at least its own sequence**. One
 /// found but not covered is not usable: using it without also re-deriving the results for the sequences it
-/// covers would leave a gap in `results.sbe` that a subscriber's backlog cannot fill for those sequences (the
-/// journal still holds them, unshortened — cutting it is a later step, §8 item 7(b)) — and re-deriving them by
-/// replaying from the snapshot defeats what the snapshot was for in the first place. So: no snapshot, or a
-/// result log not yet caught up to one that exists, falls back to `Genesis`, the always-safe answer.
+/// covers would leave a gap in `results.sbe` that a subscriber's backlog cannot fill for those sequences —
+/// re-deriving them by replaying from the snapshot would defeat what the snapshot was for in the first place. So:
+/// a result log not yet caught up to a snapshot that exists falls back to `Genesis` — *if* genesis is still
+/// possible. Once `cut` has ever run, it is not: the bytes a genesis replay would need are exactly what it
+/// removed, so a journal that no longer `starts_at_genesis` and has no *usable* snapshot is not a fallback case at
+/// all, but a real error — recovery is not possible until the result log catches up to the embedded snapshot.
 fn choose_recovery(journal: &Path, results: &Path) -> Result<Recovery, Error> {
     // A brand-new node, never yet run: nothing to look for a snapshot in. `latest` (like every other reader of a
     // journal here) takes its existence for granted, since every other caller's journal is already there.
@@ -514,12 +659,24 @@ fn choose_recovery(journal: &Path, results: &Path) -> Result<Recovery, Error> {
     }
     let snapshot = snapshots::latest(journal)?;
     let trusted = repair_results(results)?;
-    Ok(match (snapshot, trusted) {
-        (Some((at, frame)), Some(trusted_through)) if trusted_through >= at => {
-            Recovery::FromSnapshot { at, frame, trusted_through }
+    if let (Some((at, frame)), Some(trusted_through)) = (&snapshot, trusted) {
+        if trusted_through >= *at {
+            return Ok(Recovery::FromSnapshot { at: *at, frame: frame.clone(), trusted_through });
         }
-        _ => Recovery::Genesis,
-    })
+    }
+    if starts_at_genesis(journal)? {
+        return Ok(Recovery::Genesis);
+    }
+    let at = snapshot.map(|(at, _)| at);
+    Err(format!(
+        "{} was cut to sequence {}, but its result log is only trusted through {} and genesis is no longer \
+         possible: recovery is not possible until the result log catches up, or a fresh snapshot is embedded once \
+         it does",
+        journal.display(),
+        at.map_or_else(|| "?".to_string(), |at| at.to_string()),
+        trusted.map_or_else(|| "nothing".to_string(), |t| t.to_string()),
+    )
+    .into())
 }
 
 /// Brings `engine` up to date and returns the result log to keep appending to, following `plan`.
@@ -899,5 +1056,122 @@ mod tests {
         let journal = dir.join("journal.sbe"); // never created
         let results = dir.join("results.sbe"); // never created
         assert!(matches!(choose_recovery(&journal, &results).expect("decided"), Recovery::Genesis));
+    }
+
+    // ---------------------------------------------------------------------------------------------------- cutting
+
+    #[test]
+    fn rewrite_from_zero_is_a_no_op() {
+        let dir = dir("rewrite-zero");
+        let path = dir.join("file");
+        fs::write(&path, b"hello").expect("written");
+        assert_eq!(rewrite_from(&path, 0).expect("rewritten"), 0);
+        assert_eq!(fs::read(&path).expect("read"), b"hello");
+    }
+
+    #[test]
+    fn rewrite_from_keeps_only_the_tail() {
+        let dir = dir("rewrite-tail");
+        let path = dir.join("file");
+        fs::write(&path, b"0123456789").expect("written");
+        let removed = rewrite_from(&path, 4).expect("rewritten");
+        assert_eq!(removed, 4);
+        assert_eq!(fs::read(&path).expect("read"), b"456789");
+    }
+
+    #[test]
+    fn results_cut_offset_finds_the_first_group_after_at() {
+        let dir = dir("results-cut-offset");
+        let path = dir.join("results.sbe");
+        write_results(&path, &[5, 5, 6, 6, 7]);
+        // Everything at or before 5 is two 16-byte frames, each with a 4-byte length prefix.
+        assert_eq!(results_cut_offset(&path, 5).expect("scanned"), 2 * (4 + 16));
+        // Nothing after 7: cutting to 7 keeps nothing, so the offset is the whole file.
+        let total = fs::metadata(&path).expect("stat").len();
+        assert_eq!(results_cut_offset(&path, 7).expect("scanned"), total);
+        // Nothing at or before 1: cutting to 1 keeps everything, offset 0.
+        assert_eq!(results_cut_offset(&path, 1).expect("scanned"), 0);
+    }
+
+    #[test]
+    fn starts_at_genesis_is_true_for_an_embedded_but_uncut_journal() {
+        let dir = dir("starts-at-genesis-uncut");
+        let journal = fixture_journal_with_snapshot(&dir, 62);
+        assert!(starts_at_genesis(&journal).expect("checked"), "embedding alone changed where the journal starts");
+    }
+
+    #[test]
+    fn starts_at_genesis_is_false_after_a_cut() {
+        let dir = dir("starts-at-genesis-cut");
+        let journal = fixture_journal_with_snapshot(&dir, 62);
+        let results = dir.join("results.sbe");
+        replay(&journal, &results).expect("the uncut journal replays");
+        cut(&journal, &results).expect("cuts");
+        assert!(!starts_at_genesis(&journal).expect("checked"), "a cut journal still reported starting at genesis");
+    }
+
+    #[test]
+    fn cut_refuses_without_a_snapshot() {
+        let dir = dir("cut-no-snapshot");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interfaces/audit/recorded/journal.sbe");
+        let journal = dir.join("journal.sbe");
+        fs::copy(fixture, &journal).expect("the fixture journal copies");
+        let results = dir.join("results.sbe");
+        assert!(cut(&journal, &results).is_err());
+    }
+
+    #[test]
+    fn cut_refuses_when_results_do_not_cover_the_snapshot() {
+        let dir = dir("cut-no-trust");
+        let journal = fixture_journal_with_snapshot(&dir, 62);
+        let results = dir.join("results.sbe");
+        write_results(&results, &[10, 10, 20]); // trusted through 10, before the snapshot at 62
+        assert!(cut(&journal, &results).is_err());
+        // Refusing must not have touched the journal.
+        assert!(starts_at_genesis(&journal).expect("checked"), "a refused cut still cut the journal");
+    }
+
+    #[test]
+    fn cut_succeeds_and_recovery_then_uses_the_snapshot() {
+        let dir = dir("cut-succeeds");
+        let journal = fixture_journal_with_snapshot(&dir, 62);
+        let results = dir.join("results.sbe");
+        replay(&journal, &results).expect("the uncut journal replays");
+        let (at, journal_removed, results_removed) = cut(&journal, &results).expect("cuts");
+        assert_eq!(at, 62);
+        assert!(journal_removed > 0, "nothing was removed from the journal");
+        assert!(results_removed > 0, "nothing was removed from the results");
+        assert!(!starts_at_genesis(&journal).expect("checked"));
+
+        match choose_recovery(&journal, &results).expect("decided") {
+            Recovery::FromSnapshot { at: got, .. } => assert_eq!(got, 62),
+            Recovery::Genesis => panic!("a cut journal with a covering snapshot fell back to genesis"),
+        }
+    }
+
+    #[test]
+    fn choose_recovery_errors_rather_than_attempting_genesis_on_a_cut_journal_it_cannot_use() {
+        let dir = dir("cut-then-stuck");
+        let journal = fixture_journal_with_snapshot(&dir, 62);
+        let results = dir.join("results.sbe");
+        replay(&journal, &results).expect("the uncut journal replays");
+        cut(&journal, &results).expect("cuts");
+        // Simulate the result log having been lost after the cut: genesis is no longer an option (the journal no
+        // longer has sequence 1), and the snapshot alone is not enough without a trusted result log to go with it.
+        fs::remove_file(&results).expect("removed");
+        let err =
+            choose_recovery(&journal, &results).expect_err("a cut journal with no trusted results recovered anyway");
+        assert!(err.to_string().contains("cut"), "the error did not explain what went wrong: {err}");
+    }
+
+    #[test]
+    fn replay_refuses_a_cut_journal() {
+        let dir = dir("replay-refuses-cut");
+        let journal = fixture_journal_with_snapshot(&dir, 62);
+        let results = dir.join("results.sbe");
+        replay(&journal, &results).expect("the uncut journal replays");
+        cut(&journal, &results).expect("cuts");
+        let err = replay(&journal, &dir.join("out.sbe")).expect_err("replay accepted a cut journal");
+        assert!(err.to_string().contains("recover"), "the error did not point at recover: {err}");
     }
 }
