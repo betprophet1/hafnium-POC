@@ -11,6 +11,7 @@
 use crate::frames::{read_frame, template_of, write_frame};
 use crate::metrics::{NodeMetrics, Subscriber};
 use crate::sequencer::{self, Sequencer};
+use crate::snapshots;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -142,13 +143,17 @@ pub(crate) fn apply(
     outcome.map_err(|stop| format!("engine fail-stop {stop:?} at input {} (spec §18)", engine.position().0).into())
 }
 
-/// Runs every frame of a journal through `engine`, writing results. A `Snapshot` frame is not an input and is
-/// skipped rather than applied. A torn final frame, left by a crash mid-write, is reported and, when `repair` is
-/// set, cut off. Returns the number of inputs applied.
+/// Runs the frames of a journal through `engine`, writing results, in `(after, upto]` of sequence — `after: 0`
+/// for no lower bound, `upto: None` for no upper one. A `Snapshot` frame is not an input and is skipped rather
+/// than applied. Reads to the physical end of the file regardless of `upto`, so a torn final frame, left by a
+/// crash mid-write, is reported and, when `repair` is set, cut off — meaningful only for a caller reading to the
+/// true end (`upto: None`); a bounded read simply stops at its bound first. Returns the number of inputs applied.
 fn run_journal(
     engine: &mut Engine<'_>,
     path: &Path,
     results: &mut BufWriter<File>,
+    after: u64,
+    upto: Option<u64>,
     repair: bool,
 ) -> Result<u64, Error> {
     let file = OpenOptions::new().read(true).write(repair).create(repair).truncate(false).open(path)?;
@@ -158,10 +163,20 @@ fn run_journal(
     loop {
         match read_frame(&mut reader, &mut buf) {
             Ok(Some(n)) => {
-                if !is_snapshot(&buf[..n]) {
-                    apply(engine, &buf[..n], results, None)?;
-                    inputs += 1;
+                if is_snapshot(&buf[..n]) {
+                    good += 4 + n as u64;
+                    continue;
                 }
+                let sequence = u64_at(&buf[..n], 8);
+                if sequence <= after {
+                    good += 4 + n as u64;
+                    continue;
+                }
+                if upto.is_some_and(|stop| sequence > stop) {
+                    break;
+                }
+                apply(engine, &buf[..n], results, None)?;
+                inputs += 1;
                 good += 4 + n as u64;
             }
             Ok(None) => break,
@@ -177,7 +192,7 @@ fn run_journal(
         }
     }
     drop(reader);
-    if repair && good < length {
+    if repair && upto.is_none() && good < length {
         file.set_len(good)?;
         log::warn("journal cut to its last whole frame", &[("journal", &path.display()), ("bytes", &good)]);
     }
@@ -201,7 +216,7 @@ pub fn replay(journal: &Path, results: &Path) -> Result<u64, Error> {
     let mut engine =
         Engine::new(engine_config(group)?, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
     let mut log = BufWriter::new(File::create(results)?);
-    let inputs = run_journal(&mut engine, journal, &mut log, false)?;
+    let inputs = run_journal(&mut engine, journal, &mut log, 0, None, false)?;
     log.flush()?;
     Ok(inputs)
 }
@@ -471,6 +486,88 @@ fn serve_subscriber(
     Ok(())
 }
 
+/// How `serve` recovers, decided once at start and never revisited during the run.
+enum Recovery {
+    /// No usable snapshot: a fresh engine replays the whole journal, and `results.sbe` is rebuilt from nothing,
+    /// exactly as before PR #14/#15.
+    Genesis,
+    /// The latest embedded snapshot (`at`, its frame) plus how far the preserved result log is trusted
+    /// (`trusted_through`) — never earlier than `at` (below).
+    FromSnapshot { at: u64, frame: Vec<u8>, trusted_through: u64 },
+}
+
+/// Decides which of the two `serve` can take, from what is already on disk. Reads `results` through
+/// `repair_results`, which — as a side effect, regardless of which `Recovery` this returns — cuts it back to its
+/// last confirmed-complete group; this is always correct to do, because that group is never trusted anyway.
+///
+/// A snapshot only helps when the result log already trustworthily covers **at least its own sequence**. One
+/// found but not covered is not usable: using it without also re-deriving the results for the sequences it
+/// covers would leave a gap in `results.sbe` that a subscriber's backlog cannot fill for those sequences (the
+/// journal still holds them, unshortened — cutting it is a later step, §8 item 7(b)) — and re-deriving them by
+/// replaying from the snapshot defeats what the snapshot was for in the first place. So: no snapshot, or a
+/// result log not yet caught up to one that exists, falls back to `Genesis`, the always-safe answer.
+fn choose_recovery(journal: &Path, results: &Path) -> Result<Recovery, Error> {
+    // A brand-new node, never yet run: nothing to look for a snapshot in. `latest` (like every other reader of a
+    // journal here) takes its existence for granted, since every other caller's journal is already there.
+    if !journal.exists() {
+        return Ok(Recovery::Genesis);
+    }
+    let snapshot = snapshots::latest(journal)?;
+    let trusted = repair_results(results)?;
+    Ok(match (snapshot, trusted) {
+        (Some((at, frame)), Some(trusted_through)) if trusted_through >= at => {
+            Recovery::FromSnapshot { at, frame, trusted_through }
+        }
+        _ => Recovery::Genesis,
+    })
+}
+
+/// Brings `engine` up to date and returns the result log to keep appending to, following `plan`.
+///
+/// `FromSnapshot` restores the engine from the snapshot, then — only if the trusted result log runs ahead of the
+/// snapshot's own sequence, which it will on every recovery after the first once the node has kept running past
+/// the point a snapshot was taken — replays the already-trusted stretch into a throwaway sink to catch the
+/// engine's *in-memory* state up to the same point without disturbing the durable results already sitting there
+/// for it. Only what follows the trusted point is genuinely new: that is replayed for real, appended to the
+/// preserved (not truncated) result log.
+fn recover_engine(
+    engine: &mut Engine<'_>,
+    journal_path: &Path,
+    results_path: &Path,
+    plan: Recovery,
+) -> Result<BufWriter<File>, Error> {
+    match plan {
+        Recovery::Genesis => {
+            let mut results = BufWriter::new(File::create(results_path)?);
+            let recovered = run_journal(engine, journal_path, &mut results, 0, None, true)?;
+            log::info("recovered from the journal", &[("inputs", &recovered), ("journal", &journal_path.display())]);
+            Ok(results)
+        }
+        Recovery::FromSnapshot { at, frame, trusted_through } => {
+            snapshots::restore_into(engine, &frame)?;
+            if trusted_through > at {
+                let scratch = results_path.with_extension("recovery-scratch.tmp");
+                let mut discard = BufWriter::new(File::create(&scratch)?);
+                run_journal(engine, journal_path, &mut discard, at, Some(trusted_through), false)?;
+                drop(discard);
+                let _ = fs::remove_file(&scratch);
+            }
+            let mut results = BufWriter::new(OpenOptions::new().append(true).open(results_path)?);
+            let recovered = run_journal(engine, journal_path, &mut results, trusted_through, None, true)?;
+            log::info(
+                "recovered from an embedded snapshot",
+                &[
+                    ("journal", &journal_path.display()),
+                    ("snapshot_at", &at),
+                    ("results_trusted_through", &trusted_through),
+                    ("inputs", &recovered),
+                ],
+            );
+            Ok(results)
+        }
+    }
+}
+
 /// Recovers from the journal in `data_dir`, writes `EngineStarted`, then serves the ingress and the feed and
 /// injects `TimeTick` until a fail-stop or an I/O error.
 ///
@@ -515,13 +612,10 @@ pub fn serve(config: &Config) -> Result<(), Error> {
     let mut owned = OwnedMemory::new(&capacities);
     let mut engine =
         Engine::new(engine_config(config.group)?, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
-    let mut results = BufWriter::new(File::create(&results_path)?);
-    let recovered = run_journal(&mut engine, &journal_path, &mut results, true)?;
+    let plan = choose_recovery(&journal_path, &results_path)?;
+    let results = recover_engine(&mut engine, &journal_path, &results_path, plan)?;
     let (last_sequence, last_at) = engine.position();
-    log::info(
-        "recovered from the journal",
-        &[("inputs", &recovered), ("journal", &journal_path.display()), ("last_sequence", &last_sequence)],
-    );
+    log::info("recovered", &[("last_sequence", &last_sequence)]);
     let journal = BufWriter::new(OpenOptions::new().append(true).create(true).open(&journal_path)?);
     let mut pipeline = Pipeline {
         sequencer: Sequencer::resume(config.group, last_sequence, last_at),
@@ -732,5 +826,78 @@ mod tests {
         let before = fs::metadata(&path).expect("stat").len();
         assert_eq!(repair_results(&path).expect("repaired"), None, "an unconfirmed single group was trusted");
         assert_eq!(fs::metadata(&path).expect("stat").len(), before, "repair touched a file it did not trust any of");
+    }
+
+    fn fixture_journal_with_snapshot(dir: &Path, at: u64) -> PathBuf {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interfaces/audit/recorded/journal.sbe");
+        let journal = dir.join("journal.sbe");
+        fs::copy(fixture, &journal).expect("the fixture journal copies");
+        crate::snapshots::embed(&journal, Some(at)).expect("a snapshot embeds");
+        journal
+    }
+
+    #[test]
+    fn choose_recovery_falls_back_to_genesis_with_no_snapshot() {
+        let dir = dir("choose-no-snapshot");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interfaces/audit/recorded/journal.sbe");
+        let journal = dir.join("journal.sbe");
+        fs::copy(fixture, &journal).expect("the fixture journal copies");
+        let results = dir.join("results.sbe");
+        assert!(matches!(choose_recovery(&journal, &results).expect("decided"), Recovery::Genesis));
+    }
+
+    #[test]
+    fn choose_recovery_falls_back_to_genesis_with_a_snapshot_but_no_trusted_results() {
+        let dir = dir("choose-no-trust");
+        let journal = fixture_journal_with_snapshot(&dir, 62);
+        let results = dir.join("results.sbe"); // never created
+        assert!(matches!(choose_recovery(&journal, &results).expect("decided"), Recovery::Genesis));
+    }
+
+    #[test]
+    fn choose_recovery_falls_back_to_genesis_when_trust_lags_the_snapshot() {
+        let dir = dir("choose-behind");
+        let journal = fixture_journal_with_snapshot(&dir, 62);
+        let results = dir.join("results.sbe");
+        write_results(&results, &[10, 10, 20]); // trusted through 10, well before the snapshot at 62
+        assert!(matches!(choose_recovery(&journal, &results).expect("decided"), Recovery::Genesis));
+    }
+
+    #[test]
+    fn choose_recovery_takes_the_snapshot_when_trust_reaches_exactly_its_sequence() {
+        let dir = dir("choose-exact");
+        let journal = fixture_journal_with_snapshot(&dir, 62);
+        let results = dir.join("results.sbe");
+        write_results(&results, &[62, 62, 70]); // trusted through 62 (the group at 70 is last, so discarded)
+        match choose_recovery(&journal, &results).expect("decided") {
+            Recovery::FromSnapshot { at, trusted_through, .. } => {
+                assert_eq!(at, 62);
+                assert_eq!(trusted_through, 62);
+            }
+            Recovery::Genesis => panic!("a snapshot exactly covered by trust fell back to genesis"),
+        }
+    }
+
+    #[test]
+    fn choose_recovery_takes_the_snapshot_when_trust_runs_ahead_of_it() {
+        let dir = dir("choose-ahead");
+        let journal = fixture_journal_with_snapshot(&dir, 62);
+        let results = dir.join("results.sbe");
+        write_results(&results, &[90, 90, 100]); // trusted through 90 (the group at 100 is last, so discarded)
+        match choose_recovery(&journal, &results).expect("decided") {
+            Recovery::FromSnapshot { at, trusted_through, .. } => {
+                assert_eq!(at, 62);
+                assert_eq!(trusted_through, 90);
+            }
+            Recovery::Genesis => panic!("a snapshot behind trust fell back to genesis"),
+        }
+    }
+
+    #[test]
+    fn choose_recovery_is_genesis_for_a_node_that_has_never_run() {
+        let dir = dir("choose-fresh");
+        let journal = dir.join("journal.sbe"); // never created
+        let results = dir.join("results.sbe"); // never created
+        assert!(matches!(choose_recovery(&journal, &results).expect("decided"), Recovery::Genesis));
     }
 }
