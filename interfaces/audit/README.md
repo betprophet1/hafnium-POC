@@ -37,6 +37,12 @@ for.
   gateway of the same instance seals it.
   A record's day is the day of its `ts`; a record taken just before midnight and written just after it goes in the
   file that is open, so a file can end with a moment of the next day and never begins with one of the previous.
+- **Rotation, mid-day (gateway only).** A single UTC day of traffic can otherwise grow one file without bound — the
+  incident that motivated this was a 5.79 GB file for one day. Once an open file has written 1 GiB of records, the
+  gateway's writer rotates it early, the same way a day boundary does: a `close` record (`reason: rotate`) and the
+  next segment of the same day. A file rotated this way is still dated today, so it is **not** shipped until the
+  day is over (below) — this bounds how big any one file gets, it does not ship it any sooner. The FIX adapter's
+  writer does not yet do this.
 - **Sealing after a crash.** A process that stops without closing its file leaves it without a `close` record. The
   next process of the same component and instance, at start, appends one with `reason: recovered` to every such file
   whose last line is complete, chained like any other record. A file whose last line was cut off part-way is left
