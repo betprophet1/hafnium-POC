@@ -20,10 +20,16 @@ const USAGE: &str = "usage:
   venue-node replay JOURNAL RESULTS        runs a journal through a fresh engine and writes its result log
   venue-node snapshot JOURNAL OUT [--at N] replays a journal and writes the state after input N, or after the
                                            last input, as a Snapshot frame (spec §20)
+  venue-node embed-snapshot JOURNAL [--at N]
+                                           the same, but appends the frame onto JOURNAL itself (D-32) instead of a
+                                           file beside it; for a journal no live `serve` has open
   venue-node replay-from SNAPSHOT JOURNAL RESULTS [--snapshot-out FILE]
                                            restores a snapshot and replays only what follows it, writing the
                                            result log for those inputs; the results must equal the tail of a
                                            replay from genesis (E-20.9)
+  venue-node recover JOURNAL RESULTS [--snapshot-out FILE]
+                                           the same, but restores from the latest snapshot already embedded in
+                                           JOURNAL; prints and exits 1 if it has none yet
   venue-node dump FILE                     prints a journal or result log as JSON lines
   venue-node import VECTORS JOURNAL        writes a compiled scenario's inputs, as stamped, as a journal
   venue-node bench JOURNAL [--runs N]      times every input of a journal through a fresh engine; build it with
@@ -56,7 +62,9 @@ fn main() -> ExitCode {
             node::replay(Path::new(&args[1]), Path::new(&args[2])).map(|n| eprintln!("replayed {n} inputs"))
         }
         (Some("snapshot"), 3 | 5) => snapshot(&args[1..]),
+        (Some("embed-snapshot"), 2 | 4) => embed_snapshot(&args[1..]),
         (Some("replay-from"), 4 | 6) => replay_from(&args[1..]),
+        (Some("recover"), 3 | 5) => recover(&args[1..]),
         (Some("dump"), 2) => dump(&args[1]),
         (Some("import"), 3) => import(&args[1], &args[2]),
         (Some("bench"), 2 | 4) => bench(&args[1..]),
@@ -174,6 +182,19 @@ fn snapshot(args: &[String]) -> Result<(), node::Error> {
     Ok(())
 }
 
+/// `embed-snapshot JOURNAL [--at N]`. Taken by this replaying engine and never by a serving one (D-32), and
+/// written into the journal itself rather than a file beside it.
+fn embed_snapshot(args: &[String]) -> Result<(), node::Error> {
+    let at = match args.get(1).map(String::as_str) {
+        None => None,
+        Some("--at") => Some(args[2].parse::<u64>().map_err(|e| format!("--at: {e}"))?),
+        Some(other) => return Err(format!("unknown argument {other}").into()),
+    };
+    let (sequence, bytes) = snapshots::embed(Path::new(&args[0]), at)?;
+    eprintln!("snapshot embedded at sequence {sequence}, {bytes} bytes of state");
+    Ok(())
+}
+
 /// `replay-from SNAPSHOT JOURNAL RESULTS [--snapshot-out FILE]`.
 fn replay_from(args: &[String]) -> Result<(), node::Error> {
     let finish = match args.get(3).map(String::as_str) {
@@ -185,6 +206,22 @@ fn replay_from(args: &[String]) -> Result<(), node::Error> {
         snapshots::replay_from(Path::new(&args[0]), Path::new(&args[1]), Path::new(&args[2]), finish.as_deref())?;
     eprintln!("restored at sequence {at}, replayed {applied} inputs after it");
     Ok(())
+}
+
+/// `recover JOURNAL RESULTS [--snapshot-out FILE]`.
+fn recover(args: &[String]) -> Result<(), node::Error> {
+    let finish = match args.get(2).map(String::as_str) {
+        None => None,
+        Some("--snapshot-out") => Some(PathBuf::from(&args[3])),
+        Some(other) => return Err(format!("unknown argument {other}").into()),
+    };
+    match snapshots::recover(Path::new(&args[0]), Path::new(&args[1]), finish.as_deref())? {
+        Some((at, applied)) => {
+            eprintln!("restored at sequence {at}, replayed {applied} inputs after it");
+            Ok(())
+        }
+        None => Err("that journal carries no embedded snapshot yet (venue-node embed-snapshot)".into()),
+    }
 }
 
 fn dump(path: &str) -> Result<(), Error> {

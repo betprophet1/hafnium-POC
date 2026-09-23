@@ -9,7 +9,7 @@
 //! nowhere else to begin, so the journal could never be cut, so it could never be archived. A snapshot at N is a
 //! place to begin: everything before it can go to object storage and be taken off the disk.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 
@@ -20,7 +20,7 @@ use venue_journal::message_header_codec::{MessageHeaderDecoder, ENCODED_LENGTH a
 use venue_journal::snapshot_codec::{SnapshotDecoder, SnapshotEncoder, SBE_TEMPLATE_ID as SNAPSHOT};
 use venue_journal::{Encoder, ReadBuf, WriteBuf};
 
-use crate::frames::{read_frame, write_frame};
+use crate::frames::{read_frame, template_of, write_frame};
 use crate::node::{engine_config, journal_profile, Error};
 use venue_telemetry::log;
 
@@ -30,17 +30,13 @@ fn sequence_of(frame: &[u8]) -> Option<u64> {
     frame.get(HDR..HDR + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap_or_default()))
 }
 
-/// The template a frame carries, so a snapshot can be told from an input.
-fn template_of(frame: &[u8]) -> Option<u16> {
-    frame.get(2..4).map(|b| u16::from_le_bytes(b.try_into().unwrap_or_default()))
-}
-
-/// Replays `journal` and writes a snapshot of the state after sequence `at` — or after the last input, when `at`
-/// is `None` — into `out`. Returns the sequence it was taken at and how many bytes the state took.
+/// Replays `journal` up to sequence `at` — or to the last input, when `at` is `None` — and returns the sequence
+/// reached and the encoded `Snapshot` frame (template 53) describing the state there. Shared by `take`, which
+/// writes the frame beside the journal, and `embed`, which writes it into the journal (D-32).
 ///
-/// The engine is thrown away afterwards. Nothing is written to the journal being read: a snapshot belongs in the
-/// stream a *writer* is appending to, and this is a reader.
-pub fn take(journal: &Path, out: &Path, at: Option<u64>) -> Result<(u64, usize), Error> {
+/// A `Snapshot` frame already in the journal (from an earlier `embed`) is skipped rather than applied, the same
+/// way every reader of a journal skips one: it is not an input.
+fn compute(journal: &Path, at: Option<u64>) -> Result<(String, u64, Vec<u8>), Error> {
     let (profile, capacities) = journal_profile(journal)?;
     let mut owned = OwnedMemory::new(&capacities);
     let group = group_of(journal)?;
@@ -48,21 +44,23 @@ pub fn take(journal: &Path, out: &Path, at: Option<u64>) -> Result<(u64, usize),
         Engine::new(engine_config(group)?, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
 
     // Results are wanted by nobody here, but the engine must have somewhere to put them.
-    let mut sink = BufWriter::new(File::create(out.with_extension("results.tmp"))?);
+    let scratch = journal.with_extension("snapshot-scratch.tmp");
+    let mut sink = BufWriter::new(File::create(&scratch)?);
     let mut reader = BufReader::new(File::open(journal)?);
     let mut buf = Vec::new();
-    let mut applied = 0u64;
     while let Some(n) = read_frame(&mut reader, &mut buf)? {
+        if template_of(&buf[..n]) == Some(SNAPSHOT) {
+            continue;
+        }
         if let (Some(sequence), Some(stop)) = (sequence_of(&buf[..n]), at) {
             if sequence > stop {
                 break;
             }
         }
         crate::node::apply(&mut engine, &buf[..n], &mut sink, None)?;
-        applied += 1;
     }
     drop(sink);
-    let _ = std::fs::remove_file(out.with_extension("results.tmp"));
+    let _ = std::fs::remove_file(&scratch);
 
     let (sequence, when) = engine.position();
     if let Some(stop) = at {
@@ -74,23 +72,66 @@ pub fn take(journal: &Path, out: &Path, at: Option<u64>) -> Result<(u64, usize),
     let mut state = vec![0u8; 1 << 24];
     let len = engine.snapshot(&mut state).map_err(|e| format!("snapshot: {e:?}"))?;
     state.truncate(len);
-
     let frame = encode(group, sequence, when, &engine, &state)?;
+    Ok((profile, sequence, frame))
+}
+
+/// Replays `journal` and writes a snapshot of the state after sequence `at` — or after the last input, when `at`
+/// is `None` — into `out`. Returns the sequence it was taken at and how many bytes the state took.
+///
+/// The engine is thrown away afterwards. Nothing is written to the journal being read: a snapshot belongs in the
+/// stream a *writer* is appending to, and this is a reader. `embed` is the writer this is beside.
+pub fn take(journal: &Path, out: &Path, at: Option<u64>) -> Result<(u64, usize), Error> {
+    let (profile, sequence, frame) = compute(journal, at)?;
+    let len = frame.len();
     let mut file = BufWriter::new(File::create(out)?);
     write_frame(&mut file, &frame)?;
     file.flush()?;
     log::info(
         "snapshot taken",
-        &[
-            ("journal", &journal.display()),
-            ("profile", &profile),
-            ("inputs", &applied),
-            ("sequence", &sequence),
-            ("state_bytes", &len),
-            ("out", &out.display()),
-        ],
+        &[("journal", &journal.display()), ("profile", &profile), ("sequence", &sequence), ("out", &out.display())],
     );
     Ok((sequence, len))
+}
+
+/// Replays `journal` and appends a snapshot of the state after sequence `at` — or after the last input, when `at`
+/// is `None` — directly onto the end of `journal` itself: written into the journal rather than beside it (D-32),
+/// which is what lets the journal before it be archived and cut once something does (interfaces/audit/README.md's
+/// shipper is the reusable half of that transport; the readiness test still has to be sequence-based, not this).
+///
+/// For a journal no live `serve` has open. There is no lock on a node's journal today (unlike the gateway's audit
+/// instance lock), so running this against one a node is still appending to races that writer; the discipline is
+/// the same one interface's "one live process per instance" already asks for, just not yet enforced here.
+pub fn embed(journal: &Path, at: Option<u64>) -> Result<(u64, usize), Error> {
+    let (profile, sequence, frame) = compute(journal, at)?;
+    let len = frame.len();
+    let mut file = BufWriter::new(OpenOptions::new().append(true).open(journal)?);
+    write_frame(&mut file, &frame)?;
+    file.flush()?;
+    log::info("snapshot embedded", &[("journal", &journal.display()), ("profile", &profile), ("sequence", &sequence)]);
+    Ok((sequence, len))
+}
+
+/// The last `Snapshot` frame in `journal`, and the sequence it follows — whichever `embed` left with the greatest
+/// `at`, wherever in the file it landed. Position carries no meaning here: `replay_tail` filters what follows a
+/// restored engine by sequence, not by where in the file a frame sits, so the frame this returns need not be the
+/// physically last one for that to be correct — only the furthest one is worth restoring from at all.
+///
+/// `None` means the journal carries no snapshot yet; a caller falls back to a full replay from genesis.
+pub fn latest(journal: &Path) -> Result<Option<(u64, Vec<u8>)>, Error> {
+    let mut reader = BufReader::new(File::open(journal)?);
+    let mut buf = Vec::new();
+    let mut found: Option<(u64, Vec<u8>)> = None;
+    while let Some(n) = read_frame(&mut reader, &mut buf)? {
+        if template_of(&buf[..n]) != Some(SNAPSHOT) {
+            continue;
+        }
+        let at = sequence_of(&buf[..n]).ok_or("a Snapshot frame with no record header")?;
+        if found.as_ref().is_none_or(|(furthest, _)| at > *furthest) {
+            found = Some((at, buf[..n].to_vec()));
+        }
+    }
+    Ok(found)
 }
 
 /// The `Snapshot` message (template 53) around a state blob.
@@ -124,6 +165,68 @@ fn group_of(journal: &Path) -> Result<u16, Error> {
     })
 }
 
+/// Decodes a `Snapshot` frame and restores its state into `engine`. Returns the sequence it describes — the
+/// input it follows, not one of its own (interfaces/sbe/venue-journal.xml, Snapshot).
+fn restore_into(engine: &mut Engine<'_>, frame: &[u8]) -> Result<u64, Error> {
+    if template_of(frame) != Some(SNAPSHOT) {
+        return Err("that frame is not a Snapshot (template 53)".into());
+    }
+    let read = ReadBuf::new(frame);
+    let header = MessageHeaderDecoder::default().wrap(read, 0);
+    let mut dec = SnapshotDecoder::default().header(header, 0);
+    let mut record = dec.record_decoder();
+    let sequence = record.sequence();
+    dec = record.parent().map_err(|e| format!("snapshot record: {e:?}"))?;
+    let state_version = dec.state_version();
+    let (offset, length) = dec.state_decoder();
+    engine.restore(state_version, &frame[offset..offset + length]).map_err(|e| match e {
+        Refused::Version(v) => format!("this build does not implement snapshot encoding {v}"),
+        other => format!("the snapshot was refused: {other:?}"),
+    })?;
+    Ok(sequence)
+}
+
+/// Replays `journal` into `engine` — already restored to the state after sequence `at` — writing the result log
+/// for what follows to `results`. Returns how many inputs were applied.
+///
+/// Filters by sequence, not by position: everything at or before `at` is skipped, whether it sits before or after
+/// wherever a `Snapshot` frame landed in the file, and every `Snapshot` frame is skipped outright, an embedded one
+/// included, since another can only describe an earlier or the same point (E-4.1 would fail-stop on the first
+/// already-applied input otherwise, because the engine is already past it).
+fn replay_tail(engine: &mut Engine<'_>, journal: &Path, at: u64, results: &Path) -> Result<u64, Error> {
+    let mut log = BufWriter::new(File::create(results)?);
+    let mut reader = BufReader::new(File::open(journal)?);
+    let mut buf = Vec::new();
+    let mut applied = 0u64;
+    while let Some(n) = read_frame(&mut reader, &mut buf)? {
+        if template_of(&buf[..n]) == Some(SNAPSHOT) {
+            continue;
+        }
+        match sequence_of(&buf[..n]) {
+            Some(sequence) if sequence <= at => continue,
+            _ => {}
+        }
+        crate::node::apply(engine, &buf[..n], &mut log, None)?;
+        applied += 1;
+    }
+    log.flush()?;
+    Ok(applied)
+}
+
+/// A snapshot of `engine`'s current state, written to `path` — for a caller comparing the state two routes reach
+/// the same input by (E-20.9). Taken here because nothing else can see the engine.
+fn finish_snapshot(path: &Path, group: u16, engine: &mut Engine<'_>) -> Result<(), Error> {
+    let (sequence, when) = engine.position();
+    let mut state = vec![0u8; 1 << 24];
+    let len = engine.snapshot(&mut state).map_err(|e| format!("snapshot: {e:?}"))?;
+    state.truncate(len);
+    let frame = encode(group, sequence, when, engine, &state)?;
+    let mut file = BufWriter::new(File::create(path)?);
+    write_frame(&mut file, &frame)?;
+    file.flush()?;
+    Ok(())
+}
+
 /// Restores `snapshot` into a fresh engine and replays the part of `journal` that follows it, writing the result
 /// log for those inputs only. Returns the sequence restored to and how many inputs were applied after it.
 ///
@@ -144,54 +247,42 @@ pub fn replay_from(
     let mut reader = BufReader::new(File::open(snapshot)?);
     let mut buf = Vec::new();
     let n = read_frame(&mut reader, &mut buf)?.ok_or("the snapshot file is empty")?;
-    if template_of(&buf[..n]) != Some(SNAPSHOT) {
-        return Err("that file does not begin with a Snapshot frame".into());
-    }
-    let (at, state_version, offset, length) = {
-        let read = ReadBuf::new(&buf[..n]);
-        let header = MessageHeaderDecoder::default().wrap(read, 0);
-        let mut dec = SnapshotDecoder::default().header(header, 0);
-        let mut record = dec.record_decoder();
-        let sequence = record.sequence();
-        dec = record.parent().map_err(|e| format!("snapshot record: {e:?}"))?;
-        let version = dec.state_version();
-        let (offset, length) = dec.state_decoder();
-        (sequence, version, offset, length)
-    };
-    engine.restore(state_version, &buf[offset..offset + length]).map_err(|e| match e {
-        Refused::Version(v) => format!("this build does not implement snapshot encoding {v}"),
-        other => format!("the snapshot was refused: {other:?}"),
-    })?;
-
-    let mut log = BufWriter::new(File::create(results)?);
-    let mut reader = BufReader::new(File::open(journal)?);
-    let mut applied = 0u64;
-    while let Some(n) = read_frame(&mut reader, &mut buf)? {
-        // Everything the snapshot already accounts for is skipped, not re-applied: E-4.1 would fail-stop on the
-        // first of them, because the engine is already past it.
-        match sequence_of(&buf[..n]) {
-            Some(sequence) if sequence <= at => continue,
-            _ => {}
-        }
-        crate::node::apply(&mut engine, &buf[..n], &mut log, None)?;
-        applied += 1;
-    }
-    log.flush()?;
-    // A snapshot of where this finished, for a caller that wants to compare the state two routes to the same
-    // input reach (E-20.9). Taken here because nothing else can see the engine.
+    let at = restore_into(&mut engine, &buf[..n])?;
+    let applied = replay_tail(&mut engine, journal, at, results)?;
     if let Some(path) = finish {
-        let (sequence, when) = engine.position();
-        let mut state = vec![0u8; 1 << 24];
-        let len = engine.snapshot(&mut state).map_err(|e| format!("snapshot: {e:?}"))?;
-        state.truncate(len);
-        let frame = encode(group, sequence, when, &engine, &state)?;
-        let mut file = BufWriter::new(File::create(path)?);
-        write_frame(&mut file, &frame)?;
-        file.flush()?;
+        finish_snapshot(path, group, &mut engine)?;
     }
     log::info(
         "replayed from a snapshot",
         &[("snapshot", &snapshot.display()), ("at", &at), ("inputs", &applied), ("results", &results.display())],
     );
     Ok((at, applied))
+}
+
+/// The single-journal-file version of `replay_from`: restores from the latest `Snapshot` frame already embedded
+/// in `journal` (`embed`; `latest` finds it) rather than a separate snapshot file, and replays what follows it.
+/// Returns the sequence restored to and how many inputs were applied after it, or `None` when the journal carries
+/// no snapshot yet — the caller's cue to fall back to a full replay from genesis (`replay`).
+///
+/// Not yet called by `serve`'s own recovery: doing that safely still needs the result log to survive a restart
+/// rather than being rebuilt by replaying from genesis every time (`core/node/README.md`, Result log), because a
+/// recovery that skips 1..`at` has nowhere to regenerate those inputs' results from. This is the tested mechanism
+/// that step will use once the result log can carry its own history across a restart.
+pub fn recover(journal: &Path, results: &Path, finish: Option<&Path>) -> Result<Option<(u64, u64)>, Error> {
+    let Some((_, frame)) = latest(journal)? else { return Ok(None) };
+    let (_, capacities) = journal_profile(journal)?;
+    let mut owned = OwnedMemory::new(&capacities);
+    let group = group_of(journal)?;
+    let mut engine =
+        Engine::new(engine_config(group)?, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
+    let at = restore_into(&mut engine, &frame)?;
+    let applied = replay_tail(&mut engine, journal, at, results)?;
+    if let Some(path) = finish {
+        finish_snapshot(path, group, &mut engine)?;
+    }
+    log::info(
+        "recovered from an embedded snapshot",
+        &[("journal", &journal.display()), ("at", &at), ("inputs", &applied), ("results", &results.display())],
+    );
+    Ok(Some((at, applied)))
 }
