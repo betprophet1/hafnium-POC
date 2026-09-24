@@ -251,6 +251,7 @@ fn start_parlays(ingress: &str, feed: &str) -> (Arc<venue_parlays::service::Serv
         },
         responders: None,
         min_quantity: venue_parlays::rules::LOT_STEP,
+        from_view: None,
     };
     let service = venue_parlays::service::start(Catalogue::load(CATALOGUE).expect("the catalogue"), &config)
         .expect("parlay service");

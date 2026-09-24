@@ -228,9 +228,7 @@ pub mod encoder {
             self.client_order_id_from_iter(iter);
             self
         }
-
     }
-
 } // end encoder
 
 pub mod decoder {
@@ -274,13 +272,7 @@ pub mod decoder {
     }
 
     impl<'a> CancelOrderDecoder<'a> {
-        pub fn wrap(
-            mut self,
-            buf: ReadBuf<'a>,
-            offset: usize,
-            acting_block_length: u16,
-            acting_version: u16,
-        ) -> Self {
+        pub fn wrap(mut self, buf: ReadBuf<'a>, offset: usize, acting_block_length: u16, acting_version: u16) -> Self {
             let limit = offset + acting_block_length as usize;
             self.buf = buf;
             self.initial_offset = offset;
@@ -351,8 +343,5 @@ pub mod decoder {
             let buf = self.get_buf();
             ReadBuf::get_bytes_at(buf.data, self.offset + 50)
         }
-
     }
-
 } // end decoder
-

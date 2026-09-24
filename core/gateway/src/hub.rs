@@ -907,6 +907,25 @@ mod tests {
         assert_eq!(other_rx.try_iter().count(), 0);
     }
 
+    /// A hub founded on a view holds it, and resumes from where that view had got to rather than from the
+    /// beginning — which is the whole point: a venue founded on a snapshot has no inputs in its journal to send
+    /// a hub that asks for everything, so asking for everything is how a gateway ends up serving an empty venue.
+    #[test]
+    fn a_hub_founded_on_a_view_resumes_from_where_that_view_had_got_to() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/charts/venue-mini/files/markets.json");
+        let catalogue = Catalogue::load(path).expect("the mini venue's catalogue");
+        let mut view = View::default();
+        view.sequence = 62;
+        view.instruments.insert(1000, venue_link::view::InstrumentView::default());
+
+        let mut founded = Hub::founded_on(catalogue, view);
+        assert_eq!(founded.resume(), 62, "a founded hub asked for everything, not for what followed its view");
+        assert!(founded.view.instruments.contains_key(&1000), "the view it was founded on was not kept");
+
+        // And the ordinary path is unchanged: nothing held, so everything wanted.
+        assert_eq!(hub().resume(), 0);
+    }
+
     /// The mini venue's catalogue: a hub needs one, and these tests need nothing from it.
     fn hub() -> Hub {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/charts/venue-mini/files/markets.json");

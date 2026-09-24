@@ -12,7 +12,7 @@ use venue_store::Database;
 const USAGE: &str = "usage:
   venue-parlays [serve] --ingress ADDR --feed ADDR --catalogue FILE --database-url URL [--listen 127.0.0.1:7103]
                 [--window-seconds 30] [--max-parlays 100] [--capacity small] [--operator 127.0.0.1:7104]
-                [--min-quantity 10] [--migrate-on-start false] [--store postgres|memory]
+                [--min-quantity 10] [--migrate-on-start false] [--store postgres|memory] [--from-view FILE]
   venue-parlays migrate --database-url URL
   venue-parlays import --responders FILE --database-url URL
 
@@ -24,7 +24,11 @@ from its legs. It uses the core's ingress as an operator. The approved responder
 and are managed through the operator API on --operator (GET /v1/responders, PUT and DELETE /v1/responders/ACCOUNT);
 --operator none serves no operator API. serve waits for its schema, which migrate applies (--migrate-on-start true
 applies it at start); --store memory keeps approvals in memory only, for throwaway local venues. import starts the
-list from a responder file kept by an earlier version. A request is for at least --min-quantity contracts, a multiple
+list from a responder file kept by an earlier version. --from-view names the reader's half of a snapshot pair
+(venue-view snapshot), so the service starts holding the venue as it was then rather than nothing; a venue founded
+on a snapshot has no inputs in its journal to send one that asks for everything, and without this the service
+would never learn the parlays and legs it exists to reason about.
+A request is for at least --min-quantity contracts, a multiple
 of the parlay lot step (10). --capacity must name the node's capacity profile: no parlay is listed that would take the
 venue past 95% of its events, markets or price levels. Settled parlays are released by the engine a retention after
 settlement, which makes room again. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
@@ -158,6 +162,10 @@ fn run(args: &Args) -> Result<(), Error> {
         },
         responders,
         min_quantity: args.number("min-quantity", rules::LOT_STEP)?,
+        from_view: match args.get("from-view", Some(""))?.trim() {
+            "" => None,
+            path => Some(std::path::PathBuf::from(path)),
+        },
     };
     let service = service::start(catalogue, &config)?;
     let operator = args.get("operator", Some("127.0.0.1:7104"))?;
