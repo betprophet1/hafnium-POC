@@ -93,6 +93,33 @@ sequence for sequence and byte for byte in the result log, and that a refused cu
 
 Shipping what is cut to object storage is not built yet.
 
+**Seeding a fresh environment from a chosen snapshot.** `venue-node seed SNAPSHOT DATA_DIR [--capacity ...]`
+founds a brand-new `DATA_DIR` on `SNAPSHOT` instead of genesis: `journal.sbe` holds only that one `Snapshot`
+frame, `results.sbe` starts empty, and `capacity` records the profile given. A `serve` pointed at `DATA_DIR`
+starts running from exactly that state, with no history of its own before it — for a test or preview
+environment that wants to start from whatever snapshot it likes, not genesis or whatever the live venue happens
+to be running. Refuses a `DATA_DIR` that already has a journal, so it cannot silently replace a real
+environment's own history.
+
+This needed a small extension to `choose_recovery`: normally a snapshot is only trusted when the result log
+already covers it (above), because skipping replay must not leave a gap in `results.sbe` for real inputs the
+journal still carries. A freshly seeded journal has no real input anywhere in it, before or after its snapshot
+(`founded_only`, narrower than `starts_at_genesis` — an ordinary journal with a snapshot merely appended at its
+*tail*, `embed` with no `--at`, still owes results for everything before it and must keep falling back to
+genesis) — so there is nothing an empty or missing result log could have lost, and the snapshot is trusted
+unconditionally. `core/node/tests/seed_from_snapshot.rs` checks a seeded node continues sequencing exactly where
+the snapshot left off, and that it answers a new input identically to a node that reached the same point by
+actually running from genesis.
+
+`interfaces/tools/snapshot_publish.py`/`snapshot_fetch.py` put a snapshot in object storage under
+`snapshots/{environment}/{tag}`, and fetch one back by tag, verified against a `.sha256` sidecar the same way
+the audit shipper verifies before it trusts anything (`interfaces/audit/README.md`) — so a test or preview
+environment's own setup can be as simple as
+`snapshot_fetch.py --from s3://... --environment prod --tag pre-load --to seed.snapshot && venue-node seed
+seed.snapshot ./venue-data`. Wiring this into any specific environment's own startup (ArgoCD, a preview
+environment's init step) is not done — these are the building blocks, not an automatic default for every
+preview environment.
+
 ## Commands
 
 ```sh
@@ -104,6 +131,7 @@ venue-node snapshot ./venue-data/journal.sbe snap.sbe
 venue-node embed-snapshot ./venue-data/journal.sbe   # only while nothing has it open (no `serve` running)
 venue-node recover ./venue-data/journal.sbe tail.results.sbe
 venue-node cut-journal ./venue-data/journal.sbe ./venue-data/results.sbe   # same "no live serve" caveat
+venue-node seed snap.sbe ./fresh-venue-data --capacity small
 venue-node import core/target/differential/fuzz-90000.json golden.journal
 ```
 
