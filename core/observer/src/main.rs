@@ -22,13 +22,15 @@ use venue_telemetry::prometheus_client::registry::Registry;
 
 const USAGE: &str = "usage:
   venue-observer --feed ADDR [--listen 127.0.0.1:9103] [--catalogue FILE] [--capacity small|launch|scale]
-                 [--max-market-series 500]
+                 [--max-market-series 500] [--from-view FILE]
 
 Follows the node's feed at --feed and serves, on --listen, Prometheus metrics at /metrics and read-only operator
 endpoints: /v1/markets, /v1/markets/{id}?depth=N, /v1/accounts/{id}, /v1/latency and /healthz. --listen is an internal
 address for monitoring and operators, never one clients reach. --catalogue labels markets with their titles.
 --capacity names the node's capacity profile, whose table sizes capacity use is measured against. Per-market series
-stop at --max-market-series markets. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED;
+stop at --max-market-series markets. --from-view names the reader's half of a snapshot pair (venue-view snapshot),
+so the projection starts holding the venue as it was then rather than nothing; a venue founded on a snapshot has
+no inputs in its journal to send one that asks for everything. Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED;
 VENUE_LOG_FORMAT=json writes the log as JSON lines.";
 
 /// The projection the operator endpoints read, and the catalogue that names its markets.
@@ -92,7 +94,14 @@ fn run(flags: &BTreeMap<String, String>) -> Result<(), Error> {
     let hop = hops.get_or_create_owned(&vec![("hop", "sequenced_to_feed".into()), ("clock", "software".into())]);
     let mut derived =
         Derived::register(&mut registry, venue_telemetry::wall_ns(), Some(profile), max_market_series, &hop);
-    let state = Arc::new(Mutex::new(State { view: View::default(), catalogue }));
+    // The reader's half of a snapshot pair, for an observer watching a venue founded on a snapshot rather than
+    // on genesis: that venue's journal holds no inputs at all, so a projection that asked for everything would
+    // be sent nothing and report on an empty venue. Its sequence is where the resume handshake carries on from.
+    let view = match get("from-view").filter(|p| !p.is_empty()) {
+        Some(path) => View::load(std::path::Path::new(&path)).map_err(|e| format!("--from-view {path}: {e}"))?,
+        None => View::default(),
+    };
+    let state = Arc::new(Mutex::new(State { view, catalogue }));
     let bound = venue_telemetry::serve::spawn(&listen, registry, Some(operator::handler(Arc::clone(&state), hop)))?;
     log::info("serving metrics and operator endpoints", &[("listen", &bound), ("feed", &feed)]);
 

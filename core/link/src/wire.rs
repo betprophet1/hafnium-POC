@@ -71,6 +71,13 @@ pub struct Unit {
 /// the fact, so that anything the gateway derived from the feed can be derived again (interfaces/audit/README.md,
 /// frames derived from the journal). Inputs are in the order they were sequenced, each with the results of that
 /// input, which name it by `inputSequence`.
+///
+/// A `Snapshot` frame is skipped, because the feed never carried one either: the node's `serve_subscriber` skips
+/// it by template id, so a rebuild that produced one would not be a rebuild of what the feed carried. It matters
+/// most in the case §3.7 describes — `embed` appends wherever the journal currently ends, so a snapshot naming an
+/// earlier sequence can sit physically *after* later inputs. Applied as though it were an input, its record
+/// header drags a reader's own position backwards, and a reader that then resumed from there would be re-sent
+/// inputs it had already applied.
 pub fn replayed_units(journal: &Path, results: &Path) -> Result<Vec<Unit>, Error> {
     let mut by_input: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
     for result in frames_of(results)? {
@@ -78,6 +85,9 @@ pub fn replayed_units(journal: &Path, results: &Path) -> Result<Vec<Unit>, Error
     }
     let mut units = Vec::new();
     for input in frames_of(journal)? {
+        if input["msg"] == "Snapshot" {
+            continue;
+        }
         let sequence = input["record"]["sequence"].as_u64().unwrap_or(0);
         let results = by_input.remove(&sequence).unwrap_or_default();
         units.push(Unit { input, results });

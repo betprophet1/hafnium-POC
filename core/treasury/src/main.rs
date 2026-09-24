@@ -17,9 +17,17 @@ const USAGE: &str = "usage:
                  [--failure-per-mille 100] [--max-cents 100000000] [--reconcile-every-ms 60000]
                  [--reconcile-grace-ms 10000] [--faults none|demo] [--lost-notice-per-mille N]
                  [--late-notice-per-mille N] [--late-notice-ms N] [--duplicate-notice-per-mille N]
-                 [--lost-answer-per-mille N] [--lost-command-per-mille N]
+                 [--lost-answer-per-mille N] [--lost-command-per-mille N] [--from-view FILE]
   venue-treasury migrate --database-url URL
   venue-treasury import --ledger FILE --database-url URL
+
+--from-view names the reader's half of a snapshot pair (venue-view snapshot), for a venue founded on a snapshot
+rather than on genesis. The treasury takes only the sequence from it, not the view: its own state is its records,
+which outlive a restart. That sequence is where the feed resumes and the floor below which reconciliation draws no
+conclusions — without it a founded treasury reports every transfer older than the founding point as a command the
+engine never applied. It does not fill those commands in from its own records: reconciliation compares what the
+treasury believes against what the journal independently says, and sourcing both from the same place would make it
+agree with itself.
 
 The treasury's records (the ledger, transfers, the fake bank's book, reconciliation) are kept in PostgreSQL:
 --database-url postgres://USER:PASSWORD@HOST:5432/DATABASE, with --database-schema (default treasury),
@@ -166,6 +174,17 @@ fn run(args: &Args) -> Result<(), String> {
         every_ms: args.number("reconcile-every-ms", 60_000)?,
         grace_ms: args.number("reconcile-grace-ms", 10_000)?,
     };
+    // Unlike every other reader, the treasury does not restore a view from the pair's reader half — its state is
+    // its own records, which outlive a restart. What it takes from the pair is only the sequence it was founded
+    // at, which is where the feed resumes and the floor reconciliation must not reach below.
+    let founded_at = match args.get("from-view", Some(""))?.trim() {
+        "" => 0,
+        path => {
+            venue_link::view::View::load(std::path::Path::new(path))
+                .map_err(|e| format!("--from-view {path}: {e}"))?
+                .sequence
+        }
+    };
     let settings = Settings {
         ingress: args.get("ingress", None)?,
         feed: args.get("feed", None)?,
@@ -173,6 +192,7 @@ fn run(args: &Args) -> Result<(), String> {
         bank,
         max_cents: args.number("max-cents", 100_000_000)?,
         recon,
+        founded_at,
     };
     let migrate = match args.get("migrate-on-start", Some("false"))?.as_str() {
         "true" => true,

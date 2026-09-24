@@ -251,6 +251,7 @@ fn start_parlays(ingress: &str, feed: &str) -> (Arc<venue_parlays::service::Serv
         },
         responders: None,
         min_quantity: venue_parlays::rules::LOT_STEP,
+        from_view: None,
     };
     let service = venue_parlays::service::start(Catalogue::load(CATALOGUE).expect("the catalogue"), &config)
         .expect("parlay service");
@@ -284,6 +285,7 @@ fn start_treasury(name: &str, ingress: &str, feed: &str) -> String {
         bank: venue_treasury::bank::FakeBank { seed: 1, min_delay_ms: 200, max_delay_ms: 500, failure_per_mille: 0 },
         max_cents: 100_000_000,
         recon: venue_treasury::recon::Options::default(),
+        founded_at: 0,
     };
     let storage =
         match venue_store::testing::url().and_then(|_| venue_store::testing::config(&format!("gw_treasury_{name}"))) {

@@ -65,6 +65,10 @@ pub struct Config {
     pub responders: Option<venue_store::Database>,
     /// The fewest contracts a request may ask for: a multiple of the parlay lot step, and at least one lot.
     pub min_quantity: u64,
+    /// The reader's half of a snapshot pair (`venue_link::pair`) to start from, rather than from the beginning.
+    /// A venue founded on a snapshot holds no inputs in its journal at all, so a service that asked it for
+    /// everything would be sent nothing and never learn the parlays and legs it exists to reason about.
+    pub from_view: Option<std::path::PathBuf>,
 }
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -285,6 +289,10 @@ pub fn start(catalogue: Catalogue, config: &Config) -> Result<Arc<Service>, Erro
         return Err(format!("the minimum request must be a positive multiple of the lot step, {LOT_STEP}").into());
     }
     eprintln!("parlay service: approved responders {:?}", approvals.accounts());
+    let starting_view = match &config.from_view {
+        Some(path) => View::load(path).map_err(|e| format!("--from-view {}: {e}", path.display()))?,
+        None => View::default(),
+    };
     let service = Arc::new(Service {
         catalogue,
         approvals: Mutex::new(approvals),
@@ -293,7 +301,7 @@ pub fn start(catalogue: Catalogue, config: &Config) -> Result<Arc<Service>, Erro
         max_parlays: config.max_parlays,
         capacity: config.capacity,
         nonce: nonce()?,
-        state: Mutex::new(State::default()),
+        state: Mutex::new(State { view: starting_view, ..State::default() }),
         changed: Condvar::new(),
         ingress: Mutex::new((Ingress::new(&config.ingress), Ids::new('p')?)),
         gateways: Mutex::new(BTreeMap::new()),
