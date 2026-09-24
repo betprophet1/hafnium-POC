@@ -33,6 +33,10 @@ const USAGE: &str = "usage:
   venue-node cut-journal JOURNAL RESULTS   removes everything before the latest embedded snapshot from both,
                                            once RESULTS already covers it; refuses otherwise. For a journal no
                                            live `serve` has open
+  venue-node seed SNAPSHOT DATA_DIR [--capacity small|launch|scale]
+                                           founds a fresh DATA_DIR on SNAPSHOT instead of genesis, so a `serve`
+                                           pointed at it starts running from exactly that state; refuses a
+                                           DATA_DIR that already has a journal of its own
   venue-node dump FILE                     prints a journal or result log as JSON lines
   venue-node import VECTORS JOURNAL        writes a compiled scenario's inputs, as stamped, as a journal
   venue-node bench JOURNAL [--runs N]      times every input of a journal through a fresh engine; build it with
@@ -69,6 +73,7 @@ fn main() -> ExitCode {
         (Some("replay-from"), 4 | 6) => replay_from(&args[1..]),
         (Some("recover"), 3 | 5) => recover(&args[1..]),
         (Some("cut-journal"), 3) => cut_journal(&args[1..]),
+        (Some("seed"), 3 | 5) => seed(&args[1..]),
         (Some("dump"), 2) => dump(&args[1]),
         (Some("import"), 3) => import(&args[1], &args[2]),
         (Some("bench"), 2 | 4) => bench(&args[1..]),
@@ -232,6 +237,18 @@ fn recover(args: &[String]) -> Result<(), node::Error> {
 fn cut_journal(args: &[String]) -> Result<(), node::Error> {
     let (at, journal_removed, results_removed) = node::cut(Path::new(&args[0]), Path::new(&args[1]))?;
     eprintln!("cut to sequence {at}: journal -{journal_removed} bytes, results -{results_removed} bytes");
+    Ok(())
+}
+
+/// `seed SNAPSHOT DATA_DIR [--capacity small|launch|scale]`.
+fn seed(args: &[String]) -> Result<(), node::Error> {
+    let capacity = match args.get(2).map(String::as_str) {
+        None => "small",
+        Some("--capacity") => &args[3],
+        Some(other) => return Err(format!("unknown argument {other}").into()),
+    };
+    node::seed(Path::new(&args[0]), Path::new(&args[1]), capacity)?;
+    eprintln!("{} seeded from {}", args[1], args[0]);
     Ok(())
 }
 

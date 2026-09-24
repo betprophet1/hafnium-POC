@@ -39,21 +39,44 @@ pub(crate) fn is_snapshot(frame: &[u8]) -> bool {
     template_of(frame) == Some(SNAPSHOT)
 }
 
-/// Whether `journal`'s first real input is still sequence 1 — `false` once `cut` has ever removed it. A genesis
-/// replay of a cut journal would fail-stop confusingly on whatever input it did keep (E-4.1: the engine expects
-/// sequence 1 next); this is what lets a caller refuse clearly instead. Skips past any `Snapshot` frame to find
-/// that first real input rather than assuming it is the very first frame in the file — `cut` keeps every frame's
-/// original relative order, and a snapshot embedded after later inputs already existed can physically sit *after*
-/// them (§3.7), so it is not reliably the first frame even in a cut journal. An empty journal, or one with nothing
-/// but a snapshot in it, counts as starting at genesis — there is no input in it to contradict that.
+/// Whether `journal`'s first real input is still sequence 1 — `false` once `cut` has ever removed it, and
+/// `false` for a journal `seed` founded on a snapshot with nothing yet appended after it. A genesis replay of
+/// either would fail-stop confusingly (E-4.1: the engine expects sequence 1 next), or silently ignore the
+/// snapshot and construct a default engine instead, so this is what lets a caller refuse clearly rather than do
+/// either. Skips past any `Snapshot` frame to find the first real input rather than assuming it is the very
+/// first frame in the file — `cut` keeps every frame's original relative order, and a snapshot embedded after
+/// later inputs already existed can physically sit *after* them (§3.7), so it is not reliably the first frame
+/// even in a cut journal. Only a journal with no frames at all — a node that has truly never run — starts at
+/// genesis with nothing to contradict it; one with a snapshot and nothing else does not, because it was founded
+/// somewhere other than sequence 1 on purpose.
 fn starts_at_genesis(journal: &Path) -> Result<bool, Error> {
     let mut reader = BufReader::new(File::open(journal)?);
     let mut buf = Vec::new();
+    let mut saw_snapshot = false;
     while let Some(n) = read_frame(&mut reader, &mut buf)? {
         if is_snapshot(&buf[..n]) {
+            saw_snapshot = true;
             continue;
         }
         return Ok(u64_at(&buf[..n], 8) == 1);
+    }
+    Ok(!saw_snapshot)
+}
+
+/// Whether `journal` carries no real input at all — only `Snapshot` frames, or nothing. This is narrower than
+/// `starts_at_genesis`: an ordinary journal with a snapshot merely appended at its *tail* (`embed` with no `--at`)
+/// still has every one of its real inputs before that snapshot, and `results.sbe` still owes each of them a
+/// result — that case must keep falling back to a full genesis replay, same as before. This is only true of a
+/// journal `seed` produced (or the degenerate case of a journal `cut` all the way to nothing but its own latest
+/// snapshot): there is no real input anywhere in it, before or after, so there is nothing a lost or absent
+/// `results.sbe` could owe a result for, and the snapshot is safe to trust unconditionally.
+fn founded_only(journal: &Path) -> Result<bool, Error> {
+    let mut reader = BufReader::new(File::open(journal)?);
+    let mut buf = Vec::new();
+    while let Some(n) = read_frame(&mut reader, &mut buf)? {
+        if !is_snapshot(&buf[..n]) {
+            return Ok(false);
+        }
     }
     Ok(true)
 }
@@ -221,12 +244,14 @@ fn run_journal(
 /// Runs a journal through a fresh engine and writes its result log. Replaying one journal always yields the
 /// same result log, byte for byte, on any build with the same profile (blueprint §16).
 ///
-/// Refuses a journal `cut` has already shortened: a fresh engine expects sequence 1 first (E-4.1), and a cut
-/// journal starts with a `Snapshot` frame instead — `recover`, not `replay`, is what such a journal is read with.
+/// Refuses a journal that does not start at sequence 1 — either `cut` has already shortened it, or `seed` founded
+/// it on a snapshot with no genesis of its own: a fresh engine expects sequence 1 first (E-4.1), and either kind
+/// of journal starts with a `Snapshot` frame instead — `recover`, not `replay`, is what such a journal is read
+/// with.
 pub fn replay(journal: &Path, results: &Path) -> Result<u64, Error> {
     if !starts_at_genesis(journal)? {
         return Err(format!(
-            "{} has been cut and no longer starts at sequence 1; use recover, not replay",
+            "{} does not start at sequence 1 (cut, or founded on a snapshot); use recover, not replay",
             journal.display()
         )
         .into());
@@ -413,6 +438,41 @@ pub fn cut(journal: &Path, results: &Path) -> Result<(u64, u64, u64), Error> {
         ],
     );
     Ok((at, journal_removed, results_removed))
+}
+
+/// Founds a fresh data directory on `snapshot` instead of genesis: `data_dir/journal.sbe` holds only that one
+/// `Snapshot` frame, `data_dir/results.sbe` starts empty, and `data_dir/capacity` records `capacity` — so a
+/// `serve` pointed at `data_dir` recovers through `choose_recovery`'s `founded_only` case and starts running
+/// from exactly this state, with no history of its own before it (§3.9: a test or preview environment choosing
+/// which snapshot to start from, rather than genesis or whatever the live venue happens to be running).
+///
+/// Refuses a `data_dir` that already has a journal: seeding seeds a fresh environment, it does not replace one
+/// that already has real history of its own.
+pub fn seed(snapshot: &Path, data_dir: &Path, capacity: &str) -> Result<(), Error> {
+    let journal = data_dir.join(JOURNAL);
+    if journal.exists() {
+        return Err(
+            format!("{} already has a journal; seed is only for a fresh data directory", journal.display()).into()
+        );
+    }
+    let mut reader = BufReader::new(File::open(snapshot)?);
+    let mut buf = Vec::new();
+    let n = read_frame(&mut reader, &mut buf)?.ok_or("the snapshot file is empty")?;
+    if template_of(&buf[..n]) != Some(SNAPSHOT) {
+        return Err("that file does not begin with a Snapshot frame".into());
+    }
+    let at = u64_at(&buf[..n], 8);
+    fs::create_dir_all(data_dir)?;
+    let mut out = BufWriter::new(File::create(&journal)?);
+    write_frame(&mut out, &buf[..n])?;
+    out.flush()?;
+    File::create(data_dir.join(RESULTS))?;
+    fs::write(data_dir.join(CAPACITY), capacity)?;
+    log::info(
+        "data directory seeded from a snapshot",
+        &[("data_dir", &data_dir.display()), ("snapshot", &snapshot.display()), ("at", &at), ("capacity", &capacity)],
+    );
+    Ok(())
 }
 
 /// Stamps, journals and applies inputs, in that order.
@@ -651,6 +711,13 @@ enum Recovery {
 /// possible. Once `cut` has ever run, it is not: the bytes a genesis replay would need are exactly what it
 /// removed, so a journal that no longer `starts_at_genesis` and has no *usable* snapshot is not a fallback case at
 /// all, but a real error — recovery is not possible until the result log catches up to the embedded snapshot.
+///
+/// The one exception is a journal `seed` has just founded: it carries no real input at all, before or after its
+/// snapshot, so there is nothing for an uncovering result log to have lost — the check above would otherwise
+/// refuse a freshly seeded environment before it ever got to run (`founded_only`). This is narrower than a
+/// journal merely having nothing *after* its snapshot: an ordinary journal with one appended at the tail
+/// (`embed` with no `--at`) still has real input *before* it that `results.sbe` owes results for, and must still
+/// fall back to genesis, not take this shortcut.
 fn choose_recovery(journal: &Path, results: &Path) -> Result<Recovery, Error> {
     // A brand-new node, never yet run: nothing to look for a snapshot in. `latest` (like every other reader of a
     // journal here) takes its existence for granted, since every other caller's journal is already there.
@@ -659,9 +726,12 @@ fn choose_recovery(journal: &Path, results: &Path) -> Result<Recovery, Error> {
     }
     let snapshot = snapshots::latest(journal)?;
     let trusted = repair_results(results)?;
-    if let (Some((at, frame)), Some(trusted_through)) = (&snapshot, trusted) {
-        if trusted_through >= *at {
-            return Ok(Recovery::FromSnapshot { at: *at, frame: frame.clone(), trusted_through });
+    if let Some((at, frame)) = &snapshot {
+        if trusted.is_some_and(|through| through >= *at) {
+            return Ok(Recovery::FromSnapshot { at: *at, frame: frame.clone(), trusted_through: trusted.unwrap() });
+        }
+        if founded_only(journal)? {
+            return Ok(Recovery::FromSnapshot { at: *at, frame: frame.clone(), trusted_through: *at });
         }
     }
     if starts_at_genesis(journal)? {
@@ -709,7 +779,9 @@ fn recover_engine(
                 drop(discard);
                 let _ = fs::remove_file(&scratch);
             }
-            let mut results = BufWriter::new(OpenOptions::new().append(true).open(results_path)?);
+            // `create(true)`: a journal `founded_only` trusts unconditionally (`choose_recovery`) can be seeded
+            // with no `results.sbe` of its own yet — nothing has run to have written one.
+            let mut results = BufWriter::new(OpenOptions::new().create(true).append(true).open(results_path)?);
             let recovered = run_journal(engine, journal_path, &mut results, trusted_through, None, true)?;
             log::info(
                 "recovered from an embedded snapshot",
@@ -1173,5 +1245,60 @@ mod tests {
         cut(&journal, &results).expect("cuts");
         let err = replay(&journal, &dir.join("out.sbe")).expect_err("replay accepted a cut journal");
         assert!(err.to_string().contains("recover"), "the error did not point at recover: {err}");
+    }
+
+    fn fixture_snapshot_out(dir: &Path, at: u64) -> PathBuf {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interfaces/audit/recorded/journal.sbe");
+        let out = dir.join("snapshot.out");
+        snapshots::take(&fixture, &out, Some(at)).expect("a snapshot is taken");
+        out
+    }
+
+    #[test]
+    fn starts_at_genesis_is_false_for_a_journal_seed_founded() {
+        let dir = dir("starts-at-genesis-seeded");
+        let snapshot = fixture_snapshot_out(&dir, 62);
+        let fresh = dir.join("fresh");
+        seed(&snapshot, &fresh, "small").expect("seeds");
+        assert!(
+            !starts_at_genesis(&fresh.join(JOURNAL)).expect("checked"),
+            "a freshly seeded journal reported starting at genesis"
+        );
+    }
+
+    #[test]
+    fn choose_recovery_trusts_a_freshly_seeded_journal_with_no_results_history_at_all() {
+        let dir = dir("choose-seeded");
+        let snapshot = fixture_snapshot_out(&dir, 62);
+        let fresh = dir.join("fresh");
+        seed(&snapshot, &fresh, "small").expect("seeds");
+        match choose_recovery(&fresh.join(JOURNAL), &fresh.join(RESULTS)).expect("decided") {
+            Recovery::FromSnapshot { at, trusted_through, .. } => {
+                assert_eq!(at, 62);
+                assert_eq!(trusted_through, 62, "a freshly seeded journal should be trusted exactly to its snapshot");
+            }
+            Recovery::Genesis => panic!("a freshly seeded journal fell back to genesis, ignoring its snapshot"),
+        }
+    }
+
+    #[test]
+    fn seed_refuses_a_data_dir_that_already_has_a_journal() {
+        let dir = dir("seed-refuses-existing");
+        let snapshot = fixture_snapshot_out(&dir, 62);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interfaces/audit/recorded/journal.sbe");
+        let existing = dir.join("existing");
+        fs::create_dir_all(&existing).expect("a data directory");
+        fs::copy(fixture, existing.join(JOURNAL)).expect("an existing journal");
+        let err = seed(&snapshot, &existing, "small").expect_err("seed clobbered an existing environment");
+        assert!(err.to_string().contains("already has a journal"), "{err}");
+    }
+
+    #[test]
+    fn seed_refuses_a_file_that_is_not_a_snapshot() {
+        let dir = dir("seed-refuses-non-snapshot");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../interfaces/audit/recorded/journal.sbe");
+        let fresh = dir.join("fresh");
+        let err = seed(&fixture, &fresh, "small").expect_err("seed accepted a plain journal as a snapshot");
+        assert!(err.to_string().contains("Snapshot"), "{err}");
     }
 }
