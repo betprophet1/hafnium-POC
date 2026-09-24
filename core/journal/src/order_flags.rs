@@ -19,7 +19,11 @@ impl OrderFlags {
 
     #[inline]
     pub fn set_post_only(&mut self, value: bool) -> &mut Self {
-        self.0 = if value { self.0 | (1 << 0) } else { self.0 & !(1 << 0) };
+        self.0 = if value {
+            self.0 | (1 << 0)
+        } else {
+            self.0 & !(1 << 0)
+        };
         self
     }
 
@@ -30,13 +34,18 @@ impl OrderFlags {
 
     #[inline]
     pub fn set_reduce_only(&mut self, value: bool) -> &mut Self {
-        self.0 = if value { self.0 | (1 << 1) } else { self.0 & !(1 << 1) };
+        self.0 = if value {
+            self.0 | (1 << 1)
+        } else {
+            self.0 & !(1 << 1)
+        };
         self
     }
 }
 impl core::fmt::Debug for OrderFlags {
     #[inline]
     fn fmt(&self, fmt: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(fmt, "OrderFlags[post_only(0)={},reduce_only(1)={}]", self.get_post_only(), self.get_reduce_only(),)
+        write!(fmt, "OrderFlags[post_only(0)={},reduce_only(1)={}]",
+            self.get_post_only(),self.get_reduce_only(),)
     }
 }
