@@ -10,6 +10,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+# Both halves of a snapshot: the engine's, and the one a reader is restored from (src/pair.rs).
+[[bin]]
+name = "venue-view"
+path = "src/main.rs"
+
 [dependencies]
 venue-engine = { path = "../engine" }
 venue-harness = { path = "../harness" }

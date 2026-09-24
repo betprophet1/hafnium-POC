@@ -81,6 +81,35 @@ fn a_restored_view_plus_the_tail_equals_having_applied_everything() {
     assert_eq!(a, b, "resuming from a view snapshot did not land where applying everything lands");
 }
 
+/// A `Snapshot` frame embedded in the journal is not an input, and the feed never sends one to a subscriber —
+/// so rebuilding "what the feed carried" from the files must not produce one either.
+///
+/// This bites hardest in the case §3.7 describes: `embed` appends wherever the journal currently ends, so a
+/// snapshot taken at an *earlier* sequence sits physically *after* later inputs. Applied as though it were a
+/// unit, its record header would drag the view's own sequence backwards — and a reader that then resumed from
+/// that sequence would be re-sent inputs it had already applied, accumulating fills and trades twice.
+#[test]
+fn an_embedded_snapshot_is_not_applied_as_though_it_were_an_input() {
+    let dir = scratch("embedded");
+    let (journal, results) = fixture(&dir);
+    let whole = View::replayed(&journal, &results, None).expect("replays");
+    let last = whole.sequence;
+
+    // A snapshot for an early sequence, embedded once the journal already runs well past it.
+    venue_node::snapshots::embed(&journal, Some(62)).expect("a snapshot embeds");
+    let after = View::replayed(&journal, &results, None).expect("replays");
+
+    assert_eq!(
+        after.sequence, last,
+        "embedding a snapshot for sequence 62 moved the view's own sequence; it was applied as an input"
+    );
+    let (mut a, mut b) = (serde_json::to_value(&whole).expect("value"), serde_json::to_value(&after).expect("value"));
+    for v in [&mut a, &mut b] {
+        v.as_object_mut().expect("an object").remove("version");
+    }
+    assert_eq!(a, b, "embedding a snapshot changed what a reader would hold");
+}
+
 /// Why this is replayed rather than projected from the engine's own snapshot (spec §20): the engine keeps only
 /// what it needs to match on, so some of what a reader shows was never engine state at all. `defined_at` is the
 /// one this fixture can demonstrate — the engine has no such field, so a reader rebuilt from engine state would
