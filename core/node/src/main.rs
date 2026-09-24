@@ -30,6 +30,9 @@ const USAGE: &str = "usage:
   venue-node recover JOURNAL RESULTS [--snapshot-out FILE]
                                            the same, but restores from the latest snapshot already embedded in
                                            JOURNAL; prints and exits 1 if it has none yet
+  venue-node cut-journal JOURNAL RESULTS   removes everything before the latest embedded snapshot from both,
+                                           once RESULTS already covers it; refuses otherwise. For a journal no
+                                           live `serve` has open
   venue-node dump FILE                     prints a journal or result log as JSON lines
   venue-node import VECTORS JOURNAL        writes a compiled scenario's inputs, as stamped, as a journal
   venue-node bench JOURNAL [--runs N]      times every input of a journal through a fresh engine; build it with
@@ -65,6 +68,7 @@ fn main() -> ExitCode {
         (Some("embed-snapshot"), 2 | 4) => embed_snapshot(&args[1..]),
         (Some("replay-from"), 4 | 6) => replay_from(&args[1..]),
         (Some("recover"), 3 | 5) => recover(&args[1..]),
+        (Some("cut-journal"), 3) => cut_journal(&args[1..]),
         (Some("dump"), 2) => dump(&args[1]),
         (Some("import"), 3) => import(&args[1], &args[2]),
         (Some("bench"), 2 | 4) => bench(&args[1..]),
@@ -222,6 +226,13 @@ fn recover(args: &[String]) -> Result<(), node::Error> {
         }
         None => Err("that journal carries no embedded snapshot yet (venue-node embed-snapshot)".into()),
     }
+}
+
+/// `cut-journal JOURNAL RESULTS`.
+fn cut_journal(args: &[String]) -> Result<(), node::Error> {
+    let (at, journal_removed, results_removed) = node::cut(Path::new(&args[0]), Path::new(&args[1]))?;
+    eprintln!("cut to sequence {at}: journal -{journal_removed} bytes, results -{results_removed} bytes");
+    Ok(())
 }
 
 fn dump(path: &str) -> Result<(), Error> {

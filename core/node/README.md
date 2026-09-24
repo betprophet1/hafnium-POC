@@ -73,8 +73,25 @@ tail for real, appended to the *preserved* result log rather than a fresh one.
 `core/node/tests/wired_recovery.rs` checks a node recovering this way is indistinguishable from one that
 recovered from genesis, both in what a subscriber's backlog receives and in the result log's own bytes.
 
-Cutting the journal once recovery no longer needs everything before a snapshot, and shipping what is cut to
-object storage, are not built yet — this only proves the journal *can* be cut safely; nothing does.
+**Cutting.** `venue-node cut-journal JOURNAL RESULTS` removes what the latest embedded snapshot makes
+removable from *both* files — the journal has no way to drop bytes from its front the way `repair_results` drops
+an unconfirmed tail, so this rewrites each one whole (a sibling temp file, `fsync`ed, renamed over the original —
+nothing is replaced until its replacement is already durable). Refuses, touching neither file, unless the result
+log is already trusted through at least the snapshot's own sequence — the same check `choose_recovery` makes,
+because cutting past what it covers would permanently lose the ability to reconstruct those results.
+
+A single "keep from this byte onward" cut point is **not enough** to do this correctly: `embed` appends wherever
+the journal currently ends, which is not necessarily right after the sequence it describes (§3.7, position
+carries no meaning) — a higher-sequence input can physically sit *before* a snapshot embedded after it was
+already journaled. Cutting keeps the target snapshot and everything with a greater sequence, filtered frame by
+frame in their original relative order, the same discipline `replay_tail` already uses for the same reason. This
+also means a journal that has ever been cut can no longer be `replay`ed from genesis — its first *real* input is
+no longer sequence 1 (`E-4.1` would fail-stop on it) — `replay` and `serve`'s own recovery both check for this
+and refuse or fall back cleanly rather than attempting a doomed replay; `recover` is what reads a cut journal.
+`core/node/tests/cut_journal.rs` checks a cut-and-recovered node reaches the same tail a full replay would have,
+sequence for sequence and byte for byte in the result log, and that a refused cut changes nothing.
+
+Shipping what is cut to object storage is not built yet.
 
 ## Commands
 
@@ -86,6 +103,7 @@ venue-node replay ./venue-data/journal.sbe out.sbe && cmp out.sbe ./venue-data/r
 venue-node snapshot ./venue-data/journal.sbe snap.sbe
 venue-node embed-snapshot ./venue-data/journal.sbe   # only while nothing has it open (no `serve` running)
 venue-node recover ./venue-data/journal.sbe tail.results.sbe
+venue-node cut-journal ./venue-data/journal.sbe ./venue-data/results.sbe   # same "no live serve" caveat
 venue-node import core/target/differential/fuzz-90000.json golden.journal
 ```
 

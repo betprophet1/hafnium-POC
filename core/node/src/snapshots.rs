@@ -115,9 +115,12 @@ pub fn embed(journal: &Path, at: Option<u64>) -> Result<(u64, usize), Error> {
 /// The last `Snapshot` frame in `journal`, and the sequence it follows — whichever `embed` left with the greatest
 /// `at`, wherever in the file it landed. Position carries no meaning here: `replay_tail` filters what follows a
 /// restored engine by sequence, not by where in the file a frame sits, so the frame this returns need not be the
-/// physically last one for that to be correct — only the furthest one is worth restoring from at all.
+/// physically last one for that to be correct — only the furthest one is worth restoring from at all. `node::cut`
+/// relies on that same fact the other way around: it cannot cut by this frame's byte position either, since
+/// `embed` appends wherever the file currently ends, not necessarily right after the sequence it describes — a
+/// higher-sequence input can physically sit *before* a snapshot embedded after it was already journaled.
 ///
-/// `None` means the journal carries no snapshot yet; a caller falls back to a full replay from genesis.
+/// `None` means the journal carries no snapshot yet.
 pub fn latest(journal: &Path) -> Result<Option<(u64, Vec<u8>)>, Error> {
     let mut reader = BufReader::new(File::open(journal)?);
     let mut buf = Vec::new();
