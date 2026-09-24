@@ -25,6 +25,15 @@ Production puts the engine behind Aeron Cluster instead (WP-10). This node never
   input with its results, from the start of the journal, then live, as units: the input frame, its result frames,
   an empty frame. `TimeTick`s that changed nothing are left out. The web page and the bots in `core/sim` read it.
 
+  A reader opens by saying where it has got to — eight little-endian bytes, the last sequence it holds, or zero
+  for everything — and is answered one byte saying whether that position was honoured. It is honoured only when
+  the journal can actually answer for it at **both** ends: not past what the journal has reached (a reader whose
+  node was replaced under it), and not back before what the journal still carries, once `cut` has removed the
+  start of it or `seed` founded above it. A position below that floor is refused rather than served from where
+  the journal now happens to begin, which would skip everything in between while the answer said the resume had
+  worked. Holding *through* the floor is not below it: a journal founded or cut at 62 carries 63 onward, and a
+  reader saying "I have 62" is asking for exactly that.
+
 ## Framing
 
 Journal files, result logs and the TCP ingress all use one framing: a little-endian `u32` length, then that many

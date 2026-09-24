@@ -184,3 +184,58 @@ fn an_embedded_snapshot_is_not_sent_to_a_subscriber() {
     let everything = sequences(feed, 0);
     assert_eq!(everything, plain, "an embedded Snapshot frame changed what a subscriber is sent");
 }
+
+/// Opens a subscription and returns only whether the node said it was honouring the position, without reading
+/// the backlog: the handshake is the whole of what these next tests are about.
+fn honoured(feed: SocketAddr, resume_from: u64) -> bool {
+    let mut stream = TcpStream::connect(feed).expect("the feed accepts");
+    stream.write_all(&resume_from.to_le_bytes()).expect("the position is sent");
+    stream.flush().expect("flushed");
+    let mut answer = [0u8; 1];
+    stream.read_exact(&mut answer).expect("the node answers");
+    answer[0] != 0
+}
+
+/// A journal serving a fixture that has been cut back to a snapshot at 62: it no longer carries 1..62.
+fn cut_node() -> (SocketAddr, PathBuf) {
+    node_with(|journal| {
+        let results = journal.with_file_name("results.sbe");
+        venue_node::node::replay(journal, &results).expect("the fixture replays");
+        embed(journal, Some(62)).expect("a snapshot embeds");
+        venue_node::node::cut(journal, &results).expect("the journal cuts");
+    })
+}
+
+/// The lower bound. A cut journal no longer reaches back past its snapshot, so a reader asking to carry on from
+/// inside the stretch that was removed must be refused — honouring it would send only what follows where the
+/// journal now starts, silently skipping everything between, while the ack said the resume had worked.
+#[test]
+fn a_position_below_what_a_cut_journal_still_carries_is_refused() {
+    let (feed, _dir) = cut_node();
+    assert!(!honoured(feed, 30), "a position inside the stretch the cut removed was honoured");
+    assert!(!honoured(feed, 61), "the input before the cut point is gone, so carrying on from it is not possible");
+}
+
+/// The floor itself is honoured, not refused: a reader holding *through* 62 is asking for 63 onward, which is
+/// exactly what a journal cut at 62 carries. This is what every reader founded on a snapshot pair asks for, so
+/// getting the boundary wrong here refuses the entire founding path.
+#[test]
+fn a_reader_holding_through_the_cut_point_is_honoured() {
+    let (feed, _dir) = cut_node();
+    assert!(honoured(feed, 62), "a reader holding through the cut point was refused what follows it");
+}
+
+/// And the bound is a floor, not a ban: a position the cut journal does still carry resumes as it always did.
+#[test]
+fn a_position_a_cut_journal_still_carries_is_honoured() {
+    let (feed, _dir) = cut_node();
+    let after = sequences(feed, 0);
+    let carried = after.iter().copied().find(|&s| s > 62).expect("the cut journal carries something after 62");
+    assert!(honoured(feed, carried), "a position the journal still carries ({carried}) was refused");
+}
+
+// The other half of the bound — that a snapshot sitting physically last does not drag the *upper* bound below
+// the journal's own inputs — cannot be reached through a live node, and so is not tested here: `serve` appends
+// `EngineStarted` at every start, so by the time any subscriber can connect there is always a real input after
+// any snapshot an offline `embed` left at the tail. It is covered directly against `range` in node.rs's own
+// tests instead, and will start mattering here the day a live node embeds its own snapshot (§3.7).

@@ -609,17 +609,38 @@ fn publish(subscribers: &mut Vec<Live>, metrics: &NodeMetrics, input: &[u8], res
     Ok(())
 }
 
-/// The sequence of the last input in a journal's first `length` bytes. Read by walking the frames, which is what
-/// the subscriber's thread is about to do anyway; journals are opened and read here, never held open.
-fn last_sequence(path: &Path, length: u64) -> Result<u64, Error> {
+/// What a journal's first `length` bytes can answer for: the highest sequence below which it carries nothing,
+/// and the highest it carries. Read by walking the frames, which is what the subscriber's thread is about to do
+/// anyway; journals are opened and read here, never held open.
+///
+/// Only real inputs decide either end. A `Snapshot` frame's own sequence names the input it follows rather than
+/// one of its own, and `embed` appends wherever the file currently ends — so the frame that happens to sit last
+/// can name an *earlier* sequence than inputs before it (§3.7). Taking the last frame's sequence, whatever it
+/// was, made a journal with a snapshot embedded at its tail report an upper bound below its own real inputs, and
+/// refuse resumes that were perfectly valid.
+///
+/// A journal `seed` founded, or `cut` down to nothing but its snapshot, has no real input to speak for it. Then
+/// the snapshot's sequence is both ends at once: nothing below it is carried, and nothing above it has happened.
+fn range(path: &Path, length: u64) -> Result<(u64, u64), Error> {
     let mut reader = BufReader::new(File::open(path)?.take(length));
-    let (mut buf, mut last) = (Vec::new(), 0u64);
+    let mut buf = Vec::new();
+    let (mut first, mut last, mut snapshot_at) = (None, 0u64, 0u64);
     while let Some(n) = read_frame(&mut reader, &mut buf)? {
-        if n >= 16 {
-            last = u64_at(&buf[..n], 8);
+        if n < 16 {
+            continue;
         }
+        let sequence = u64_at(&buf[..n], 8);
+        if is_snapshot(&buf[..n]) {
+            snapshot_at = snapshot_at.max(sequence);
+            continue;
+        }
+        first.get_or_insert(sequence);
+        last = last.max(sequence);
     }
-    Ok(last)
+    match first {
+        Some(first) => Ok((first.saturating_sub(1), last)),
+        None => Ok((snapshot_at, snapshot_at)),
+    }
 }
 
 /// Sends a subscriber the journal and result log up to the given lengths, pairing each input with its results by
@@ -648,12 +669,35 @@ fn serve_subscriber(
     let asked_for = u64::from_le_bytes(position);
     stream.set_read_timeout(None)?;
 
-    // Whether the node can honour it. A reader that asks for a sequence this journal has never reached is one
-    // whose node was replaced under it — a fresh data directory, or another group's — and sending it the tail
-    // would leave it with a view built on a history that never happened. It is sent everything instead, and told
-    // so, because a reader that kept its view has to be able to throw it away.
-    let last = last_sequence(journal.0, journal.1)?;
-    let resume_from = if asked_for > 0 && asked_for <= last { asked_for } else { 0 };
+    // Whether the node can honour it, at both ends. Too high is a reader whose node was replaced under it — a
+    // fresh data directory, or another group's — and sending it the tail would leave it with a view built on a
+    // history that never happened. Too low is a reader asking to carry on from a point this journal no longer
+    // reaches back to, because `cut` removed it or `seed` founded above it: honouring that would quietly skip
+    // everything between what it holds and where the journal now starts, while the ack told it the resume had
+    // worked. Either way it is sent what there is and told the position was refused, because a reader that kept
+    // a view has to be able to throw it away.
+    //
+    // `>= floor`, not `>`: a reader holding *through* the floor is exactly right. A journal founded or cut at 62
+    // carries 63 onward, so a reader that says "I have 62" is asking for precisely what is there — which is what
+    // every reader founded on a snapshot pair says (`venue-view snapshot`). Refusing that would refuse the whole
+    // founding path, which is how `founded_venue.rs` caught this being `>` first.
+    let (floor, last) = range(journal.0, journal.1)?;
+    let resume_from = if asked_for >= floor && asked_for <= last { asked_for } else { 0 };
+    let peer = || stream.peer_addr().map_or_else(|_| "unknown".to_string(), |a| a.to_string());
+    if asked_for > 0 && asked_for < floor {
+        log::warn(
+            "a subscriber asked to resume from below what this journal still carries",
+            &[("peer", &peer()), ("asked_for", &asked_for), ("carried_from", &floor)],
+        );
+    } else if asked_for == 0 && floor > 0 {
+        // Not refusable with the one byte this handshake has, and not silently wrong either: what follows is a
+        // real backlog, just not the whole history the reader is asking for. A reader founded on a snapshot pair
+        // (`venue-view snapshot`) asks for its own sequence instead and never lands here.
+        log::warn(
+            "a subscriber asked for everything, and this journal no longer starts at the beginning",
+            &[("peer", &peer()), ("carried_from", &floor)],
+        );
+    }
     stream.write_all(&[u8::from(resume_from > 0)])?;
     let mut out = BufWriter::new(stream);
     let mut inputs = BufReader::new(File::open(journal.0)?.take(journal.1));
@@ -1252,6 +1296,37 @@ mod tests {
         let out = dir.join("snapshot.out");
         snapshots::take(&fixture, &out, Some(at)).expect("a snapshot is taken");
         out
+    }
+
+    /// Both ends of what a journal can answer for are decided by its real inputs. A `Snapshot` frame's sequence
+    /// names the input it follows, and `embed` appends wherever the file currently ends — so one taken at an
+    /// earlier sequence lands *after* later inputs (§3.7). Taking the last frame's sequence, whatever it was,
+    /// put the upper bound below the journal's own inputs and refused resumes that were valid.
+    ///
+    /// Unreachable through a live node today, which is why it is tested here rather than in `feed_resume.rs`:
+    /// `serve` appends `EngineStarted` at every start, so a snapshot an offline `embed` left at the tail always
+    /// has a real input after it by the time a subscriber can connect.
+    #[test]
+    fn a_journals_range_is_decided_by_its_inputs_not_by_whichever_frame_sits_last() {
+        let dir = dir("range-tail-snapshot");
+        let journal = fixture_journal_with_snapshot(&dir, 62);
+        let length = journal.metadata().expect("stat").len();
+        let (floor, last) = range(&journal, length).expect("read");
+        assert_eq!(floor, 0, "an uncut journal carries everything from its first input");
+        assert!(last > 62, "the tail snapshot's own sequence was taken as the journal's last: {last}");
+    }
+
+    /// A journal founded on a snapshot has no real input to speak for it, so the snapshot's own sequence is both
+    /// ends: nothing below it is carried, and nothing above it has happened yet.
+    #[test]
+    fn a_founded_journal_carries_nothing_below_its_snapshot_and_nothing_above_it() {
+        let dir = dir("range-founded");
+        let snapshot = fixture_snapshot_out(&dir, 62);
+        let fresh = dir.join("fresh");
+        seed(&snapshot, &fresh, "small").expect("seeds");
+        let journal = fresh.join(JOURNAL);
+        let length = journal.metadata().expect("stat").len();
+        assert_eq!(range(&journal, length).expect("read"), (62, 62));
     }
 
     #[test]
