@@ -67,12 +67,35 @@ pub struct Recorded {
     pub outcome: Adjusted,
 }
 
-/// Every treasury command the journal holds so far, by command ID, and how far through the journal that is.
+/// Every treasury command the journal holds so far, by command ID, and the range of the journal that is.
+///
+/// The range has two ends, and both matter. `through` is the obvious one. `from` is the sequence this reader was
+/// founded at — the point below which it has read nothing and never will, because it was handed a starting
+/// position rather than the whole history (`venue-view snapshot`, `core/link/src/pair.rs`). Without it a founded
+/// reader would take "sequenced at or before `through`" to mean "in `commands` if it is anywhere", and report
+/// every transfer older than its floor as a command the engine never applied.
+///
+/// It is deliberately *not* filled in from the treasury's own records. Reconciliation compares what the treasury
+/// believes against what the journal independently says; sourcing the journal's side from the treasury's own
+/// database would make the comparison vacuous. A reader that cannot check a range says so, rather than checking
+/// it against itself.
 #[derive(Clone, Debug, Default)]
 pub struct Journal {
     pub commands: BTreeMap<String, Recorded>,
-    /// The highest input sequence read: a command sequenced at or before it is in `commands` if it is anywhere.
+    /// The sequence below which nothing was read: 0 for a reader that started from the beginning, so the usual
+    /// case is unchanged. A command at or before it is outside what this reader can speak to.
+    pub from: u64,
+    /// The highest input sequence read: a command sequenced after `from` and at or before this is in `commands`
+    /// if it is anywhere.
     pub through: u64,
+}
+
+impl Journal {
+    /// Whether this reader has actually read the stretch of journal a command at `sequence` would sit in, and so
+    /// whether its absence from `commands` means anything.
+    pub fn covers(&self, sequence: u64) -> bool {
+        sequence > self.from && sequence <= self.through
+    }
 }
 
 /// The sequencer group, as far as the treasury needs it: sleeve grants and reclaims (spec E-7.2), and the record of

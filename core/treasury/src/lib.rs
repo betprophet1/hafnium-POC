@@ -35,6 +35,10 @@ pub struct Settings {
     pub max_cents: u64,
     /// Messages to lose on purpose, and when to reconcile.
     pub recon: recon::Options,
+    /// The sequence a venue founded on a snapshot was founded at, if this is one: where the feed resumes, and
+    /// the floor below which this treasury has read nothing and reconciliation must not draw conclusions
+    /// (`node::Node::founded_at`). Zero for a venue running from genesis, which is every venue until one is not.
+    pub founded_at: u64,
 }
 
 /// Where the treasury's records are kept.
@@ -76,7 +80,8 @@ pub fn start(settings: &Settings, records: Arc<dyn Records>, listener: TcpListen
         .collect();
     let config = Config { bank: settings.bank, max_cents: settings.max_cents, accounts, recon: settings.recon };
     let treasury = Arc::new(Treasury::open(config, records, clock::wall_ms())?);
-    let node = node::Node::new(&settings.ingress, &settings.feed, treasury.command_prefix());
+    let node =
+        node::Node::founded_at(&settings.ingress, &settings.feed, treasury.command_prefix(), settings.founded_at);
     let mut node = faults::Lossy::new(node, settings.recon.faults, settings.bank.seed);
     let driver = Arc::clone(&treasury);
     thread::spawn(move || loop {

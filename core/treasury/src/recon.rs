@@ -12,16 +12,23 @@
 //! - **Sequencer group.** A reclaim or grant sent without an answer is looked up by its command ID: if the journal
 //!   has it, its outcome is applied as if the answer had come; if not, it is sent again under the same command ID,
 //!   which the sequencer group deduplicates (spec E-7.1), so a send that did arrive after all moves nothing twice.
-//!   A command the journal applied that the treasury does not expect, or one it expects that the journal (read past
-//!   its sequence) does not have, or amounts that differ, are reported.
+//!   A command the journal applied that the treasury does not expect, or one it expects that the journal (read over
+//!   a stretch that covers its sequence) does not have, or amounts that differ, are reported.
 //! - **Invariants.** The ledger sums to zero; the bank's omnibus, less what it has decided and the treasury has not
 //!   booked yet, equals the customers' cash plus money in transit (§11's "sum of customer cash equals the FBO balance
 //!   minus in-flight transfers", with the bank's own balance rather than the ledger's copy of it); and for every
 //!   account, what the treasury granted less what it reclaimed equals what the journal applied. A breach is a break
 //!   like any other, and the run's status says `breach`. It does not halt anything: see the README.
 //!
-//! The journal is read from the node's feed, which replays it whole to each follower, so this is the nightly replay
-//! check of §11 run as often as the schedule says. Runs are cheap here; the schedule is a flag.
+//! The journal is read from the node's feed, so this is the nightly replay check of §11 run as often as the
+//! schedule says. Runs are cheap here; the schedule is a flag.
+//!
+//! What the feed replays is whole only for a treasury that started at the beginning. One following a venue founded
+//! on a snapshot (`venue-view snapshot`) was handed a position instead, and has read nothing below it — so
+//! `Journal` carries that floor as well as its `through`, and every check here asks `covers` rather than comparing
+//! against `through` alone. A range this reader never read is one it draws no conclusions about, in either
+//! direction. Filling it in from the treasury's own records would defeat the point: this check is worth something
+//! precisely because the two sides are derived independently.
 //!
 //! A break is found once: a later run that finds the same thing (kind, transfer, account) counts it as still open,
 //! and a run that no longer finds it closes it. Resolving is idempotent, because each fix first checks that the
@@ -380,14 +387,16 @@ pub fn match_engine(transfers: &BTreeMap<u64, Transfer>, journal: &Journal, nonc
                     Fix::Report,
                 )),
                 (Expect::Applied, None) => {
-                    // The feed may simply not have reached it yet.
-                    if t.sequence.is_some_and(|s| s <= journal.through) {
+                    // The feed may simply not have reached it yet — or this reader may have been founded above
+                    // it and never read that stretch at all, in which case its absence says nothing (`covers`).
+                    if t.sequence.is_some_and(|s| journal.covers(s)) {
                         findings.push(Finding::of(
                             "engine_command_missing",
                             t,
                             format!(
-                                "the treasury has {id} applied at sequence {}, and the journal through {} does not have it",
+                                "the treasury has {id} applied at sequence {}, and the journal read over {}..{} does not have it",
                                 t.sequence.unwrap_or(0),
+                                journal.from,
                                 journal.through
                             ),
                             Fix::Report,
@@ -500,8 +509,11 @@ pub(crate) fn invariants(
     let mut treasury: BTreeMap<u64, i128> = BTreeMap::new();
     let mut engine: BTreeMap<u64, i128> = BTreeMap::new();
     for t in inner.transfers.values() {
+        // Past what the feed has reached, or below the floor this reader was founded at: either way the journal
+        // has nothing to say about it, and counting it on one side only would make the two sides disagree by
+        // construction.
         if matches!(t.stage, Stage::Reclaiming | Stage::Granting { .. })
-            || t.sequence.is_some_and(|s| s > journal.through)
+            || t.sequence.is_some_and(|s| !journal.covers(s))
         {
             continue;
         }
@@ -981,6 +993,39 @@ mod tests {
         assert_eq!(again["status"], "clean", "{again}");
         assert_eq!(postings(&treasury), before);
         assert_eq!(group.sleeves[&ACCOUNT], 700);
+    }
+
+    /// A treasury founded on a snapshot has read nothing below the sequence it was founded at, so a transfer
+    /// older than that has no command in its journal — and that absence means nothing. Reading it as "the engine
+    /// never applied this" would report a breach per transfer for a venue that is in fact perfectly consistent.
+    ///
+    /// The second half is what the first half is worth: with the floor at 0, which is what a reader that started
+    /// from the beginning has, the very same state *is* a breach, and should be.
+    #[test]
+    fn a_transfer_from_before_a_founded_reader_was_founded_is_not_a_breach() {
+        let p = Memory::default();
+        let treasury = open_with(&p, options(Faults::NONE));
+        let mut group = Group::default();
+        treasury.request(ACCOUNT, &body("d", "deposit", 700, "dummy_instant"), 1_000).expect("requested");
+        advance(&treasury, &mut group, 1_000, 1_500);
+        assert!(!group.journal.commands.is_empty(), "the deposit never reached the journal; the test proves nothing");
+
+        // A reader founded above everything it had seen: it holds no command below its floor, and never will.
+        let founded_at = group.journal.through;
+        group.journal.commands.clear();
+        group.journal.from = founded_at;
+
+        let run = reconcile(&treasury, &mut group, 2_000);
+        assert_eq!(run["status"], "clean", "a founded reader reported a breach for a transfer below its floor: {run}");
+        invariants_hold(&run);
+
+        // The same missing command, for a reader that did read from the beginning: genuinely a breach.
+        group.journal.from = 0;
+        let run = reconcile(&treasury, &mut group, 3_000);
+        assert_eq!(
+            run["status"], "breach",
+            "a command missing from a reader that read everything was not a breach: {run}"
+        );
     }
 
     #[test]

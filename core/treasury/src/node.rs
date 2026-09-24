@@ -32,7 +32,23 @@ impl Node {
     /// Sends to the ingress at `ingress`, and follows the feed at `feed` for the outcomes of commands whose IDs start
     /// with `prefix`.
     pub fn new(ingress: &str, feed: &str, prefix: String) -> Self {
-        let seen: Seen = Arc::default();
+        Self::founded_at(ingress, feed, prefix, 0)
+    }
+
+    /// The same, for a venue founded on a snapshot rather than on genesis: `from` is the sequence that venue was
+    /// founded at, which is both where this reader resumes and the floor below which it has read nothing.
+    ///
+    /// The floor is the point. Reconciliation reads "sequenced at or before `through`" as "in `commands` if it is
+    /// anywhere", which is only true of a reader that started at the beginning. Without the floor a founded
+    /// treasury reports every transfer older than it as a command the engine never applied — a breach per
+    /// transfer, for a venue that is in fact perfectly consistent.
+    ///
+    /// What it does *not* do is fill those commands in from the treasury's own records. Reconciliation exists to
+    /// compare what the treasury believes against what the journal independently says; sourcing the journal's
+    /// side from the treasury's database would make it agree with itself by construction. A range that cannot be
+    /// checked is declared, not faked.
+    pub fn founded_at(ingress: &str, feed: &str, prefix: String, from: u64) -> Self {
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Journal { from, through: from, ..Journal::default() }));
         let (journal, feed) = (Arc::clone(&seen), feed.to_string());
         thread::spawn(move || {
             wire::follow(
