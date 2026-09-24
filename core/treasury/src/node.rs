@@ -105,9 +105,11 @@ impl Sequencer for Node {
         if let Some(adjusted) = adjusted(sequence, outcome, &applied["rejectReason"]) {
             return Ok(adjusted);
         }
-        // A duplicate: its first outcome is on the feed, or will be once the feed catches up.
+        // A duplicate: its first outcome is on the feed, or will be once the feed catches up — or never, if it
+        // lies below the floor this reader was founded at. `sequence` is this re-send's own, which is what lets
+        // the caller tell those apart once the feed has read past it (`Treasury::strand`).
         let first = self.seen.lock().unwrap_or_else(PoisonError::into_inner).commands.get(command_id).cloned();
-        Ok(first.map_or(Adjusted::Unknown, |r| r.outcome))
+        Ok(first.map_or(Adjusted::Unknown { after: sequence }, |r| r.outcome))
     }
 
     fn journal(&self) -> Journal {

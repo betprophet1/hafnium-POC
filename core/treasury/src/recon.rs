@@ -344,7 +344,12 @@ pub fn match_bank(
 }
 
 /// Matches the treasury's transfers against the treasury commands the journal holds.
-pub fn match_engine(transfers: &BTreeMap<u64, Transfer>, journal: &Journal, nonce: u32) -> Vec<Finding> {
+pub fn match_engine(
+    transfers: &BTreeMap<u64, Transfer>,
+    journal: &Journal,
+    nonce: u32,
+    unresolvable: &BTreeMap<u64, String>,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
     for t in transfers.values() {
         for what in ['r', 'g'] {
@@ -360,12 +365,19 @@ pub fn match_engine(transfers: &BTreeMap<u64, Transfer>, journal: &Journal, nonc
                             format!("{id} was sent and its answer never read; the journal has it {:?}", rec.outcome),
                             Fix::Outcome(rec.outcome.clone()),
                         ),
-                        None => Finding::of(
-                            "engine_command_lost",
-                            t,
-                            format!("{id} was sent and never answered, and the journal does not have it"),
-                            Fix::Resend,
-                        ),
+                        // Resending is the right answer only while the group might still not have seen it. Once
+                        // it has answered DUPLICATE for a command whose first outcome the feed will never carry,
+                        // resending only earns another DUPLICATE — so this says so and leaves it to an operator
+                        // rather than turning the retry loop it replaced into a reconciliation-driven one.
+                        None => match unresolvable.get(&t.id) {
+                            Some(why) => Finding::of("engine_duplicate_unresolvable", t, why.clone(), Fix::Report),
+                            None => Finding::of(
+                                "engine_command_lost",
+                                t,
+                                format!("{id} was sent and never answered, and the journal does not have it"),
+                                Fix::Resend,
+                            ),
+                        },
                     });
                 }
                 continue;
@@ -614,7 +626,7 @@ impl Treasury {
             seen.push((self.record_new(inner, run, f, now, &mut resolved), true));
         }
 
-        for f in match_engine(&inner.transfers, journal, inner.nonce) {
+        for f in match_engine(&inner.transfers, journal, inner.nonce, &inner.unresolvable) {
             seen.push(self.take_up(inner, run, f, now, &mut resolved));
         }
 
@@ -993,6 +1005,39 @@ mod tests {
         assert_eq!(again["status"], "clean", "{again}");
         assert_eq!(postings(&treasury), before);
         assert_eq!(group.sleeves[&ACCOUNT], 700);
+    }
+
+    /// A duplicate whose first outcome the feed has already run past is never coming: the re-send is itself a
+    /// journaled input, so the original lies before it, and a feed that has read past the re-send without
+    /// carrying the original never will. Retrying that every second for ever learns nothing — and neither does
+    /// reconciliation resending it, which is what it used to do.
+    #[test]
+    fn a_duplicate_the_feed_has_run_past_is_reported_rather_than_retried_for_ever() {
+        let p = Memory::default();
+        let treasury = open_with(&p, options(Faults::NONE));
+        let mut group = Group::default();
+        group.sleeves.insert(ACCOUNT, 50_000);
+        treasury.request(ACCOUNT, &body("w", "withdrawal", 400, "dummy_bank"), 1_000).expect("requested");
+
+        // Deduplicated, with the feed well past the re-send and no first outcome in it.
+        group.answer_unknown_after = Some(1);
+        group.journal.through = 100;
+        treasury.step(&mut group, 1_000);
+        let sent = group.sent;
+        assert!(sent > 0, "nothing was sent at all; the test proves nothing");
+
+        // It stops asking a question that has no answer.
+        treasury.step(&mut group, 2_000);
+        treasury.step(&mut group, 3_000);
+        assert_eq!(group.sent, sent, "the treasury went on re-sending a command whose answer can never come");
+
+        // And an operator is told, with a fix that is not another resend.
+        let run = reconcile(&treasury, &mut group, 4_000);
+        assert!(
+            kinds(&treasury, "open").contains(&"engine_duplicate_unresolvable".to_string()),
+            "the stranded transfer was not reported: {run}, {:?}",
+            kinds(&treasury, "open")
+        );
     }
 
     /// A treasury founded on a snapshot has read nothing below the sequence it was founded at, so a transfer

@@ -48,8 +48,11 @@ pub enum Adjusted {
     Applied(u64),
     /// Rejected, with the engine's reason in lower snake case.
     Rejected(String),
-    /// Answered as a duplicate of a command whose outcome is not known yet: try again later.
-    Unknown,
+    /// The sequencer group answered `DUPLICATE` — it decided this command before, and E-7.1 does not have it say
+    /// how — and the feed has not carried that first outcome yet. `after` is the sequence of the *re-send*, which
+    /// is itself a journaled input: the original must lie before it, so once the feed has read past `after` and
+    /// the command is still not there, it never will be (`Treasury::strand`).
+    Unknown { after: u64 },
     /// Sent, and no answer came back. An error says the command may never have left and is tried again shortly; this
     /// is what a relay sees when an answer goes missing without a failure to show for it, as `faults::Lossy` makes
     /// happen. The transfer waits, in doubt, until reconciliation reads what the sequencer group applied.
@@ -166,6 +169,14 @@ pub(crate) struct Inner {
     next_update: u64,
     /// When work that failed may be tried again, by transfer.
     pub(crate) retry_at: BTreeMap<u64, u64>,
+    /// Transfers whose command the sequencer group deduplicated and whose first outcome the feed will never
+    /// carry, with what is known about why: retrying one of these forever would never learn anything, so it is
+    /// stopped and reported instead (`strand`, and `duplicate_unresolvable` in `recon`).
+    ///
+    /// Held in memory rather than in the records on purpose. A restart re-sends the command, is answered
+    /// `DUPLICATE` again, and works the same conclusion out again once the feed has caught up — so this rebuilds
+    /// itself, and needs no migration to hold something derived.
+    pub(crate) unresolvable: BTreeMap<u64, String>,
     /// Counts every change, so that whoever waits for one cannot miss one made just before it started waiting.
     pub(crate) generation: u64,
 }
@@ -289,6 +300,7 @@ impl Treasury {
             updates: VecDeque::new(),
             next_update: 0,
             retry_at: BTreeMap::new(),
+            unresolvable: BTreeMap::new(),
             generation: 0,
         };
         Ok(Self { config, records, inner: Mutex::new(inner), changed: Condvar::new() })
@@ -649,6 +661,22 @@ impl Treasury {
                 }
             };
             let outcome = sequencer.adjust(&command.command_id, command.account, command.cents, command.reason);
+            // A duplicate whose first outcome the feed has already run past is never going to arrive, and
+            // retrying it every second for ever would not learn anything. `after` is the re-send's own sequence,
+            // so the original lies before it: once the feed has read that far and the command is still not
+            // there, it is either below the floor this reader was founded at, or — for a reader that started at
+            // the beginning, where nothing can lie below the floor — a real inconsistency worth an operator.
+            if let Ok(Adjusted::Unknown { after }) = outcome {
+                let journal = sequencer.journal();
+                if journal.through >= after {
+                    let mut inner = locked(&self.inner);
+                    if let Err(e) = self.strand(&mut inner, &command, after, &journal, now) {
+                        eprintln!("treasury: transfer {}: {e}", command.transfer);
+                        inner.retry_at.insert(command.transfer, now + RETRY_MS);
+                    }
+                    continue;
+                }
+            }
             let mut inner = locked(&self.inner);
             if let Err(e) = self.apply(&mut inner, &command, outcome, now) {
                 eprintln!("treasury: transfer {}: {e}", command.transfer);
@@ -733,6 +761,43 @@ impl Treasury {
         Duration::from_millis(due.map_or(RETRY_MS, |d| d.saturating_sub(now).clamp(1, RETRY_MS)))
     }
 
+    /// Stops retrying a command whose first outcome can never be learned, and leaves it for an operator.
+    ///
+    /// The transfer is left exactly where it stands, in doubt: nothing is guessed about which way the original
+    /// went, because guessing wrong either pays a customer twice or strands their money. What changes is that the
+    /// treasury stops asking a question that has no answer, and says so where reconciliation will report it —
+    /// a stage like `Reclaiming` is `Expect::InFlight` to reconciliation, so without this the transfer would sit
+    /// silently for ever, which is worse than the retry loop it replaces rather than better.
+    pub(crate) fn strand(
+        &self,
+        inner: &mut Inner,
+        command: &Command,
+        after: u64,
+        journal: &Journal,
+        now: u64,
+    ) -> Result<(), String> {
+        let Some(mut t) = inner.transfers.get(&command.transfer).cloned() else { return Ok(()) };
+        let detail = if journal.from > 0 {
+            format!(
+                "{} was deduplicated by the sequencer group when re-sent at sequence {after}, so its first \
+                 outcome is before that — and before {}, which this treasury was founded at and has not read",
+                command.command_id, journal.from
+            )
+        } else {
+            format!(
+                "{} was deduplicated by the sequencer group when re-sent at sequence {after}, so its first \
+                 outcome is before that; the journal read over {}..{} does not carry it, which it must if the \
+                 group decided it",
+                command.command_id, journal.from, journal.through
+            )
+        };
+        eprintln!("treasury: transfer {}: {detail}", t.id);
+        inner.unresolvable.insert(t.id, detail);
+        inner.retry_at.remove(&t.id);
+        t.in_doubt = Some(now);
+        self.commit(inner, t, &[], now)
+    }
+
     /// Puts what the sequencer group said about a command back into its transfer.
     pub(crate) fn apply(
         &self,
@@ -746,7 +811,9 @@ impl Treasury {
         let customer = ledger::customer(t.account);
         let mut postings = Vec::new();
         match (t.stage, outcome) {
-            (_, Adjusted::Unknown) => return Err("a duplicate whose first outcome is not known yet".into()),
+            // Retryable, and meant to be: the feed has not reached the first outcome yet. `step` takes the other
+            // case — the feed having gone past it, so that it is never coming — before ever getting here.
+            (_, Adjusted::Unknown { .. }) => return Err("a duplicate whose first outcome is not known yet".into()),
             (Stage::Reclaiming | Stage::Granting { .. }, Adjusted::NoAnswer) => {
                 eprintln!("treasury: transfer {}: {} sent and no answer came back", t.id, command.command_id);
                 t.in_doubt = Some(now);
@@ -803,6 +870,9 @@ pub(crate) mod tests {
         sequence: u64,
         pub(crate) down: bool,
         pub(crate) sent: usize,
+        /// Answer everything as a duplicate whose first outcome this reader does not hold, as the real group
+        /// does for a command it decided before the sequence a founded treasury was founded at.
+        pub(crate) answer_unknown_after: Option<u64>,
     }
 
     impl Sequencer for Group {
@@ -812,6 +882,9 @@ pub(crate) mod tests {
             }
             self.sent += 1;
             self.sequence += 1;
+            if let Some(after) = self.answer_unknown_after {
+                return Ok(Adjusted::Unknown { after });
+            }
             if let Some(first) = self.outcomes.get(command_id) {
                 return Ok(first.clone());
             }
