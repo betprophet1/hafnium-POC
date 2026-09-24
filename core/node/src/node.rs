@@ -398,6 +398,207 @@ fn rewrite_journal_cut(journal: &Path, at: u64) -> Result<u64, Error> {
     Ok(before.saturating_sub(kept))
 }
 
+/// What a cut would remove, written out whole rather than discarded. Everything a `Snapshot` at `at` makes
+/// droppable, in a form that can be archived, verified in place, and only then cut away.
+#[derive(Debug)]
+pub struct Segment {
+    pub at: u64,
+    pub journal: PathBuf,
+    pub results: PathBuf,
+    pub journal_sha256: String,
+    pub results_sha256: String,
+    /// The span of real inputs the journal half carries. Equal when it carries exactly one; both zero when it
+    /// carries none, which is a journal already cut to this snapshot and nothing to archive again.
+    pub first_sequence: u64,
+    pub last_sequence: u64,
+}
+
+/// Writes out exactly what `cut` would remove, and **changes nothing**: neither file is written back, so this is
+/// safe against a node that is still serving, and the segment can be shipped and verified long before anything
+/// is discarded. The complement of `rewrite_journal_cut`'s filter, frame for frame, and of `results_cut_offset`'s
+/// prefix, byte for byte — so what this saves and what a later cut drops are the same bytes by construction
+/// rather than by two rules that have to be kept in step.
+///
+/// Refuses on the same preconditions as `cut` (a snapshot to cut to, a result log trusted at least that far), so
+/// a segment only ever exists for a cut that would actually be allowed. It checks them with `trusted_results`
+/// rather than `repair_results`, because repairing truncates and this must not write.
+///
+/// Refuses a directory that already holds a segment: overwriting one is how an unshipped archive gets lost.
+pub fn export_cut(journal: &Path, results: &Path, out_dir: &Path) -> Result<Segment, Error> {
+    let Some((at, _)) = snapshots::latest(journal)? else {
+        return Err(
+            format!("{} has no embedded snapshot to cut to (venue-node embed-snapshot)", journal.display()).into()
+        );
+    };
+    match trusted_results(results)? {
+        Some((trusted, _)) if trusted >= at => {}
+        Some((trusted, _)) => {
+            return Err(format!(
+                "the result log is only trusted through {trusted}, before the snapshot at {at}: run the node so \
+                 it catches up, or embed a snapshot at or before {trusted}"
+            )
+            .into())
+        }
+        None => return Err(format!("the result log has nothing trusted yet, so cutting to {at} would lose it").into()),
+    }
+
+    let (journal_out, results_out) =
+        (out_dir.join(format!("journal-{at}.sbe")), out_dir.join(format!("results-{at}.sbe")));
+    let manifest_out = out_dir.join(SEGMENT_MANIFEST);
+    for existing in [&journal_out, &results_out, &manifest_out] {
+        if existing.exists() {
+            return Err(
+                format!("{} already exists: a segment is there, ship or move it first", existing.display()).into()
+            );
+        }
+    }
+    fs::create_dir_all(out_dir)?;
+
+    // The journal half: every frame the cut would not keep. A superseded `Snapshot` goes too — it describes a
+    // point inside the stretch being archived, so it belongs with it.
+    let (mut first, mut last) = (None, 0u64);
+    let mut hasher = Sha256::new();
+    {
+        let mut reader = BufReader::new(File::open(journal)?);
+        let mut output = BufWriter::new(File::create(&journal_out)?);
+        let mut buf = Vec::new();
+        while let Some(n) = read_frame(&mut reader, &mut buf)? {
+            let sequence = u64_at(&buf[..n], 8);
+            let snapshot = is_snapshot(&buf[..n]);
+            if if snapshot { sequence == at } else { sequence > at } {
+                continue; // kept by the cut, so not ours to archive
+            }
+            if !snapshot {
+                first.get_or_insert(sequence);
+                last = last.max(sequence);
+            }
+            hasher.update((n as u32).to_le_bytes());
+            hasher.update(&buf[..n]);
+            write_frame(&mut output, &buf[..n])?;
+        }
+        output.flush()?;
+        output.get_ref().sync_all()?;
+    }
+    let journal_sha256 = hex(hasher.finalize().as_slice());
+
+    // The result half is a byte prefix, so it is copied as one rather than re-framed.
+    let results_sha256 = copy_prefix(results, results_cut_offset(results, at)?, &results_out)?;
+
+    let segment = Segment {
+        at,
+        journal: journal_out,
+        results: results_out,
+        journal_sha256,
+        results_sha256,
+        first_sequence: first.unwrap_or(0),
+        last_sequence: if first.is_some() { last } else { 0 },
+    };
+    write_segment_manifest(&manifest_out, &segment)?;
+    log::info(
+        "cut segment exported",
+        &[
+            ("at", &segment.at),
+            ("first_sequence", &segment.first_sequence),
+            ("last_sequence", &segment.last_sequence),
+            ("out", &out_dir.display()),
+        ],
+    );
+    Ok(segment)
+}
+
+/// The manifest a segment carries, and what `--require-shipped` later reads back.
+pub const SEGMENT_MANIFEST: &str = "segment.json";
+
+/// The receipt `journal_ship.py` writes beside a segment once object storage has it and has been read back.
+pub const SEGMENT_RECEIPT: &str = "shipped.json";
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Copies `length` bytes from the front of `from` into `to`, returning their digest.
+fn copy_prefix(from: &Path, length: u64, to: &Path) -> Result<String, Error> {
+    let mut reader = BufReader::new(File::open(from)?.take(length));
+    let mut output = BufWriter::new(File::create(to)?);
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        output.write_all(&buf[..n])?;
+    }
+    output.flush()?;
+    output.get_ref().sync_all()?;
+    Ok(hex(hasher.finalize().as_slice()))
+}
+
+fn write_segment_manifest(path: &Path, segment: &Segment) -> Result<(), Error> {
+    let manifest = serde_json::json!({
+        "at": segment.at,
+        "first_sequence": segment.first_sequence,
+        "last_sequence": segment.last_sequence,
+        "journal": segment.journal.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+        "results": segment.results.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+        "journal_sha256": segment.journal_sha256,
+        "results_sha256": segment.results_sha256,
+    });
+    let mut file = File::create(path)?;
+    file.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Reads a shipped receipt and says whether it really covers the segment in `dir` — the check that stands
+/// between a cut and deleting history nothing has stored. The receipt names the digests object storage gave
+/// back; the manifest names the digests of the files on disk; both must agree with each other and with the
+/// snapshot the cut is about to cut to. A receipt for a *different* snapshot is the dangerous case, and the one
+/// this exists to catch: it would otherwise look like a perfectly good archive.
+fn shipped_covers(dir: &Path, at: u64) -> Result<(), Error> {
+    let read = |name: &str| -> Result<serde_json::Value, Error> {
+        let path = dir.join(name);
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("{}: {e} (run venue-node export-cut, then journal_ship.py)", path.display()))?;
+        Ok(serde_json::from_str(&text)?)
+    };
+    let (manifest, receipt) = (read(SEGMENT_MANIFEST)?, read(SEGMENT_RECEIPT)?);
+
+    let manifest_at = manifest["at"].as_u64().ok_or("the segment manifest has no 'at'")?;
+    if manifest_at != at {
+        return Err(format!(
+            "the segment in {} is for the snapshot at {manifest_at}, but this cut would cut to {at}: that \
+             segment does not contain what is about to be removed",
+            dir.display()
+        )
+        .into());
+    }
+    if receipt["at"].as_u64() != Some(at) {
+        return Err(format!("the receipt in {} is not for the snapshot at {at}", dir.display()).into());
+    }
+    if receipt["verified"] != serde_json::Value::Bool(true) {
+        return Err(format!("{} does not say the upload was verified", dir.join(SEGMENT_RECEIPT).display()).into());
+    }
+    for half in ["journal", "results"] {
+        let key = format!("{half}_sha256");
+        let (theirs, ours) = (&receipt[&key], &manifest[&key]);
+        if theirs != ours || theirs.is_null() {
+            return Err(format!(
+                "the {half} half was shipped as {theirs} but the segment on disk is {ours}: the receipt is not \
+                 for these bytes"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Cuts a journal, and its result log with it, to start at the latest embedded snapshot — removing everything
 /// D-32 says a snapshot is what makes removable. Refuses unless the result log is already trusted through at
 /// least the snapshot's own sequence (`repair_results`, which this calls first and whose own repair happens
@@ -410,6 +611,13 @@ fn rewrite_journal_cut(journal: &Path, at: u64) -> Result<u64, Error> {
 ///
 /// Returns the sequence cut to, and how many bytes were removed from the journal and from the result log.
 pub fn cut(journal: &Path, results: &Path) -> Result<(u64, u64, u64), Error> {
+    cut_checked(journal, results, None)
+}
+
+/// The same, but `shipped` names a segment directory that must already have been archived and verified — see
+/// `shipped_covers`. This is the difference between cutting as *archiving* and cutting as deletion: without it
+/// the bytes are simply gone, and nothing in the tool would have said so.
+pub fn cut_checked(journal: &Path, results: &Path, shipped: Option<&Path>) -> Result<(u64, u64, u64), Error> {
     let Some((at, _)) = snapshots::latest(journal)? else {
         return Err(
             format!("{} has no embedded snapshot to cut to (venue-node embed-snapshot)", journal.display()).into()
@@ -425,6 +633,9 @@ pub fn cut(journal: &Path, results: &Path) -> Result<(u64, u64, u64), Error> {
             .into())
         }
         None => return Err(format!("the result log has nothing trusted yet, so cutting to {at} would lose it").into()),
+    }
+    if let Some(dir) = shipped {
+        shipped_covers(dir, at)?;
     }
     let journal_removed = rewrite_journal_cut(journal, at)?;
     let results_removed = rewrite_from(results, results_cut_offset(results, at)?)?;

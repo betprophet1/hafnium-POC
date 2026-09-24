@@ -113,7 +113,32 @@ and refuse or fall back cleanly rather than attempting a doomed replay; `recover
 `core/node/tests/cut_journal.rs` checks a cut-and-recovered node reaches the same tail a full replay would have,
 sequence for sequence and byte for byte in the result log, and that a refused cut changes nothing.
 
-Shipping what is cut to object storage is not built yet.
+**Archiving what is cut, rather than deleting it.** `cut-journal` on its own *discards* the stretch before the
+snapshot, and that stretch is the only copy of it. Three steps make it an archive instead:
+
+```sh
+venue-node export-cut ./venue-data/journal.sbe ./venue-data/results.sbe ./segment
+interfaces/tools/journal_ship.py ./segment --to s3://BUCKET --environment prod
+venue-node cut-journal ./venue-data/journal.sbe ./venue-data/results.sbe --require-shipped ./segment
+```
+
+`export-cut` writes out exactly what a cut would remove and **changes neither file**, so it is safe against a
+node that is still serving and the archive can be proven long before anything is discarded. It is the complement
+of the cut's own filter, frame for frame and byte for byte, so the two cannot drift apart. It refuses on the same
+grounds a cut would — no snapshot, or a result log not yet trusted that far — which *is* the readiness test a
+journal needs: an audit file is ready when it is closed and its day is over, but a journal has no such marker and
+only a sequence means anything. It also refuses a directory that already holds a segment, since overwriting one
+is how an unshipped archive gets lost.
+
+`journal_ship.py` uploads both halves with `.sha256` sidecars under `journals/{environment}/`, reads them back
+and compares, and only then writes a `shipped.json` receipt. It shares `snapshot_publish.py`'s verified upload
+rather than reimplementing that care.
+
+`--require-shipped` is what closes the loop: the cut refuses unless the receipt is for **this** snapshot and
+names **these** bytes. The case it exists for is not a forged receipt but an honest stale one — a segment
+exported and shipped at sequence 30, after which the venue ran on and embedded a newer snapshot at 62. Every
+artifact checks out individually, and cutting to 62 against that segment would destroy 30..62, which no archive
+contains (`core/node/tests/export_cut.rs`).
 
 **Seeding a fresh environment from a chosen snapshot.** `venue-node seed SNAPSHOT DATA_DIR [--capacity ...]`
 founds a brand-new `DATA_DIR` on `SNAPSHOT` instead of genesis: `journal.sbe` holds only that one `Snapshot`
@@ -152,7 +177,9 @@ venue-node replay ./venue-data/journal.sbe out.sbe && cmp out.sbe ./venue-data/r
 venue-node snapshot ./venue-data/journal.sbe snap.sbe
 venue-node embed-snapshot ./venue-data/journal.sbe   # only while nothing has it open (no `serve` running)
 venue-node recover ./venue-data/journal.sbe tail.results.sbe
+venue-node export-cut ./venue-data/journal.sbe ./venue-data/results.sbe ./segment   # changes neither file
 venue-node cut-journal ./venue-data/journal.sbe ./venue-data/results.sbe   # same "no live serve" caveat
+venue-node cut-journal ./venue-data/journal.sbe ./venue-data/results.sbe --require-shipped ./segment
 venue-node seed snap.sbe ./fresh-venue-data --capacity small
 venue-node import core/target/differential/fuzz-90000.json golden.journal
 ```

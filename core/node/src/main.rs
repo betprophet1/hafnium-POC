@@ -30,9 +30,17 @@ const USAGE: &str = "usage:
   venue-node recover JOURNAL RESULTS [--snapshot-out FILE]
                                            the same, but restores from the latest snapshot already embedded in
                                            JOURNAL; prints and exits 1 if it has none yet
-  venue-node cut-journal JOURNAL RESULTS   removes everything before the latest embedded snapshot from both,
+  venue-node export-cut JOURNAL RESULTS DIR
+                                           writes what a cut would remove into DIR, changing neither file, so it
+                                           can be archived and verified before anything discards it; refuses on
+                                           the same grounds a cut would, and refuses a DIR that already holds one
+  venue-node cut-journal JOURNAL RESULTS [--require-shipped DIR]
+                                           removes everything before the latest embedded snapshot from both,
                                            once RESULTS already covers it; refuses otherwise. For a journal no
-                                           live `serve` has open
+                                           live `serve` has open. With --require-shipped it also refuses unless
+                                           DIR holds a segment for this same snapshot that journal_ship.py has
+                                           already put in object storage and read back — without it, a cut
+                                           deletes history rather than archiving it
   venue-node seed SNAPSHOT DATA_DIR [--capacity small|launch|scale]
                                            founds a fresh DATA_DIR on SNAPSHOT instead of genesis, so a `serve`
                                            pointed at it starts running from exactly that state; refuses a
@@ -72,7 +80,8 @@ fn main() -> ExitCode {
         (Some("embed-snapshot"), 2 | 4) => embed_snapshot(&args[1..]),
         (Some("replay-from"), 4 | 6) => replay_from(&args[1..]),
         (Some("recover"), 3 | 5) => recover(&args[1..]),
-        (Some("cut-journal"), 3) => cut_journal(&args[1..]),
+        (Some("cut-journal"), 3 | 5) => cut_journal(&args[1..]),
+        (Some("export-cut"), 4) => export_cut(&args[1..]),
         (Some("seed"), 3 | 5) => seed(&args[1..]),
         (Some("dump"), 2) => dump(&args[1]),
         (Some("import"), 3) => import(&args[1], &args[2]),
@@ -233,10 +242,30 @@ fn recover(args: &[String]) -> Result<(), node::Error> {
     }
 }
 
-/// `cut-journal JOURNAL RESULTS`.
+/// `cut-journal JOURNAL RESULTS [--require-shipped DIR]`.
 fn cut_journal(args: &[String]) -> Result<(), node::Error> {
-    let (at, journal_removed, results_removed) = node::cut(Path::new(&args[0]), Path::new(&args[1]))?;
+    let shipped = match args.get(2).map(String::as_str) {
+        None => None,
+        Some("--require-shipped") => Some(PathBuf::from(args.get(3).ok_or("--require-shipped needs a directory")?)),
+        Some(other) => return Err(format!("unknown argument {other}").into()),
+    };
+    let (at, journal_removed, results_removed) =
+        node::cut_checked(Path::new(&args[0]), Path::new(&args[1]), shipped.as_deref())?;
     eprintln!("cut to sequence {at}: journal -{journal_removed} bytes, results -{results_removed} bytes");
+    Ok(())
+}
+
+/// `export-cut JOURNAL RESULTS DIR`.
+fn export_cut(args: &[String]) -> Result<(), node::Error> {
+    let segment = node::export_cut(Path::new(&args[0]), Path::new(&args[1]), Path::new(&args[2]))?;
+    eprintln!(
+        "segment at {}: inputs {}..{} -> {} and {}",
+        segment.at,
+        segment.first_sequence,
+        segment.last_sequence,
+        segment.journal.display(),
+        segment.results.display()
+    );
     Ok(())
 }
 
