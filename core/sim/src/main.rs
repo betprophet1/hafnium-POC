@@ -23,9 +23,9 @@ use venue_link::wire::{Error, Ids, Ingress};
 const USAGE: &str = "usage:
   venue-sim seed  --ingress ADDR --catalogue FILE [--capacity small]
   venue-sim web   --ingress ADDR --feed ADDR --gateway ADDR --catalogue FILE [--listen 127.0.0.1:8080]
-                  [--public-gateway ADDR] [--oracle 127.0.0.1:8082] [--treasury 127.0.0.1:8083]
+                  [--public-gateway ADDR] [--oracle 127.0.0.1:8082] [--treasury 127.0.0.1:8083] [--from-view FILE]
   venue-sim oracle --ingress ADDR --feed ADDR --catalogue FILE --calendar FILE --database-url URL [--capacity small]
-                  [--listen 127.0.0.1:8082] [--migrate-on-start false] [--store postgres|memory]
+                  [--listen 127.0.0.1:8082] [--migrate-on-start false] [--store postgres|memory] [--from-view FILE]
   venue-sim oracle migrate --database-url URL
   venue-sim maker --gateway ADDR [--public-gateway ADDR] [--token dev-synthetic-maker] [--size 10] [--levels 3] [--spread 1]
                   [--interval-ms 700] [--seed 1] [--margin 100]
@@ -45,6 +45,10 @@ workload puts a venue-shaped load on a core on its own, with no gateway in the w
 resolution cases in PostgreSQL (--database-url postgres://USER:PASSWORD@HOST:5432/DATABASE, --database-schema oracle,
 --database-tls, --database-ca-file: core/store/README.md) and waits for its schema, which oracle migrate applies;
 --store memory keeps them in memory only.
+--from-view names the reader's half of a snapshot pair (venue-view snapshot), to start from the venue as it was
+then rather than from the beginning. A venue founded on a snapshot holds no inputs in its journal at all, so a
+reader that asks it for everything is sent nothing and shows an empty venue; in one of those this flag is required
+rather than an optimisation.
 Every flag can also be given as VENUE_<FLAG> in the environment, for example VENUE_GATEWAY.";
 
 struct Args(BTreeMap<String, String>);
@@ -71,6 +75,22 @@ impl Args {
             .ok()
             .or_else(|| default.map(str::to_string))
             .ok_or_else(|| Error::from(format!("--{key} (or {env}) is required")))
+    }
+
+    /// A flag that may simply not be given: `None` when neither it nor `VENUE_<FLAG>` is set.
+    fn optional(&self, key: &str) -> Option<String> {
+        self.get(key, Some("")).ok().filter(|value| !value.is_empty())
+    }
+
+    /// The reader this process follows the feed with: from a view snapshot when one is named, else from the
+    /// beginning. A venue founded on a snapshot has no inputs in its journal to send a reader that asks for
+    /// everything, so in one of those this is the difference between the venue and an empty screen.
+    fn live(&self) -> Result<Arc<view::Live>, Error> {
+        let feed = self.get("feed", None)?;
+        match self.optional("from-view") {
+            Some(path) => Ok(view::Live::follow_from(&feed, std::path::Path::new(&path))?),
+            None => Ok(view::Live::follow(&feed)),
+        }
     }
 
     /// The dummy oracle's database, if a URL is given.
@@ -185,7 +205,7 @@ fn seed(args: &Args) -> Result<(), Error> {
 
 fn web(args: &Args) -> Result<(), Error> {
     let catalogue = Catalogue::load(&args.get("catalogue", None)?)?;
-    let live = view::Live::follow(&args.get("feed", None)?);
+    let live = args.live()?;
     let (gateway, oracle) = (args.get("gateway", Some("127.0.0.1:8081"))?, args.get("oracle", Some("127.0.0.1:8082"))?);
     let public = args.get("public-gateway", Some(&gateway))?;
     let treasury = args.get("treasury", Some("127.0.0.1:8083"))?;
@@ -201,7 +221,7 @@ fn oracle(args: &Args) -> Result<(), Error> {
     let profile = venue_link::catalogue::capacity_profile(&args.get("capacity", Some("small"))?)?;
     let capacity =
         oracle::Capacity { events: profile.events, instruments: profile.instruments, levels: profile.levels };
-    let live = view::Live::follow(&args.get("feed", None)?);
+    let live = args.live()?;
     let ingress = Ingress::new(&args.get("ingress", None)?);
     let store = match args.get("store", Some("postgres"))?.as_str() {
         "postgres" => {

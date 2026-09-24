@@ -125,7 +125,7 @@ mod positions_as_triples {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct View {
     /// The last input applied; a reader has seen an input's effects once this reaches its sequence.
     pub sequence: u64,
@@ -580,8 +580,23 @@ pub struct Live {
 }
 
 impl Live {
+    /// Follows `feed` from the beginning: a reader with nothing, which asks for everything.
     pub fn follow(feed: &str) -> Arc<Self> {
-        let live = Arc::new(Self { view: Mutex::new(View::default()), changed: Condvar::new() });
+        Self::spawn(feed, View::default())
+    }
+
+    /// Follows `feed` starting from the view snapshot at `snapshot`, rather than from the beginning.
+    ///
+    /// Nothing in the protocol changes for this: the view arrives already knowing the sequence it holds, and
+    /// the resume handshake a reconnect already uses says so, so the node sends only what followed it. That
+    /// matters in an environment founded on a snapshot rather than on genesis — there the node's journal holds
+    /// no inputs at all, so a reader asking for everything would be sent nothing and come up empty.
+    pub fn follow_from(feed: &str, snapshot: &std::path::Path) -> Result<Arc<Self>, wire::Error> {
+        Ok(Self::spawn(feed, View::load(snapshot)?))
+    }
+
+    fn spawn(feed: &str, view: View) -> Arc<Self> {
+        let live = Arc::new(Self { view: Mutex::new(view), changed: Condvar::new() });
         let (me, addr) = (Arc::clone(&live), feed.to_string());
         named("link-view", move || {
             wire::follow(

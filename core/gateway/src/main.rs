@@ -50,7 +50,7 @@ const USAGE: &str = "usage:
   venue-gateway --feed ADDR --catalogue FILE [--serve both] [--ingress ADDR] [--treasury ADDR] [--parlays ADDR]
                 [--identity ADDR] [--dev-tokens true] [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
                 [--audit-dir ./gateway-audit] [--audit-instance HOSTNAME] [--audit-fsync true] [--trusted-proxies ADDRS]
-                [--allowed-origins ORIGINS] [--environments FILE]
+                [--allowed-origins ORIGINS] [--environments FILE] [--from-view FILE]
                 [--metrics ADDR]
 
 --serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
@@ -65,6 +65,10 @@ otherwise act as their accounts with every permission. Every request and what it
 --environments names a JSON file listing the venues an app may point itself at, served as GET /v4/bootstrap and read
 afresh on every request so that a file replaced under a running gateway is noticed; without it the route is not
 offered (interfaces/gateway/README.md, choosing an environment).
+--from-view names the reader's half of a snapshot pair (venue-view snapshot), so the hub starts holding the venue
+as it was then rather than nothing. A venue founded on a snapshot holds no inputs in its journal at all, so a hub
+that asks it for everything is sent nothing and serves an empty venue; in one of those this is required rather
+than an optimisation. Its sequence is where the feed's own resume handshake then carries on from.
 --allowed-origins is a comma-separated list of the origins a browser page may call this gateway from, such as
 https://app.example.com or http://127.0.0.1:8081 for a front end in development. None by default, which serves a page
 from the gateway's own origin and refuses every other, since a browser asks before it sends.
@@ -229,13 +233,23 @@ fn run(args: &Args) -> Result<(), Error> {
     let audit =
         Audit::start_measured(&audit_dir, &args.get("audit-instance", Some(&hostname))?, fsync, metrics.audit.clone())
             .map_err(|e| format!("audit log in {}: {e}", audit_dir.display()))?;
+    // The reader's half of a snapshot pair, for a gateway serving a venue founded on a snapshot rather than on
+    // genesis: that venue's journal holds no inputs at all, so a hub that asked for everything would be sent
+    // nothing and serve an empty venue. Loaded once, before either half, so a bad path fails the process rather
+    // than leaving one half up and wrong.
+    let founding = match args.optional("from-view").filter(|p| !p.is_empty()) {
+        Some(path) => {
+            venue_link::view::View::load(std::path::Path::new(&path)).map_err(|e| format!("--from-view {path}: {e}"))?
+        }
+        None => venue_link::view::View::default(),
+    };
     let halves = Halves {
         public: if public {
             // The origins go to this half too. Market data is what a page asks for first, and a browser will not
             // let it read an answer from an origin the server has not named — so without this a front end served
             // from anywhere else failed on its very first call, while every private route worked. The test harness
             // gives both halves the origins, which is why no test saw it: what was wrong was the wiring here.
-            let gateway = Gateway::public(Hub::new(Catalogue::load(&catalogue_file)?), limits)
+            let gateway = Gateway::public(Hub::founded_on(Catalogue::load(&catalogue_file)?, founding.clone()), limits)
                 .with_origins(origins.clone())
                 .with_metrics(metrics.half(api::Half::Public));
             Some(start_half(gateway.with_audit(audit.clone()).with_trusted_proxies(proxies.clone()), &feed))
@@ -258,7 +272,7 @@ fn run(args: &Args) -> Result<(), Error> {
                 "" => crate::bootstrap::Environments::none(),
                 file => crate::bootstrap::Environments::from_file(file),
             };
-            let mut gateway = Gateway::private(Hub::new(catalogue), ingress, limits)
+            let mut gateway = Gateway::private(Hub::founded_on(catalogue, founding), ingress, limits)
                 .with_origins(origins.clone())
                 .with_environments(environments)
                 .with_metrics(half_metrics)

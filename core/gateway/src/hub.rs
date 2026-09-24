@@ -246,13 +246,25 @@ pub struct Hub {
 
 impl Hub {
     pub fn new(catalogue: Catalogue) -> Self {
+        Self::founded_on(catalogue, View::default())
+    }
+
+    /// A hub holding `view` already, rather than nothing — the reader's half of a snapshot pair
+    /// (`venue_link::pair`), for a gateway serving a venue founded on a snapshot rather than on genesis.
+    ///
+    /// Everything else a hub holds is either bounded and derived from the units it goes on to see (`history`,
+    /// `accepted`) or comes from the catalogue and its live connections rather than the feed, so the view is the
+    /// whole of what it needs restoring. `last_sequence` follows the view's, so the feed's own resume handshake
+    /// then asks for what came after it — no part of the protocol changes for this.
+    pub fn founded_on(catalogue: Catalogue, view: View) -> Self {
         let tokens = catalogue
             .accounts()
             .iter()
             .filter_map(|a| Some((a["token"].as_str()?.to_string(), a["id"].as_u64()?)))
             .collect();
+        let sequence = view.sequence;
         Self {
-            view: View::default(),
+            view,
             catalogue,
             tokens,
             sessions: BTreeMap::new(),
@@ -265,7 +277,7 @@ impl Hub {
             last_unit: None,
             accepted: BTreeMap::new(),
             accepted_order: VecDeque::new(),
-            last_sequence: 0,
+            last_sequence: sequence,
             highest_order: 0,
             awaiting: Vec::new(),
         }
