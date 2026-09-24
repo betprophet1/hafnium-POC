@@ -39,6 +39,19 @@ Production puts the engine behind Aeron Cluster instead (WP-10). This node never
 Journal files, result logs and the TCP ingress all use one framing: a little-endian `u32` length, then that many
 bytes of SBE (`interfaces/sbe/venue-journal.xml`), message header first.
 
+There are two length bounds, not one. An input is bounded by its schema — no arrangement of fields makes a
+`PlaceOrder` large — so inputs are held to `MAX_FRAME`, 64 KiB, which is far above any of them and refuses a
+garbage length cheaply. A `Snapshot` is not bounded that way: it is the engine's whole logical state, and it
+grows with the venue, so it is held to `MAX_SNAPSHOT_FRAME` (16 MiB, the buffer `snapshots::compute` already
+encodes into). Only template 53 gets the larger bound; anything else past 64 KiB is still refused, on the way
+out and on the way in. On the way in the template is read from the header's first four bytes *before* the
+length is honoured, so a garbage length still costs four bytes rather than an allocation.
+
+This matters more than a limit usually does. A real venue's state passed 64 KiB somewhere between its 30,000th
+and 60,000th input — a few hours of demo traffic — and from there `snapshot` and `embed-snapshot` both failed
+with nothing to say but `frame longer than MAX_FRAME`. Since a journal with no snapshot in it can never be
+`cut`, the disk this was all meant to stop filling filled anyway, and nothing said why.
+
 On the ingress a connection sends client messages or commands with a zeroed record header. For each input it
 receives the input's results, then an empty frame. Only the sender receives an input's results, and only after
 the input is journaled (E-17.4 without a quorum). Sequencer events and anything that is not a journal input close
