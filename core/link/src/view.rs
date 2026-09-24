@@ -9,13 +9,14 @@
 use crate::catalogue::Catalogue;
 use crate::named;
 use crate::wire::{self, Unit};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 
 const KEEP: usize = 60;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct EventView {
     pub state_count: u64,
     pub started: bool,
@@ -36,7 +37,7 @@ pub struct EventView {
 }
 
 /// An applied `ResolveEvent` (E-15.4), as the feed recorded it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resolution {
     /// `RESOLVED` or `VOID`.
     pub kind: String,
@@ -46,7 +47,7 @@ pub struct Resolution {
     pub at: u64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct InstrumentView {
     pub event: u64,
     pub table: u64,
@@ -63,7 +64,7 @@ pub struct InstrumentView {
 }
 
 /// One leg of a parlay: the market, and whether the parlay needs its YES (rather than its NO) to pay.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Leg {
     pub event: u64,
     pub instrument: u64,
@@ -81,14 +82,14 @@ impl InstrumentView {
 }
 
 /// One row of a tick table, exactly as `DefineTickTable` gave it (spec E-6.1).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Row {
     pub numerator: u64,
     pub denominator: u64,
     pub complement: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OrderView {
     pub account: u64,
     pub instrument: u64,
@@ -105,7 +106,26 @@ pub struct OrderView {
     pub expires_at: Option<u64>,
 }
 
-#[derive(Default)]
+/// `positions` is keyed by `(account, instrument)`, and JSON has no such key — a map key must be a string. The
+/// pair travels as a flat triple instead, which is also what somebody reading the file would expect to see.
+mod positions_as_triples {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(map: &BTreeMap<(u64, u64), i64>, s: S) -> Result<S::Ok, S::Error> {
+        map.iter()
+            .map(|(&(account, instrument), &position)| (account, instrument, position))
+            .collect::<Vec<_>>()
+            .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<(u64, u64), i64>, D::Error> {
+        let triples = Vec::<(u64, u64, i64)>::deserialize(d)?;
+        Ok(triples.into_iter().map(|(account, instrument, position)| ((account, instrument), position)).collect())
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
 pub struct View {
     /// The last input applied; a reader has seen an input's effects once this reaches its sequence.
     pub sequence: u64,
@@ -120,6 +140,7 @@ pub struct View {
     pub events: BTreeMap<u64, EventView>,
     pub instruments: BTreeMap<u64, InstrumentView>,
     pub orders: BTreeMap<u64, OrderView>,
+    #[serde(with = "positions_as_triples")]
     pub positions: BTreeMap<(u64, u64), i64>,
     /// Account to (available, reserved) cents.
     pub sleeves: BTreeMap<u64, (i64, i64)>,
@@ -138,7 +159,7 @@ pub struct View {
 }
 
 /// What a parlay needs of a leg's event once the engine has released it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleasedLeg {
     pub resolution: Option<Resolution>,
     /// Market to its state mask.
@@ -445,6 +466,52 @@ impl View {
         }
     }
 
+    /// The view a reader would hold after being sent everything in `journal`/`results` up to and including
+    /// sequence `at` — or all of it, when `at` is `None`.
+    ///
+    /// This is a *view* snapshot, and it is deliberately built the way a live reader builds one: by applying the
+    /// same units, through the same `apply`. The engine's own snapshot (spec §20) cannot stand in for it. That
+    /// one is the engine's logical state, and §20 has it omit whatever the engine does not need — so it carries
+    /// no parlay legs (only the mask the engine matches on), no resolution kind or winning state (only
+    /// `resolved`), none of an event's timestamps, and no per-order filled total (only what still rests). A
+    /// reader rebuilt from it would look right and be quietly wrong for parlays, for a calendar counting an
+    /// event's stages, and for any client asking what an order has filled. Replaying the units loses nothing,
+    /// because the units are what a reader's state is a function of in the first place.
+    pub fn replayed(
+        journal: &std::path::Path,
+        results: &std::path::Path,
+        at: Option<u64>,
+    ) -> Result<Self, wire::Error> {
+        let mut view = Self::default();
+        for unit in wire::replayed_units(journal, results)? {
+            if at.is_some_and(|stop| u(&unit.input["record"]["sequence"]) > stop) {
+                break;
+            }
+            view.apply(&unit);
+        }
+        Ok(view)
+    }
+
+    /// Writes the view to `path`, durably and atomically: a sibling temp file, `fsync`ed, then renamed over the
+    /// original — the same discipline the journal's own rewrites use, so a crash mid-write leaves whatever was
+    /// there before rather than a half-written view.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), wire::Error> {
+        let temp = path.with_extension("view-tmp");
+        {
+            let file = std::fs::File::create(&temp)?;
+            serde_json::to_writer(std::io::BufWriter::new(&file), self)?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    }
+
+    /// Reads back what `save` wrote.
+    pub fn load(path: &std::path::Path) -> Result<Self, wire::Error> {
+        let file = std::fs::File::open(path)?;
+        Ok(serde_json::from_reader(std::io::BufReader::new(file))?)
+    }
+
     /// Everything the web page draws, labelled from the catalogue.
     pub fn snapshot(&self, catalogue: &Catalogue) -> Value {
         let events: Vec<Value> = self
@@ -661,5 +728,98 @@ mod tests {
         let version = view.version;
         view.apply(&unit(json!({"msg": "TimeTick"}), 7, false));
         assert_eq!((view.now, view.sequence, view.version), (7, 7, version));
+    }
+
+    /// Every field, populated, through `save` and `load`.
+    ///
+    /// The recorded fixture the integration tests replay is thin — it produces no positions, trades, payouts,
+    /// parlay legs, resolutions or part-filled orders at all — so a round trip over *it* leaves most of this
+    /// struct untouched and would not notice a field that silently failed to survive. `positions` is the one
+    /// that cannot be derived: it is keyed by a pair, which JSON cannot use as a map key, so it is the one part
+    /// of this serialisation written by hand rather than derived.
+    #[test]
+    fn every_field_survives_being_saved_and_loaded() {
+        let resolution = Resolution { kind: "RESOLVED".into(), winning_state: 2, case_id: 7, at: 900 };
+        let mut view = View {
+            sequence: 500,
+            now: 1_234,
+            version: 9,
+            tables: BTreeMap::from([(1, vec![100, 200])]),
+            ladders: BTreeMap::from([(1, vec![Row { numerator: 1, denominator: 4, complement: 3 }])]),
+            events: BTreeMap::from([(
+                5,
+                EventView {
+                    state_count: 3,
+                    started: true,
+                    suspended: false,
+                    ended: true,
+                    resolved: true,
+                    instruments: vec![50, 51],
+                    defined_at: 10,
+                    scheduled_start: 20,
+                    started_at: Some(30),
+                    ended_at: None,
+                    suspended_ever: true,
+                    resolution: Some(resolution.clone()),
+                },
+            )]),
+            instruments: BTreeMap::from([(
+                50,
+                InstrumentView {
+                    event: 5,
+                    table: 1,
+                    lot: 10,
+                    mask: 6,
+                    class: "PARLAY".into(),
+                    state: "OPEN".into(),
+                    bids: BTreeMap::from([(3, (40, 2))]),
+                    asks: BTreeMap::from([(9, (11, 1))]),
+                    last: Some(4),
+                    legs: vec![Leg { event: 1, instrument: 100, yes: true }],
+                },
+            )]),
+            orders: BTreeMap::from([(
+                77,
+                OrderView {
+                    account: 10,
+                    instrument: 50,
+                    side: "BUY".into(),
+                    tick: 3,
+                    remaining: 5,
+                    client_order_id: "abc".into(),
+                    filled: 6,
+                    filled_yes_cents: 150,
+                    expires_at: Some(5_000),
+                },
+            )]),
+            positions: BTreeMap::from([((10, 50), -3), ((11, 51), 8)]),
+            sleeves: BTreeMap::from([(10, (900, 100))]),
+            trades: VecDeque::from([json!({"sequence": 4, "quantity": 2})]),
+            payouts: VecDeque::from([json!({"sequence": 5, "cents": 300})]),
+            settled_event: 5,
+            released_rounds: BTreeMap::from([(3, (7, 11))]),
+            released_legs: BTreeMap::from([(
+                1,
+                ReleasedLeg { resolution: Some(resolution), masks: BTreeMap::from([(100, 2)]) },
+            )]),
+        };
+        // A reader that has seen nothing of a field must round trip too, not only one that has seen something.
+        view.events.insert(6, EventView::default());
+
+        let dir = std::env::temp_dir().join(format!("venue-view-fields-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("view.json");
+        view.save(&path).expect("saves");
+        let restored = View::load(&path).expect("loads");
+
+        let (before, after) =
+            (serde_json::to_value(&view).expect("serialises"), serde_json::to_value(&restored).expect("serialises"));
+        assert_eq!(before, after, "a view did not survive being written and read back");
+        // Named explicitly, because an equal serialisation of two views that both dropped the same field would
+        // still compare equal.
+        assert_eq!(restored.positions, view.positions, "positions did not survive");
+        assert_eq!(restored.settled_event, 5, "settled_event did not survive");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
