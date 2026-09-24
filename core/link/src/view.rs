@@ -520,15 +520,17 @@ impl Live {
             wire::follow(
                 &addr,
                 || {
-                    // Starts over, so it asks for everything. A view that could be carried across a reconnect
-                    // would answer with the sequence it holds instead.
+                    // Carries on from the sequence this view already holds, so a reconnect that finds the same
+                    // journal still there costs only what happened while disconnected, not the whole history.
+                    me.view.lock().map(|v| v.sequence).unwrap_or(0)
+                },
+                || {
+                    // The node could not honour that position (a different journal under the same address, or
+                    // one that no longer goes back that far) — this view is of a history that never happened.
                     if let Ok(mut v) = me.view.lock() {
                         *v = View::default();
                     }
-                    0
                 },
-                // Asks for everything every time, so it is never told to start over.
-                || {},
                 |unit| {
                     if let Ok(mut v) = me.view.lock() {
                         v.apply(&unit);

@@ -307,6 +307,12 @@ pub fn start(catalogue: Catalogue, config: &Config) -> Result<Arc<Service>, Erro
         wire::follow(
             &feed,
             || {
+                // Carries on from the sequence this view already holds, so a reconnect that finds the same
+                // journal still there costs only what happened while disconnected.
+                locked(&follower.state).view.sequence
+            },
+            || {
+                // The node could not honour that position — this view is of a history that never happened.
                 let mut state = locked(&follower.state);
                 state.view = View::default();
                 state.caught_up = false;
@@ -315,10 +321,7 @@ pub fn start(catalogue: Catalogue, config: &Config) -> Result<Arc<Service>, Erro
                 // view, which is the one way this could be worse than what it replaces.
                 state.last_unit_ns = 0;
                 state.in_flight.clear();
-                // The view was just discarded, so everything is wanted again.
-                0
             },
-            || {},
             |unit| follower.on_unit(&unit),
         );
     });

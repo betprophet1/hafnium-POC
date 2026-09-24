@@ -102,12 +102,15 @@ fn run(flags: &BTreeMap<String, String>) -> Result<(), Error> {
         wire::follow_reporting(
             &feed,
             || {
-                state.lock().unwrap_or_else(PoisonError::into_inner).view = View::default();
                 *reconnecting.lock().unwrap_or_else(PoisonError::into_inner) = true;
-                // A fresh projection, so everything is wanted again.
-                0
+                // Carries on from the sequence this projection already holds, so a reconnect that finds the
+                // same journal still there costs only what happened while disconnected.
+                state.lock().unwrap_or_else(PoisonError::into_inner).view.sequence
             },
-            || {},
+            || {
+                // The node could not honour that position — this projection is of a history that never happened.
+                state.lock().unwrap_or_else(PoisonError::into_inner).view = View::default();
+            },
             |unit| {
                 if std::mem::take(&mut *reconnect.lock().unwrap_or_else(PoisonError::into_inner)) {
                     derived.reconnected();
