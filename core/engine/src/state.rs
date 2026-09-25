@@ -124,6 +124,9 @@ pub struct Account {
     pub reserved: i64,
     pub closed_only: bool,
     pub self_match_prevention: SelfMatchPrevention,
+    /// 0 = none, else the account whose family this one shares for self-match prevention (E-3.2, D-33). Set once
+    /// by `SetMasterAccount` (E-7.13) and never reassigned.
+    pub master_account_id: u64,
     pub second: Option<u64>,
     pub new_orders_in_second: u32,
     pub fills_in_second: u32,

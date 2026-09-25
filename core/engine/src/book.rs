@@ -99,6 +99,17 @@ impl<'a> Engine<'a> {
         Ok(&mut self.accounts[slot as usize])
     }
 
+    /// The account whose family this one shares for self-match prevention: itself if it has no master, else its
+    /// master (E-3.2, E-13.1, D-33).
+    pub(crate) fn effective_master(&self, slot: u32) -> u64 {
+        let a = &self.accounts[slot as usize];
+        if a.master_account_id == 0 {
+            a.id
+        } else {
+            a.master_account_id
+        }
+    }
+
     fn holding_w(&mut self, key: HoldingKey) -> Result<&mut Holding, FailStop> {
         let old = self.holdings.get(&key).copied();
         if self.dry {
