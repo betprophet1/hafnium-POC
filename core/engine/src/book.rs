@@ -314,7 +314,10 @@ impl<'a> Engine<'a> {
     /// it if `value.count` is now 0 -- the only two ways a sparse book's occupied-tick count changes. A
     /// brand-new entry that would push a sparse book's occupied-tick count past `PROMOTE_ABOVE` promotes it
     /// to dense first.
-    fn level_set(&mut self, instrument_slot: u32, side: Side, tick: u16, value: Level) -> Result<(), FailStop> {
+    /// `pub(crate)`: also used by `snapshot.rs`'s `read_books` to place a restored book's occupied ticks,
+    /// deriving tier the same way live trading would have (ADR-0001) rather than reading it from the
+    /// snapshot.
+    pub(crate) fn level_set(&mut self, instrument_slot: u32, side: Side, tick: u16, value: Level) -> Result<(), FailStop> {
         if self.instruments[instrument_slot as usize].dense {
             let li = crate::level_index(&self.instruments[instrument_slot as usize], side, tick);
             let was_occupied = self.levels[li].count > 0;
