@@ -43,8 +43,11 @@ fn compute(journal: &Path, at: Option<u64>) -> Result<(String, u64, Vec<u8>), Er
     let mut engine =
         Engine::new(engine_config(group)?, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
 
-    // Results are wanted by nobody here, but the engine must have somewhere to put them.
-    let scratch = journal.with_extension("snapshot-scratch.tmp");
+    // Results are wanted by nobody here, but the engine must have somewhere to put them. This goes in a temp
+    // directory rather than beside the journal: taking a snapshot is otherwise a read-only operation on a data
+    // directory, and writing scratch into it is what would stop a scheduled job from mounting a live venue's
+    // volume read-only. The name carries the process id because two of these may run at once.
+    let scratch = std::env::temp_dir().join(format!("venue-snapshot-scratch-{}.tmp", std::process::id()));
     let mut sink = BufWriter::new(File::create(&scratch)?);
     let mut reader = BufReader::new(File::open(journal)?);
     let mut buf = Vec::new();

@@ -4,6 +4,7 @@ environment can fetch it back by tag (§3.9: starting from whatever snapshot it 
 whatever the live venue happens to be running).
 
   snapshot_publish.py FILE --to s3://BUCKET --environment NAME --tag TAG
+  snapshot_publish.py --pair DIR --to s3://BUCKET --environment NAME [--tag TAG]   both halves of a pair
   snapshot_publish.py FILE --to /some/directory --environment NAME --tag TAG    on disk, for a demo or a test
   snapshot_publish.py --self-test                                              check the tool against files it writes
 
@@ -18,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -102,6 +104,34 @@ def publish(path, destination, tag, suffix="snapshot"):
     return snapshot_key, sha
 
 
+def publish_pair(directory, destination, tag=None):
+    """Publishes both halves of a snapshot pair (`venue-view snapshot`) under one tag, each verified the same
+    way a lone snapshot is. A pair is one artifact in two files: the engine's half founds a node, the reader's
+    half founds everything downstream, and a half on its own founds nothing — so they are published together
+    and the tag names the pair, not the file.
+
+    The tag defaults to a UTC timestamp, so a scheduled job needs to invent nothing."""
+    directory = Path(directory)
+    tag = tag or time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    # The half is part of the *tag*, not just the suffix, because `publish` derives the `.sha256` sidecar's key
+    # from the tag alone. Two halves sharing one tag would share one sidecar, and the second upload would
+    # silently overwrite the first's digest — leaving a pair whose engine half is unverifiable and a checksum
+    # that describes the wrong file. `journal_ship.py` names its two halves the same way, for the same reason.
+    halves = (("engine", "engine.snapshot", f"{tag}.engine", "snapshot"), ("view", "view.json", f"{tag}.view", "json"))
+
+    # Both halves are checked before either is uploaded. Publishing one and then discovering the other is
+    # missing would leave exactly the thing this function exists to prevent: a tag that looks like a pair and
+    # founds nothing.
+    for _, filename, _, _ in halves:
+        if not (directory / filename).exists():
+            raise ValueError(f"{directory / filename} is missing: {directory} is not a pair venue-view wrote")
+
+    published = {
+        half: publish(directory / filename, destination, half_tag, suffix) for half, filename, half_tag, suffix in halves
+    }
+    return tag, published
+
+
 def self_test():
     failures = []
     with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as store:
@@ -148,6 +178,44 @@ def self_test():
         finally:
             Destination.fetch = real_fetch
 
+        # A pair goes up as one artifact under one tag, and a half on its own founds nothing — so a directory
+        # missing either half is refused rather than half-published.
+        pair = Path(work) / "pair"
+        pair.mkdir()
+        (pair / "engine.snapshot").write_bytes(b"the engine's half, for the self-test")
+        try:
+            publish_pair(pair, destination, "half")
+            failures.append("a pair missing its view half was published")
+        except ValueError:
+            pass
+        if (Path(store) / "snapshots" / "selftest" / "half.snapshot").exists():
+            failures.append("a pair missing its view half uploaded the engine half before being refused")
+
+        (pair / "view.json").write_text('{"sequence": 62}')
+        tag, published = publish_pair(pair, destination, "whole")
+        if tag != "whole":
+            failures.append(f"an explicit tag was not used: {tag}")
+        if set(published) != {"engine", "view"}:
+            failures.append(f"a pair did not publish both halves: {sorted(published)}")
+        # Both halves AND both sidecars. Checking only that "a .sha256 exists" is what let the first version of
+        # this ship a pair whose two halves shared one sidecar, so the engine half's digest was overwritten by
+        # the view half's and the engine half could never be verified again.
+        for name in ("whole.engine.snapshot", "whole.engine.sha256", "whole.view.json", "whole.view.sha256"):
+            if not (Path(store) / "snapshots" / "selftest" / name).exists():
+                failures.append(f"a published pair is missing {name}")
+        digests = {
+            name: (Path(store) / "snapshots" / "selftest" / name).read_text().strip()
+            for name in ("whole.engine.sha256", "whole.view.sha256")
+            if (Path(store) / "snapshots" / "selftest" / name).exists()
+        }
+        if len(set(digests.values())) != len(digests):
+            failures.append("both halves of a pair were published under the same digest sidecar")
+
+        # And the tag invents itself, so a scheduled job needs to know nothing.
+        auto, _ = publish_pair(pair, destination)
+        if not (len(auto) == 16 and auto[8] == "T" and auto.endswith("Z")):
+            failures.append(f"an automatic pair tag is not a UTC stamp: {auto}")
+
     for failure in failures:
         print(f"self-test: {failure}", file=sys.stderr)
     return 1 if failures else 0
@@ -157,6 +225,7 @@ def main():
     parser = argparse.ArgumentParser(add_help=True, description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("file", nargs="?")
+    parser.add_argument("--pair", help="a directory venue-view wrote: publishes engine.snapshot and view.json")
     parser.add_argument("--to")
     parser.add_argument("--environment", help="which venue this is for: prod, pr-4. Names part of the key.")
     parser.add_argument("--tag", help="the name a test/preview environment will ask for later: main, pre-load, ...")
@@ -165,6 +234,18 @@ def main():
 
     if args.self_test:
         return self_test()
+    if args.pair:
+        if not args.to or not args.environment:
+            parser.error("--pair needs --to and --environment")
+        try:
+            tag, published = publish_pair(args.pair, Destination(args.to, args.environment))
+        except (ValueError, subprocess.CalledProcessError, OSError) as e:
+            print(f"not published: {e}", file=sys.stderr)
+            return 1
+        for half, (key, sha) in published.items():
+            print(f"published {key} ({sha[:12]}\u2026)")
+        print(f"the pair is tagged {tag}")
+        return 0
     if not args.file or not args.to or not args.environment or not args.tag:
         parser.error("FILE, --to, --environment and --tag are all needed")
 
