@@ -1,0 +1,69 @@
+{
+  "name": "SetMasterAccount groups accounts into a family; self-match prevention blocks the whole family, not just literal equality",
+  "rules": ["E-7.13", "E-13.1", "E-3.2"],
+  "notes": [
+    "Account 1 is the master; accounts 2 and 4 are its subaccounts (siblings of each other); account 3 is unrelated.",
+    "sm3 is rejected because account 2 is itself a subaccount, so it may not be used as anyone's master (E-7.13).",
+    "sm4 is rejected because account 2 already has a master (1) and a master is set once, never reassigned.",
+    "sm5 repeats sm1's exact value and is accepted as a no-op: the account's master does not change.",
+    "sm6 is rejected for naming itself as its own master; sm7 and sm8 for accountId and masterAccountId of 0.",
+    "Account 2 offers 5 at tick 59: reservation noCost(59, 5) = 200 (scenario 12's fill at this tick and quantity gives buyerCash -300, sellerCash -200 for a fresh mint, so noCost(59,5) = 200 and yesCost(59,5) = 300).",
+    "Account 1 (2's master) bids 5 at tick 59: blocked, though 1 and 2 are different accounts, because they share an effective master (E-13.1 widened by D-33) — the point of this scenario.",
+    "Account 4 (2's sibling subaccount) bids the same: blocked for the same reason, without account 1 being party to either order.",
+    "Account 3 (no master at all) bids the same and fills normally: the widened rule blocks a family, not everyone.",
+    "Account 2's balance after the fill: 10000 - 200 = 9800. Account 3's: 10000 - 300 = 9700."
+  ],
+  "setup": [
+    {"op": "centTable", "tickTableId": 1},
+    {"op": "binary", "eventId": 100, "instrumentId": 1000},
+    {"op": "fund", "accountId": 1, "cents": 10000},
+    {"op": "fund", "accountId": 2, "cents": 10000},
+    {"op": "fund", "accountId": 3, "cents": 10000},
+    {"op": "fund", "accountId": 4, "cents": 10000}
+  ],
+  "steps": [
+    {"input": {"msg": "SetMasterAccount", "commandId": "sm1", "accountId": 2, "masterAccountId": 1},
+     "expect": [{"msg": "CommandApplied", "commandId": "sm1", "outcome": "APPLIED"}]},
+    {"input": {"msg": "SetMasterAccount", "commandId": "sm2", "accountId": 4, "masterAccountId": 1},
+     "expect": [{"msg": "CommandApplied", "commandId": "sm2", "outcome": "APPLIED"}]},
+    {"input": {"msg": "SetMasterAccount", "commandId": "sm3", "accountId": 1, "masterAccountId": 2},
+     "expect": [{"msg": "CommandApplied", "commandId": "sm3", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}]},
+    {"input": {"msg": "SetMasterAccount", "commandId": "sm4", "accountId": 2, "masterAccountId": 3},
+     "expect": [{"msg": "CommandApplied", "commandId": "sm4", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}]},
+    {"input": {"msg": "SetMasterAccount", "commandId": "sm5", "accountId": 2, "masterAccountId": 1},
+     "expect": [{"msg": "CommandApplied", "commandId": "sm5", "outcome": "APPLIED"}]},
+    {"input": {"msg": "SetMasterAccount", "commandId": "sm6", "accountId": 5, "masterAccountId": 5},
+     "expect": [{"msg": "CommandApplied", "commandId": "sm6", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}]},
+    {"input": {"msg": "SetMasterAccount", "commandId": "sm7", "accountId": 0, "masterAccountId": 1},
+     "expect": [{"msg": "CommandApplied", "commandId": "sm7", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}]},
+    {"input": {"msg": "SetMasterAccount", "commandId": "sm8", "accountId": 6, "masterAccountId": 0},
+     "expect": [{"msg": "CommandApplied", "commandId": "sm8", "outcome": "REJECTED", "rejectReason": "INVALID_COMMAND"}]},
+
+    {"input": {"msg": "NewOrder", "accountId": 2, "clientOrderId": "a1", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 5},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O1", "accountId": 2, "clientOrderId": "a1", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 5, "reservedCents": 200},
+       {"msg": "SleeveChanged", "accountId": 2, "availableCents": 9800, "reservedCents": 200},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 5, "orderCount": 1}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 1, "clientOrderId": "b1", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 5},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O2", "accountId": 1, "clientOrderId": "b1", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 5, "reservedCents": 300},
+       {"msg": "OrderCancelled", "orderId": "O2", "accountId": 1, "instrumentId": 1000, "cancelledQuantity": 5, "reason": "SELF_MATCH_PREVENTED"}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 4, "clientOrderId": "b2", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 5},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O3", "accountId": 4, "clientOrderId": "b2", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 5, "reservedCents": 300},
+       {"msg": "OrderCancelled", "orderId": "O3", "accountId": 4, "instrumentId": 1000, "cancelledQuantity": 5, "reason": "SELF_MATCH_PREVENTED"}
+     ]},
+    {"input": {"msg": "NewOrder", "accountId": 3, "clientOrderId": "b3", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 5},
+     "expect": [
+       {"msg": "OrderAccepted", "orderId": "O4", "accountId": 3, "clientOrderId": "b3", "instrumentId": 1000, "side": "BUY", "tick": 59, "quantity": 5, "reservedCents": 300},
+       {"msg": "Fill", "tradeId": "T1", "instrumentId": 1000, "tick": 59, "quantity": 5, "makerOrderId": "O1", "makerAccountId": 2, "makerRemaining": 0, "takerOrderId": "O4", "takerAccountId": 3, "takerRemaining": 0, "takerSide": "BUY", "mintedPairs": 5, "burnedPairs": 0, "buyerCashCents": -300, "sellerCashCents": -200},
+       {"msg": "PositionChanged", "accountId": 2, "instrumentId": 1000, "position": -5},
+       {"msg": "PositionChanged", "accountId": 3, "instrumentId": 1000, "position": 5},
+       {"msg": "SleeveChanged", "accountId": 2, "availableCents": 9800, "reservedCents": 0},
+       {"msg": "SleeveChanged", "accountId": 3, "availableCents": 9700, "reservedCents": 0},
+       {"msg": "BookLevelChanged", "instrumentId": 1000, "side": "SELL", "tick": 59, "quantity": 0, "orderCount": 0}
+     ]}
+  ]
+}

@@ -67,6 +67,7 @@ pub mod set_group_parameters_codec;
 pub mod set_listing_parameters_codec;
 pub mod set_maker_protection_codec;
 pub mod set_market_state_codec;
+pub mod set_master_account_codec;
 pub mod set_order_group_codec;
 pub mod set_rule_limits_codec;
 pub mod set_venue_mode_codec;
