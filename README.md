@@ -11,6 +11,7 @@ Architecture, specifications and the core prototype for the new ProphetX predict
 | [`adapters/`](adapters/) | Protocol adapters outside the Rust core: the FIX 4.4 adapter on Artio, in Java | People and coding agents, against the gates |
 | [`deploy/`](deploy/) | The mini-venue Helm chart, the core's image and the one-command laptop cluster | People and coding agents |
 | [`AGENTS.md`](AGENTS.md) | How to work here, including what an implementation may never change | — |
+| [`docs/legacy-comparison.md`](docs/legacy-comparison.md) | How this architecture compares to ProphetX's current production venue: what it fixes, what production still does that this doesn't yet | People |
 
 The published blueprint is at https://claude.ai/code/artifact/5e4d2278-46dd-4f2c-a617-da87c3ae0831.
 
