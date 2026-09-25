@@ -144,6 +144,7 @@ fn render(
         queues.push((account, rx));
     }
     for unit in wire::replayed_units(journal, results)? {
+        let unit = unit?;
         hub.apply(&unit);
     }
     let mut out: BTreeMap<Frame, Vec<String>> = BTreeMap::new();

@@ -137,3 +137,36 @@ fn an_uncut_journal_still_gives_a_pair_on_its_own() {
     let (journal, results) = (dir.join("journal.sbe"), dir.join("results.sbe"));
     pair::take(&journal, &dir.join("out"), Some(62), Some(&results)).expect("a pair from an uncut journal");
 }
+
+/// A result log that still reaches back further than the journal does. `cut` trims both together, so this does
+/// not arise from cutting alone — but it does the moment the two are restored, replaced or copied
+/// independently, and the pairing walks them in lockstep rather than looking each input up. Results naming
+/// inputs the journal no longer carries have to be stepped over: attaching input 1's results to input 63 would
+/// corrupt the view silently, and stopping at the first mismatch would leave every later input with none.
+#[test]
+fn results_reaching_back_further_than_the_journal_are_stepped_over() {
+    let dir = prepared("stale-results");
+    let (journal, results) = (dir.join("journal.sbe"), dir.join("results.sbe"));
+
+    let base = View::replayed(&journal, &results, Some(62)).expect("a base at 62");
+    embed(&journal, Some(62)).expect("a snapshot embeds");
+    let segment = dir.join("segment");
+    export_cut(&journal, &results, &segment).expect("a segment exports");
+    cut_checked(&journal, &results, None).expect("cuts");
+
+    // Restoring gives back a result log reaching to input 1, while the journal beside it still starts at 63.
+    let restored = dir.join("restored");
+    venue_node::node::restore_cut(&segment, &journal, &results, &restored).expect("the segment restores");
+    let full_results = restored.join("results.sbe");
+
+    let from_cut =
+        View::replayed_from(Some(base.clone()), &journal, &results, Some(90)).expect("from the cut result log");
+    let from_full = View::replayed_from(Some(base), &journal, &full_results, Some(90))
+        .expect("from the result log that reaches back further");
+    assert_eq!(
+        serde_json::to_value(&from_full).expect("json"),
+        serde_json::to_value(&from_cut).expect("json"),
+        "results reaching back before the journal changed what the view became"
+    );
+    assert_eq!(from_full.sequence, 90, "the view did not reach the sequence asked for");
+}

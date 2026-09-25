@@ -506,6 +506,7 @@ impl View {
         let from = base.as_ref().map_or(0, |view| view.sequence);
         let mut view = base.unwrap_or_default();
         for unit in wire::replayed_units(journal, results)? {
+            let unit = unit?;
             let sequence = u(&unit.input["record"]["sequence"]);
             if at.is_some_and(|stop| sequence > stop) {
                 break;
