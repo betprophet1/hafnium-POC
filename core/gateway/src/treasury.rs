@@ -186,7 +186,7 @@ fn follow(gateway: &Gateway, address: &str) -> Result<(), String> {
 /// What a client can rely on for deposits and withdrawals, against a gateway, a treasury and a node, all real.
 #[cfg(test)]
 mod tests {
-    use crate::testing::{self, eventually, MAKER_TOKEN, RETAIL_TOKEN};
+    use crate::testing::{self, eventually, MAKER, MAKER_TOKEN, RETAIL_TOKEN};
     use serde_json::{json, Value};
     use std::io::{Read, Write};
     use std::net::TcpStream;
@@ -316,5 +316,55 @@ mod tests {
             "dep-slow cancelled",
         ];
         assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn an_internal_transfer_moves_money_within_a_family_and_nowhere_else() {
+        let venue = testing::venue_with_treasury("internal-transfers");
+        let a = &venue.address;
+
+        let (status, sub) =
+            request(a, "POST", "/v4/subaccounts", Some(MAKER_TOKEN), Some(&json!({"label": "scalping"})));
+        assert_eq!(status, 200, "{sub}");
+        let sub_id = sub["accountId"].as_str().expect("an id").to_string();
+        let key_path = format!("/v4/subaccounts/{sub_id}/keys");
+        let (status, key) = request(
+            a,
+            "POST",
+            &key_path,
+            Some(MAKER_TOKEN),
+            Some(&json!({"label": "bot", "permissions": ["read", "trade", "transfers"]})),
+        );
+        assert_eq!(status, 200, "{key}");
+        let sub_cred =
+            format!("{}.{}", key["keyId"].as_str().expect("an id"), key["secret"].as_str().expect("a secret"));
+
+        // The subaccount is unknown to the treasury until it has transacted; a deposit through its own key opens it,
+        // the same way any account the catalogue never named opens.
+        let opening = transfer("open", "deposit", 5_000, "dummy_instant");
+        let (status, opened) = request(a, "POST", "/v4/transfers", Some(&sub_cred), Some(&opening));
+        assert_eq!((status, opened["state"].as_str()), (200, Some("settled")), "{opened}");
+        eventually("the opening deposit reaches available cash", || available(a, &sub_cred) == 5_000);
+
+        let maker_start = available(a, MAKER_TOKEN);
+        let move_in =
+            json!({"clientTransferId": "in-1", "kind": "internal", "amountCents": 2_000, "toAccountId": sub_id});
+        let (status, moved) = request(a, "POST", "/v4/transfers", Some(MAKER_TOKEN), Some(&move_in));
+        assert_eq!((status, moved["state"].as_str()), (200, Some("settled")), "{moved}");
+        assert_eq!(moved["method"], Value::Null, "an internal transfer names no bank method: {moved}");
+        eventually("the source loses it", || available(a, MAKER_TOKEN) == maker_start - 2_000);
+        eventually("the destination gains it", || available(a, &sub_cred) == 5_000 + 2_000);
+
+        // An unrelated account is refused: it is not part of this subaccount's family.
+        let elsewhere =
+            json!({"clientTransferId": "in-2", "kind": "internal", "amountCents": 1, "toAccountId": sub_id});
+        let (status, refused) = request(a, "POST", "/v4/transfers", Some(RETAIL_TOKEN), Some(&elsewhere));
+        assert_eq!((status, refused["error"]["code"].as_str()), (403, Some("FORBIDDEN")), "{refused}");
+
+        // The other direction works too: the subaccount can move money back to its master.
+        let move_back = json!({"clientTransferId": "out-1", "kind": "internal", "amountCents": 1_000,
+                                "toAccountId": MAKER.to_string()});
+        let (status, back) = request(a, "POST", "/v4/transfers", Some(&sub_cred), Some(&move_back));
+        assert_eq!((status, back["state"].as_str()), (200, Some("settled")), "{back}");
     }
 }

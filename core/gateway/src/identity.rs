@@ -12,6 +12,7 @@
 //! and that a key is not making a key with more than it holds; the answer is interface 1's already.
 
 use crate::api::{only, ApiError, Gateway};
+use crate::forwarded::{self, AllowedIps};
 use crate::http::Request;
 use crate::limits::monotonic;
 use crate::metrics::{HalfMetrics, Outcome, Service};
@@ -66,6 +67,9 @@ pub struct Credential {
     pub permissions: Permissions,
     /// When the key expires, in milliseconds since the epoch.
     expires_at: Option<u64>,
+    /// Addresses this key may be used from (decision G-23); unrestricted for a dev token or a member's session,
+    /// which have no allow-list of their own.
+    allowed: AllowedIps,
     /// What the key's answer is remembered under, for a session to look it up without asking again.
     fingerprint: Option<[u8; 32]>,
 }
@@ -73,7 +77,15 @@ pub struct Credential {
 impl Credential {
     /// A dev token: its account, with every permission.
     pub const fn dev_token(account: u64) -> Self {
-        Self { account, key: None, member: None, permissions: Permissions::ALL, expires_at: None, fingerprint: None }
+        Self {
+            account,
+            key: None,
+            member: None,
+            permissions: Permissions::ALL,
+            expires_at: None,
+            allowed: AllowedIps::unrestricted(),
+            fingerprint: None,
+        }
     }
 
     /// Refuses with 403 `FORBIDDEN` unless the credential holds `permission`.
@@ -82,6 +94,16 @@ impl Credential {
             Ok(())
         } else {
             Err(ApiError::forbidden(format!("this API key does not hold the {} permission", permission.name())))
+        }
+    }
+
+    /// Refuses with 403 `FORBIDDEN` unless `client` is on this credential's allow-list (decision G-23). Worded so a
+    /// caller cannot tell an off-list address from a key that does not exist (G-11's reasoning).
+    pub fn require_ip(&self, client: &str) -> Result<(), ApiError> {
+        if self.allowed.allows(forwarded::parse_client(client)) {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden("this API key may not be used from this address"))
         }
     }
 }
@@ -148,6 +170,27 @@ impl Identity {
     /// Whether API keys are verified here at all.
     pub const fn serves_keys(&self) -> bool {
         self.address.is_some()
+    }
+
+    /// One account's own master, if it is a subaccount (decisions D-33, G-22): asked fresh every time, never
+    /// remembered like a credential's verdict is, because this is a transfer's ownership check rather than a
+    /// per-request lookup order entry depends on, and transfers are rare enough that the round trip costs nothing
+    /// worth caching. `Ok(None)` for an account that exists and has no master; an unknown account is 404.
+    pub fn account_master(&self, account: u64) -> Result<Option<u64>, ApiError> {
+        let address = self.address()?;
+        let (status, answer) = family_call(address, account)
+            .map_err(|e| ApiError::unavailable(&format!("the identity service did not answer: {e}")))?;
+        match status {
+            200 => match &answer["masterAccountId"] {
+                Value::Null => Ok(None),
+                Value::String(s) => {
+                    s.parse().map(Some).map_err(|_| ApiError::unavailable("a malformed answer from identity"))
+                }
+                _ => Err(ApiError::unavailable("a malformed answer from identity")),
+            },
+            404 => Err(ApiError::bad(format!("account {account}: no such account"))),
+            _ => Err(ApiError::unavailable("the identity service refused")),
+        }
     }
 
     fn address(&self) -> Result<&str, ApiError> {
@@ -352,6 +395,13 @@ fn valid(answer: &Value, fingerprint: [u8; 32]) -> Option<Credential> {
             Value::Null => None,
             v => Some(clock::parse_rfc3339(v.as_str()?)?),
         },
+        allowed: match answer["allowedIps"].as_array() {
+            Some(ips) => AllowedIps::from_strings(
+                &ips.iter().map(|v| v.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?,
+            ),
+            // Older answers, and a session's, carry no allowedIps at all: unrestricted, not a reason to refuse.
+            None => AllowedIps::unrestricted(),
+        },
         fingerprint: Some(fingerprint),
     })
 }
@@ -369,6 +419,29 @@ fn verify_call(address: &str, credential: &str) -> Result<(u16, Value), String> 
     let request = format!(
         "POST /v1/verify HTTP/1.1\r\nHost: identity\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
+    );
+    stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&response);
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("a response with no head")?;
+    let status = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or("a response with no status")?;
+    let answer = serde_json::from_str(body).map_err(|e| format!("a response that is not JSON: {e}"))?;
+    Ok((status, answer))
+}
+
+/// One `GET /v1/accounts/{account}`, for `Identity::account_master`.
+fn family_call(address: &str, account: u64) -> Result<(u16, Value), String> {
+    let socket = address
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .next()
+        .ok_or_else(|| format!("{address} resolves to nothing"))?;
+    let mut stream = TcpStream::connect_timeout(&socket, VERIFY_TIMEOUT).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(VERIFY_TIMEOUT)).map_err(|e| e.to_string())?;
+    stream.set_write_timeout(Some(VERIFY_TIMEOUT)).map_err(|e| e.to_string())?;
+    let request = format!(
+        "GET /v1/accounts/{account} HTTP/1.1\r\nHost: identity\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).map_err(|e| e.to_string())?;
     let mut response = Vec::new();
@@ -430,7 +503,7 @@ pub fn members(gateway: &Gateway, request: &Request, client: &str, notify: &Noti
         }
         ("DELETE", ["v4", "sessions", "current"]) => {
             // Only the session itself may end itself, which is what holding its credential proves.
-            let credential = crate::rest::credential(gateway, request, Permissions::READ)?;
+            let credential = crate::rest::credential(gateway, request, client, Permissions::READ)?;
             let session = credential
                 .key
                 .as_deref()
@@ -450,11 +523,11 @@ pub fn members(gateway: &Gateway, request: &Request, client: &str, notify: &Noti
 /// A member's own account: what they are, the sessions they hold elsewhere, and their second factor. Every route
 /// here is addressed by the member the session belongs to, never by one named in the request, so a session can only
 /// ever reach its own (interfaces/gateway/README.md, members and sessions).
-pub fn me(gateway: &Gateway, request: &Request, notify: &Notify) -> Result<Call, ApiError> {
+pub fn me(gateway: &Gateway, request: &Request, client: &str, notify: &Notify) -> Result<Call, ApiError> {
     let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
     let identity = &gateway.identity;
     let notify = Arc::clone(notify);
-    let credential = crate::rest::credential(gateway, request, Permissions::READ)?;
+    let credential = crate::rest::credential(gateway, request, client, Permissions::READ)?;
     let member = credential
         .member
         .as_deref()
@@ -504,7 +577,7 @@ pub fn manage(
         ("POST", ["v4", "keys"]) => {
             let mut body: Value = serde_json::from_slice(&request.body)
                 .map_err(|e| ApiError::bad(format!("the body is not JSON: {e}")))?;
-            let fields = only(&body, &["label", "permissions", "expiresAt"])?;
+            let fields = only(&body, &["label", "permissions", "expiresAt", "allowedIps"])?;
             let asked = fields
                 .get("permissions")
                 .and_then(Value::as_array)
@@ -518,6 +591,63 @@ pub fn manage(
                 body["createdBy"] = json!(credential.key);
             }
             identity.pass(credential.account, "POST", "", body.to_string().as_bytes(), notify)
+        }
+        _ => Err(ApiError::not_found("no such route")),
+    }
+}
+
+/// `/v4/subaccounts`: an account's family (decisions D-33, G-21). Needs `keys`, like managing keys, since minting a
+/// subaccount is as much a delegation of the master's identity as a key is (G-5's reasoning) — a subaccount gets
+/// keys of its own once it exists, so a credential that could not manage keys should not be able to make one either.
+pub fn subaccounts(
+    gateway: &Gateway,
+    credential: &Credential,
+    request: &Request,
+    notify: &Notify,
+) -> Result<Call, ApiError> {
+    credential.require(Permissions::KEYS)?;
+    let identity = &gateway.identity;
+    let notify = Arc::clone(notify);
+    let path = format!("/v1/accounts/{}/subaccounts", credential.account);
+    match request.method.as_str() {
+        "GET" => identity.pass_to("GET", &path, &[], notify),
+        "POST" => identity.pass_to("POST", &path, &request.body, notify),
+        _ => Err(ApiError::not_found("no such route")),
+    }
+}
+
+/// `/v4/subaccounts/{accountId}/keys`: the master's own way to give a subaccount its first key, since a subaccount
+/// has no dev token and no session of its own to make one with (decisions D-33, G-21). The caller must hold `keys`
+/// and be `accountId`'s own master — checked fresh against identity, never assumed from the path.
+pub fn subaccount_keys(
+    gateway: &Gateway,
+    credential: &Credential,
+    account_id: u64,
+    request: &Request,
+    notify: &Notify,
+) -> Result<Call, ApiError> {
+    credential.require(Permissions::KEYS)?;
+    if gateway.identity.account_master(account_id)? != Some(credential.account) {
+        return Err(ApiError::forbidden("this account is not one of the caller's subaccounts"));
+    }
+    let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
+    let identity = &gateway.identity;
+    let notify = Arc::clone(notify);
+    match (request.method.as_str(), segments.as_slice()) {
+        ("GET", ["v4", "subaccounts", _, "keys"]) => identity.pass(account_id, "GET", "", &[], notify),
+        ("DELETE", ["v4", "subaccounts", _, "keys", key_id]) => {
+            if !key::is_id(key_id) {
+                return Err(ApiError::bad("keyId must be ak_ and 16 lower-case hex digits"));
+            }
+            identity.pass(account_id, "DELETE", &format!("/{key_id}"), &[], notify)
+        }
+        ("POST", ["v4", "subaccounts", _, "keys"]) => {
+            let body: Value = serde_json::from_slice(&request.body)
+                .map_err(|e| ApiError::bad(format!("the body is not JSON: {e}")))?;
+            // No beyond_the_creator check: the creator's key belongs to the master's account, not the subaccount's,
+            // so a permission it holds says nothing about what the subaccount's own keys should be limited to.
+            only(&body, &["label", "permissions", "expiresAt", "allowedIps"])?;
+            identity.pass(account_id, "POST", "", body.to_string().as_bytes(), notify)
         }
         _ => Err(ApiError::not_found("no such route")),
     }
@@ -634,6 +764,86 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn subaccounts_are_made_and_listed_over_rest_and_a_key_without_keys_is_refused() {
+        let venue = testing::venue("subaccounts");
+        let a = &venue.address;
+        let (status, created) =
+            request(a, "POST", "/v4/subaccounts", Some(MAKER_TOKEN), Some(&json!({"label": "scalping"})));
+        assert_eq!(status, 200, "{created}");
+        assert_eq!(created["masterAccountId"], json!(MAKER.to_string()));
+        let sub = created["accountId"].as_str().expect("an id").to_string();
+
+        let (status, listed) = request(a, "GET", "/v4/subaccounts", Some(MAKER_TOKEN), None);
+        assert_eq!((status, &listed["subaccounts"][0]["accountId"]), (200, &json!(sub)), "{listed}");
+
+        // A key without `keys` cannot make or list subaccounts, same as it cannot manage keys.
+        let blind = make_key(a, MAKER_TOKEN, &["read", "trade"]);
+        let refused = request(a, "POST", "/v4/subaccounts", Some(&credential(&blind)), Some(&json!({"label": "x"})));
+        assert!(forbidden(&refused), "{refused:?}");
+
+        // A second subaccount of the same master is fine; the family is not limited to one.
+        let (status, _) =
+            request(a, "POST", "/v4/subaccounts", Some(MAKER_TOKEN), Some(&json!({"label": "liquidity"})));
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn a_masters_key_makes_its_subaccounts_first_key_and_nobody_else_can() {
+        let venue = testing::venue("subaccount-keys");
+        let a = &venue.address;
+        let (status, sub) =
+            request(a, "POST", "/v4/subaccounts", Some(MAKER_TOKEN), Some(&json!({"label": "scalping"})));
+        assert_eq!(status, 200, "{sub}");
+        let sub_id = sub["accountId"].as_str().expect("an id").to_string();
+        let path = format!("/v4/subaccounts/{sub_id}/keys");
+
+        let body = json!({"label": "bot", "permissions": ["read", "trade"]});
+        let (status, created) = request(a, "POST", &path, Some(MAKER_TOKEN), Some(&body));
+        assert_eq!(status, 200, "{created}");
+
+        let (status, listed) = request(a, "GET", &path, Some(MAKER_TOKEN), None);
+        assert_eq!((status, &listed["keys"][0]["keyId"]), (200, &created["keyId"]), "{listed}");
+
+        // Not this subaccount's master: refused, even with `keys`.
+        let refused = request(a, "POST", &path, Some(RETAIL_TOKEN), Some(&body));
+        assert!(forbidden(&refused), "{refused:?}");
+
+        // The subaccount's key does not appear under the master's own key list: it is a different account's.
+        let (_, own) = request(a, "GET", "/v4/keys", Some(MAKER_TOKEN), None);
+        assert!(
+            !own.to_string().contains(created["keyId"].as_str().expect("an id")),
+            "leaked into the master's own list: {own}"
+        );
+    }
+
+    #[test]
+    fn a_key_restricted_to_an_allow_list_is_refused_from_an_address_off_it() {
+        let venue = testing::venue("keys-ip-allowlist");
+        let a = &venue.address;
+        let elsewhere = json!({"label": "colo", "permissions": ["read"], "allowedIps": ["203.0.113.0/24"]});
+        let (status, created) = request(a, "POST", "/v4/keys", Some(MAKER_TOKEN), Some(&elsewhere));
+        assert_eq!(status, 200, "{created}");
+        assert_eq!(created["allowedIps"], json!(["203.0.113.0/24"]));
+        let restricted = credential(&created);
+        // The test connects over loopback, which is not on this key's list.
+        assert!(forbidden(&request(a, "GET", "/v4/account", Some(&restricted), None)), "off the allow-list");
+
+        let here = json!({"label": "here", "permissions": ["read"], "allowedIps": ["127.0.0.1"]});
+        let (status, created) = request(a, "POST", "/v4/keys", Some(MAKER_TOKEN), Some(&here));
+        assert_eq!(status, 200, "{created}");
+        let (status, _) = request(a, "GET", "/v4/account", Some(&credential(&created)), None);
+        assert_eq!(status, 200, "loopback is on its own allow-list");
+
+        // No allowedIps at all is unrestricted, as every key made before this existed still is.
+        let unrestricted = make_key(a, MAKER_TOKEN, &["read"]);
+        assert_eq!(unrestricted["allowedIps"], json!([]));
+        assert_eq!(request(a, "GET", "/v4/account", Some(&credential(&unrestricted)), None).0, 200);
+
+        let malformed = json!({"label": "x", "permissions": ["read"], "allowedIps": ["not-an-address"]});
+        assert_eq!(request(a, "POST", "/v4/keys", Some(MAKER_TOKEN), Some(&malformed)).0, 400);
     }
 
     #[test]

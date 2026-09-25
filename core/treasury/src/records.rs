@@ -183,7 +183,8 @@ impl Records for Memory {
     fn commit(&self, transfer: &Transfer, postings: &[(&str, Posting)], _now: u64) -> Result<(), Error> {
         let mut data = self.data()?;
         if let Some(t) = data.transfers.get(&transfer.id) {
-            let terms = |t: &Transfer| (t.account, t.client_id.clone(), t.kind, t.amount, t.method, t.created);
+            let terms =
+                |t: &Transfer| (t.account, t.client_id.clone(), t.kind, t.amount, t.method, t.to_account, t.created);
             if terms(t) != terms(transfer) {
                 return Err(Error::refused(format!("transfer {}: its terms cannot change", t.id)));
             }

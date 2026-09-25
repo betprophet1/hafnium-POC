@@ -42,6 +42,16 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "member_staff",
         sql: include_str!("../migrations/20260918000003_member_staff.sql"),
     },
+    Migration {
+        version: "20260925000001",
+        name: "key_ip_allowlist",
+        sql: include_str!("../migrations/20260925000001_key_ip_allowlist.sql"),
+    },
+    Migration {
+        version: "20260925000002",
+        name: "subaccounts",
+        sql: include_str!("../migrations/20260925000002_subaccounts.sql"),
+    },
 ];
 
 /// An account as the catalogue describes it.
@@ -51,6 +61,9 @@ pub struct Account {
     pub name: String,
     /// The dev token that acts as the account in test environments, if it has one. Only its hash is kept.
     pub dev_token: Option<String>,
+    /// The account this one is a subaccount of (decision D-33), set once and never reassigned; none for a master or
+    /// an account with no family at all.
+    pub master: Option<u64>,
 }
 
 /// What a dev token is kept as: tagged like a key's hash (decision G-2), so neither can stand for the other.
@@ -74,6 +87,8 @@ pub struct KeyRow {
     pub revoked_at: Option<u64>,
     pub created_by: Option<String>,
     pub last_used: Option<u64>,
+    /// Addresses and networks this key may be used from (decision G-23); empty means unrestricted.
+    pub allowed_ips: Vec<String>,
 }
 
 /// A member: the person behind an account (`member.rs`). The password is here only as its Argon2id hash.
@@ -163,6 +178,12 @@ pub trait KeyRecords: Send + Sync {
     fn next_account(&self, floor: u64) -> Result<u64, Error>;
     /// Writes an account and the member of it together: either both or neither.
     fn create_member(&self, member: &MemberRow, name: &str, now: u64) -> Result<(), Error>;
+    /// One account, if the environment has it (decision D-33, G-21): its own master, if it is a subaccount.
+    fn account(&self, account_id: u64) -> Result<Option<Account>, Error>;
+    /// Writes a subaccount of `master`, which must exist and not itself be a subaccount.
+    fn create_subaccount(&self, account_id: u64, name: &str, master: u64, now: u64) -> Result<(), Error>;
+    /// Every subaccount of `master`, oldest first.
+    fn subaccounts_of(&self, master: u64) -> Result<Vec<Account>, Error>;
     /// The member who logs in with `email`, if there is one. Read when someone logs in, not on every request.
     fn member_by_email(&self, email: &str) -> Result<Option<MemberRow>, Error>;
     /// Every session that has not ended and has not expired at `now`, read once at start.
@@ -308,9 +329,33 @@ impl KeyRecords for Memory {
         if data.members.iter().any(|m| m.email == member.email) {
             return Err(Error::refused("that email already has an account"));
         }
-        data.accounts.insert(member.account, Account { id: member.account, name: name.to_string(), dev_token: None });
+        data.accounts.insert(
+            member.account,
+            Account { id: member.account, name: name.to_string(), dev_token: None, master: None },
+        );
         data.members.push(member.clone());
         Ok(())
+    }
+
+    fn account(&self, account_id: u64) -> Result<Option<Account>, Error> {
+        Ok(self.data()?.accounts.get(&account_id).cloned())
+    }
+
+    fn create_subaccount(&self, account_id: u64, name: &str, master: u64, _now: u64) -> Result<(), Error> {
+        let mut data = self.data()?;
+        let found = data.accounts.get(&master).ok_or_else(|| Error::refused("no such master account"))?;
+        if found.master.is_some() {
+            return Err(Error::refused("a master account may not itself be a subaccount"));
+        }
+        data.accounts.insert(
+            account_id,
+            Account { id: account_id, name: name.to_string(), dev_token: None, master: Some(master) },
+        );
+        Ok(())
+    }
+
+    fn subaccounts_of(&self, master: u64) -> Result<Vec<Account>, Error> {
+        Ok(self.data()?.accounts.values().filter(|a| a.master == Some(master)).cloned().collect())
     }
 
     fn member_by_email(&self, email: &str) -> Result<Option<MemberRow>, Error> {
@@ -552,6 +597,7 @@ fn key_from(row: &Row) -> Result<KeyRow, Error> {
         revoked_at: row.get::<_, Option<SystemTime>>("revoked_at").map(millis),
         created_by: row.get("created_by"),
         last_used: row.get::<_, Option<SystemTime>>("last_used_at").map(millis),
+        allowed_ips: row.get("allowed_ips"),
     })
 }
 
@@ -582,8 +628,8 @@ impl KeyRecords for Postgres {
         let expires = k.expires_at.map(time);
         self.db.get()?.execute(
             "INSERT INTO api_keys (key_id, account_id, label, permissions, secret_sha256, created_at, expires_at,
-               created_by, revoked_at, last_used_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+               created_by, revoked_at, last_used_at, allowed_ips)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &k.id,
                 &big(k.account)?,
@@ -595,6 +641,7 @@ impl KeyRecords for Postgres {
                 &k.created_by,
                 &k.revoked_at.map(time),
                 &k.last_used.map(time),
+                &k.allowed_ips,
             ],
         )?;
         Ok(())
@@ -643,6 +690,51 @@ impl KeyRecords for Postgres {
             )?;
             Ok(())
         })
+    }
+
+    fn account(&self, account_id: u64) -> Result<Option<Account>, Error> {
+        let row = self.db.get()?.query_opt(
+            "SELECT account_id, display_name, master_account_id FROM accounts WHERE account_id = $1",
+            &[&big(account_id)?],
+        )?;
+        row.map(|r| {
+            Ok(Account {
+                id: unsigned(r.get(0))?,
+                name: r.get(1),
+                dev_token: None,
+                master: r.get::<_, Option<i64>>(2).map(unsigned).transpose()?,
+            })
+        })
+        .transpose()
+    }
+
+    fn create_subaccount(&self, account_id: u64, name: &str, master: u64, now: u64) -> Result<(), Error> {
+        self.db.get()?.execute(
+            "INSERT INTO accounts (account_id, display_name, dev_token_sha256, master_account_id, created_at, updated_at)
+             VALUES ($1, $2, NULL, $3, $4, $4)",
+            &[&big(account_id)?, &name, &big(master)?, &time(now)],
+        )?;
+        Ok(())
+    }
+
+    fn subaccounts_of(&self, master: u64) -> Result<Vec<Account>, Error> {
+        self.db
+            .get()?
+            .query(
+                "SELECT account_id, display_name, master_account_id FROM accounts
+                 WHERE master_account_id = $1 ORDER BY account_id",
+                &[&big(master)?],
+            )?
+            .iter()
+            .map(|r| {
+                Ok(Account {
+                    id: unsigned(r.get(0))?,
+                    name: r.get(1),
+                    dev_token: None,
+                    master: r.get::<_, Option<i64>>(2).map(unsigned).transpose()?,
+                })
+            })
+            .collect()
     }
 
     fn member_by_email(&self, email: &str) -> Result<Option<MemberRow>, Error> {
@@ -995,6 +1087,8 @@ pub fn import(path: &std::path::Path, records: &dyn KeyRecords) -> Result<usize,
                 created_by: r["createdBy"].as_str().map(str::to_string),
                 last_used: None,
                 id,
+                // A key from before the allow-list existed is unrestricted, as any key without one is.
+                allowed_ips: Vec::new(),
             }),
             Some(op @ ("revoke" | "used")) => {
                 let when = r["at"].as_u64().ok_or_else(|| at("no at"))?;
@@ -1025,7 +1119,7 @@ mod tests {
         let db = Database::connect(&config).expect("the test database");
         db.migrate(&venue_store::migrations_dir!()).expect("migrated");
         let records: Arc<dyn KeyRecords> = Arc::new(Postgres::new(db.clone()));
-        let accounts = [1, 2].map(|id| Account { id, name: format!("account {id}"), dev_token: None });
+        let accounts = [1, 2].map(|id| Account { id, name: format!("account {id}"), dev_token: None, master: None });
         records.seed_accounts(&accounts, 1_000).expect("seeded");
         Some((db, records))
     }
@@ -1054,11 +1148,34 @@ mod tests {
     }
 
     #[test]
+    fn subaccounts_are_kept_in_postgres_and_the_family_stays_two_levels_deep() {
+        let Some((db, records)) = postgres("identity_subaccounts") else { return };
+        records.create_subaccount(101, "scalping", 1, 4_000).expect("created");
+        let found = records.account(101).expect("read").expect("exists");
+        assert_eq!((found.name.as_str(), found.master), ("scalping", Some(1)));
+        let listed = records.subaccounts_of(1).expect("listed");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, 101);
+        assert_eq!(records.account(2).expect("read").expect("exists").master, None, "unrelated to account 1");
+
+        // A subaccount cannot itself be a master: the trigger refuses it even bypassing the store.
+        assert!(records.create_subaccount(102, "nested", 101, 4_000).is_err());
+        // A sibling of an existing subaccount is fine.
+        records.create_subaccount(103, "liquidity", 1, 4_000).expect("a sibling subaccount");
+        // And an account that already has subaccounts cannot become one, even by a direct update.
+        let mut conn = db.get().expect("a connection");
+        assert!(
+            conn.execute("UPDATE accounts SET master_account_id = 2 WHERE account_id = 1", &[]).is_err(),
+            "an account with subaccounts of its own cannot become a subaccount"
+        );
+    }
+
+    #[test]
     fn accounts_are_seeded_idempotently_and_a_key_can_only_be_revoked() {
         let Some((db, records)) = postgres("identity_enforced") else { return };
         let catalogue = [
-            Account { id: 1, name: "Market maker".into(), dev_token: Some("dev-market-maker".into()) },
-            Account { id: 2, name: "account 2".into(), dev_token: None },
+            Account { id: 1, name: "Market maker".into(), dev_token: Some("dev-market-maker".into()), master: None },
+            Account { id: 2, name: "account 2".into(), dev_token: None, master: None },
         ];
         records.seed_accounts(&catalogue, 2_000).expect("seeded");
         records.seed_accounts(&catalogue, 3_000).expect("seeded again");
@@ -1080,6 +1197,7 @@ mod tests {
             revoked_at: None,
             created_by: None,
             last_used: None,
+            allowed_ips: Vec::new(),
         };
         records.create(&key).expect("created");
         assert!(records.create(&key).is_err(), "made twice");

@@ -18,11 +18,18 @@ use venue_store::postgres::{Row, Transaction};
 use venue_store::{big, millis, time, unsigned, Database, Migration};
 
 /// The treasury's schema, in order. A released migration is never edited: a change is a new one.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: "20260917000001",
-    name: "ledger",
-    sql: include_str!("../migrations/20260917000001_ledger.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: "20260917000001",
+        name: "ledger",
+        sql: include_str!("../migrations/20260917000001_ledger.sql"),
+    },
+    Migration {
+        version: "20260925000001",
+        name: "internal_transfers",
+        sql: include_str!("../migrations/20260925000001_internal_transfers.sql"),
+    },
+];
 
 pub struct Postgres {
     db: Database,
@@ -70,13 +77,17 @@ fn transfer_from(row: &Row) -> Result<Transfer, Error> {
         client_id: text("client_transfer_id")?,
         kind: Kind::parse(&text("kind")?).ok_or_else(|| bad("an unknown kind"))?,
         amount: unsigned(row.get("amount_cents"))?,
-        method: Method::parse(&text("method")?).ok_or_else(|| bad("an unknown method"))?,
+        method: row
+            .get::<_, Option<String>>("method")
+            .map(|m| Method::parse(&m).ok_or_else(|| bad("an unknown method")))
+            .transpose()?,
         state: State::parse(&text("state")?).ok_or_else(|| bad("an unknown state"))?,
         reason: row.get::<_, Option<String>>("reason").as_deref().and_then(Reason::parse),
         sequence: row.get::<_, Option<i64>>("sequence").map(unsigned).transpose()?,
         created: millis(row.get("created_at")),
         updated: millis(row.get("updated_at")),
         stage,
+        to_account: row.get::<_, Option<i64>>("to_account_id").map(unsigned).transpose()?,
         in_doubt: row.get::<_, Option<SystemTime>>("in_doubt_since").map(millis),
     })
 }
@@ -261,29 +272,30 @@ impl Records for Postgres {
         let in_doubt = t.in_doubt.map(time);
         let (created, updated) = (time(t.created), time(t.updated));
         let (kind, method, state, reason) =
-            (t.kind.name(), t.method.name(), t.state.name(), t.reason.map(Reason::name));
+            (t.kind.name(), t.method.map(Method::name), t.state.name(), t.reason.map(Reason::name));
+        let to_account = t.to_account.map(big).transpose()?;
         self.db.transaction(|tx| {
             // Inserted, or updated if where it stands changed: a repeat of a write already made changes nothing.
             let changed = tx.query_opt(
                 "INSERT INTO transfers AS t (transfer_id, account_id, client_transfer_id, kind, amount_cents, method,
                    state, reason, sequence, stage, due_at, then_state, then_reason, in_doubt_since, created_at,
-                   updated_at, version)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 1)
+                   updated_at, to_account_id, version)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 1)
                  ON CONFLICT (transfer_id) DO UPDATE SET state = EXCLUDED.state, reason = EXCLUDED.reason,
                    sequence = EXCLUDED.sequence, stage = EXCLUDED.stage, due_at = EXCLUDED.due_at,
                    then_state = EXCLUDED.then_state, then_reason = EXCLUDED.then_reason,
                    in_doubt_since = EXCLUDED.in_doubt_since, updated_at = EXCLUDED.updated_at,
                    account_id = EXCLUDED.account_id, client_transfer_id = EXCLUDED.client_transfer_id,
                    kind = EXCLUDED.kind, amount_cents = EXCLUDED.amount_cents, method = EXCLUDED.method,
-                   created_at = EXCLUDED.created_at, version = t.version + 1
+                   created_at = EXCLUDED.created_at, to_account_id = EXCLUDED.to_account_id, version = t.version + 1
                  WHERE (t.state, t.reason, t.sequence, t.stage, t.due_at, t.then_state, t.then_reason,
                         t.in_doubt_since, t.updated_at, t.account_id, t.client_transfer_id, t.kind, t.amount_cents,
-                        t.method, t.created_at)
+                        t.method, t.created_at, t.to_account_id)
                    IS DISTINCT FROM
                        (EXCLUDED.state, EXCLUDED.reason, EXCLUDED.sequence, EXCLUDED.stage, EXCLUDED.due_at,
                         EXCLUDED.then_state, EXCLUDED.then_reason, EXCLUDED.in_doubt_since, EXCLUDED.updated_at,
                         EXCLUDED.account_id, EXCLUDED.client_transfer_id, EXCLUDED.kind, EXCLUDED.amount_cents,
-                        EXCLUDED.method, EXCLUDED.created_at)
+                        EXCLUDED.method, EXCLUDED.created_at, EXCLUDED.to_account_id)
                  RETURNING version",
                 &[
                     &id,
@@ -302,6 +314,7 @@ impl Records for Postgres {
                     &in_doubt,
                     &created,
                     &updated,
+                    &to_account,
                 ],
             )?;
             if let Some(row) = changed {
@@ -559,13 +572,14 @@ mod tests {
             client_id: "same".into(),
             kind: Kind::Deposit,
             amount: 250,
-            method: Method::DummyInstant,
+            method: Some(Method::DummyInstant),
             state: State::Pending,
             reason: None,
             sequence: None,
             created: 1_000,
             updated: 1_000,
             stage: Stage::Granting { then: State::Settled, reason: None },
+            to_account: None,
             in_doubt: None,
         };
         let received = Posting::moving(250, ledger::FBO, ledger::DEPOSITS_IN_TRANSIT).expect("a posting");

@@ -75,6 +75,8 @@ struct Key {
     revoked_at: Option<u64>,
     created_by: Option<String>,
     last_used: Option<u64>,
+    /// Addresses and networks this key may be used from (decision G-23); empty means unrestricted.
+    allowed_ips: Vec<String>,
     /// The last use written to the records.
     written_use: Option<u64>,
 }
@@ -86,7 +88,8 @@ impl Key {
         json!({
             "keyId": self.id, "label": self.label, "permissions": self.permissions.names(),
             "createdAt": clock::rfc3339(self.created_at), "expiresAt": time(self.expires_at),
-            "revokedAt": time(self.revoked_at), "lastUsedAt": time(self.last_used), "createdBy": self.created_by
+            "revokedAt": time(self.revoked_at), "lastUsedAt": time(self.last_used), "createdBy": self.created_by,
+            "allowedIps": self.allowed_ips
         })
     }
 
@@ -106,6 +109,7 @@ impl Key {
             revoked_at: self.revoked_at,
             created_by: self.created_by.clone(),
             last_used: self.last_used,
+            allowed_ips: self.allowed_ips.clone(),
         }
     }
 
@@ -121,6 +125,7 @@ impl Key {
             revoked_at: row.revoked_at,
             created_by: row.created_by,
             last_used: row.last_used,
+            allowed_ips: row.allowed_ips,
             written_use: row.last_used,
         })
     }
@@ -137,6 +142,9 @@ pub struct Verified {
     pub member: Option<String>,
     pub permissions: Permissions,
     pub expires_at: Option<u64>,
+    /// Addresses and networks the key may be used from (decision G-23); empty means unrestricted. Always empty for a
+    /// session, which is a person's, not a bot's, and has no allow-list of its own.
+    pub allowed_ips: Vec<String>,
 }
 
 impl Verified {
@@ -146,7 +154,7 @@ impl Verified {
         json!({
             "keyId": (!session).then(|| self.key_id.clone()), "sessionId": session.then(|| self.key_id.clone()),
             "memberId": self.member, "accountId": self.account.to_string(), "permissions": self.permissions.names(),
-            "expiresAt": self.expires_at.map(clock::rfc3339)
+            "expiresAt": self.expires_at.map(clock::rfc3339), "allowedIps": self.allowed_ips
         })
     }
 }
@@ -285,8 +293,9 @@ impl Store {
     /// checks the key is well formed.
     pub fn create(&self, account: u64, body: &Value, now: u64) -> Result<Value, Refusal> {
         let fields = body.as_object().ok_or_else(|| Refusal::bad("the body must be a JSON object"))?;
-        if let Some(unknown) =
-            fields.keys().find(|k| !["label", "permissions", "expiresAt", "createdBy"].contains(&k.as_str()))
+        if let Some(unknown) = fields
+            .keys()
+            .find(|k| !["label", "permissions", "expiresAt", "createdBy", "allowedIps"].contains(&k.as_str()))
         {
             return Err(Refusal::bad(format!("unknown field {unknown}")));
         }
@@ -329,6 +338,24 @@ impl Store {
                     .to_string(),
             ),
         };
+        let allowed_ips = match fields.get("allowedIps") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(v) => {
+                let entries = v.as_array().ok_or_else(|| Refusal::bad("allowedIps must be a list of addresses"))?;
+                if entries.len() > key::MAX_ALLOWED_IPS {
+                    return Err(Refusal::bad(format!("allowedIps holds at most {} entries", key::MAX_ALLOWED_IPS)));
+                }
+                entries
+                    .iter()
+                    .map(|e| {
+                        e.as_str()
+                            .filter(|ip| key::is_ip_or_network(ip))
+                            .map(str::to_string)
+                            .ok_or_else(|| Refusal::bad("allowedIps entries must be an address or a CIDR network, such as 192.0.2.7 or 10.42.0.0/16"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
         let random = |e: std::io::Error| {
             eprintln!("identity: the random source: {e}");
             Refusal::unavailable("no key could be made; nothing was changed")
@@ -358,6 +385,7 @@ impl Store {
             revoked_at: None,
             created_by,
             last_used: None,
+            allowed_ips,
             written_use: None,
         };
         if let Err(e) = self.records.create(&made.row()) {
@@ -401,6 +429,47 @@ impl Store {
         let revoked = state.keys.get_mut(key_id).ok_or_else(|| Refusal::not_found("no such key of this account"))?;
         revoked.revoked_at = Some(revoked_at);
         Ok(revoked.json())
+    }
+
+    /// Makes a subaccount of `master` (decisions D-33, G-21): `master` must exist and not itself be a subaccount.
+    /// Numbered from the same floor as a member's own account, so it is told apart from the catalogue's at a glance.
+    pub fn create_subaccount(&self, master: u64, body: &Value, now: u64) -> Result<Value, Refusal> {
+        let fields = body.as_object().ok_or_else(|| Refusal::bad("the body must be a JSON object"))?;
+        if let Some(unknown) = fields.keys().find(|k| k.as_str() != "label") {
+            return Err(Refusal::bad(format!("unknown field {unknown}")));
+        }
+        let label = fields
+            .get("label")
+            .and_then(Value::as_str)
+            .filter(|l| (1..=MAX_LABEL).contains(&l.len()) && l.bytes().all(|b| (0x20..=0x7e).contains(&b)))
+            .ok_or_else(|| Refusal::bad(format!("label must be 1 to {MAX_LABEL} printable ASCII characters")))?;
+        let found = self.records.account(master).map_err(records_refusal)?;
+        let found = found.ok_or_else(|| Refusal::not_found("no such account"))?;
+        if found.master.is_some() {
+            return Err(Refusal::bad("a master account may not itself be a subaccount"));
+        }
+        let account_id = self.records.next_account(MEMBER_ACCOUNTS_FROM).map_err(records_refusal)?;
+        self.records.create_subaccount(account_id, label, master, now).map_err(records_refusal)?;
+        locked(&self.state).accounts.insert(account_id);
+        Ok(json!({"accountId": account_id.to_string(), "masterAccountId": master.to_string(), "label": label}))
+    }
+
+    /// Every subaccount of `master`, oldest first.
+    pub fn list_subaccounts(&self, master: u64) -> Result<Value, Refusal> {
+        let subaccounts = self.records.subaccounts_of(master).map_err(records_refusal)?;
+        Ok(json!({
+            "subaccounts": subaccounts.into_iter().map(|a| json!({
+                "accountId": a.id.to_string(), "masterAccountId": master.to_string(), "label": a.name
+            })).collect::<Vec<_>>()
+        }))
+    }
+
+    /// One account's family: its own master, if it has one (decisions D-33, G-21, G-22). Used to check that two
+    /// accounts an internal transfer names share a master before any money moves.
+    pub fn account_family(&self, account_id: u64) -> Result<Value, Refusal> {
+        let found = self.records.account(account_id).map_err(records_refusal)?;
+        let found = found.ok_or_else(|| Refusal::not_found("no such account"))?;
+        Ok(json!({"accountId": found.id.to_string(), "masterAccountId": found.master.map(|m| m.to_string())}))
     }
 
     /// A member signing up. The answer says nothing about whether the email was already somebody's: that would tell
@@ -906,6 +975,7 @@ impl Store {
             member: Some(found.member.clone()),
             permissions: member_permissions(found.verified),
             expires_at: Some(found.expires_at),
+            allowed_ips: Vec::new(),
         };
         let due = found.last_used.is_none_or(|t| now >= t.saturating_add(USED_EVERY_MS));
         if due && self.records.session_used(id, now).is_ok() {
@@ -945,6 +1015,7 @@ impl Store {
             member: None,
             permissions: found.permissions,
             expires_at: found.expires_at,
+            allowed_ips: found.allowed_ips.clone(),
         };
         let due = found.written_use.is_none_or(|t| now >= t.saturating_add(USED_EVERY_MS));
         // A use that cannot be written down is not a reason to refuse the key: it is only ever a minute out.
@@ -1010,7 +1081,8 @@ pub(crate) mod tests {
                 account: 1,
                 member: None,
                 permissions: Permissions::READ.with(Permissions::TRADE),
-                expires_at: None
+                expires_at: None,
+                allowed_ips: Vec::new()
             }
         );
         let wrong = format!("{id}.{}", "0".repeat(64));
@@ -1036,11 +1108,45 @@ pub(crate) mod tests {
             ("a long label", 1, request(&"x".repeat(65), &["read"], None)),
             ("an expiry in the past", 1, request("x", &["read"], Some(NOW - 1))),
             ("an unknown field", 1, json!({"label": "x", "permissions": ["read"], "secret": "mine"})),
+            (
+                "a malformed allowed IP",
+                1,
+                json!({"label": "x", "permissions": ["read"], "allowedIps": ["not-an-address"]}),
+            ),
+            (
+                "an allowed IP with too wide a prefix",
+                1,
+                json!({"label": "x", "permissions": ["read"], "allowedIps": ["10.0.0.0/33"]}),
+            ),
+            (
+                "too many allowed IPs",
+                1,
+                json!({"label": "x", "permissions": ["read"],
+                       "allowedIps": (0..=key::MAX_ALLOWED_IPS).map(|n| format!("10.0.0.{}", n % 256)).collect::<Vec<_>>()}),
+            ),
         ] {
             assert_eq!(store.create(account, &body, NOW).expect_err(why).status, 400, "{why}");
         }
         assert_eq!(store.create(3, &request("x", &["read"], None), NOW).expect_err("no such account").status, 404);
         assert_eq!(store.list(1)["keys"], json!([]));
+    }
+
+    #[test]
+    fn a_key_may_be_restricted_to_an_allow_list_carried_through_verification() {
+        let store = open(&memory());
+        let body = json!({"label": "colo box", "permissions": ["read", "trade"],
+                           "allowedIps": ["192.0.2.7", "10.42.0.0/16"]});
+        let created = store.create(1, &body, NOW).expect("created");
+        assert_eq!(created["allowedIps"], json!(["192.0.2.7", "10.42.0.0/16"]));
+        assert_eq!(store.list(1)["keys"][0]["allowedIps"], json!(["192.0.2.7", "10.42.0.0/16"]));
+        let verified = store.verify(&credential(&created), NOW + 1).expect("valid");
+        assert_eq!(verified.allowed_ips, vec!["192.0.2.7".to_string(), "10.42.0.0/16".to_string()]);
+        assert_eq!(verified.json()["allowedIps"], json!(["192.0.2.7", "10.42.0.0/16"]));
+
+        // A key made with no allowedIps is unrestricted, as every key made before this existed is.
+        let unrestricted = store.create(1, &request("open", &["read"], None), NOW).expect("created");
+        assert_eq!(unrestricted["allowedIps"], json!([]));
+        assert_eq!(store.verify(&credential(&unrestricted), NOW + 1).expect("valid").allowed_ips, Vec::<String>::new());
     }
 
     #[test]
@@ -1079,6 +1185,43 @@ pub(crate) mod tests {
         let listed = store.list(2);
         assert_eq!(listed["keys"][0]["label"], "in its place", "newest first");
         assert_eq!(listed["keys"].as_array().map(Vec::len), Some(MAX_ACTIVE + 1));
+    }
+
+    #[test]
+    fn a_subaccount_shares_its_masters_family_but_not_its_book() {
+        use crate::records::Account;
+        let records = memory();
+        records
+            .seed_accounts(&[Account { id: 1, name: "Market maker".into(), dev_token: None, master: None }], NOW)
+            .expect("seeded");
+        let store = open(&records);
+
+        let created = store.create_subaccount(1, &json!({"label": "scalping"}), NOW).expect("created");
+        assert_eq!(created["masterAccountId"], json!("1"));
+        let sub: u64 = created["accountId"].as_str().expect("an id").parse().expect("a number");
+
+        let listed = store.list_subaccounts(1).expect("listed");
+        assert_eq!(listed["subaccounts"][0]["accountId"], json!(sub.to_string()));
+        assert_eq!(listed["subaccounts"][0]["label"], json!("scalping"));
+
+        let family = store.account_family(sub).expect("family");
+        assert_eq!(family["masterAccountId"], json!("1"));
+        assert_eq!(store.account_family(1).expect("family")["masterAccountId"], Value::Null, "a master has none");
+
+        // A subaccount cannot itself be a master: the family is two levels deep at most.
+        let nested = store.create_subaccount(sub, &json!({"label": "nested"}), NOW).expect_err("nested a subaccount");
+        assert_eq!(nested.status, 400);
+
+        // A key made for the subaccount can create orders for it, but its account is not the master's: the two
+        // cannot be told apart from any other pair of accounts by the identity service alone — that is E-13.1's job.
+        let unrelated = store.create_subaccount(9_999, &json!({"label": "x"}), NOW).expect_err("no such account");
+        assert_eq!(unrelated.status, 404);
+
+        assert_eq!(
+            store.create_subaccount(1, &json!({"label": ""}), NOW).expect_err("empty label").status,
+            400,
+            "a subaccount's label is validated like a key's"
+        );
     }
 
     /// Keys, revocations and uses outlive the store; a secret is never written anywhere.

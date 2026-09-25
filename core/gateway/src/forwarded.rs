@@ -9,6 +9,7 @@
 //! says; flood and logon limits are per account and session, never per address.
 
 use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 
 /// The most of an entry that is not an address (`unknown`, an obfuscated identifier) a record keeps.
 const MAX_OPAQUE: usize = 64;
@@ -52,6 +53,38 @@ impl Network {
             }
             _ => false,
         }
+    }
+}
+
+/// The address a resolved client is carried as: usually bare (`origin.client`, or `origin.ip` with the port left
+/// off), but `address:port` in the last-resort case where a connection had no peer address to fall back to.
+pub fn parse_client(client: &str) -> Option<IpAddr> {
+    IpAddr::from_str(client).ok().or_else(|| SocketAddr::from_str(client).ok().map(|s| s.ip()))
+}
+
+/// The addresses a key may be used from (interfaces/gateway/decisions.md, G-23). Empty means unrestricted, matching
+/// every key made before this existed.
+#[derive(Clone, Debug, Default)]
+pub struct AllowedIps(Vec<Network>);
+
+impl AllowedIps {
+    /// No restriction: a dev token's, a member session's, or a key made with no `allowedIps`.
+    pub const fn unrestricted() -> Self {
+        Self(Vec::new())
+    }
+
+    /// From the addresses and networks the identity service answered, in the same textual form as
+    /// `--trusted-proxies`. The identity service already validated each entry when the key was made; one this cannot
+    /// parse is left out rather than failing the whole credential, so the effect of a bad entry is only that it never
+    /// matches, never that every address does.
+    pub fn from_strings(entries: &[String]) -> Self {
+        Self(entries.iter().filter_map(|e| Network::parse(e).ok()).collect())
+    }
+
+    /// Whether a client at `ip` may use a key with this allow-list. An unrestricted list allows any `ip`, so a client
+    /// address that could not even be resolved is only ever refused for a key that names one.
+    pub fn allows(&self, ip: Option<IpAddr>) -> bool {
+        self.0.is_empty() || ip.is_some_and(|ip| self.0.iter().any(|n| n.contains(ip)))
     }
 }
 
