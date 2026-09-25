@@ -280,7 +280,12 @@ pub enum Undo {
     /// ADR-0001: one shared overflow pool slot, logged before it's written — the same per-slot approach
     /// `Bits` already gets.
     Overflow(u32, OverflowEntry),
-    Scalars { next_trade: u64, free_order: u32, resting_orders: u32, overflow_free: u32 },
+    Scalars {
+        next_trade: u64,
+        free_order: u32,
+        resting_orders: u32,
+        overflow_free: u32,
+    },
 }
 
 impl Default for Undo {

@@ -244,7 +244,10 @@ impl<'a> Engine<'a> {
         let overflow = memory.overflow;
         let overflow_len = overflow.len();
         for (i, e) in overflow.iter_mut().enumerate() {
-            *e = OverflowEntry { next: if i + 1 < overflow_len { i as u32 + 1 } else { NONE }, ..OverflowEntry::default() };
+            *e = OverflowEntry {
+                next: if i + 1 < overflow_len { i as u32 + 1 } else { NONE },
+                ..OverflowEntry::default()
+            };
         }
         let overflow_free = if overflow.is_empty() { NONE } else { 0 };
         Ok(Self {
