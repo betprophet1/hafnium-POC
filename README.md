@@ -14,6 +14,9 @@ Architecture, specifications and the core prototype for the new ProphetX predict
 
 The published blueprint is at https://claude.ai/code/artifact/5e4d2278-46dd-4f2c-a617-da87c3ae0831.
 
+`STATE.md` maps where every kind of state lives, what a restart does with it, how it is archived, and how a test
+environment is founded on a chosen snapshot rather than on genesis.
+
 ## Checking everything
 
 ```sh
