@@ -197,7 +197,7 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool, proxies: 
         public: public.then(|| Arc::clone(&public_half)),
         private: private.then(|| Arc::clone(&gateway)),
     };
-    thread::spawn(move || crate::serve_with(&halves, &listener, MAX_BEHIND));
+    thread::spawn(move || crate::serve_with(&halves, &listener, MAX_BEHIND, None));
     // Up to ten seconds for the feed to deliver the listing to both halves, counted in waits rather than read off a
     // clock.
     for wait in 0.. {
@@ -496,7 +496,7 @@ impl Fleet {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
         let listening = listener.local_addr().expect("its address").to_string();
         let halves = crate::Halves { public: public.clone(), private: private.clone() };
-        thread::spawn(move || crate::serve_with(&halves, &listener, MAX_BEHIND));
+        thread::spawn(move || crate::serve_with(&halves, &listener, MAX_BEHIND, None));
         for half in public.iter().chain(private.iter()) {
             eventually("a gateway's half has the venue from the feed", || half.hub().market(MARKET).is_some());
         }

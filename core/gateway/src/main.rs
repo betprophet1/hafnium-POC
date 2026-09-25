@@ -51,7 +51,7 @@ const USAGE: &str = "usage:
                 [--identity ADDR] [--dev-tokens true] [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
                 [--audit-dir ./gateway-audit] [--audit-instance HOSTNAME] [--audit-fsync true] [--trusted-proxies ADDRS]
                 [--allowed-origins ORIGINS] [--environments FILE] [--from-view FILE]
-                [--metrics ADDR]
+                [--metrics ADDR] [--reactor-threads N]
 
 --serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
 /v4/ws_public and GET /v4/markets; private is orders and accounts on /v4/ws_private, /v4/account and /v4/orders,
@@ -77,6 +77,9 @@ the gateway, an ingress: on a connection from one, the audit log also records th
 Forwarded header names. None by default, and those headers are never believed from any other address.
 --metrics serves Prometheus metrics at http://ADDR/metrics, apart from the client-facing --listen (none by default);
 VENUE_LOG_FORMAT=json writes the log as JSON lines (deploy/observability/metrics.md).
+--reactor-threads sizes the event-loop pool serving connections; without it, the host's own core count is asked
+(capped at 4, since past that on the hosts this was tuned against, contention between reactor threads for the
+same connections' work outweighs the benefit). Size it explicitly on a host with more to give.
 Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
 struct Args(BTreeMap<String, String>);
@@ -196,6 +199,11 @@ fn run(args: &Args) -> Result<(), Error> {
         burst: args.number("burst", 400)?,
         logons_per_minute: args.number("logons-per-minute", 30)?,
     };
+    let reactor_threads = args
+        .optional("reactor-threads")
+        .map(|v| v.parse::<usize>())
+        .transpose()
+        .map_err(|e| format!("--reactor-threads: {e}"))?;
     let serving = args.get("serve", Some("both"))?;
     let (public, private) = match serving.as_str() {
         "both" => (true, true),
@@ -304,7 +312,7 @@ fn run(args: &Args) -> Result<(), Error> {
         "serving",
         &[("listen", &listener.local_addr()?), ("halves", &serving), ("audit_dir", &audit_dir.display())],
     );
-    serve(&halves, &listener);
+    serve(&halves, &listener, reactor_threads);
     Ok(())
 }
 
@@ -377,14 +385,18 @@ fn conflate(gateway: &Arc<Gateway>) {
 const MAX_BEHIND: usize = 4 * 1024 * 1024;
 
 /// Accepts connections for ever and hands each one to an event loop of the half it is for, which serves it whether it
-/// is a WebSocket session or a REST request.
-fn serve(halves: &Halves, listener: &TcpListener) {
-    serve_with(halves, listener, MAX_BEHIND);
+/// is a WebSocket session or a REST request. `reactor_threads` overrides the auto-detected default (`--reactor-threads`,
+/// `VENUE_REACTOR_THREADS`); `None` keeps auto-detecting.
+fn serve(halves: &Halves, listener: &TcpListener, reactor_threads: Option<usize>) {
+    serve_with(halves, listener, MAX_BEHIND, reactor_threads);
 }
 
 /// `serve`, with a WebSocket client allowed to fall `max_behind` bytes behind.
-fn serve_with(halves: &Halves, listener: &TcpListener, max_behind: usize) {
-    let threads = thread::available_parallelism().map_or(2, |n| n.get().min(4));
+fn serve_with(halves: &Halves, listener: &TcpListener, max_behind: usize, reactor_threads: Option<usize>) {
+    // Capped at 4 by default: past that, contention between reactor threads for the same connections' work
+    // outweighs the benefit on the hosts this was tuned against. A host with more to give can say so directly
+    // rather than wait for a higher default that would need retuning for whatever the next host looks like.
+    let threads = reactor_threads.unwrap_or_else(|| thread::available_parallelism().map_or(2, |n| n.get().min(4)));
     let start = |gateway: &Arc<Gateway>| Reactors::start(gateway, threads, max_behind);
     let (public, private) =
         match (halves.public.as_ref().map(start).transpose(), halves.private.as_ref().map(start).transpose()) {
