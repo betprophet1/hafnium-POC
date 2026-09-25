@@ -191,6 +191,12 @@ become one.
 `POST /v4/subaccounts` (REST only, needs `keys`) makes one under the caller's own account, with a `label`; the
 caller's account must not itself be a subaccount. `GET /v4/subaccounts` lists an account's own, oldest first.
 
+Making a subaccount does two things: identity commits it, and the gateway tells the matching engine
+(`SetMasterAccount`, spec E-7.13) so self-match prevention actually protects the family from that moment (D-33). If
+the gateway dies between the two, `POST /v4/subaccounts` answers 503 rather than success, but the subaccount already
+exists in identity, unprotected, until the next minute's reconciliation sweep resends the same command and closes
+the gap on its own (decision G-25) — no restart and no operator needed.
+
 A fresh subaccount has no dev token and no session of its own to make a key with, so the master's own credential
 does it instead: `POST /v4/subaccounts/{accountId}/keys` (and its `GET`/`DELETE`), needing `keys` and that
 `accountId` be one of the caller's own subaccounts — checked fresh against identity on every call, never cached.

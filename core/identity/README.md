@@ -65,6 +65,7 @@ interface 1's terms (`Key`, `KeyCreated`, `Keys`, `Error`), so the gateway passe
 | `POST /v1/accounts/{accountId}/subaccounts` | makes a subaccount of `accountId`, which must exist and not itself be a subaccount: `{"label"}`; answers `{"accountId", "masterAccountId", "label"}` |
 | `GET /v1/accounts/{accountId}/subaccounts` | every subaccount of `accountId`, oldest first |
 | `GET /v1/accounts/{accountId}` | `{"accountId", "masterAccountId"}` (null if `accountId` is not a subaccount), or 404; how the gateway checks two accounts share a family before an internal transfer (interfaces/gateway/decisions.md, G-22) |
+| `GET /v1/subaccounts` | every subaccount in the environment, whoever its master is; not a client route, but how the gateway reconciles the engine's own record of masters against identity's (interfaces/gateway/decisions.md, G-25) |
 | `POST /v1/members` | signs a member up: `email`, `password`, optional `displayName`; makes their account and answers with a session |
 | `POST /v1/sessions` | logs a member in: `email` and `password`, answered as signing up is |
 | `DELETE /v1/sessions/{sessionId}` | ends a session; one already ended is answered as it is |

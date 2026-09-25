@@ -631,8 +631,9 @@ fn set_master_account_command_id(subaccount: u64) -> String {
 /// Both steps must look like they succeeded or neither should: a subaccount identity considers real but the engine
 /// does not protect is exactly the gap subaccounts exist to close. If the engine step fails after identity has
 /// already committed the subaccount, this answers 503 rather than the identity service's 200 — the subaccount
-/// exists and can be retried (`SetMasterAccount` is the same idempotent command every time for the same account,
-/// safe to send again), but it is not yet protected, and the caller must not be told otherwise.
+/// exists and is not yet protected, and the caller must not be told otherwise. It does not stay that way for long
+/// unattended: `reconcile_subaccounts` resends the same idempotent command for every subaccount identity holds,
+/// once a minute, and closes exactly this gap without an operator (decision G-25).
 fn create_subaccount(gateway: &Gateway, master: u64, body: Vec<u8>, notify: Notify) -> Result<Call, ApiError> {
     let address = gateway.identity.address()?.to_string();
     let ingress = gateway.ingress_handle()?;
@@ -662,15 +663,25 @@ fn subaccount_created(address: &str, master: u64, body: &[u8], ingress: &Submit)
         .as_str()
         .and_then(|s| s.parse::<u64>().ok())
         .ok_or("identity's answer named no accountId")?;
+    send_set_master_account(ingress, subaccount, master)?;
+    Ok(crate::http::response(200, &created, &[]))
+}
+
+/// Sends `SetMasterAccount` (E-7.13) for `account`/`master` and returns the outcome the sequencer group gave it —
+/// `"APPLIED"` the first time, `"DUPLICATE"` for any resend, since the command ID is fixed by `account` alone. An
+/// `Err` covers everything else: the sequencer group refusing it (which should not happen, since identity's own
+/// checks mirror E-7.13's before a subaccount is ever made), or not answering at all.
+fn send_set_master_account(ingress: &Submit, account: u64, master: u64) -> Result<&'static str, String> {
     let input = wire::command(
         "SetMasterAccount",
-        set_master_account_command_id(subaccount),
-        json!({"accountId": subaccount, "masterAccountId": master}),
+        set_master_account_command_id(account),
+        json!({"accountId": account, "masterAccountId": master}),
     );
     let results = ingress.send(input).map_err(|e| e.to_string())?;
     let applied = results.iter().find(|r| r["msg"] == "CommandApplied").ok_or("no CommandApplied in the answer")?;
     match applied["outcome"].as_str() {
-        Some("APPLIED" | "DUPLICATE") => Ok(crate::http::response(200, &created, &[])),
+        Some("APPLIED") => Ok("APPLIED"),
+        Some("DUPLICATE") => Ok("DUPLICATE"),
         _ => Err(format!("SetMasterAccount was not applied: {applied}")),
     }
 }
@@ -700,6 +711,92 @@ fn subaccount_call(address: &str, master: u64, body: &[u8]) -> Result<(u16, Valu
     let status = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or("a response with no status")?;
     let answer = serde_json::from_str(body).map_err(|e| format!("a response that is not JSON: {e}"))?;
     Ok((status, answer))
+}
+
+/// How often `reconcile_subaccounts` sweeps: the treasury's own reconciliation runs every minute by default
+/// (`core/treasury/README.md`, `--reconcile-every-ms`), and there is no reason this needs to be more prompt — a gap
+/// only opens if the gateway died between identity committing a subaccount and `SetMasterAccount` being sent, which
+/// is rare, and the sweep is what closes it within a bounded time rather than leaving it to an operator to notice.
+const RECONCILE_EVERY: Duration = Duration::from_secs(60);
+
+/// The treasury reconciles its own records against the bank and the journal because deposits and withdrawals can
+/// disagree with what actually happened; subaccounts have the same shape of problem for a much smaller fact —
+/// identity commits a subaccount and the gateway tells the engine about it in two separate steps
+/// (`create_subaccount`), and a crash between them leaves identity certain of a family the engine has never heard
+/// of. This is that reconciliation: resend `SetMasterAccount` for every subaccount identity knows about. There is
+/// nothing to compare it against first, because the command is idempotent and a resend of one already applied
+/// (E-7.1) costs one round trip and changes nothing — so, unlike the treasury, this finds nothing to leave open for
+/// an operator; every gap it can see, it closes in the same sweep.
+///
+/// Runs on every gateway that has both an identity service and an ingress (the private half only), for as long as
+/// the gateway lives; redundant across several such gateways (decision G-13), but harmless, since every resend is
+/// safe.
+pub fn reconcile_subaccounts(gateway: &Arc<Gateway>) {
+    if !gateway.identity.serves_keys() || gateway.ingress_handle().is_err() {
+        return;
+    }
+    let half = Arc::downgrade(gateway);
+    thread::spawn(move || loop {
+        thread::sleep(RECONCILE_EVERY);
+        let Some(gateway) = half.upgrade() else { return };
+        if let Err(e) = reconcile_subaccounts_once(&gateway) {
+            log::warn("reconciling subaccounts", &[("error", &e)]);
+        }
+    });
+}
+
+fn reconcile_subaccounts_once(gateway: &Gateway) -> Result<(), String> {
+    let address = gateway.identity.address().map_err(|e| e.body().to_string())?;
+    let subaccounts = all_subaccounts_call(address)?;
+    if subaccounts.is_empty() {
+        return Ok(());
+    }
+    let ingress = gateway.ingress_handle().map_err(|e| e.body().to_string())?;
+    let mut fixed = 0u64;
+    for s in &subaccounts {
+        let (Some(account), Some(master)) = (
+            s["accountId"].as_str().and_then(|v| v.parse::<u64>().ok()),
+            s["masterAccountId"].as_str().and_then(|v| v.parse::<u64>().ok()),
+        ) else {
+            continue;
+        };
+        match send_set_master_account(&ingress, account, master) {
+            Ok("APPLIED") => fixed += 1,
+            Ok(_) => {}
+            Err(e) => log::warn("reconciling a subaccount", &[("accountId", &account), ("error", &e)]),
+        }
+    }
+    if fixed > 0 {
+        log::warn(
+            "reconciled subaccounts the engine had not yet protected",
+            &[("count", &fixed), ("of", &subaccounts.len())],
+        );
+    }
+    Ok(())
+}
+
+/// Every subaccount in the environment (`GET /v1/subaccounts`), for `reconcile_subaccounts`.
+fn all_subaccounts_call(address: &str) -> Result<Vec<Value>, String> {
+    let socket = address
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .next()
+        .ok_or_else(|| format!("{address} resolves to nothing"))?;
+    let mut stream = TcpStream::connect_timeout(&socket, VERIFY_TIMEOUT).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(VERIFY_TIMEOUT)).map_err(|e| e.to_string())?;
+    stream.set_write_timeout(Some(VERIFY_TIMEOUT)).map_err(|e| e.to_string())?;
+    let request = b"GET /v1/subaccounts HTTP/1.1\r\nHost: identity\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    stream.write_all(request).map_err(|e| e.to_string())?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&response);
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("a response with no head")?;
+    let status: u16 = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or("a response with no status")?;
+    if status != 200 {
+        return Err(format!("identity answered {status}: {body}"));
+    }
+    let answer: Value = serde_json::from_str(body).map_err(|e| format!("a response that is not JSON: {e}"))?;
+    Ok(answer["subaccounts"].as_array().cloned().unwrap_or_default())
 }
 
 /// `/v4/subaccounts/{accountId}/keys`: the master's own way to give a subaccount its first key, since a subaccount
@@ -771,7 +868,7 @@ fn beyond_the_creator(creator: &Credential, asked: Permissions, expires_at: Opti
 /// Who may do what with API keys, against a gateway, a node, a treasury and an identity service, all real.
 #[cfg(test)]
 mod tests {
-    use super::Identity;
+    use super::{reconcile_subaccounts_once, subaccount_call, Identity};
     use crate::api::{Gateway, Limits};
     use crate::hub::Hub;
     use crate::limits::monotonic;
@@ -964,6 +1061,72 @@ mod tests {
         let (status, _) = request(a, "POST", "/v4/orders", Some(RETAIL_TOKEN), Some(&taker));
         assert_eq!(status, 200);
         eventually("the unrelated buy fills the master's resting sell", || resting_orders(MAKER_TOKEN) == Some(0));
+    }
+
+    /// The gap `reconcile_subaccounts` exists to close: identity commits a subaccount through its own real path
+    /// (so its caches stay consistent, exactly like a genuine request would leave them), and the gateway never
+    /// gets to tell the engine — as if it had died between the two steps of `create_subaccount`. Before
+    /// reconciliation runs, the family trades against itself freely, because the engine has never heard of it;
+    /// after one sweep, it cannot, with no restart and no operator involved.
+    #[test]
+    fn reconciliation_protects_a_subaccount_the_gateway_never_told_the_engine_about() {
+        let venue = testing::venue_with_treasury("subaccount-reconcile");
+        let a = &venue.address;
+        let address = venue.gateway.identity.address().expect("an identity address").to_string();
+
+        let (status, created) = subaccount_call(&address, MAKER, json!({"label": "orphaned"}).to_string().as_bytes())
+            .expect("identity answered");
+        assert_eq!(status, 200, "{created}");
+        let sub_id: u64 = created["accountId"].as_str().expect("an id").parse().expect("a number");
+
+        // Its key is made normally: that path does not depend on the engine having heard of the subaccount.
+        let key_path = format!("/v4/subaccounts/{sub_id}/keys");
+        let (status, key) = request(
+            a,
+            "POST",
+            &key_path,
+            Some(MAKER_TOKEN),
+            Some(&json!({"label": "bot", "permissions": ["read", "trade", "transfers"]})),
+        );
+        assert_eq!(status, 200, "{key}");
+        let sub_cred =
+            format!("{}.{}", key["keyId"].as_str().expect("an id"), key["secret"].as_str().expect("a secret"));
+        let opening =
+            json!({"clientTransferId": "open", "kind": "deposit", "amountCents": 5_000, "method": "dummy_instant"});
+        let (status, opened) = request(a, "POST", "/v4/transfers", Some(&sub_cred), Some(&opening));
+        assert_eq!((status, opened["state"].as_str()), (200, Some("settled")), "{opened}");
+        let available = |token: &str| {
+            request(a, "GET", "/v4/account", Some(token), None).1["availableCents"].as_i64().unwrap_or(i64::MIN)
+        };
+        eventually("the opening deposit reaches available cash", || available(&sub_cred) == 5_000);
+
+        let resting_orders =
+            |token: &str| request(a, "GET", "/v4/account", Some(token), None).1["orders"].as_array().map(Vec::len);
+
+        // Before reconciliation: unprotected. The engine has never been told these two share a family, so a fill
+        // between them goes through as if they were strangers.
+        let before_sell = json!({"clientOrderId": "before-sell", "instrumentId": MARKET.to_string(), "action": "sell",
+                                  "outcome": "yes", "price": {"tick": 7}, "quantity": 2});
+        request(a, "POST", "/v4/orders", Some(MAKER_TOKEN), Some(&before_sell));
+        let before_buy = json!({"clientOrderId": "before-buy", "instrumentId": MARKET.to_string(), "action": "buy",
+                                 "outcome": "yes", "price": {"tick": 7}, "quantity": 2});
+        request(a, "POST", "/v4/orders", Some(&sub_cred), Some(&before_buy));
+        eventually("unprotected: the trade fills before reconciliation runs", || {
+            resting_orders(MAKER_TOKEN) == Some(0)
+        });
+
+        reconcile_subaccounts_once(&venue.gateway).expect("reconciled");
+
+        // After one sweep, a fresh pair of orders behaves the way it always should have.
+        let after_sell = json!({"clientOrderId": "after-sell", "instrumentId": MARKET.to_string(), "action": "sell",
+                                 "outcome": "yes", "price": {"tick": 8}, "quantity": 2});
+        request(a, "POST", "/v4/orders", Some(MAKER_TOKEN), Some(&after_sell));
+        eventually("the master's second sell rests", || resting_orders(MAKER_TOKEN) == Some(1));
+        let after_buy = json!({"clientOrderId": "after-buy", "instrumentId": MARKET.to_string(), "action": "buy",
+                                "outcome": "yes", "price": {"tick": 8}, "quantity": 2});
+        request(a, "POST", "/v4/orders", Some(&sub_cred), Some(&after_buy));
+        eventually("protected: self-match prevented after reconciliation", || resting_orders(&sub_cred) == Some(0));
+        assert_eq!(resting_orders(MAKER_TOKEN), Some(1), "the master's resting sell is untouched");
     }
 
     #[test]
