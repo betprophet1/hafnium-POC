@@ -26,6 +26,7 @@ python3 "$ROOT/interfaces/tools/audit_ship.py" --self-test
 python3 "$ROOT/interfaces/tools/snapshot_publish.py" --self-test
 python3 "$ROOT/interfaces/tools/snapshot_fetch.py" --self-test
 python3 "$ROOT/interfaces/tools/journal_ship.py" --self-test
+python3 "$ROOT/interfaces/tools/db_archive.py" --self-test
 
 step "Reference model: normative scenarios and random sequences"
 python3 "$ROOT/spec/engine/reference/run_scenarios.py"

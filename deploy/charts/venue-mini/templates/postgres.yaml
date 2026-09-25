@@ -146,7 +146,10 @@ spec:
   policyTypes: [Ingress]
   ingress:
     - from:
-        {{- range $component := concat $services (list "migrate") }}
+        {{- /* `dbarchive` is here unconditionally: when database.archive is off nothing carries that label, so
+               this allows nothing. Leaving it out instead would make the CronJob's pods fail to reach 5432 with
+               a connection timeout, which reads like a database problem rather than a policy one. */ -}}
+        {{- range $component := concat $services (list "migrate" "dbarchive") }}
         - podSelector:
             matchLabels:
               {{- include "venue-mini.selector" (dict "ctx" $ "component" $component) | nindent 14 }}
