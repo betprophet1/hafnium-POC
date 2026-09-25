@@ -66,6 +66,7 @@ fn a_restored_view_plus_the_tail_equals_having_applied_everything() {
     assert_eq!(resumed.sequence, 62, "the snapshot was not taken where it was asked for");
 
     for unit in wire::replayed_units(&journal, &results).expect("units") {
+        let unit = unit.expect("a unit");
         if unit.input["record"]["sequence"].as_u64().unwrap_or(0) <= 62 {
             continue;
         }

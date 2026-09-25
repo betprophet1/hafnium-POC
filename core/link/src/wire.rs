@@ -1,7 +1,6 @@
 //! Talking to a node: inputs through the ingress, everything that happened through the feed.
 
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
@@ -78,34 +77,92 @@ pub struct Unit {
 /// earlier sequence can sit physically *after* later inputs. Applied as though it were an input, its record
 /// header drags a reader's own position backwards, and a reader that then resumed from there would be re-sent
 /// inputs it had already applied.
-pub fn replayed_units(journal: &Path, results: &Path) -> Result<Vec<Unit>, Error> {
-    let mut by_input: BTreeMap<u64, Vec<Value>> = BTreeMap::new();
-    for result in frames_of(results)? {
-        by_input.entry(result["result"]["inputSequence"].as_u64().unwrap_or(0)).or_default().push(result);
-    }
-    let mut units = Vec::new();
-    for input in frames_of(journal)? {
-        if input["msg"] == "Snapshot" {
-            continue;
-        }
-        let sequence = input["record"]["sequence"].as_u64().unwrap_or(0);
-        let results = by_input.remove(&sequence).unwrap_or_default();
-        units.push(Unit { input, results });
-    }
-    Ok(units)
+/// **Neither file is held in memory.** This used to decode the whole journal and the whole result log into
+/// `Vec<Value>` before pairing them, which is fine on a fixture and not fine on a venue: taking a snapshot pair
+/// from the live journal — 780,000 units — peaked at **3.6 GB**, against a scheduled job's 512 MiB on an 8 GB
+/// node that also runs the venue. The cost grew with the length of history rather than with the size of the
+/// state, so it got worse every day and no amount of cutting the *engine's* work helped, because the
+/// materialising happened before any of it.
+///
+/// Both files are in sequence order — the node appends an input and then the results of applying it — so they
+/// can be walked in lockstep, and nothing bigger than one unit is ever live. That order is the one assumption
+/// here, and it is the same one `results_cut_offset` and `trusted_results` already make. A result naming an
+/// input the journal no longer carries (a journal `cut` past it) is skipped rather than kept for a sequence
+/// that will never arrive.
+pub fn replayed_units(journal: &Path, results: &Path) -> Result<Units, Error> {
+    Ok(Units { journal: Frames::open(journal)?, results: Frames::open(results)?.peekable() })
 }
 
-/// Every frame of a journal or result log, decoded. A file cut off mid-frame ends where it was cut, as the node's own
-/// reader treats it.
-fn frames_of(path: &Path) -> Result<Vec<Value>, Error> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let (mut frame, mut out) = (Vec::new(), Vec::new());
-    loop {
-        match read_frame(&mut reader, &mut frame) {
-            Ok(Some(n)) => out.push(codec::decode(&frame[..n])?),
-            Ok(None) => return Ok(out),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(out),
-            Err(e) => return Err(e.into()),
+/// The units of a journal and its result log, one at a time.
+pub struct Units {
+    journal: Frames,
+    results: std::iter::Peekable<Frames>,
+}
+
+impl Iterator for Units {
+    type Item = Result<Unit, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let input = match self.journal.next()? {
+                Ok(input) => input,
+                Err(e) => return Some(Err(e)),
+            };
+            if input["msg"] == "Snapshot" {
+                continue;
+            }
+            let sequence = input["record"]["sequence"].as_u64().unwrap_or(0);
+
+            let mut results = Vec::new();
+            loop {
+                // Peek before taking, so the borrow is released before the results are advanced.
+                let wanted = match self.results.peek() {
+                    Some(Ok(result)) => result["result"]["inputSequence"].as_u64().unwrap_or(0) <= sequence,
+                    Some(Err(_)) => true,
+                    None => false,
+                };
+                if !wanted {
+                    break;
+                }
+                match self.results.next() {
+                    // Equal: this input's own results. Lower: a result for an input this journal no longer
+                    // carries, which is dropped rather than attached to the wrong input.
+                    Some(Ok(result)) => {
+                        if result["result"]["inputSequence"].as_u64().unwrap_or(0) == sequence {
+                            results.push(result);
+                        }
+                    }
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => break,
+                }
+            }
+            return Some(Ok(Unit { input, results }));
+        }
+    }
+}
+
+/// Every frame of a journal or result log, decoded, one at a time. A file cut off mid-frame ends where it was
+/// cut, as the node's own reader treats it.
+struct Frames {
+    reader: BufReader<File>,
+    frame: Vec<u8>,
+}
+
+impl Frames {
+    fn open(path: &Path) -> Result<Self, Error> {
+        Ok(Self { reader: BufReader::new(File::open(path)?), frame: Vec::new() })
+    }
+}
+
+impl Iterator for Frames {
+    type Item = Result<Value, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match read_frame(&mut self.reader, &mut self.frame) {
+            Ok(Some(n)) => Some(codec::decode(&self.frame[..n]).map_err(Into::into)),
+            Ok(None) => None,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
+            Err(e) => Some(Err(e.into())),
         }
     }
 }
