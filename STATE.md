@@ -60,6 +60,16 @@ exactly. The node then restarted by replaying **4 inputs instead of 1,878,320**.
 A `Snapshot` of this venue is ~650 KB, which is why `MAX_FRAME` had to stop applying to it: the input bound is
 64 KiB, and a venue that has traded for a few hours cannot snapshot itself under it (`core/node/src/frames.rs`).
 
+**Reading it back.** `venue-node restore-cut SEGMENT JOURNAL RESULTS OUT` puts an archived segment back in front
+of the journal it was cut from. It exists as much to be *tested* as to be run: an archive nobody has ever read
+back is bytes, not a record.
+
+The restored journal is deliberately **not** byte-identical to the one that was cut — `embed` appends wherever
+the file ends, so the original carried its `Snapshot` at the tail, after inputs with higher sequences, while a
+restored journal carries it in the middle. Position has never meant anything in a journal (§3.7 of the handoff).
+What holds is that a replay of the restored journal produces the same result log as a replay of the original,
+byte for byte, and that is what the test asserts.
+
 ---
 
 ## 3. What a restart actually does
@@ -98,10 +108,29 @@ Two halves because of a dependency direction: `venue-link` depends on `venue-nod
 reader's projection**. The engine's snapshot is not a view and cannot be turned into one without replaying.
 
 ```sh
-venue-view snapshot journal.sbe ./pair --at N --results results.sbe   # both halves, or it refuses
+venue-view snapshot journal.sbe ./pair --at trusted --results results.sbe [--from-pair ./previous]
 venue-node seed ./pair/engine.snapshot ./venue-data --capacity small  # a journal holding one Snapshot frame
 venue-gateway --from-view ./pair/view.json ...                        # and the readers
 ```
+
+**A journal that has been `cut` cannot give a pair on its own — it needs the previous one.** This is the single
+most important operational fact here, because the failure it prevents is silent. The engine half copes alone: it
+restores from the snapshot the journal was cut to. The view half cannot. A view is built by applying units in
+order from an empty state, and the units before the cut are gone, so replaying one from nothing yields a view
+holding **only what followed the cut** — with no error, and a `sequence` that still matches the engine's. The
+two halves would agree with each other and both be wrong. `--from-pair` names the previously published pair to
+carry on from, and `pair::take` refuses a cut journal without one, and a previous view older than what the
+journal still carries.
+
+That also makes each pair depend on its predecessor, which is why there is a *chain* rather than independent
+snapshots, and why a venue whose journal has been cut needs one pair published by hand before a scheduled job
+can take over.
+
+**`--at trusted` rather than a sequence.** A pair can only be taken as far as the *result log* reaches, which is
+not as far as the journal: inputs that produce nothing leave no group behind, and `cut` drops the last
+unconfirmed one. Asking for more does not fail — `View::apply` advances the view's sequence for an input whether
+or not results came with it — so a pair taken at the journal's end can claim a sequence whose effects it never
+saw. Both halves are pinned to what the results cover, and an explicit `--at` beyond it is refused.
 
 `seed` refuses a data directory that already has a journal, so it cannot silently replace a real environment's
 history. The node then starts at exactly that sequence with no history of its own before it — `founded_only`
@@ -165,15 +194,65 @@ The prefixes are deliberately separate so a lifecycle rule written for one canno
 at all**, so their objects sit in Standard indefinitely. That is correct for history nothing should ever delete,
 and it is a cost decision being made by omission.
 
+Every object has a `.sha256` beside it, written after the upload has been read back and compared — nothing is
+reported archived that has not been verified in place. A pair is four objects, because its halves carry
+**separate** sidecars:
+
+```
+snapshots/prod/20260925T184939Z.engine.snapshot   .engine.sha256
+snapshots/prod/20260925T184939Z.view.json         .view.sha256
+```
+
+The half is part of the tag rather than only the suffix, and that is not cosmetic: the sidecar's key is derived
+from the tag, so two halves sharing one tag shared one sidecar, and the second upload silently overwrote the
+first's digest. `journal_ship.py` names its two halves the same way, for the same reason. The newest pair is
+found by sorting these tags, which is why a tag must be a UTC stamp — a descriptive one like `bootstrap` sorts
+above every timestamp and would pin the chain to itself for ever.
+
 ---
 
-## 7. What is not done
+## 7. What runs on a schedule, and how to tell it still is
 
-- **Nothing schedules a journal cut.** It is three commands run by hand, and it needs the node stopped, because
-  there is no lock on a journal.
+Three CronJobs, all in the `venue` namespace, all off by default in the chart and on in prod:
+
+| | when | what it does | chart key |
+|---|---|---|---|
+| `venue-archive` | hourly, `:17` | ships closed audit files, then unlinks them | `gateway.audit.archive` |
+| `venue-dbarchive-*` | daily, 02:43 | one verified `pg_dump` per database | `database.archive` |
+| `venue-snapshot` | daily, 03:13 | takes a pair and publishes it | `core.snapshots` |
+
+**Only one of these complains when it stops.** The audit shipper's volume fills up and eventually the gateway
+cannot write, so silence there becomes loud on its own. Nothing downstream of the other two fills up: a database
+that is not being dumped and a venue that is not producing pairs look exactly like ones that are. Both failed
+silently at least once while being built, and both times it was found by running the job by hand rather than
+waiting for the schedule. **Do that after any change to either.**
+
+```sh
+kubectl -n venue create job --from=cronjob/venue-snapshot check-it
+kubectl -n venue logs job/check-it -c take        # and -c previous, -c publish
+```
+
+Note the Job controller deletes a failed pod within seconds and takes its logs with it, so read the logs while
+it runs, or the events afterwards (`kubectl -n venue get events`). What is actually in object storage is the
+only answer that settles it:
+
+```sh
+aws s3 ls s3://BUCKET/snapshots/prod/     # newest pair, and its two sidecars
+aws s3 ls s3://BUCKET/databases/prod/     # one dump per database per day
+```
+
+A job that refuses is doing its job. `venue-snapshot` refusing with *"was cut at N ... give the previously
+published view half"* means the chain has no start — publish one pair by hand (§4) and it recovers by itself.
+
+## 8. What is not done
+
+- **Nothing schedules a journal cut.** It is three commands run by hand and it needs the node stopped, because
+  there is no lock on a journal, so it stays a deliberate act rather than a cron entry.
 - **No chart passes `--from-view`.** Founding works and is proven twice over, but no deployed service uses it, so
-  every deploy still restarts readers into a replay.
-- **Restoring a database is manual.** The dumps are verified restorable; nothing automates putting one back.
+  every deploy still restarts readers into a replay. This is the largest remaining gap: it is what would make a
+  deploy cost seconds rather than a full backlog.
+- **Restoring a database is manual.** The dumps are verified restorable — `pg_restore --list` at archive time,
+  and a real restore into a fresh database once — but nothing automates putting one back.
 - **Interface 29 is unbuilt** — no store has a retention policy, only a copy.
-- **The snapshot pair is not taken automatically.** A live node never embeds its own snapshot; it is an offline
-  operation against a stopped node.
+- **A live node never embeds its own snapshot.** Taking a pair needs no downtime and is scheduled; *embedding*
+  one and cutting still need the writer stopped.
