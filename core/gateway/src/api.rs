@@ -441,6 +441,13 @@ impl Gateway {
         self.ingress.as_ref().ok_or_else(|| ApiError::not_found("orders are served on the private half"))
     }
 
+    /// An owned handle to the same ingress, for a caller that needs to reach the sequencer group from a thread of
+    /// its own — orchestrating a service call and a command together, say — rather than borrow one that outlives
+    /// it (`identity.rs`, subaccount creation).
+    pub(crate) fn ingress_handle(&self) -> Result<Submit, ApiError> {
+        self.ingress().cloned()
+    }
+
     pub fn hub(&self) -> MutexGuard<'_, Hub> {
         locked(&self.hub)
     }

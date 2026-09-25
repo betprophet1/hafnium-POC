@@ -30,7 +30,8 @@ use std::time::{Duration, Instant};
 use venue_identity::clock;
 use venue_identity::key::{self, Permissions};
 use venue_identity::member;
-use venue_link::submit::Notify;
+use venue_link::submit::{Notify, Submit};
+use venue_link::wire;
 use venue_telemetry::log;
 
 /// How long an answer about a credential is taken as true.
@@ -611,9 +612,94 @@ pub fn subaccounts(
     let path = format!("/v1/accounts/{}/subaccounts", credential.account);
     match request.method.as_str() {
         "GET" => identity.pass_to("GET", &path, &[], notify),
-        "POST" => identity.pass_to("POST", &path, &request.body, notify),
+        "POST" => create_subaccount(gateway, credential.account, request.body.clone(), notify),
         _ => Err(ApiError::not_found("no such route")),
     }
+}
+
+/// A command ID `SetMasterAccount` for `subaccount` can always be resent under (E-7.1): one letter, so it cannot be
+/// mistaken for the treasury's own scheme (`T` + hex, `treasury.rs::command_id`), then the account's ID in hex,
+/// wide enough that any u64 fits without truncation — `CommandId` is 16 bytes exactly, and this is 16 characters.
+fn set_master_account_command_id(subaccount: u64) -> String {
+    format!("M{subaccount:015x}")
+}
+
+/// `POST /v4/subaccounts`: makes the subaccount in identity, then tells the engine the two accounts share a family
+/// for self-match prevention (`SetMasterAccount`, decisions D-33, G-21, E-7.13) — spawned on a thread of its own,
+/// as every call to a service already is, so this blocks no one else.
+///
+/// Both steps must look like they succeeded or neither should: a subaccount identity considers real but the engine
+/// does not protect is exactly the gap subaccounts exist to close. If the engine step fails after identity has
+/// already committed the subaccount, this answers 503 rather than the identity service's 200 — the subaccount
+/// exists and can be retried (`SetMasterAccount` is the same idempotent command every time for the same account,
+/// safe to send again), but it is not yet protected, and the caller must not be told otherwise.
+fn create_subaccount(gateway: &Gateway, master: u64, body: Vec<u8>, notify: Notify) -> Result<Call, ApiError> {
+    let address = gateway.identity.address()?.to_string();
+    let ingress = gateway.ingress_handle()?;
+    let (tx, response) = sync_channel(1);
+    thread::spawn(move || {
+        let answer = subaccount_created(&address, master, &body, &ingress).unwrap_or_else(|e| {
+            log::warn("creating a subaccount", &[("identity", &address), ("error", &e)]);
+            crate::rest::response(Err(ApiError::unavailable(&format!(
+                "the subaccount was made but its protection from the sequencer group could not be confirmed: {e}"
+            ))))
+        });
+        let _ = tx.send(answer);
+        notify();
+    });
+    Ok(Call::new(response))
+}
+
+/// The identity call and the engine command in order, as raw response bytes ready to send back — or `Err` if
+/// either step could not be completed, for the caller to turn into a 503.
+fn subaccount_created(address: &str, master: u64, body: &[u8], ingress: &Submit) -> Result<Vec<u8>, String> {
+    let (status, created) = subaccount_call(address, master, body)?;
+    if status != 200 {
+        // Identity refused it (a malformed label, or master itself being a subaccount): nothing to protect.
+        return Ok(crate::http::response(status, &created, &[]));
+    }
+    let subaccount = created["accountId"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or("identity's answer named no accountId")?;
+    let input = wire::command(
+        "SetMasterAccount",
+        set_master_account_command_id(subaccount),
+        json!({"accountId": subaccount, "masterAccountId": master}),
+    );
+    let results = ingress.send(input).map_err(|e| e.to_string())?;
+    let applied = results.iter().find(|r| r["msg"] == "CommandApplied").ok_or("no CommandApplied in the answer")?;
+    match applied["outcome"].as_str() {
+        Some("APPLIED" | "DUPLICATE") => Ok(crate::http::response(200, &created, &[])),
+        _ => Err(format!("SetMasterAccount was not applied: {applied}")),
+    }
+}
+
+/// One `POST /v1/accounts/{master}/subaccounts`.
+fn subaccount_call(address: &str, master: u64, body: &[u8]) -> Result<(u16, Value), String> {
+    let socket = address
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .next()
+        .ok_or_else(|| format!("{address} resolves to nothing"))?;
+    let mut stream = TcpStream::connect_timeout(&socket, VERIFY_TIMEOUT).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(VERIFY_TIMEOUT)).map_err(|e| e.to_string())?;
+    stream.set_write_timeout(Some(VERIFY_TIMEOUT)).map_err(|e| e.to_string())?;
+    let path = format!("/v1/accounts/{master}/subaccounts");
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: identity\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body);
+    stream.write_all(&request).map_err(|e| e.to_string())?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&response);
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("a response with no head")?;
+    let status = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or("a response with no status")?;
+    let answer = serde_json::from_str(body).map_err(|e| format!("a response that is not JSON: {e}"))?;
+    Ok((status, answer))
 }
 
 /// `/v4/subaccounts/{accountId}/keys`: the master's own way to give a subaccount its first key, since a subaccount
@@ -817,6 +903,67 @@ mod tests {
             !own.to_string().contains(created["keyId"].as_str().expect("an id")),
             "leaked into the master's own list: {own}"
         );
+    }
+
+    /// The point of the whole feature (decisions D-33, G-21, G-22): creating a subaccount through the gateway does
+    /// not just record the relationship in identity, it tells the real matching engine, so a subaccount and its
+    /// master — and two subaccounts of the same master — are refused a fill against each other from the moment
+    /// the subaccount exists, exactly as an account is refused against itself.
+    #[test]
+    fn a_subaccount_cannot_fill_against_its_master_in_the_real_engine() {
+        let venue = testing::venue_with_treasury("subaccount-self-match");
+        let a = &venue.address;
+
+        let (status, sub) =
+            request(a, "POST", "/v4/subaccounts", Some(MAKER_TOKEN), Some(&json!({"label": "scalping"})));
+        assert_eq!(status, 200, "{sub}");
+        let sub_id: u64 = sub["accountId"].as_str().expect("an id").parse().expect("a number");
+        let key_path = format!("/v4/subaccounts/{sub_id}/keys");
+        let (status, key) = request(
+            a,
+            "POST",
+            &key_path,
+            Some(MAKER_TOKEN),
+            Some(&json!({"label": "bot", "permissions": ["read", "trade", "transfers"]})),
+        );
+        assert_eq!(status, 200, "{key}");
+        let sub_cred =
+            format!("{}.{}", key["keyId"].as_str().expect("an id"), key["secret"].as_str().expect("a secret"));
+
+        // The subaccount needs money of its own to place an order with.
+        let opening =
+            json!({"clientTransferId": "open", "kind": "deposit", "amountCents": 5_000, "method": "dummy_instant"});
+        let (status, opened) = request(a, "POST", "/v4/transfers", Some(&sub_cred), Some(&opening));
+        assert_eq!((status, opened["state"].as_str()), (200, Some("settled")), "{opened}");
+        let available = |token: &str| {
+            request(a, "GET", "/v4/account", Some(token), None).1["availableCents"].as_i64().unwrap_or(i64::MIN)
+        };
+        eventually("the opening deposit reaches available cash", || available(&sub_cred) == 5_000);
+
+        let resting_orders =
+            |token: &str| request(a, "GET", "/v4/account", Some(token), None).1["orders"].as_array().map(Vec::len);
+
+        // The master rests a sell; the subaccount's buy at the same price is its family trading against itself.
+        let sell = json!({"clientOrderId": "master-sell", "instrumentId": MARKET.to_string(), "action": "sell",
+                           "outcome": "yes", "price": {"tick": 4}, "quantity": 2});
+        let (status, _) = request(a, "POST", "/v4/orders", Some(MAKER_TOKEN), Some(&sell));
+        assert_eq!(status, 200);
+        eventually("the master's sell rests", || resting_orders(MAKER_TOKEN) == Some(1));
+
+        let buy = json!({"clientOrderId": "sub-buy", "instrumentId": MARKET.to_string(), "action": "buy",
+                          "outcome": "yes", "price": {"tick": 4}, "quantity": 2});
+        let (status, _) = request(a, "POST", "/v4/orders", Some(&sub_cred), Some(&buy));
+        assert_eq!(status, 200, "accepted, then cancelled — the REST reply only ever reports acceptance");
+        eventually("the subaccount's buy does not rest: self-match prevented", || resting_orders(&sub_cred) == Some(0));
+        // And the master's sell is untouched: the default mode cancels the incoming order, not the resting one.
+        assert_eq!(resting_orders(MAKER_TOKEN), Some(1));
+
+        // An unrelated account is not part of this family, and fills against the master's resting sell normally.
+        let taker = json!({"clientOrderId": "retail-buy", "instrumentId": MARKET.to_string(), "action": "buy",
+                            "outcome": "yes", "price": {"tick": 4}, "quantity": 2});
+        let (status, _) = request(a, "POST", "/v4/orders", Some(RETAIL_TOKEN), Some(&taker));
+        assert_eq!(status, 200);
+        eventually("the unrelated buy fills the master's resting sell", || resting_orders(MAKER_TOKEN) == Some(0));
     }
 
     #[test]
