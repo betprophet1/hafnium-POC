@@ -144,6 +144,35 @@ database:
   caSecret: ""
   # Connections each service opens at most.
   poolSize: 4
+  # A verified `pg_dump` of each database to object storage, on a schedule. Off by default: it needs somewhere to
+  # put them and a role that may write there.
+  #
+  # This copies and never deletes — from the database or from the bucket. The databases are append-only by
+  # construction (a trigger on each refuses DELETE and TRUNCATE) and they are small: all four held about 4 MB
+  # after half a day of trading on 2026-09-25, against the engine journal's 35 MB/hour. The gap this fills is
+  # that they had no copy anywhere, not that they were filling anything up. Removing rows on an age rule is
+  # interface 29, planned and unbuilt.
+  #
+  # **A dump of `identity` contains the venue's only personal data** (`members`, and the addresses in
+  # `outbox_mail`). Whatever bucket this names must be private and encrypted at rest, and its objects are
+  # Restricted: treat a dump the way you would treat the database.
+  archive:
+    enabled: false
+    # Daily, offset from the audit shipper's :17 so the two are not competing for the node's disk and uplink.
+    schedule: "43 2 * * *"
+    # s3://bucket[/prefix], or a directory for a demo. Keys are databases/{environment}/{database}-{stamp}.dump
+    to: ""
+    # Which venue these dumps belong to: prod, pr-4. Names part of the key.
+    environment: ""
+    region: eu-central-1
+    # The dump is written here before it is uploaded, on the node's own disk — size it against the database, not
+    # against the pod.
+    scratchSize: 2Gi
+    image:
+      repository: ghcr.io/lordnacho/venue-dbarchive
+      tag: ""
+      pullPolicy: IfNotPresent
+      pullSecrets: []
   treasury:
     url: ""
     existingSecret: ""

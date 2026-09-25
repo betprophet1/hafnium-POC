@@ -87,3 +87,46 @@ docker run -d --rm --name venue-pg -e POSTGRES_PASSWORD=dev -p 127.0.0.1:18400:5
 VENUE_TEST_DATABASE_URL='postgres://postgres:dev@127.0.0.1:18400/postgres?sslmode=disable' \
   VENUE_ATLAS=core/target/tools/atlas-v1.3.3 cargo test --workspace
 ```
+
+## Archiving a database
+
+`interfaces/tools/db_archive.py` takes a verified `pg_dump` of one database to object storage. A CronJob per
+database runs it (`deploy/charts/venue-mini/templates/dbarchive.yaml`, off unless `database.archive.enabled`).
+
+```sh
+VENUE_DATABASE_URL=... db_archive.py --database identity --to s3://BUCKET --environment prod
+# -> databases/prod/identity-20260925T093224Z.dump, with a .sha256 beside it
+```
+
+**It copies and never deletes** — not from the database, not from the bucket — and that is deliberate twice over.
+
+These databases are *append-only by construction*: each installs a trigger that raises on `DELETE` and
+`TRUNCATE` and `REVOKE`s those privileges, and each has a test asserting the refusal. Treasury's message says
+what the rule is for — "a correction is a compensating entry, never an edit". Age-based pruning would mean
+removing that.
+
+They are also not a capacity problem. Measured 2026-09-25, all four together held about **4 MB** of application
+data after half a day of continuous trading — roughly **0.34 MB/hour**, against the engine journal's
+**35 MB/hour**. The journal was what filled the disk, and it is cut and archived separately (`core/node`). What
+the databases lacked was not pruning but *any copy at all*: the journal ships to S3, the audit log ships to S3,
+and the ledger and identity records existed only on one node's local disk.
+
+Deciding what may eventually be *removed* from a store is interface 29 ("Stores → retention archive",
+`interfaces/catalogue.toml`), which is planned, unbuilt, and has to answer to the legal-hold register that
+outranks every retention period. This tool is only the copying half and takes no position on the other.
+
+Three details worth knowing before changing any of it:
+
+- **`pg_dump` must not be older than the server.** `deploy/images/venue-dbarchive.Dockerfile` is built `FROM` the
+  same digest-pinned PostgreSQL image the server runs, rather than `apk add postgresql-client` — Alpine 3.21's
+  client is 17 against a server on 18.6, which builds fine and then fails only when it meets a real database.
+  Move this image's base when `values.yaml` moves the server's.
+- **The password never reaches a command line.** The URL comes from the environment; the tool parses it and hands
+  the password to `pg_dump` in `PGPASSWORD`, so it is not visible in `ps`.
+- **A dump of `identity` is Restricted data.** `members` is the venue's only personal data and `outbox_mail`
+  carries addresses too. The destination bucket must block public access and encrypt at rest; treat a dump the
+  way you would treat the database.
+
+The dump is verified twice: `pg_restore --list` proves it is a readable archive rather than bytes that merely
+arrived intact — a checksum cannot tell you a dump was truncated at source — and then the object is read back
+from storage and compared before anything is reported archived.
