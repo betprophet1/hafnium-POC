@@ -1,0 +1,122 @@
+# ADR-0001: Tiered, space-time-tradeoff representation for order book levels
+
+**Status:** Proposed
+**Date:** 2026-09-25
+**Deciders:** core/engine owners (Engineering)
+
+## Context
+
+`core/engine`'s `Capacities` (`core/engine/src/state.rs`) presizes every table a sequencer group needs — `instruments`, `orders`, `levels`, `accounts`, etc. — once at process start, and never grows them while running: "the engine never allocates" (`state.rs:1-4`). This is deliberate: no allocation on the hot path, deterministic replay (no allocator-timing dependence), and a clean fail-stop story (a full table is a sizing failure, decided identically on every replica, never a silent resize).
+
+`ListInstrument` (`core/engine/src/commands.rs:387-417`) reserves `2 * per_side` slots from the shared `levels` pool for every listed book, where `per_side` is that book's tick-table width — and holds that reservation for the book's entire lifetime, regardless of whether any order ever rests there. `levels` is one flat array shared across every book in the group (`state.rs:380`); a book's `levels_start` is just an offset into it.
+
+This was measured directly. Building `venue-node` with the `perf` profile and driving it with `venue-sim workload` (a direct-to-core order-flow generator, `core/sim/src/workload.rs`) against the `small` capacity profile (`levels: 131_072`) and the workload's default 99-tick cent tick table:
+
+- 600–660 concurrent books: sustained fine, ~100,000–117,000 inputs/sec.
+- 665+ books: `engine fail-stop Capacity` (spec §18), always at the same journal position (the 661st `ListInstrument`), regardless of `--accounts`/`--makers` or how far past 665 the target book count was.
+
+The arithmetic confirms the mechanism: `131,072 ÷ (2 × 99 ticks) ≈ 661.98` — the `levels` pool, not the documented `instruments: 1_024` ceiling, is what actually limits book count for this tick width. `instruments` still had ~360 slots free when the run died.
+
+This directly contradicts the venue's own stated requirement (`blueprint/prediction-exchange.html`, §1): *"Power-law volume over a huge instrument count... the marginal cost of a listed instrument must approach zero, forcing a tiered activity model (§10)."* Blueprint §10 sketches a HOT/WARM/COLD/DORMANT tiering scheme with resident-memory budgets (~2 MB / ~64 KB / ~8 KB / 0, for ≤50 / ≤2,000 / ~100,000 / unbounded markets respectively) and a promotion/demotion behavior ("demotion is lazy and cheap; promotion must be instant... within one sequencer event"), but **no data structure or trigger rule is specified, and none of it is implemented** — `grep -r "tier\|dormant\|DORMANT" core/engine/src core/node/src` returns nothing. Every book in the current engine runs permanently as if it were HOT.
+
+Separately, the per-book `Book`-shape metadata itself (aggregate qty + FIFO head/tail per tick + occupancy bitmap; blueprint's illustrative struct, `[u32;100]×3 + u128×2 + u8 + u64`) costs **~1.25 KiB fixed per book** regardless of activity — this is the "shape of the book" cost that scales with tick-width × book-count and that this ADR targets. It is distinct from order storage: individual orders already live in one shared, elastic slab (`core/engine/src/state.rs`'s `orders` pool) and cost nothing per book beyond what's actually resting — a level with 10,000 resting orders costs the same fixed level-slot as one with zero.
+
+## Decision
+
+Introduce a **per-book tiered representation for the `levels`/`level_bits` structures** (not for `orders`, see Non-Goals):
+
+- **Dense** (today's mechanism, unchanged): a contiguous slice of the shared `levels`/`level_bits` pools, one slot per tick per side. O(1) best-price via bitmap count-leading-zeros, no scan. Reserved for genuinely active books.
+- **Sparse/inline**: a small, fixed-capacity array of `(tick, qty, head, tail)` tuples held directly with the book's own record — sized for however many ticks a quiet book actually needs (a handful, not its full tick-table width). No interaction with any shared pool as long as it fits.
+- **Overflow** (only if sparse capacity is exceeded without promoting to dense): extra occupied-tick entries borrow a slot from a new, separate, much-smaller shared pool — elastic like `orders` today, not a per-book reservation.
+
+**Tier assignment**, evaluated only from state already available to the engine (no wall-clock reads, consistent with the "deterministic function of the journal" invariant, blueprint line 657):
+
+- **Demotion** (dense → sparse): driven by two independently-checkable signals, each computed from a new small per-instrument counter (a few bytes — negligible next to the ~1.25 KiB this saves):
+  - *Staleness*: `current_tick − last_touched_tick > D_idle`, using the existing `TimeTick` stream (already the mechanism GTD expiry relies on) rather than a live clock.
+  - *Occupied-tick density*: `occupied_ticks / table.len < density_threshold` — lets an actively-touched but structurally sparse book (a handful of occupied ticks out of 99) qualify without waiting for idleness.
+- **Promotion** (sparse → dense): triggered synchronously by the touching command itself (an order arriving is already a sequenced event, so the check is free), the instant sparse+overflow capacity would be exceeded — never by a scan over other books.
+- **No top-K/ranking step.** An earlier version of this proposal considered a comparative "HOT is the busiest ≤50 books" rule requiring periodic re-ranking across all instruments. Rejected: re-ranking cost scales with instrument count, which is exactly the cost this ADR is trying to bound, and it would need to run on a busy-spinning matching thread that must stay under ~40% peak load (blueprint §10). Threshold-based, single-book-local classification avoids ever comparing one book to another.
+
+## Non-Goals
+
+- **Segmenting the shared `orders` slab is out of scope for this ADR.** It solves a different problem: not fixed-reservation waste (orders already cost nothing when absent), but shared-capacity pressure from many legitimate, low-activity resting orders accumulating over time ("what actually fills a slab is abuse and accumulation, not load," blueprint line 1336). The existing GTC max-lifetime and cancel-at-resolution rules already bound the worst case. Revisit only if long-tail slab pressure is measured as a real (not theoretical) problem — likely as a follow-up ADR.
+
+  This is a stronger claim than "already elastic," worth stating precisely: the `orders` slab (`core/engine/src/book.rs:295-311`) is already a textbook intrusive free-list pool allocator — one scalar head (`free_order`), LIFO push/pop, threaded through the `account_next` field of freed slots themselves (no separate free-list storage), O(1) alloc and free, zero runtime allocation. A freed slot anywhere in the flat array is immediately reusable by any book, any account, any tick — there is no fragmentation mode where a hole becomes unusable, so there is nothing here for a tiering scheme to fix.
+
+  The one real cost of this shape is that a level's FIFO (threaded through each `Order`'s own `prev`/`next`) can be scattered across the slab rather than contiguous — the blueprint says as much outright ("one tick's queue can be scattered across memory," line 1297) without proposing a mitigation. This is a materially smaller concern than a classic scattered-heap linked list, though: every hop lands inside one bounded, pre-sized array (not an arbitrary heap address), and the LIFO free list happens to favor reuse of recently-touched (cache-warm) slots. Where it costs something is a long FIFO walk during a large sweep fill — plausibly part of why `bench`'s measured `NewOrder` p99 (7.4µs) sits well above its p50 (0.27µs) — but that is a cost of the access pattern (walking time priority at a price), not of the allocator, and a tiered/segmented pool would not remove it. Reworking this pool would mean trading a solved problem (a correct, standard, already-adequate O(1) allocator) for an unsolved one (a new segmented pool with its own promotion/demotion correctness burden) without addressing the actual cost driver. That asymmetry, not just scope, is why this ADR leaves it alone.
+- No change to matching semantics, order priority, or the `orders` pool's structure.
+- No change to sequencer-group boundaries (moving a book between sequencer groups, blueprint §5, is a separate, coarser-grained mechanism and not addressed here).
+
+## Options Considered
+
+### Option A: Raise the `levels` capacity number
+| Dimension | Assessment |
+|---|---|
+| Complexity | Low — change one constant |
+| Cost | Low engineering, but pure resident-memory cost, paid even by books that never trade |
+| Scalability | Poor — cost still scales linearly with book-count × tick-width; only moves the ceiling, doesn't remove the power-law problem blueprint §1 explicitly calls out |
+| Team familiarity | High |
+
+**Pros:** trivial, no new replay/snapshot surface.
+**Cons:** does not address the actual requirement ("marginal cost of a listed instrument must approach zero"); a fixed table still "never grows while it runs" (`state.rs`), so it just relocates the same failure mode to a higher book count.
+
+### Option B: Coarser tick tables for low-value books
+| Dimension | Assessment |
+|---|---|
+| Complexity | Low-Medium |
+| Cost | Low |
+| Scalability | Partial — shrinks footprint only for books deliberately listed on a wider ladder |
+| Team familiarity | High |
+
+**Pros:** no new representation or promotion/demotion machinery at all.
+**Cons:** changes the traded product (price granularity) rather than being a pure infrastructure optimization; a book that starts wide and becomes popular can't be widened to finer ticks without relisting, which is a much bigger compatibility break than a representation swap.
+
+### Option C: Cross-sequencer-group migration (route cold instruments to a dedicated, cheaply-provisioned group)
+| Dimension | Assessment |
+|---|---|
+| Complexity | High — needs the sequenced-transfer protocol blueprint §5 describes |
+| Cost | Avoids in-process representation complexity entirely |
+| Scalability | Good, but coarse-grained (whole-group, not per-book) |
+| Team familiarity | Low — no such transfer exists yet |
+
+**Pros:** keeps every engine's internal book model uniform and simple; cold instruments genuinely cost ~0 on the busy group.
+**Cons:** much larger surface (cross-group consistency, a real migration protocol, "never by moving live memory" per blueprint §5); a promoted book pays a migration round-trip instead of an in-process representation swap; harder to reason about determinism across two sequencer groups than within one.
+
+### Option D (chosen): In-process tiered book representation (Decision, above)
+| Dimension | Assessment |
+|---|---|
+| Complexity | Medium-High — three code paths in the matching hot path instead of one |
+| Cost | Scales with actual occupied-tick count, not book-count × tick-width |
+| Scalability | Good — directly targets the mechanism blueprint §1/§10 call for |
+| Team familiarity | Medium — extends existing patterns (`compact_levels()`'s relocation, the `orders` pool's elastic-slot model) rather than introducing new ones |
+
+**Pros:** addresses the measured failure directly; reuses existing patterns (slot-index addressing, no pointers, elastic shared pools) rather than inventing new ones; demotion/promotion rules are single-book-local, so no ranking cost.
+**Cons:** see Consequences.
+
+## Trade-off Analysis
+
+The core trade being made is **matching-latency guarantee vs. resident memory**, book by book instead of uniformly:
+
+- Dense keeps the O(1), branch-free, bitmap-indexed best-price lookup the whole engine currently relies on (blueprint §6) — necessary for books that actually need the 7–15µs matching budget (blueprint §9).
+- Sparse/inline trades that guarantee for memory: best-price becomes a scan over however many entries are occupied (cheap when that count is small, which is exactly the condition gating a book into this tier).
+- The promotion rule is deliberately conservative (promote the instant capacity would be exceeded, not once thoroughly proven "hot") to avoid ever paying scan cost on a book with real depth.
+- Rejecting the top-K/HOT-ranking idea (see Decision) keeps every classification decision local to one book, at the cost of not having a hard "≤50 busiest markets" cap the way blueprint §10's figure implies — a threshold-based scheme can't guarantee an exact count, only a resident-cost ceiling.
+
+## Consequences
+
+- **Easier:** the effective "how many books can we run" number stops being dominated by tick-width × book-count and starts tracking actual occupied-tick count across the venue — directly targets the blueprint's own stated requirement.
+- **Easier:** capacity planning for the long tail (blueprint §1's "power-law volume... instrument count") no longer requires either wasting memory on dead books or capping the venue at a few hundred/thousand instruments.
+- **Harder:** every hot-path book operation (insert, cancel, fill, best-price) now branches on tier — this must be measured against the existing 7–15µs matching-and-clearing budget (`core/node/src/bench.rs` is the existing tool for this) to confirm the branch doesn't erode it for dense/HOT books, which are the ones the budget matters most for.
+- **Harder:** promotion/demotion is a new state transition that must be proven byte-identical on replay and survive snapshot/restore, the same way `core/node/tests/snapshot_replay.rs` / `embedded_snapshot.rs` already prove for existing recovery paths. A book that changes tier mid-journal needs its own test in this family.
+- **Harder:** relocating a book's data between dense and sparse representations is a new bidirectional transform, distinct from (though related to) the existing `compact_levels()` relocation (`core/engine/src/commands.rs`), which only ever moves dense-to-dense on release/reclaim.
+- **New operational surface:** the sparse-overflow pool is a second, smaller shared capacity ceiling alongside the existing dense `levels` pool — one hard ceiling becomes two softer ones. Both need their own `Capacities` fields and default sizing for `small`/`launch`/`scale`.
+- **To revisit:** whether promotion should be "any touch on a dormant/cold book instantly goes fully dense" (simpler, but wastes a dense reservation on a book touched once and gone quiet again) or "grow within sparse until inline+overflow capacity is actually exceeded" (better packed, more edge cases to test). Not resolved by this ADR.
+
+## Action Items
+
+1. [ ] Prototype the sparse/inline book representation and its hot-path cost in isolation (following `core/prototypes/maskbench`'s existing pattern of micro-benchmarking a representation choice before adopting it) — confirm scan cost at the chosen inline capacity `K` is acceptable.
+2. [ ] Pin down the exact demotion thresholds (`D_idle` in `TimeTick` units, `density_threshold`) as a pure function of existing/new per-instrument counters; confirm the function is replay-deterministic.
+3. [ ] Add an `overflow` field to `Capacities` (`core/engine/src/state.rs`) and choose default sizes for `small`/`launch`/`scale`; re-run today's `venue-sim workload` bisection against a prototype to measure the new book-count ceiling for the same 99-tick workload.
+4. [ ] Decide the promotion policy from the open question in Consequences ("instant-to-dense" vs. "grow-within-sparse").
+5. [ ] Write replay/snapshot tests for a book that changes tier mid-journal, alongside the existing `snapshot_replay.rs` / `embedded_snapshot.rs` suite.
+6. [ ] File a separate, explicitly lower-priority follow-up for order-slab segmentation (Non-Goals) rather than bundling it into this work.
