@@ -4,6 +4,7 @@ mod bots;
 mod calendar;
 mod cases;
 mod client;
+mod gwload;
 mod oracle;
 mod resolution;
 mod session;
@@ -36,6 +37,10 @@ const USAGE: &str = "usage:
                   [--order-limit N] [--id-window-seconds N]
                   (the last two default from the node's capacity profile: 3/4 of its orders, and its
                   client order ID table's entries / 120 000 seconds)
+  venue-sim gwload --gateway ADDR [--token dev-market-maker] [--instrument 10010] [--connections 1] [--seconds 10]
+                  the gateway-facing counterpart to `venue-node load`: each connection logs in over
+                  /v4/ws_private, places one resting order, then amends it back and forth until the deadline,
+                  reporting messages/s and round-trip percentiles the same way.
 
 The bots are clients of the gateway. --gateway serves the private half (orders, accounts, sessions); --public-gateway,
 the gateway serving the public half (markets, books), defaults to it. The maker subscribes to requests for quote and answers them when its account is an
@@ -125,6 +130,7 @@ fn main() -> ExitCode {
         "maker" => maker(&a),
         "taker" => taker(&a),
         "workload" => workload(&a),
+        "gwload" => gwload(&a),
         _ => Err(USAGE.into()),
     });
     match outcome {
@@ -258,6 +264,17 @@ fn maker(args: &Args) -> Result<(), Error> {
     let api = client::Api::new(&gateway, &token).with_public(&public);
     let gateways = session::Gateways { private: gateway, public };
     bots::maker(&api, &gateways, &token, &config, Ids::new('m')?, Ids::new('q')?)
+}
+
+fn gwload(args: &Args) -> Result<(), Error> {
+    let config = gwload::Config {
+        gateway: args.get("gateway", None)?,
+        token: args.get("token", Some("dev-market-maker"))?,
+        instrument: args.number("instrument", 10010)?,
+        connections: usize::try_from(args.number("connections", 1)?)?,
+        seconds: args.number("seconds", 10)?,
+    };
+    gwload::run(config)
 }
 
 fn taker(args: &Args) -> Result<(), Error> {
