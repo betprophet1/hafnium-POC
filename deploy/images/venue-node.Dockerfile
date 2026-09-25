@@ -8,7 +8,9 @@ FROM rust:1.96.0-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY core/ core/
-RUN cd core && cargo build --release --locked -p venue-node -p venue-gateway -p venue-parlays -p venue-sim -p venue-treasury -p venue-identity -p venue-observer
+# venue-link carries `venue-view`, which takes both halves of a snapshot pair. It is in the image because
+# the scheduled pair job runs it against the live journal volume, not because any service needs it.
+RUN cd core && cargo build --release --locked -p venue-node -p venue-gateway -p venue-parlays -p venue-sim -p venue-treasury -p venue-identity -p venue-observer -p venue-link
 
 # Atlas applies the schemas (core/store/decisions.md, S-2), pinned by version and by the hash of the binary.
 FROM debian:bookworm-slim AS atlas
@@ -32,7 +34,7 @@ RUN useradd --system --uid 10001 --home-dir /var/lib/venue venue \
 COPY --from=build /src/core/target/release/venue-node /src/core/target/release/venue-gateway \
      /src/core/target/release/venue-parlays /src/core/target/release/venue-sim \
      /src/core/target/release/venue-treasury /src/core/target/release/venue-identity \
-     /src/core/target/release/venue-observer /usr/local/bin/
+     /src/core/target/release/venue-observer /src/core/target/release/venue-view /usr/local/bin/
 COPY --from=atlas /atlas /usr/local/bin/atlas
 # The migrations as files, which is what Atlas applies: the same directories the services embed, under the service
 # name (the migrate job names one of them, deploy/charts/venue-mini/templates/migrate.yaml).
