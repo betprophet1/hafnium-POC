@@ -135,6 +135,19 @@ Built `core/prototypes/tieredbook` (mirrors `core/prototypes/maskbench`'s patter
 - The promotion policy doesn't need to be justified primarily by a latency cliff — absolute sparse cost stays small even at high occupancy. The real reason to promote before a book gets busy is code-path simplicity and avoiding pathological overflow-pool churn, not a hard matching-budget threat. This should soften Action Item 4 below: the exact threshold matters less for correctness than for keeping the common case cheap.
 - Not measured here: removal cost for a deep/old overflow entry, and any interaction with real order-slab churn under concurrent inserts/cancels — both need the real `core/engine` integration to observe, not this isolated prototype.
 
+**Conversion cost** (`promote`/`demote`, added after the initial prototype pass): both walk only occupied ticks — `promote` via the sparse book's inline entries plus its overflow chain, `demote` via the dense bitmap directly (`trailing_zeros`, never a 0..100 scan) — so cost tracks *occupied-tick count*, not the book's tick-table width. Neither touches an `Order` record; both only relocate the small per-tick `(qty, head, tail)` triple, the same scope `compact_levels()` already operates in.
+
+| Occupied ticks | Promote (sparse→dense) | Demote (dense→sparse) |
+|---|---|---|
+| 1 | 12.3 ns | 4.8 ns |
+| 4 (INLINE=4, at capacity) | 14.7 ns | 7.6 ns |
+| 8 (INLINE=4, overflow) | 24.9 ns | 15.7 ns |
+| 8 (INLINE=8, at capacity) | 18.1 ns | 13.3 ns |
+| 32 (INLINE=8, overflow) | 50.7 ns | 73.5 ns |
+| 64 (INLINE=8, overflow) | 98.6 ns | 168.0 ns |
+
+Even the most expensive case measured (64 occupied ticks, demote) costs ~168 ns — **~1–2% of the 7–15µs matching-and-clearing budget**, comfortably inside "promotion must be instant, within one sequencer event." Demote is cheaper than promote at low occupancy (walking a bitmap directly beats iterating a small array) but grows faster at high occupancy (each overflow allocation touches five separate pool arrays vs. promote's flat writes into a fixed inline destination) — worth knowing, but not a practical concern at any occupancy where demotion should actually be triggered. Both round-tripped correctly against an independently-built reference book (dense-built-from-scratch vs. promoted-from-sparse, and vice versa) across every scenario tested.
+
 ## Action Items
 
 1. [x] Prototype the sparse/inline book representation and its hot-path cost in isolation (following `core/prototypes/maskbench`'s existing pattern of micro-benchmarking a representation choice before adopting it) — confirm scan cost at the chosen inline capacity `K` is acceptable. **Done** — see Prototype Findings above; `core/prototypes/tieredbook`.

@@ -206,6 +206,74 @@ impl<const INLINE: usize> SparseBook<INLINE> {
     }
 }
 
+/// Sparse -> dense: copies each occupied tick's (qty, head, tail) into the dense array and sets its bitmap
+/// bit. Never touches an `Order` record itself — a real conversion only relocates these small per-tick
+/// triples, the same thing `compact_levels()` already does dense-to-dense in `core/engine/src/commands.rs`,
+/// just between two different shapes here instead of within one.
+fn promote<const INLINE: usize>(sparse: &SparseBook<INLINE>, pool: &OverflowPool) -> DenseBook {
+    let mut dense = DenseBook::empty();
+    for i in 0..sparse.len as usize {
+        let t = sparse.tick[i] as usize;
+        dense.qty[t] = sparse.qty[i];
+        dense.head[t] = sparse.head[i];
+        dense.tail[t] = sparse.tail[i];
+        dense.bits |= 1u128 << t;
+    }
+    let mut cur = sparse.overflow_head;
+    while cur != NONE {
+        let t = pool.tick[cur as usize] as usize;
+        dense.qty[t] = pool.qty[cur as usize];
+        dense.head[t] = pool.head[cur as usize];
+        dense.tail[t] = pool.tail[cur as usize];
+        dense.bits |= 1u128 << t;
+        cur = pool.next[cur as usize];
+    }
+    dense
+}
+
+/// Dense -> sparse: walks the occupancy bitmap directly (never a 0..100 scan), placing each occupied tick
+/// inline until capacity, then spilling the rest into the shared pool. Demotion should only ever be attempted
+/// on a book already known (by the density check) to fit; if it doesn't, that's a design bug in the caller,
+/// not a normal runtime condition — this asserts rather than degrading silently, the same fail-stop instinct
+/// the real engine applies to any other table that turns out to be too small.
+fn demote<const INLINE: usize>(dense: &DenseBook, pool: &mut OverflowPool) -> SparseBook<INLINE> {
+    let mut sparse = SparseBook::<INLINE>::empty();
+    let mut bits = dense.bits;
+    while bits != 0 {
+        let t = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        if (sparse.len as usize) < INLINE {
+            let i = sparse.len as usize;
+            sparse.tick[i] = t as u16;
+            sparse.qty[i] = dense.qty[t];
+            sparse.head[i] = dense.head[t];
+            sparse.tail[i] = dense.tail[t];
+            sparse.len += 1;
+        } else {
+            let slot = pool.alloc();
+            pool.tick[slot as usize] = t as u16;
+            pool.qty[slot as usize] = dense.qty[t];
+            pool.head[slot as usize] = dense.head[t];
+            pool.tail[slot as usize] = dense.tail[t];
+            pool.next[slot as usize] = sparse.overflow_head;
+            sparse.overflow_head = slot;
+        }
+    }
+    sparse
+}
+
+/// Returns every overflow slot a sparse book holds to the pool's free list. Used only to make repeated
+/// `demote` benchmark reps safe to run back-to-back without exhausting the pool — not part of the real
+/// design, where a demoted book simply keeps whatever overflow slots it was given.
+fn release<const INLINE: usize>(sparse: &SparseBook<INLINE>, pool: &mut OverflowPool) {
+    let mut cur = sparse.overflow_head;
+    while cur != NONE {
+        let nxt = pool.next[cur as usize];
+        pool.free_slot(cur);
+        cur = nxt;
+    }
+}
+
 fn build_dense(levels: &[usize]) -> DenseBook {
     let mut b = DenseBook::empty();
     for &l in levels {
@@ -269,6 +337,43 @@ fn bench_insert_remove<const INLINE: usize>(pool_cap: usize, name: &str, levels:
     row(name, d, s);
 }
 
+fn conv_row(name: &str, ns: f64) {
+    println!("{name:<48} {ns:>10.2} ns");
+}
+
+fn bench_promote<const INLINE: usize>(pool_cap: usize, name: &str, levels: &[usize]) {
+    let mut pool = OverflowPool::with_capacity(pool_cap);
+    let sparse = build_sparse::<INLINE>(&mut pool, levels);
+    let reference = build_dense(levels);
+    let promoted = promote(&sparse, &pool);
+    for p in 0..=TICKS {
+        assert_eq!(reference.best_below(p), promoted.best_below(p), "promote mismatch at p={p} for {name}");
+    }
+    let ns = time_ns_per_op(1, || promote(black_box(&sparse), black_box(&pool)).bits as u64);
+    conv_row(name, ns);
+}
+
+fn bench_demote<const INLINE: usize>(pool_cap: usize, name: &str, levels: &[usize]) {
+    let dense = build_dense(levels);
+    let mut ref_pool = OverflowPool::with_capacity(pool_cap);
+    let reference = build_sparse::<INLINE>(&mut ref_pool, levels);
+    let mut pool = OverflowPool::with_capacity(pool_cap);
+    // demote + release is a size-preserving (if not byte-identical) round trip on the pool's free list, the
+    // same way insert+remove was for bench_insert_remove — so one pool survives every timed rep below.
+    let check = demote::<INLINE>(&dense, &mut pool);
+    for p in 0..=TICKS {
+        assert_eq!(reference.best_below(&ref_pool, p), check.best_below(&pool, p), "demote mismatch at p={p} for {name}");
+    }
+    release(&check, &mut pool);
+    let ns = time_ns_per_op(1, || {
+        let s = demote::<INLINE>(black_box(&dense), &mut pool);
+        let n = s.len as u64;
+        release(&s, &mut pool);
+        n
+    });
+    conv_row(name, ns);
+}
+
 fn mem_row(name: &str, bytes: usize) {
     println!("{name:<48} {bytes:>10} bytes");
 }
@@ -302,6 +407,25 @@ fn main() {
     bench_insert_remove::<4>(64, "into 8 occupied, INLINE=4 (overflow)", &distinct(&mut rng, 8, 1, 90), 95);
     bench_insert_remove::<8>(64, "into 8 occupied, INLINE=8 (at capacity)", &distinct(&mut rng, 8, 1, 90), 95);
     bench_insert_remove::<8>(64, "into 32 occupied, INLINE=8 (overflow)", &distinct(&mut rng, 32, 1, 90), 95);
+    println!();
 
-    println!("\ncorrectness: sparse best_below matched dense for every query position across every scenario above");
+    println!("{:<48} {:>13}", "promote sparse -> dense (one full conversion)", "ns/op");
+    bench_promote::<4>(64, "1 occupied tick, INLINE=4", &distinct(&mut rng, 1, 1, 99));
+    bench_promote::<4>(64, "4 occupied ticks, INLINE=4 (at capacity)", &distinct(&mut rng, 4, 1, 99));
+    bench_promote::<4>(64, "8 occupied ticks, INLINE=4 (4 in overflow)", &distinct(&mut rng, 8, 1, 99));
+    bench_promote::<8>(64, "8 occupied ticks, INLINE=8 (at capacity)", &distinct(&mut rng, 8, 1, 99));
+    bench_promote::<8>(96, "32 occupied ticks, INLINE=8 (24 in overflow)", &distinct(&mut rng, 32, 1, 99));
+    bench_promote::<8>(96, "64 occupied ticks, INLINE=8 (56 in overflow)", &distinct(&mut rng, 64, 1, 99));
+    println!();
+
+    println!("{:<48} {:>13}", "demote dense -> sparse (one full conversion)", "ns/op");
+    bench_demote::<4>(64, "1 occupied tick, INLINE=4", &distinct(&mut rng, 1, 1, 99));
+    bench_demote::<4>(64, "4 occupied ticks, INLINE=4 (at capacity)", &distinct(&mut rng, 4, 1, 99));
+    bench_demote::<4>(64, "8 occupied ticks, INLINE=4 (4 in overflow)", &distinct(&mut rng, 8, 1, 99));
+    bench_demote::<8>(64, "8 occupied ticks, INLINE=8 (at capacity)", &distinct(&mut rng, 8, 1, 99));
+    bench_demote::<8>(96, "32 occupied ticks, INLINE=8 (24 in overflow)", &distinct(&mut rng, 32, 1, 99));
+    bench_demote::<8>(96, "64 occupied ticks, INLINE=8 (56 in overflow)", &distinct(&mut rng, 64, 1, 99));
+
+    println!("\ncorrectness: sparse best_below matched dense for every query position across every scenario above,");
+    println!("and every promote/demote round-trip matched an independently-built reference book too");
 }
