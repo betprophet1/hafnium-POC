@@ -9,6 +9,7 @@ on:
     paths:
       - "interfaces/tools/db_archive.py"
       - "interfaces/tools/snapshot_publish.py"
+      - "interfaces/tools/snapshot_fetch.py"
       - "deploy/images/venue-dbarchive.Dockerfile"
       - ".github/workflows/dbarchive-image.yml"
   workflow_dispatch:

@@ -49,18 +49,48 @@ fn compute(journal: &Path, at: Option<u64>) -> Result<(String, u64, Vec<u8>), Er
     // volume read-only. The name carries the process id because two of these may run at once.
     let scratch = std::env::temp_dir().join(format!("venue-snapshot-scratch-{}.tmp", std::process::id()));
     let mut sink = BufWriter::new(File::create(&scratch)?);
+
+    // Where to begin. A journal that has been `cut` no longer starts at sequence 1 — its first real input is
+    // whatever followed the snapshot it was cut to — so replaying it through a *fresh* engine fail-stops on
+    // E-4.1 at the very first input it applies. `choose_recovery` has always known this; taking a snapshot has
+    // to know it too, and the same embedded snapshot is what makes it possible. Restoring is also simply
+    // cheaper on a journal that has one, cut or not: the work becomes proportional to what has happened since,
+    // which is what a snapshot is for. E-20.9 is what says the two give the same state.
+    let restored_to = match latest(journal)? {
+        Some((sequence, frame)) if at.is_none_or(|stop| sequence <= stop) => restore_into(&mut engine, &frame)?,
+        _ => 0,
+    };
+
     let mut reader = BufReader::new(File::open(journal)?);
     let mut buf = Vec::new();
+    let mut first_input = None;
     while let Some(n) = read_frame(&mut reader, &mut buf)? {
         if template_of(&buf[..n]) == Some(SNAPSHOT) {
             continue;
         }
-        if let (Some(sequence), Some(stop)) = (sequence_of(&buf[..n]), at) {
+        let sequence = sequence_of(&buf[..n]);
+        first_input.get_or_insert(sequence.unwrap_or(0));
+        // Everything the restored state already covers is skipped, exactly as `replay_from` skips it.
+        if sequence.is_some_and(|s| s <= restored_to) {
+            continue;
+        }
+        if let (Some(sequence), Some(stop)) = (sequence, at) {
             if sequence > stop {
                 break;
             }
         }
         crate::node::apply(&mut engine, &buf[..n], &mut sink, None)?;
+    }
+    // A cut journal with nothing to restore from would have fail-stopped above with `SequenceOrTime at input 0`,
+    // which says nothing about why. Say why instead.
+    if restored_to == 0 && first_input.is_some_and(|first| first > 1) {
+        return Err(format!(
+            "{} starts at input {}, not 1, and has no embedded snapshot at or below the sequence asked for: it \
+             was cut, and what came before it is only in the archive (venue-node restore-cut)",
+            journal.display(),
+            first_input.unwrap_or(0)
+        )
+        .into());
     }
     drop(sink);
     let _ = std::fs::remove_file(&scratch);

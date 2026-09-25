@@ -68,6 +68,12 @@ cut, because recovery has nowhere to begin but sequence 1. A `Snapshot` frame is
 walks a journal frame by frame (a full replay, recovery, a subscriber's backlog) skips it by template id, exactly
 as it skips one embedded earlier when computing a later one.
 
+Taking a snapshot **restores from the latest embedded one** when the journal has it, rather than replaying from
+genesis. That is an optimisation on an ordinary journal and a necessity on a cut one: a cut journal's first real
+input is no longer sequence 1, so a fresh engine fail-stops on E-4.1 at the first input it applies. E-20.9 is
+what says the two routes give the same state. Against the live venue the difference was 60 seconds of replay
+versus 3.6.
+
 `venue-node recover JOURNAL RESULTS [--snapshot-out FILE]` restores from the latest embedded snapshot and replays
 only what follows it — the single-journal-file version of `replay-from` (which does the same from a snapshot
 file of its own). Both are checked against a full replay from genesis for the same journal, byte for byte

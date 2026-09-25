@@ -15,8 +15,11 @@ RUN apk add --no-cache python3 aws-cli
 # `db_archive.py` imports `snapshot_publish.py` beside it for the verified upload: an object is only reported
 # archived once it has been read back and compared, and that is the same code the snapshot and journal shippers
 # use rather than a third copy of the same care.
+#
+# `snapshot_publish.py` and `snapshot_fetch.py` are here too: the scheduled snapshot-pair job publishes with one
+# and fetches the pair it carries on from with the other, and this is the image that already has the AWS CLI.
 WORKDIR /opt/venue
-COPY interfaces/tools/db_archive.py interfaces/tools/snapshot_publish.py ./
+COPY interfaces/tools/db_archive.py interfaces/tools/snapshot_publish.py interfaces/tools/snapshot_fetch.py ./
 
 # No credentials are built in or mounted. On an EC2 node the CLI reads the instance's role through the metadata
 # service; the database password arrives in the environment from the release's Secret, and never on a command
