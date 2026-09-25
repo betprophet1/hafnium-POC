@@ -11,6 +11,11 @@ pub const FBO: &str = "bank:fbo_omnibus";
 pub const DEPOSITS_IN_TRANSIT: &str = "transit:deposits";
 /// Withdrawals taken from customers and not yet paid out by the bank, or not yet granted back.
 pub const WITHDRAWALS_IN_TRANSIT: &str = "transit:withdrawals";
+/// An internal transfer's money between the reclaim from its source and the grant to its destination (decisions
+/// D-34, G-22): no bank or FBO omnibus leg, since the money never leaves the venue, but a holding account still
+/// keeps the ledger balanced at every step, since the reclaim and the grant are two commands applied at two moments,
+/// possibly by two different sequencer groups.
+pub const INTERNAL_TRANSFERS_IN_TRANSIT: &str = "transit:internal_transfers";
 
 /// An account's cash as the treasury has moved it: what came in through deposits and the seed, less what went out
 /// through withdrawals. Trading moves cash inside the sequencer group, which this ledger does not see yet.

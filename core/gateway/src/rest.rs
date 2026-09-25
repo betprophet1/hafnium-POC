@@ -75,6 +75,9 @@ fn account(gateway: &Gateway, request: &Request, client: &str, permission: Permi
 fn transfer(gateway: &Gateway, request: &Request, client: &str, notify: &Notify) -> Result<Routed, ApiError> {
     let needs = if request.method == "GET" { Permissions::READ } else { Permissions::TRANSFERS };
     let account = account(gateway, request, client, needs)?;
+    if request.method == "POST" {
+        check_internal_family(gateway, account, request)?;
+    }
     let treasury = gateway.treasury()?;
     if let Some(id) = request.path.trim_matches('/').split('/').nth(2) {
         parse_id(id, "transferId")?;
@@ -83,6 +86,34 @@ fn transfer(gateway: &Gateway, request: &Request, client: &str, notify: &Notify)
     let call =
         treasury.call(account, &request.method, &request.path, &query.join("&"), &request.body, Arc::clone(notify))?;
     Ok(Routed::Service(call))
+}
+
+/// An internal transfer (decisions D-34, G-22) may only move money within the caller's own family of accounts. The
+/// treasury trusts the account in the path and knows nothing about masters or subaccounts, so this is the gateway's
+/// to check, before the request is ever sent on; not required at all for a deposit or a withdrawal.
+fn check_internal_family(gateway: &Gateway, account: u64, request: &Request) -> Result<(), ApiError> {
+    let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+    if body["kind"].as_str() != Some("internal") {
+        return Ok(());
+    }
+    let to = body["toAccountId"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| ApiError::bad("toAccountId must be a decimal string"))?;
+    let (source_master, dest_master) =
+        (gateway.identity.account_master(account)?, gateway.identity.account_master(to)?);
+    // Family: the two share a master, or one of them is the other's master.
+    let family = match (source_master, dest_master) {
+        (Some(a), Some(b)) => a == b,
+        (Some(a), None) => a == to,
+        (None, Some(b)) => b == account,
+        (None, None) => false,
+    };
+    if family {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("an internal transfer must stay within the caller's own family of accounts"))
+    }
 }
 
 fn body(request: &Request) -> Result<Value, ApiError> {
@@ -201,6 +232,16 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, client: &str, notify: &
         ("GET" | "POST", ["v4", "keys"]) | ("DELETE", ["v4", "keys", _]) => {
             let credential = credential(gateway, request, client, Permissions::KEYS)?;
             Ok(Routed::Service(identity::manage(gateway, &credential, request, notify)?))
+        }
+        ("GET" | "POST", ["v4", "subaccounts"]) => {
+            let credential = credential(gateway, request, client, Permissions::KEYS)?;
+            Ok(Routed::Service(identity::subaccounts(gateway, &credential, request, notify)?))
+        }
+        ("GET" | "POST", ["v4", "subaccounts", account_id, "keys"])
+        | ("DELETE", ["v4", "subaccounts", account_id, "keys", _]) => {
+            let credential = credential(gateway, request, client, Permissions::KEYS)?;
+            let account_id = parse_id(account_id, "accountId")?;
+            Ok(Routed::Service(identity::subaccount_keys(gateway, &credential, account_id, request, notify)?))
         }
         _ => Err(ApiError::not_found("no such route")),
     }
