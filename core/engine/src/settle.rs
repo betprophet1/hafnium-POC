@@ -137,14 +137,30 @@ impl<'a> Engine<'a> {
         while cur != NONE {
             let inst = self.instruments[cur as usize];
             self.instrument_index.remove(&inst.id).ok_or(FailStop::Inconsistent)?;
-            let freed = &mut self.instruments[cur as usize];
-            freed.in_use = false;
-            freed.next_in_event = self.free_instrument;
-            self.free_instrument = cur;
+            // E-6.5's policy total counts every listed book at its full table width regardless of tier
+            // (ADR-0001), unchanged from before this ADR -- released the same way whether dense or sparse.
             let levels = 2 * usize::from(inst.table.len);
             self.levels_carried = self.levels_carried.checked_sub(levels).ok_or(FailStop::Inconsistent)?;
             let words = 2 * inst.words_per_side();
             self.level_bits_carried = self.level_bits_carried.checked_sub(words).ok_or(FailStop::Inconsistent)?;
+            // ADR-0001: only a promoted book actually reserved dense-pool space to give back. A sparse book's
+            // overflow chain (if any) has to be returned to the shared pool explicitly instead -- nothing
+            // else ever frees it.
+            if inst.dense {
+                self.levels_dense = self.levels_dense.checked_sub(levels).ok_or(FailStop::Inconsistent)?;
+                self.level_bits_dense = self.level_bits_dense.checked_sub(words).ok_or(FailStop::Inconsistent)?;
+            } else {
+                let mut ocur = inst.overflow_head;
+                while ocur != NONE {
+                    let next = self.overflow[ocur as usize].next;
+                    self.overflow_free_slot(ocur)?;
+                    ocur = next;
+                }
+            }
+            let freed = &mut self.instruments[cur as usize];
+            freed.in_use = false;
+            freed.next_in_event = self.free_instrument;
+            self.free_instrument = cur;
             self.instruments_carried = self.instruments_carried.checked_sub(1).ok_or(FailStop::Inconsistent)?;
             cur = inst.next_in_event;
         }

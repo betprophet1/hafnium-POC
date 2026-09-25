@@ -123,11 +123,22 @@ pub struct Engine<'a> {
     /// The end of the level pool's used part. Books take ranges from it; a release leaves a hole, and a listing that
     /// does not fit at the end compacts the pool (`commands.rs`), so what the group carries always fits (E-18.3).
     levels_used: usize,
-    /// Levels of the books the group carries, holes not counted: its price levels (E-6.5).
+    /// Levels of the books the group carries, holes not counted: its price levels (E-6.5). Every listed book
+    /// counts here at its full table width, dense or not yet promoted (ADR-0001) -- this is the policy total
+    /// `maxPriceLevels` bounds, distinct from `levels_dense` below, which is what's actually reserved.
     levels_carried: usize,
     level_bits: &'a mut [u64],
     level_bits_used: usize,
     level_bits_carried: usize,
+    /// ADR-0001: levels actually reserved from the dense pool, by promoted books only -- what `compact_levels`
+    /// and `promote`'s own capacity check need. A sparse book contributes 0 here regardless of its table
+    /// width, which is the entire point: `levels_carried` (E-6.5 policy accounting) and `levels_dense` (actual
+    /// pool usage) coincide only once every listed book has promoted.
+    levels_dense: usize,
+    level_bits_dense: usize,
+    /// ADR-0001: shared overflow entries for sparse books' occupied ticks beyond `SPARSE_INLINE`.
+    overflow: &'a mut [OverflowEntry],
+    overflow_free: u32,
     accounts: &'a mut [Account],
     accounts_used: usize,
     account_index: FixedMap<'a, u64, u32>,
@@ -210,7 +221,12 @@ impl<'a> Engine<'a> {
         let derived_short = memory.gtd.len() < order_count.saturating_mul(2)
             || memory.expiry.len() < memory.duplicates.len()
             || memory.command_expiry.len() < memory.commands.len();
-        if order_count >= NONE as usize || memory.scratch.len() < scratch_needed || check_short || derived_short {
+        if order_count >= NONE as usize
+            || memory.overflow.len() >= NONE as usize
+            || memory.scratch.len() < scratch_needed
+            || check_short
+            || derived_short
+        {
             return Err(FailStop::Capacity);
         }
         let (check_orders, check_holdings) = (memory.check_orders, memory.check_holdings);
@@ -225,6 +241,12 @@ impl<'a> Engine<'a> {
             };
         }
         let free_order = if orders.is_empty() { NONE } else { 0 };
+        let overflow = memory.overflow;
+        let overflow_len = overflow.len();
+        for (i, e) in overflow.iter_mut().enumerate() {
+            *e = OverflowEntry { next: if i + 1 < overflow_len { i as u32 + 1 } else { NONE }, ..OverflowEntry::default() };
+        }
+        let overflow_free = if overflow.is_empty() { NONE } else { 0 };
         Ok(Self {
             config,
             stopped: false,
@@ -258,6 +280,10 @@ impl<'a> Engine<'a> {
             level_bits: memory.level_bits,
             level_bits_used: 0,
             level_bits_carried: 0,
+            levels_dense: 0,
+            level_bits_dense: 0,
+            overflow,
+            overflow_free,
             accounts: memory.accounts,
             accounts_used: 0,
             account_index: cap(FixedMap::new(memory.account_index, seed))?,
@@ -555,9 +581,8 @@ impl<'a> Engine<'a> {
         if self.dry {
             return Ok(());
         }
-        let inst = &self.instruments[instrument_slot as usize];
-        let level = self.levels[level_index(inst, side, tick)];
-        let key = (inst.id, side_rank(side), tick);
+        let level = self.level(instrument_slot, side, tick);
+        let key = (self.instruments[instrument_slot as usize].id, side_rank(side), tick);
         self.level_touches.touch(key, (level.quantity, level.count)).map_err(|_| FailStop::Capacity)
     }
 
@@ -581,6 +606,7 @@ impl<'a> Engine<'a> {
             instruments,
             instrument_index,
             levels,
+            overflow,
             emitter,
             voided,
             unit_serial,
@@ -624,8 +650,7 @@ impl<'a> Engine<'a> {
         level_touches.finish(
             |k| {
                 instrument_index.get(&k.0).map_or((0, 0), |&slot| {
-                    let inst = &instruments[slot as usize];
-                    let l = levels[level_index(inst, side_of_rank(k.1), k.2)];
+                    let l = read_level(instruments, levels, overflow, slot, side_of_rank(k.1), k.2);
                     (l.quantity, l.count)
                 })
             },
@@ -693,4 +718,36 @@ const fn side_of_rank(rank: u8) -> Side {
 fn level_index(inst: &Instrument, side: Side, tick: u16) -> usize {
     let per_side = usize::from(inst.table.len);
     inst.levels_start as usize + usize::from(side_rank(side)) * per_side + usize::from(tick)
+}
+
+/// A book's level at `(side, tick)`; one not (yet) occupied reads as [`Level::EMPTY`]. ADR-0001: dense reads
+/// the shared pool exactly as before; sparse scans the instrument's inline entries, then its overflow chain.
+/// A free function, not an `Engine` method, so `end_unit`'s already-disjoint-borrowed fields can call it too.
+#[inline]
+pub(crate) fn read_level(
+    instruments: &[Instrument],
+    levels: &[Level],
+    overflow: &[OverflowEntry],
+    instrument_slot: u32,
+    side: Side,
+    tick: u16,
+) -> Level {
+    let inst = &instruments[instrument_slot as usize];
+    if inst.dense {
+        return levels[level_index(inst, side, tick)];
+    }
+    for e in &inst.sparse[..inst.sparse_len as usize] {
+        if e.side == side && e.tick == tick {
+            return e.level;
+        }
+    }
+    let mut cur = inst.overflow_head;
+    while cur != NONE {
+        let e = &overflow[cur as usize];
+        if e.side == side && e.tick == tick {
+            return e.level;
+        }
+        cur = e.next;
+    }
+    Level::EMPTY
 }

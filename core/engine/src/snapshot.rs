@@ -25,7 +25,7 @@ use crate::emit::{AtEventStart, MarketState, Side};
 use crate::fixed::FixedMap;
 use crate::state::{
     Account, Duplicate, Event, FeeOverride, FeeRates, Holding, Instrument, Level, MakerSetting, Order, OrderGroup,
-    RuleLimits, TickRow, TickTable, WindowCounter, NONE,
+    RuleLimits, SparseEntry, TickRow, TickTable, WindowCounter, NONE, SPARSE_INLINE,
 };
 use crate::{Engine, FailStop};
 use venue_journal::allocation_policy::AllocationPolicy;
@@ -148,6 +148,15 @@ impl Engine<'_> {
     pub fn snapshot(&mut self, out: &mut [u8]) -> Result<usize, FailStop> {
         if self.stopped {
             return Err(FailStop::Stopped);
+        }
+        // ADR-0001 (docs/adr): the snapshot format does not encode a book's tier or its sparse/overflow state
+        // yet -- only the dense pool. `write_books` would silently read whatever happens to sit at a sparse
+        // book's meaningless `levels_start`/`bits_start` (0/0, or another book's real slice) rather than fail,
+        // so this is checked loudly, up front, instead. A production build of this design needs the sparse
+        // format added before snapshotting is safe to enable on it; this repo's `venue-node snapshot`/
+        // `embed-snapshot`/recovery paths must not be used against a node carrying a sparse-tiered engine yet.
+        if self.instruments[..self.instruments_used].iter().any(|inst| inst.in_use && !inst.dense) {
+            return Err(FailStop::Inconsistent);
         }
         let mut w = Writer::new(out);
         self.write_scalars(&mut w)?;
@@ -926,6 +935,12 @@ impl Engine<'_> {
                 next_in_event: NONE,
                 levels_start: u32::try_from(levels_start).map_err(|_| Refused::TooLarge)?,
                 bits_start: u32::try_from(bits_start).map_err(|_| Refused::TooLarge)?,
+                // ADR-0001: the snapshot format does not encode a book's tier yet (only dense state), so
+                // everything a snapshot restores is dense -- see the write side's matching guard.
+                dense: true,
+                sparse_len: 0,
+                sparse: [SparseEntry::default(); SPARSE_INLINE],
+                overflow_head: NONE,
             };
             self.instruments_used = slot + 1;
             self.levels_used = levels_start + 2 * per_side;
@@ -934,6 +949,10 @@ impl Engine<'_> {
             self.instruments_carried += 1;
             self.levels_carried += 2 * per_side;
             self.level_bits_carried += 2 * words;
+            // ADR-0001: every book a snapshot restores is dense (the format doesn't encode sparse state yet,
+            // guarded in `Engine::snapshot`), so it counts fully against the actual dense-pool usage too.
+            self.levels_dense += 2 * per_side;
+            self.level_bits_dense += 2 * words;
             let slot32 = u32::try_from(slot).map_err(|_| Refused::TooLarge)?;
             self.instrument_index.insert(id, slot32).map_err(|_| Refused::TooLarge)?;
 
