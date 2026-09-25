@@ -18,7 +18,8 @@ key used from somewhere new, and the people who own accounts, which this service
 | Secret | 64 lower-case hex digits (256 bits), from `/dev/urandom`, answered once when the key is made. |
 | Credential | `<keyId>.<secret>`, which clients send wherever a token goes. |
 | Kept as | `SHA-256("venue-api-key/1:" + keyId + ":" + secret)`, compared in constant time. |
-| Permissions | `read` (every key), `trade`, `transfers`, `keys`. |
+| Permissions | `read` (every key), `trade`, `transfers`, `keys`, `respond`. |
+| Allow-list | addresses and CIDR networks it may be used from (decision G-23), at most 20; empty means unrestricted. |
 | Also | a label, when it was made, an optional expiry, when it was revoked, the key that made it, its last use. |
 
 At most 20 keys of an account are neither revoked nor expired at once. A key cannot be changed, only revoked.

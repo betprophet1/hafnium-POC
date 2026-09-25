@@ -146,14 +146,22 @@ A request with a valid credential that lacks the permission is refused with HTTP
 key's ID. A missing, unknown, wrong, revoked or expired credential is 401 `UNAUTHORIZED`. Cancel-on-disconnect and a
 missed heartbeat cancel a session's orders whatever its key holds: they protect the account, and are not trading.
 
-**Managing keys** (`/v4/keys`, REST only, needs `keys`). `POST /v4/keys` creates a key with a `label`, `permissions`
-and an optional `expiresAt`, and answers with the key, its `secret` and its `credential`. `GET /v4/keys` lists every
-key of the account, revoked and expired ones included, newest first, without secrets. `DELETE /v4/keys/{keyId}`
-revokes a key at once and for good; revoking one already revoked answers it as it is. Nothing about a key can be
-changed after it is made: a key that should hold something else is replaced. A key that manages keys cannot create a
-key with a permission it does not hold itself, nor one that outlives it: a key made by an expiring key must expire no
-later. Revoking a key does not revoke the keys it created. An account holds at most 20 keys that are neither revoked
-nor expired.
+**Managing keys** (`/v4/keys`, REST only, needs `keys`). `POST /v4/keys` creates a key with a `label`, `permissions`,
+an optional `expiresAt` and an optional `allowedIps`, and answers with the key, its `secret` and its `credential`.
+`GET /v4/keys` lists every key of the account, revoked and expired ones included, newest first, without secrets.
+`DELETE /v4/keys/{keyId}` revokes a key at once and for good; revoking one already revoked answers it as it is.
+Nothing about a key can be changed after it is made: a key that should hold something else is replaced. A key that
+manages keys cannot create a key with a permission it does not hold itself, nor one that outlives it: a key made by
+an expiring key must expire no later. Revoking a key does not revoke the keys it created. An account holds at most 20
+keys that are neither revoked nor expired.
+
+**`allowedIps`** (decision G-23) restricts a key to the addresses or CIDR networks it names (`192.0.2.7`,
+`10.42.0.0/16`), at most 20 entries; omitted or empty, a key works from anywhere, as every key made before this
+existed does. A request from an address not on the list is refused with the same 403 `FORBIDDEN` a missing permission
+gets, worded so a caller cannot tell an off-list address from a key that does not exist. The gateway checks the
+request's real client address the same way it already resolves one for flood protection: the address a trusted proxy
+named, or the connection's own. Checked on REST today; a WebSocket or FIX session's own logon-time check, and closing
+a live session within the same 10-second bound a revocation gets, are not yet built.
 
 **Revocation and expiry take effect within 10 seconds.** A gateway remembers what the identity service said about a
 credential for up to 5 seconds, so a REST call with a key revoked or expired that moment is refused at most 5 seconds

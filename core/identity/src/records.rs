@@ -42,6 +42,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "member_staff",
         sql: include_str!("../migrations/20260918000003_member_staff.sql"),
     },
+    Migration {
+        version: "20260925000001",
+        name: "key_ip_allowlist",
+        sql: include_str!("../migrations/20260925000001_key_ip_allowlist.sql"),
+    },
 ];
 
 /// An account as the catalogue describes it.
@@ -74,6 +79,8 @@ pub struct KeyRow {
     pub revoked_at: Option<u64>,
     pub created_by: Option<String>,
     pub last_used: Option<u64>,
+    /// Addresses and networks this key may be used from (decision G-23); empty means unrestricted.
+    pub allowed_ips: Vec<String>,
 }
 
 /// A member: the person behind an account (`member.rs`). The password is here only as its Argon2id hash.
@@ -552,6 +559,7 @@ fn key_from(row: &Row) -> Result<KeyRow, Error> {
         revoked_at: row.get::<_, Option<SystemTime>>("revoked_at").map(millis),
         created_by: row.get("created_by"),
         last_used: row.get::<_, Option<SystemTime>>("last_used_at").map(millis),
+        allowed_ips: row.get("allowed_ips"),
     })
 }
 
@@ -582,8 +590,8 @@ impl KeyRecords for Postgres {
         let expires = k.expires_at.map(time);
         self.db.get()?.execute(
             "INSERT INTO api_keys (key_id, account_id, label, permissions, secret_sha256, created_at, expires_at,
-               created_by, revoked_at, last_used_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+               created_by, revoked_at, last_used_at, allowed_ips)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &k.id,
                 &big(k.account)?,
@@ -595,6 +603,7 @@ impl KeyRecords for Postgres {
                 &k.created_by,
                 &k.revoked_at.map(time),
                 &k.last_used.map(time),
+                &k.allowed_ips,
             ],
         )?;
         Ok(())
@@ -995,6 +1004,8 @@ pub fn import(path: &std::path::Path, records: &dyn KeyRecords) -> Result<usize,
                 created_by: r["createdBy"].as_str().map(str::to_string),
                 last_used: None,
                 id,
+                // A key from before the allow-list existed is unrestricted, as any key without one is.
+                allowed_ips: Vec::new(),
             }),
             Some(op @ ("revoke" | "used")) => {
                 let when = r["at"].as_u64().ok_or_else(|| at("no at"))?;
@@ -1080,6 +1091,7 @@ mod tests {
             revoked_at: None,
             created_by: None,
             last_used: None,
+            allowed_ips: Vec::new(),
         };
         records.create(&key).expect("created");
         assert!(records.create(&key).is_err(), "made twice");

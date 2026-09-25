@@ -12,6 +12,7 @@
 //! and that a key is not making a key with more than it holds; the answer is interface 1's already.
 
 use crate::api::{only, ApiError, Gateway};
+use crate::forwarded::{self, AllowedIps};
 use crate::http::Request;
 use crate::limits::monotonic;
 use crate::metrics::{HalfMetrics, Outcome, Service};
@@ -66,6 +67,9 @@ pub struct Credential {
     pub permissions: Permissions,
     /// When the key expires, in milliseconds since the epoch.
     expires_at: Option<u64>,
+    /// Addresses this key may be used from (decision G-23); unrestricted for a dev token or a member's session,
+    /// which have no allow-list of their own.
+    allowed: AllowedIps,
     /// What the key's answer is remembered under, for a session to look it up without asking again.
     fingerprint: Option<[u8; 32]>,
 }
@@ -73,7 +77,15 @@ pub struct Credential {
 impl Credential {
     /// A dev token: its account, with every permission.
     pub const fn dev_token(account: u64) -> Self {
-        Self { account, key: None, member: None, permissions: Permissions::ALL, expires_at: None, fingerprint: None }
+        Self {
+            account,
+            key: None,
+            member: None,
+            permissions: Permissions::ALL,
+            expires_at: None,
+            allowed: AllowedIps::unrestricted(),
+            fingerprint: None,
+        }
     }
 
     /// Refuses with 403 `FORBIDDEN` unless the credential holds `permission`.
@@ -82,6 +94,16 @@ impl Credential {
             Ok(())
         } else {
             Err(ApiError::forbidden(format!("this API key does not hold the {} permission", permission.name())))
+        }
+    }
+
+    /// Refuses with 403 `FORBIDDEN` unless `client` is on this credential's allow-list (decision G-23). Worded so a
+    /// caller cannot tell an off-list address from a key that does not exist (G-11's reasoning).
+    pub fn require_ip(&self, client: &str) -> Result<(), ApiError> {
+        if self.allowed.allows(forwarded::parse_client(client)) {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden("this API key may not be used from this address"))
         }
     }
 }
@@ -352,6 +374,13 @@ fn valid(answer: &Value, fingerprint: [u8; 32]) -> Option<Credential> {
             Value::Null => None,
             v => Some(clock::parse_rfc3339(v.as_str()?)?),
         },
+        allowed: match answer["allowedIps"].as_array() {
+            Some(ips) => AllowedIps::from_strings(
+                &ips.iter().map(|v| v.as_str().map(str::to_string)).collect::<Option<Vec<_>>>()?,
+            ),
+            // Older answers, and a session's, carry no allowedIps at all: unrestricted, not a reason to refuse.
+            None => AllowedIps::unrestricted(),
+        },
         fingerprint: Some(fingerprint),
     })
 }
@@ -430,7 +459,7 @@ pub fn members(gateway: &Gateway, request: &Request, client: &str, notify: &Noti
         }
         ("DELETE", ["v4", "sessions", "current"]) => {
             // Only the session itself may end itself, which is what holding its credential proves.
-            let credential = crate::rest::credential(gateway, request, Permissions::READ)?;
+            let credential = crate::rest::credential(gateway, request, client, Permissions::READ)?;
             let session = credential
                 .key
                 .as_deref()
@@ -450,11 +479,11 @@ pub fn members(gateway: &Gateway, request: &Request, client: &str, notify: &Noti
 /// A member's own account: what they are, the sessions they hold elsewhere, and their second factor. Every route
 /// here is addressed by the member the session belongs to, never by one named in the request, so a session can only
 /// ever reach its own (interfaces/gateway/README.md, members and sessions).
-pub fn me(gateway: &Gateway, request: &Request, notify: &Notify) -> Result<Call, ApiError> {
+pub fn me(gateway: &Gateway, request: &Request, client: &str, notify: &Notify) -> Result<Call, ApiError> {
     let segments: Vec<&str> = request.path.trim_matches('/').split('/').collect();
     let identity = &gateway.identity;
     let notify = Arc::clone(notify);
-    let credential = crate::rest::credential(gateway, request, Permissions::READ)?;
+    let credential = crate::rest::credential(gateway, request, client, Permissions::READ)?;
     let member = credential
         .member
         .as_deref()
@@ -504,7 +533,7 @@ pub fn manage(
         ("POST", ["v4", "keys"]) => {
             let mut body: Value = serde_json::from_slice(&request.body)
                 .map_err(|e| ApiError::bad(format!("the body is not JSON: {e}")))?;
-            let fields = only(&body, &["label", "permissions", "expiresAt"])?;
+            let fields = only(&body, &["label", "permissions", "expiresAt", "allowedIps"])?;
             let asked = fields
                 .get("permissions")
                 .and_then(Value::as_array)
@@ -634,6 +663,33 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn a_key_restricted_to_an_allow_list_is_refused_from_an_address_off_it() {
+        let venue = testing::venue("keys-ip-allowlist");
+        let a = &venue.address;
+        let elsewhere = json!({"label": "colo", "permissions": ["read"], "allowedIps": ["203.0.113.0/24"]});
+        let (status, created) = request(a, "POST", "/v4/keys", Some(MAKER_TOKEN), Some(&elsewhere));
+        assert_eq!(status, 200, "{created}");
+        assert_eq!(created["allowedIps"], json!(["203.0.113.0/24"]));
+        let restricted = credential(&created);
+        // The test connects over loopback, which is not on this key's list.
+        assert!(forbidden(&request(a, "GET", "/v4/account", Some(&restricted), None)), "off the allow-list");
+
+        let here = json!({"label": "here", "permissions": ["read"], "allowedIps": ["127.0.0.1"]});
+        let (status, created) = request(a, "POST", "/v4/keys", Some(MAKER_TOKEN), Some(&here));
+        assert_eq!(status, 200, "{created}");
+        let (status, _) = request(a, "GET", "/v4/account", Some(&credential(&created)), None);
+        assert_eq!(status, 200, "loopback is on its own allow-list");
+
+        // No allowedIps at all is unrestricted, as every key made before this existed still is.
+        let unrestricted = make_key(a, MAKER_TOKEN, &["read"]);
+        assert_eq!(unrestricted["allowedIps"], json!([]));
+        assert_eq!(request(a, "GET", "/v4/account", Some(&credential(&unrestricted)), None).0, 200);
+
+        let malformed = json!({"label": "x", "permissions": ["read"], "allowedIps": ["not-an-address"]});
+        assert_eq!(request(a, "POST", "/v4/keys", Some(MAKER_TOKEN), Some(&malformed)).0, 400);
     }
 
     #[test]

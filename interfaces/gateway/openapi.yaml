@@ -898,9 +898,15 @@ components:
           type: string
           format: date-time
           description: When the key stops working, in UTC (`Z`), in the future. Omitted, it works until revoked.
+        allowedIps:
+          type: array
+          items: { type: string }
+          description: |
+            Addresses and CIDR networks (`192.0.2.7`, `10.42.0.0/16`) this key may be used from (decision G-23).
+            Omitted or empty means unrestricted. Set once, at most 20 entries; changed only by revoking and remaking.
     Key:
       type: object
-      required: [keyId, label, permissions, createdAt, expiresAt, revokedAt, lastUsedAt, createdBy]
+      required: [keyId, label, permissions, createdAt, expiresAt, revokedAt, lastUsedAt, createdBy, allowedIps]
       properties:
         keyId: { $ref: '#/components/schemas/KeyId' }
         label: { type: string }
@@ -916,6 +922,10 @@ components:
           type: [string, 'null']
           pattern: '^ak_[0-9a-f]{16}$'
           description: The key that created this one, or null when a dev token or an operator did.
+        allowedIps:
+          type: array
+          items: { type: string }
+          description: Addresses and networks this key may be used from (decision G-23). Empty means unrestricted.
     KeyCreated:
       allOf:
         - $ref: '#/components/schemas/Key'
