@@ -664,8 +664,8 @@ impl<'a> Engine<'a> {
                 cur = next;
                 continue;
             }
-            if r.account_id == taker.account_id {
-                // E-13.1
+            if self.effective_master(r.account_slot) == self.effective_master(taker.account_slot) {
+                // E-13.1, D-33
                 match mode {
                     SelfMatchPrevention::CANCEL_RESTING => {
                         self.remove(cur, CancelReason::SELF_MATCH_PREVENTED, sink)?;
@@ -693,12 +693,14 @@ impl<'a> Engine<'a> {
         let (inst_slot, maker_side) = (taker.instrument_slot, opposite(taker.side));
         let lot = self.instruments[inst_slot as usize].lot_step;
         let mode = self.accounts[taker.account_slot as usize].self_match_prevention;
-        // E-13.1: the account's own orders at the tick, together, in ascending order ID.
+        let mine = self.effective_master(taker.account_slot);
+        // E-13.1, D-33: resting orders sharing the incoming order's effective master, at the tick, together, in
+        // ascending order ID.
         let mut own = 0;
         let mut cur = self.level(inst_slot, maker_side, tick).head;
         while cur != NONE {
             let r = self.orders[cur as usize];
-            if r.account_id == taker.account_id {
+            if self.effective_master(r.account_slot) == mine {
                 self.scratch[own] = (r.id, u64::from(cur));
                 own += 1;
             }

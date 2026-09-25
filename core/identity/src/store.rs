@@ -472,6 +472,19 @@ impl Store {
         Ok(json!({"accountId": found.id.to_string(), "masterAccountId": found.master.map(|m| m.to_string())}))
     }
 
+    /// Every subaccount in the environment, whoever its master is: not a client route, but how the gateway
+    /// reconciles the engine's own record of masters against identity's (`core/gateway/src/identity.rs`,
+    /// `reconcile_subaccounts`), since creating a subaccount tells both and the two can disagree if the gateway
+    /// died between them.
+    pub fn all_subaccounts(&self) -> Result<Value, Refusal> {
+        let subaccounts = self.records.all_subaccounts().map_err(records_refusal)?;
+        Ok(json!({
+            "subaccounts": subaccounts.into_iter().map(|a| json!({
+                "accountId": a.id.to_string(), "masterAccountId": a.master.map(|m| m.to_string()), "label": a.name
+            })).collect::<Vec<_>>()
+        }))
+    }
+
     /// A member signing up. The answer says nothing about whether the email was already somebody's: that would tell
     /// anyone who asked which addresses this venue knows. Either way a message goes to the address — "here is your
     /// link" or "somebody tried to sign up as you" — and the answer is the same.

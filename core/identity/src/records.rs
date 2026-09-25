@@ -184,6 +184,9 @@ pub trait KeyRecords: Send + Sync {
     fn create_subaccount(&self, account_id: u64, name: &str, master: u64, now: u64) -> Result<(), Error>;
     /// Every subaccount of `master`, oldest first.
     fn subaccounts_of(&self, master: u64) -> Result<Vec<Account>, Error>;
+    /// Every subaccount in the environment, whoever its master is: for reconciling the engine's own record of
+    /// masters against identity's (`core/gateway/src/identity.rs`, `reconcile_subaccounts`), not for a client.
+    fn all_subaccounts(&self) -> Result<Vec<Account>, Error>;
     /// The member who logs in with `email`, if there is one. Read when someone logs in, not on every request.
     fn member_by_email(&self, email: &str) -> Result<Option<MemberRow>, Error>;
     /// Every session that has not ended and has not expired at `now`, read once at start.
@@ -356,6 +359,10 @@ impl KeyRecords for Memory {
 
     fn subaccounts_of(&self, master: u64) -> Result<Vec<Account>, Error> {
         Ok(self.data()?.accounts.values().filter(|a| a.master == Some(master)).cloned().collect())
+    }
+
+    fn all_subaccounts(&self) -> Result<Vec<Account>, Error> {
+        Ok(self.data()?.accounts.values().filter(|a| a.master.is_some()).cloned().collect())
     }
 
     fn member_by_email(&self, email: &str) -> Result<Option<MemberRow>, Error> {
@@ -724,6 +731,26 @@ impl KeyRecords for Postgres {
                 "SELECT account_id, display_name, master_account_id FROM accounts
                  WHERE master_account_id = $1 ORDER BY account_id",
                 &[&big(master)?],
+            )?
+            .iter()
+            .map(|r| {
+                Ok(Account {
+                    id: unsigned(r.get(0))?,
+                    name: r.get(1),
+                    dev_token: None,
+                    master: r.get::<_, Option<i64>>(2).map(unsigned).transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    fn all_subaccounts(&self) -> Result<Vec<Account>, Error> {
+        self.db
+            .get()?
+            .query(
+                "SELECT account_id, display_name, master_account_id FROM accounts
+                 WHERE master_account_id IS NOT NULL ORDER BY account_id",
+                &[],
             )?
             .iter()
             .map(|r| {

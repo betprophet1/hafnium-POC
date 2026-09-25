@@ -315,14 +315,16 @@ struct Halves {
     private: Option<Arc<Gateway>>,
 }
 
-/// A half that follows the node's feed and sends its book subscribers what changed, and keeps checking the API keys
-/// its sessions use when it verifies keys.
+/// A half that follows the node's feed and sends its book subscribers what changed, keeps checking the API keys
+/// its sessions use when it verifies keys, and (the private half, when it has an identity service) keeps
+/// reconciling subaccounts the engine has not yet been told to protect.
 fn start_half(gateway: Gateway, feed: &str) -> Arc<Gateway> {
     let gateway = Arc::new(gateway);
     follow_feed(&gateway, feed.to_string());
     conflate(&gateway);
     if gateway.identity.serves_keys() {
         identity::keep_checking(&gateway);
+        identity::reconcile_subaccounts(&gateway);
     }
     gateway
 }

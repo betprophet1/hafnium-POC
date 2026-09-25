@@ -95,6 +95,7 @@ impl<'a> Engine<'a> {
             set_rule_limits_codec::SBE_TEMPLATE_ID
             | set_account_controls_codec::SBE_TEMPLATE_ID
             | set_maker_protection_codec::SBE_TEMPLATE_ID => self.check_account_settings(template, input)?,
+            set_master_account_codec::SBE_TEMPLATE_ID => self.check_master_account(input)?,
             set_fee_schedule_codec::SBE_TEMPLATE_ID => {
                 let dec = set_fee_schedule_codec::SetFeeScheduleDecoder::default().header(header(input), 0);
                 valid(fees::rates_valid(dec.maker_rate_micros(), dec.taker_rate_micros()))
@@ -203,6 +204,7 @@ impl<'a> Engine<'a> {
                 self.remove_fee_override(dec.override_id());
                 Ok(())
             }
+            set_master_account_codec::SBE_TEMPLATE_ID => self.apply_master_account(input),
             _ => self.apply_account_settings(template, input),
         }
     }
@@ -556,6 +558,31 @@ impl<'a> Engine<'a> {
             }
             _ => return Err(FailStop::NotImplemented),
         }
+        Ok(())
+    }
+
+    /// E-7.13. Reads with `account_slot`/`master_account_id` rather than through `account_slot(&mut self, ..)`
+    /// where possible so a rejected command allocates no slot beyond what E-3.2 already treats as unobservable.
+    fn check_master_account(&mut self, input: &[u8]) -> Decoded<Verdict> {
+        let dec = set_master_account_codec::SetMasterAccountDecoder::default().header(header(input), 0);
+        let (account_id, master_id) = (dec.account_id(), dec.master_account_id());
+        if account_id == 0 || master_id == 0 || account_id == master_id {
+            return Ok(Rejected(RejectReason::INVALID_COMMAND));
+        }
+        let master_slot = self.account_slot(master_id)?;
+        if self.accounts[master_slot as usize].master_account_id != 0 {
+            // A master may not itself be a subaccount: a family is two levels deep at most (D-33).
+            return Ok(Rejected(RejectReason::INVALID_COMMAND));
+        }
+        let slot = self.account_slot(account_id)?;
+        let existing = self.accounts[slot as usize].master_account_id;
+        Ok(valid(existing == 0 || existing == master_id))
+    }
+
+    fn apply_master_account(&mut self, input: &[u8]) -> Result<(), FailStop> {
+        let dec = set_master_account_codec::SetMasterAccountDecoder::default().header(header(input), 0);
+        let slot = self.account_slot(dec.account_id())?;
+        self.accounts[slot as usize].master_account_id = dec.master_account_id();
         Ok(())
     }
 

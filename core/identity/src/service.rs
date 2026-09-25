@@ -188,6 +188,8 @@ fn route(store: &Store, request: &Request) -> Result<Value, Refusal> {
         }
         ("GET", ["v1", "accounts", id, "subaccounts"]) => store.list_subaccounts(account(id)?),
         ("GET", ["v1", "accounts", id]) => store.account_family(account(id)?),
+        // Venue-wide, for the gateway's own reconciliation (`reconcile_subaccounts`), not a client route.
+        ("GET", ["v1", "subaccounts"]) => store.all_subaccounts(),
         _ => Err(Refusal::not_found("no such route")),
     }
 }
@@ -562,5 +564,11 @@ mod tests {
             404,
             "no such master account"
         );
+
+        // Venue-wide, for the gateway's own reconciliation: every subaccount, whoever its master is.
+        let (status, all) = call(&a, "GET", "/v1/subaccounts", None);
+        assert_eq!((status, &all["subaccounts"][0]["accountId"]), (200, &json!(sub)), "{all}");
+        assert_eq!(all["subaccounts"][0]["masterAccountId"], json!("1"));
+        assert_eq!(all["subaccounts"].as_array().map(Vec::len), Some(1), "account 1 is a master, not listed here");
     }
 }
