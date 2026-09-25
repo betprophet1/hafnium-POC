@@ -921,6 +921,14 @@ fn publish(subscribers: &mut Vec<Live>, metrics: &NodeMetrics, input: &[u8], res
 ///
 /// A journal `seed` founded, or `cut` down to nothing but its snapshot, has no real input to speak for it. Then
 /// the snapshot's sequence is both ends at once: nothing below it is carried, and nothing above it has happened.
+/// The sequence below which `journal` carries nothing: zero for a journal that still starts at genesis, and the
+/// point it was `cut` or `seed`ed at otherwise. The same floor `serve_subscriber` refuses resume positions
+/// below, exposed because a reader's view has the same problem for the same reason — what is below the floor is
+/// in the archive, not here.
+pub fn journal_floor(journal: &Path) -> Result<u64, Error> {
+    Ok(range(journal, journal.metadata()?.len())?.0)
+}
+
 fn range(path: &Path, length: u64) -> Result<(u64, u64), Error> {
     let mut reader = BufReader::new(File::open(path)?.take(length));
     let mut buf = Vec::new();

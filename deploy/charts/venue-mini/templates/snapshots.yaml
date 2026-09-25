@@ -57,6 +57,39 @@ spec:
           securityContext:
             {{- include "venue-mini.podSecurity" . | nindent 12 }}
           initContainers:
+            # The previous pair, which a journal that has been cut *requires*: the units before the cut are in
+            # the archive, so a view built without it would silently hold only what followed. Finding nothing is
+            # not a failure — the first run has no predecessor, and an uncut journal needs none — so this exits
+            # 0 either way and `venue-view` is what refuses when one was actually needed.
+            - name: previous
+              image: "{{ $s.image.repository }}:{{ $s.image.tag | default $.Chart.AppVersion }}"
+              imagePullPolicy: {{ $s.image.pullPolicy }}
+              command: ["python3", "/opt/venue/snapshot_fetch.py"]
+              args:
+                - --from
+                - {{ $s.to | quote }}
+                - --environment
+                - {{ $s.environment | quote }}
+                - --pair
+                - /previous
+              env:
+                - name: AWS_REGION
+                  value: {{ $s.region | quote }}
+                - name: HOME
+                  value: /tmp
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 64Mi
+                limits:
+                  memory: 512Mi
+              securityContext:
+                {{- include "venue-mini.containerSecurity" . | nindent 16 }}
+              volumeMounts:
+                - name: previous
+                  mountPath: /previous
+                - name: tmp
+                  mountPath: /tmp
             - name: take
               image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -72,6 +105,8 @@ spec:
                 - trusted
                 - --results
                 - /var/lib/venue/results.sbe
+                - --from-pair
+                - /previous
               resources:
                 requests:
                   cpu: 100m
@@ -88,6 +123,8 @@ spec:
                   readOnly: true
                 - name: pair
                   mountPath: /pair
+                - name: previous
+                  mountPath: /previous
                 - name: tmp
                   mountPath: /tmp
           containers:
@@ -130,6 +167,9 @@ spec:
                 claimName: journal-{{ $name }}-core-0
                 readOnly: true
             - name: pair
+              emptyDir:
+                sizeLimit: {{ $s.pairSize | quote }}
+            - name: previous
               emptyDir:
                 sizeLimit: {{ $s.pairSize | quote }}
             - name: tmp
