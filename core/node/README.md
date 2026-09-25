@@ -120,6 +120,7 @@ snapshot, and that stretch is the only copy of it. Three steps make it an archiv
 venue-node export-cut ./venue-data/journal.sbe ./venue-data/results.sbe ./segment
 interfaces/tools/journal_ship.py ./segment --to s3://BUCKET --environment prod
 venue-node cut-journal ./venue-data/journal.sbe ./venue-data/results.sbe --require-shipped ./segment
+venue-node restore-cut ./segment ./venue-data/journal.sbe ./venue-data/results.sbe ./restored
 ```
 
 `export-cut` writes out exactly what a cut would remove and **changes neither file**, so it is safe against a
@@ -133,6 +134,23 @@ is how an unshipped archive gets lost.
 `journal_ship.py` uploads both halves with `.sha256` sidecars under `journals/{environment}/`, reads them back
 and compares, and only then writes a `shipped.json` receipt. It shares `snapshot_publish.py`'s verified upload
 rather than reimplementing that care.
+
+**Reading it back.** `venue-node restore-cut SEGMENT_DIR JOURNAL RESULTS OUT_DIR` puts an archived segment
+back in front of the journal it was cut from. An archive nobody has ever read back is bytes rather than a
+record, so this exists as much to be *tested* as to be run.
+
+The restored journal is **not** byte-identical to the one that was cut, and must not be expected to be: `embed`
+appends wherever the file ends, so the original carried its `Snapshot` at the tail, after inputs with higher
+sequences, while a restored journal carries it between the segment and what followed. Position has never meant
+anything in a journal (§3.7). What holds is that a **replay of the restored journal produces the same result
+log as a replay of the original**, byte for byte — the same shape of equivalence E-20.9 uses for snapshots, and
+what `core/node/tests/restore_cut.rs` checks.
+
+It refuses a segment that is not the one this journal was cut at, in both directions: the segment's last input
+must be the sequence the journal's snapshot was taken at, and the journal's own first input must be the one
+after. That guard matters because the mistake it prevents leaves a **well-formed file** — every frame valid,
+every length agreeing — with a gap or an overlap spliced into the middle of the history, which a replay would
+only discover as a fail-stop somewhere confusing.
 
 `--require-shipped` is what closes the loop: the cut refuses unless the receipt is for **this** snapshot and
 names **these** bytes. The case it exists for is not a forged receipt but an honest stale one — a segment

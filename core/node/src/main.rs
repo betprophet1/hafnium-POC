@@ -34,6 +34,10 @@ const USAGE: &str = "usage:
                                            writes what a cut would remove into DIR, changing neither file, so it
                                            can be archived and verified before anything discards it; refuses on
                                            the same grounds a cut would, and refuses a DIR that already holds one
+  venue-node restore-cut SEGMENT_DIR JOURNAL RESULTS OUT_DIR
+                                           puts an archived segment back in front of the journal it was cut from,
+                                           writing OUT_DIR/journal.sbe and results.sbe; refuses a segment that is
+                                           not the one this journal was cut at
   venue-node cut-journal JOURNAL RESULTS [--require-shipped DIR]
                                            removes everything before the latest embedded snapshot from both,
                                            once RESULTS already covers it; refuses otherwise. For a journal no
@@ -82,6 +86,7 @@ fn main() -> ExitCode {
         (Some("recover"), 3 | 5) => recover(&args[1..]),
         (Some("cut-journal"), 3 | 5) => cut_journal(&args[1..]),
         (Some("export-cut"), 4) => export_cut(&args[1..]),
+        (Some("restore-cut"), 5) => restore_cut(&args[1..]),
         (Some("seed"), 3 | 5) => seed(&args[1..]),
         (Some("dump"), 2) => dump(&args[1]),
         (Some("import"), 3) => import(&args[1], &args[2]),
@@ -252,6 +257,14 @@ fn cut_journal(args: &[String]) -> Result<(), node::Error> {
     let (at, journal_removed, results_removed) =
         node::cut_checked(Path::new(&args[0]), Path::new(&args[1]), shipped.as_deref())?;
     eprintln!("cut to sequence {at}: journal -{journal_removed} bytes, results -{results_removed} bytes");
+    Ok(())
+}
+
+/// `restore-cut SEGMENT_DIR JOURNAL RESULTS OUT_DIR`.
+fn restore_cut(args: &[String]) -> Result<(), node::Error> {
+    let (first, last) =
+        node::restore_cut(Path::new(&args[0]), Path::new(&args[1]), Path::new(&args[2]), Path::new(&args[3]))?;
+    eprintln!("restored inputs {first}..{last} into {}", args[3]);
     Ok(())
 }
 

@@ -506,6 +506,95 @@ pub fn export_cut(journal: &Path, results: &Path, out_dir: &Path) -> Result<Segm
     Ok(segment)
 }
 
+/// Puts an archived segment back in front of the journal it was cut from, reconstituting the history a cut
+/// removed. The other end of `export_cut`, and the thing that decides whether the archive is a record or just
+/// bytes nobody has ever read back.
+///
+/// **The result is not byte-identical to the journal that was cut, and must not be expected to be.** `embed`
+/// appends wherever the file ends, so the original carried its `Snapshot` at the *tail*, after inputs with
+/// higher sequences; the restored file carries it between the segment and the tail. Position has never meant
+/// anything in a journal (§3.7) — what has to hold is that a replay of the restored journal produces the same
+/// result log as a replay of the original, and that is what `core/node/tests/restore_cut.rs` checks.
+///
+/// Refuses unless the segment is the one that belongs in front of *this* journal: its last real input must be
+/// the sequence the journal's snapshot was taken at, and the journal's own first real input must be the one
+/// after. A segment from a different cut would otherwise splice a gap or an overlap into the history and the
+/// file would still look well-formed.
+pub fn restore_cut(segment_dir: &Path, journal: &Path, results: &Path, out_dir: &Path) -> Result<(u64, u64), Error> {
+    let manifest: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(segment_dir.join(SEGMENT_MANIFEST))
+            .map_err(|e| format!("{}: {e}", segment_dir.join(SEGMENT_MANIFEST).display()))?,
+    )?;
+    let at = manifest["at"].as_u64().ok_or("the segment manifest has no 'at'")?;
+    let last = manifest["last_sequence"].as_u64().ok_or("the segment manifest has no 'last_sequence'")?;
+    let name = |half: &str| -> Result<PathBuf, Error> {
+        let file = manifest[half].as_str().ok_or_else(|| format!("the segment manifest has no '{half}'"))?;
+        Ok(segment_dir.join(file))
+    };
+
+    let Some((snapshot_at, _)) = snapshots::latest(journal)? else {
+        return Err(format!("{} has no embedded snapshot, so nothing was cut from it", journal.display()).into());
+    };
+    if snapshot_at != at {
+        return Err(format!(
+            "the segment was cut at {at} but {} was cut at {snapshot_at}: that segment does not belong in front \
+             of this journal",
+            journal.display()
+        )
+        .into());
+    }
+    if last != at {
+        return Err(format!("the segment's last input is {last}, not the {at} it was cut at").into());
+    }
+    // The journal's own first real input has to be the one after the cut point: no gap, no overlap.
+    let (floor, _) = range(journal, journal.metadata()?.len())?;
+    if floor != at {
+        return Err(format!("{} carries inputs from {floor}, not from {at}", journal.display()).into());
+    }
+
+    fs::create_dir_all(out_dir)?;
+    let (journal_out, results_out) = (out_dir.join("journal.sbe"), out_dir.join("results.sbe"));
+    for existing in [&journal_out, &results_out] {
+        if existing.exists() {
+            return Err(format!("{} already exists", existing.display()).into());
+        }
+    }
+    concatenate(&[name("journal")?, journal.to_path_buf()], &journal_out)?;
+    concatenate(&[name("results")?, results.to_path_buf()], &results_out)?;
+
+    let (first, restored_last) = range(&journal_out, journal_out.metadata()?.len())?;
+    log::info(
+        "cut segment restored",
+        &[
+            ("at", &at),
+            ("first_sequence", &(first + 1)),
+            ("last_sequence", &restored_last),
+            ("out", &out_dir.display()),
+        ],
+    );
+    Ok((first + 1, restored_last))
+}
+
+/// Writes `parts` end to end into `to`, durably. Frames carry their own lengths, so a journal really is the
+/// concatenation of its pieces — there is no header or index to merge.
+fn concatenate(parts: &[PathBuf], to: &Path) -> Result<(), Error> {
+    let mut output = BufWriter::new(File::create(to)?);
+    let mut buf = vec![0u8; 1 << 16];
+    for part in parts {
+        let mut reader = BufReader::new(File::open(part)?);
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            output.write_all(&buf[..n])?;
+        }
+    }
+    output.flush()?;
+    output.get_ref().sync_all()?;
+    Ok(())
+}
+
 /// The manifest a segment carries, and what `--require-shipped` later reads back.
 pub const SEGMENT_MANIFEST: &str = "segment.json";
 
