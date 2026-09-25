@@ -30,17 +30,23 @@ def digest(path):
 
 
 class Destination:
-    """Somewhere to put an object and read it back. A directory or a bucket; the difference is two commands."""
+    """Somewhere to put an object and read it back. A directory or a bucket; the difference is two commands.
 
-    def __init__(self, where, environment):
+    `prefix` is what kind of thing is being stored — `snapshots` here, `journals` for `journal_ship.py`. Keeping
+    them apart in the key space is the same instinct as the audit shipper's per-environment prefixes: a lifecycle
+    rule written for one must not be able to reach the other (§7.4 learned that the hard way).
+    """
+
+    def __init__(self, where, environment, prefix="snapshots"):
         self.where = where.rstrip("/")
         self.environment = environment
+        self.prefix = prefix
         self.s3 = where.startswith("s3://")
 
     def key(self, tag, suffix="snapshot"):
         if "/" in self.environment or "/" in tag:
             raise ValueError("environment and tag each become part of a key: no slashes")
-        return f"snapshots/{self.environment}/{tag}.{suffix}"
+        return f"{self.prefix}/{self.environment}/{tag}.{suffix}"
 
     def put(self, path, key):
         if not self.s3:
@@ -66,13 +72,16 @@ class Destination:
         return f"{rest[1]}/{key}" if len(rest) > 1 else key
 
 
-def publish(path, destination, tag):
+def publish(path, destination, tag, suffix="snapshot"):
     """Uploads `path` and a `.sha256` sidecar naming its digest, then reads both back and compares before
     returning. Raises on any mismatch or transport failure — nothing is reported published unless it verified
-    in place, the same principle `interfaces/audit/README.md` already rests on."""
+    in place, the same principle `interfaces/audit/README.md` already rests on.
+
+    `journal_ship.py` uses this too, with a different `suffix`: one verified upload, not two implementations of
+    the same care."""
     path = Path(path)
     sha = digest(path)
-    snapshot_key = destination.key(tag)
+    snapshot_key = destination.key(tag, suffix)
     sha_key = destination.key(tag, "sha256")
 
     destination.put(path, snapshot_key)
