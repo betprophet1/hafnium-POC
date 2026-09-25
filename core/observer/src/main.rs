@@ -118,6 +118,7 @@ fn run(flags: &BTreeMap<String, String>) -> Result<(), Error> {
             },
             || {
                 // The node could not honour that position — this projection is of a history that never happened.
+                log::warn("the feed is starting over; the projection is being thrown away", &[("feed", &feed)]);
                 state.lock().unwrap_or_else(PoisonError::into_inner).view = View::default();
             },
             |unit| {

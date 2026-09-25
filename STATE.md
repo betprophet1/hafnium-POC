@@ -93,6 +93,19 @@ Why this matters more than it sounds: before readers could resume, every deploy 
 genesis replay. With ~36.7M inputs and eight subscribers replaying at once on two vCPUs, the gateway took
 **~102 minutes** to come back. After the cut, it is seconds.
 
+**Asking for "everything" is not exempt from the floor, and used to be treated as if it were.** Position 0 means
+"send me the whole history" — but on a journal that has been cut, the whole history is not what the node has any
+more. Until this was fixed, a reader asking for 0 against a floor above 0 was answered with the same ack byte a
+genuine from-genesis serve gets, and the client's own guard only ever inspected that byte when it had asked for a
+position *greater than* zero — so the one reader that most needed to be told ("you asked for everything and
+this is not everything") was built not to look. Every reader deployed today asks for 0 on a fresh start, because
+none is founded on a pair (§8), so this was live risk under a healthy-looking venue: any pod restart after a cut
+would silently show a view missing everything before it. Both halves are fixed now — the ack reflects whether
+`asked_for` is actually covered, `asked_for == 0` included, and the client's guard no longer excuses zero. A
+restart in this state now throws the view away and says so (a log line, not a metric or an alert), the same path
+that already existed for a node being replaced under a reader. **It does not make the view complete** — nothing
+does that except founding on a pair — it makes the incompleteness observable instead of silent.
+
 ---
 
 ## 4. Founding an environment on a chosen snapshot
