@@ -112,9 +112,32 @@ The core trade being made is **matching-latency guarantee vs. resident memory**,
 - **New operational surface:** the sparse-overflow pool is a second, smaller shared capacity ceiling alongside the existing dense `levels` pool — one hard ceiling becomes two softer ones. Both need their own `Capacities` fields and default sizing for `small`/`launch`/`scale`.
 - **To revisit:** whether promotion should be "any touch on a dormant/cold book instantly goes fully dense" (simpler, but wastes a dense reservation on a book touched once and gone quiet again) or "grow within sparse until inline+overflow capacity is actually exceeded" (better packed, more edge cases to test). Not resolved by this ADR.
 
+## Prototype Findings (2026-09-25)
+
+Built `core/prototypes/tieredbook` (mirrors `core/prototypes/maskbench`'s pattern: a standalone benchmark, not wired into `core/engine`). Dense reproduces today's mechanism (100-tick array + bitmap); sparse holds a few ticks inline plus a shared `OverflowPool` implemented as the same intrusive singly-linked free list `core/engine/src/book.rs`'s order slab already uses, not a `Vec` per book (a `Vec`'s own header costs ~96 bytes regardless of occupancy, which would understate a cold book's real footprint).
+
+**Memory** (fixed, independent of occupancy):
+
+| Representation | Size |
+|---|---|
+| `DenseBook` (100 ticks, today's mechanism) | 1,216 bytes |
+| `SparseBook<4>` inline shell | 64 bytes (19x smaller) |
+| `SparseBook<8>` inline shell | 120 bytes (10x smaller) |
+| `SparseBook<16>` inline shell | 232 bytes (5.2x smaller) |
+| One overflow entry (shared, amortised) | 18 bytes |
+
+**Best-price lookup** (`best_below`, scanning all 100 tick positions): dense stays flat at ~1.8 ns regardless of occupancy (as expected — O(1) bitmap). Sparse scales roughly with occupied-tick count: ~3.5 ns at 4 occupied (INLINE=4, no overflow), ~7.5 ns at 8 occupied (INLINE=8, no overflow), up to ~110 ns at 99 occupied (fully dense, worst realistic misclassification). The practically important number: **even the worst case (a 99-tick book wrongly still classified as sparse) costs ~110 ns — roughly 0.7–1.5% of the 7–15µs matching-and-clearing budget.** Misclassification is a real slowdown but not a latency-budget threat at any occupancy this format would plausibly be used at.
+
+**Insert+remove one tick**: dense costs a flat ~17.4 ns regardless of existing occupancy (always touches the same fixed set of arrays + one bitmap bit). Sparse costs ~6–7 ns across every scenario tested — cheaper, not just competitive, since it only ever touches a handful of small array entries or one pool slot. Caveat: this measured the best case for removal — the freshly-inserted entry sits at the head of the overflow chain, so removing it is O(1); removing an arbitrary older entry buried in a long overflow chain would cost proportionally more, same shape as `best_below`.
+
+**What this settles, and what it doesn't:**
+- Inline capacity `K` is mostly a memory-floor decision, not a speed one — `best_below` cost at a given occupied-tick count is nearly identical whether those ticks are split inline/overflow (INLINE=4, 8 occupied: 6.98 ns) or packed differently (INLINE=8, 8 occupied: 7.52 ns). The lever `K` actually controls is what fraction of real cold books never touch the shared pool at all.
+- The promotion policy doesn't need to be justified primarily by a latency cliff — absolute sparse cost stays small even at high occupancy. The real reason to promote before a book gets busy is code-path simplicity and avoiding pathological overflow-pool churn, not a hard matching-budget threat. This should soften Action Item 4 below: the exact threshold matters less for correctness than for keeping the common case cheap.
+- Not measured here: removal cost for a deep/old overflow entry, and any interaction with real order-slab churn under concurrent inserts/cancels — both need the real `core/engine` integration to observe, not this isolated prototype.
+
 ## Action Items
 
-1. [ ] Prototype the sparse/inline book representation and its hot-path cost in isolation (following `core/prototypes/maskbench`'s existing pattern of micro-benchmarking a representation choice before adopting it) — confirm scan cost at the chosen inline capacity `K` is acceptable.
+1. [x] Prototype the sparse/inline book representation and its hot-path cost in isolation (following `core/prototypes/maskbench`'s existing pattern of micro-benchmarking a representation choice before adopting it) — confirm scan cost at the chosen inline capacity `K` is acceptable. **Done** — see Prototype Findings above; `core/prototypes/tieredbook`.
 2. [ ] Pin down the exact demotion thresholds (`D_idle` in `TimeTick` units, `density_threshold`) as a pure function of existing/new per-instrument counters; confirm the function is replay-deterministic.
 3. [ ] Add an `overflow` field to `Capacities` (`core/engine/src/state.rs`) and choose default sizes for `small`/`launch`/`scale`; re-run today's `venue-sim workload` bisection against a prototype to measure the new book-count ceiling for the same 99-tick workload.
 4. [ ] Decide the promotion policy from the open question in Consequences ("instant-to-dense" vs. "grow-within-sparse").
