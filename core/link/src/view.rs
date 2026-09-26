@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use venue_journal::message_header_codec::MessageHeaderDecoder;
 use venue_journal::side::Side;
-use venue_journal::{book_level_changed_codec, fill_codec, order_accepted_codec, ReadBuf};
+use venue_journal::{book_level_changed_codec, command_applied_codec, fill_codec, order_accepted_codec, ReadBuf};
 
 const KEEP: usize = 60;
 
@@ -220,7 +220,12 @@ impl View {
             return;
         }
         self.version += 1;
-        let applied = unit.results.iter().any(|r| r["msg"] == "CommandApplied" && r["outcome"] == "APPLIED");
+        // The template first: this runs over every result, and asking each one through the JSON shape decodes
+        // frames nothing else here reads (ADR-0002).
+        let applied = unit
+            .results
+            .iter()
+            .any(|r| r.template() == command_applied_codec::SBE_TEMPLATE_ID && r["outcome"] == "APPLIED");
         match input["msg"].as_str().unwrap_or("") {
             "DefineTickTable" if applied => {
                 let rows: Vec<Row> = input["ticks"]

@@ -106,6 +106,12 @@ impl Frame {
         &self.bytes
     }
 
+    /// Whether anything has asked for the JSON shape of this frame yet. For tests that mean to check a reader
+    /// takes a frame typed rather than decoding it, which is otherwise only visible as a timing difference.
+    pub fn decoded(&self) -> bool {
+        self.value.get().is_some()
+    }
+
     /// Which message this is, without decoding it: the schema's template id, for dispatch.
     pub fn template(&self) -> u16 {
         MessageHeaderDecoder::default().wrap(ReadBuf::new(&self.bytes), 0).template_id()

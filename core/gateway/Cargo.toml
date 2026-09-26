@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 venue-link = { path = "../link" }
+# The generated SBE decoders, to read a feed result without inflating it into JSON (`hub.rs`, ADR-0002).
+venue_journal = { path = "../journal" }
 # What a key's credential and permissions look like, read the same way the identity service reads them.
 venue-identity = { path = "../identity" }
 serde_json = "1"

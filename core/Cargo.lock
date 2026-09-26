@@ -1042,6 +1042,7 @@ dependencies = [
  "venue-store",
  "venue-telemetry",
  "venue-treasury",
+ "venue_journal",
 ]
 
 [[package]]

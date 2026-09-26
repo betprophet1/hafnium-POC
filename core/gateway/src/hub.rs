@@ -9,10 +9,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SendError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use venue_journal::message_header_codec::MessageHeaderDecoder;
+use venue_journal::side::Side;
+use venue_journal::{
+    book_level_changed_codec, command_applied_codec, event_released_codec, fill_codec, market_state_changed_codec,
+    order_accepted_codec, order_cancelled_codec, order_rejected_codec, ReadBuf,
+};
 use venue_link::catalogue::Catalogue;
 use venue_link::submit::Notify;
 use venue_link::view::{InstrumentView, Row, View};
-use venue_link::wire::Unit;
+use venue_link::wire::{Frame, Unit};
 
 /// Private messages kept per account for sessions resuming by sequence.
 const HISTORY: usize = 2_000;
@@ -50,6 +56,42 @@ pub fn ladder(view: &View, instrument: u64) -> &[Row] {
 /// The executions an input's results mean for each account, from the view as it was before the input.
 /// Takes the results as an iterator of `&Value` rather than a slice, so a caller holding feed frames can hand
 /// over what they decode to without collecting them first (`wire::Frame`).
+/// A frame's SBE header, for handing to a generated decoder.
+fn header_of(f: &Frame) -> MessageHeaderDecoder<ReadBuf<'_>> {
+    MessageHeaderDecoder::default().wrap(ReadBuf::new(f.bytes()), 0)
+}
+
+/// Whether a result is a `CommandApplied` saying so. The template is checked first, so a scan for one does not
+/// decode every other frame of the unit on the way past (ADR-0002).
+fn applied_ok(f: &Frame) -> bool {
+    f.template() == command_applied_codec::SBE_TEMPLATE_ID && f["outcome"] == "APPLIED"
+}
+
+/// The order id of an `OrderAccepted` frame, without decoding the rest of it.
+fn order_accepted_order_id(f: &Frame) -> u64 {
+    let mut dec = order_accepted_codec::OrderAcceptedDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    dec.order_id()
+}
+
+/// The results `executions` has anything to say about. Everything else it ignores, so a frame of any other
+/// kind is filtered out before it is looked at rather than after -- which is the difference between a book
+/// level costing a decode and costing nothing, since a decoded frame is kept once anything asks (ADR-0002).
+const EXECUTION_RESULTS: [u16; 5] = [
+    order_accepted_codec::SBE_TEMPLATE_ID,
+    order_rejected_codec::SBE_TEMPLATE_ID,
+    fill_codec::SBE_TEMPLATE_ID,
+    order_cancelled_codec::SBE_TEMPLATE_ID,
+    venue_journal::order_reduced_codec::SBE_TEMPLATE_ID,
+];
+
+/// `executions` over a unit's frames, reading only the ones it answers for.
+pub fn executions_of(view: &View, results: &[Frame], sequence: u64) -> Vec<(u64, Value)> {
+    let wanted = results.iter().filter(|f| EXECUTION_RESULTS.contains(&f.template()));
+    executions(view, wanted.map(|f| &**f), sequence)
+}
+
 pub fn executions<'a>(view: &View, results: impl IntoIterator<Item = &'a Value>, sequence: u64) -> Vec<(u64, Value)> {
     let mut out = Vec::new();
     let mut accepted: BTreeMap<u64, (String, u64)> = BTreeMap::new();
@@ -441,12 +483,12 @@ impl Hub {
     pub fn apply(&mut self, unit: &Unit) {
         let input = &unit.input;
         let sequence = u(&input["record"]["sequence"]);
-        let executions = executions(&self.view, unit.results.iter().map(|f| &**f), sequence);
+        let executions = executions_of(&self.view, &unit.results, sequence);
         // Markets the engine releases with their events (E-8.4), found before the view forgets them.
         let released: Vec<(u64, Vec<u64>)> = unit
             .results
             .iter()
-            .filter(|r| r["msg"] == "EventReleased")
+            .filter(|r| r.template() == event_released_codec::SBE_TEMPLATE_ID)
             .map(|r| {
                 let event = u(&r["eventId"]);
                 (event, self.view.events.get(&event).map(|e| e.instruments.clone()).unwrap_or_default())
@@ -461,7 +503,14 @@ impl Hub {
         self.last_unit = Some((monotonic(), u(&input["record"]["sequencedAt"])));
         // The view has now applied this unit, so every order accepted at or before it can be forgotten here.
         self.last_sequence = self.last_sequence.max(sequence);
-        let highest = unit.results.iter().filter(|r| r["msg"] == "OrderAccepted").map(|r| u(&r["orderId"])).max();
+        // By template id and then straight out of the decoder: this runs over every result of every unit, and
+        // asking it through the JSON shape means decoding frames nothing else reads (ADR-0002).
+        let highest = unit
+            .results
+            .iter()
+            .filter(|r| r.template() == order_accepted_codec::SBE_TEMPLATE_ID)
+            .map(order_accepted_order_id)
+            .max();
         if let Some(highest) = highest.filter(|h| *h > self.highest_order) {
             self.highest_order = highest;
             self.awaiting.retain(|(order, _, notify)| {
@@ -489,9 +538,21 @@ impl Hub {
         let settled_event = unit
             .results
             .iter()
-            .find(|r| r["msg"] == "MarketStateChanged")
+            .find(|r| r.template() == market_state_changed_codec::SBE_TEMPLATE_ID)
             .map_or(0, |r| event_of(&self.view, u(&r["instrumentId"])));
         for r in &unit.results {
+            // The engine already said exactly what moved, so keep it rather than re-reading the book later.
+            // Read typed: a book level moves on nearly every unit and nothing else here looks at the frame, so
+            // this is the one result a busy feed never has to decode at all (ADR-0002).
+            if r.template() == book_level_changed_codec::SBE_TEMPLATE_ID {
+                let mut dec = book_level_changed_codec::BookLevelChangedDecoder::default().header(header_of(r), 0);
+                let mut group = dec.result_decoder();
+                dec = group.parent().expect("the result group");
+                let level = (dec.side() == Side::BUY, u64::from(dec.tick()));
+                let moved = (u64::from(dec.quantity()), u64::from(dec.order_count()));
+                self.dirty.entry(dec.instrument_id()).or_default().insert(level, moved);
+                continue;
+            }
             let instrument = u(&r["instrumentId"]);
             match r["msg"].as_str().unwrap_or("") {
                 "PositionChanged" => accounts
@@ -535,12 +596,6 @@ impl Hub {
                     });
                     self.send_to_topic("markets", &market.to_string());
                 }
-                // The engine already said exactly what moved, so keep it rather than re-reading the book later.
-                "BookLevelChanged" => {
-                    let level = (r["side"] == "BUY", u(&r["tick"]));
-                    let moved = (u(&r["quantity"]), u(&r["orderCount"]));
-                    self.dirty.entry(instrument).or_default().insert(level, moved);
-                }
                 _ => {}
             }
         }
@@ -557,7 +612,7 @@ impl Hub {
             let gone = json!({"type": "market", "sequence": id(sequence), "eventId": id(*event), "released": true});
             self.send_to_topic("markets", &gone.to_string());
         }
-        if input["msg"] == "SetEventPhase" && unit.results.iter().any(|r| r["outcome"] == "APPLIED") {
+        if input["msg"] == "SetEventPhase" && unit.results.iter().any(applied_ok) {
             let phase = json!({
                 "type": "market", "sequence": id(sequence), "eventId": id(u(&input["eventId"])),
                 "phase": lower(&input["phase"])
@@ -572,7 +627,7 @@ impl Hub {
             Some("ExpireParlay") => self.view.instruments.get(&u(&input["instrumentId"])).map(|i| i.event),
             _ => None,
         };
-        if let Some(event) = resolved.filter(|_| unit.results.iter().any(|r| r["outcome"] == "APPLIED")) {
+        if let Some(event) = resolved.filter(|_| unit.results.iter().any(applied_ok)) {
             let resolved = json!({
                 "type": "market", "sequence": id(sequence), "eventId": id(event), "resolution": self.resolution(event)
             });
@@ -1092,5 +1147,34 @@ mod tests {
         let fee = |account: u64| out.iter().find(|(a, _)| *a == account).map(|(_, e)| e["feeCents"].clone());
         assert_eq!(fee(1), Some(json!(-3)));
         assert_eq!(fee(2), Some(json!(15)));
+    }
+
+    /// A book level moving is the most frequent thing on a live feed, and nothing in the gateway needs its JSON
+    /// shape: the hub keeps the moved level for the next conflate flush and the view updates its book, both
+    /// straight out of the decoder. So applying one must leave the frame undecoded.
+    ///
+    /// This is asserted rather than timed because the decoded shape is kept once anything asks for it, so a
+    /// single reader still reaching for it costs the whole decode and shows up only as a slightly slower feed
+    /// thread. `Frame::decoded` makes that visible (ADR-0002).
+    #[test]
+    fn a_book_level_is_applied_without_decoding_it() {
+        let mut hub = hub();
+        let moved = Frame::of(&json!({
+            "msg": "BookLevelChanged",
+            "result": {"inputSequence": 9, "resultIndex": 0, "sequencedAt": 0, "sequencerGroup": 1},
+            "instrumentId": 10_010, "side": "BUY", "tick": 40, "quantity": 250, "orderCount": 2
+        }));
+        let input = Frame::of(&json!({"msg": "NewOrder",
+            "record": {"sequence": 9, "sequencedAt": 0, "sequencerGroup": 1}}));
+        let unit = Unit { input, results: vec![moved] };
+
+        hub.apply(&unit);
+
+        assert!(!unit.results[0].decoded(), "a book level change should never need its JSON shape");
+        assert_eq!(
+            hub.dirty.get(&10_010).and_then(|levels| levels.get(&(true, 40))),
+            Some(&(250, 2)),
+            "and the moved level is still what the engine said"
+        );
     }
 }
