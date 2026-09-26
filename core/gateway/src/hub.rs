@@ -981,6 +981,7 @@ fn typed(kind: &str, mut body: Value) -> String {
 mod tests {
     use super::*;
     use std::sync::{mpsc, Arc};
+    use venue_link::view::OrderView;
     use venue_link::wire::Frame;
 
     /// A session's outbox, and what arrives in it.
@@ -1239,5 +1240,126 @@ mod tests {
             let unfiltered = executions(&view, frames.iter().map(|f| &**f), 3);
             assert_eq!(out, unfiltered, "filtering frames changed what a {kind} produces");
         }
+    }
+
+    /// A view with enough in it that the arms which consult one have something to find: a cent ladder so
+    /// `quote` converts a tick to a real price, and a resting order so the branches that look one up are taken
+    /// rather than skipped.
+    fn view_for_executions() -> View {
+        let mut view = View::default();
+        view.ladders
+            .insert(1, (0..=100).map(|t| Row { numerator: t, denominator: 100, complement: 100 - t }).collect());
+        view.instruments.insert(
+            10_010,
+            InstrumentView { event: 7, table: 1, lot: 1, state: "OPEN".into(), ..InstrumentView::default() },
+        );
+        view.orders.insert(
+            700,
+            OrderView {
+                account: 7,
+                instrument: 10_010,
+                side: "SELL".into(),
+                tick: 60,
+                remaining: 40,
+                client_order_id: "resting".into(),
+                filled: 0,
+                filled_yes_cents: 0,
+                expires_at: None,
+            },
+        );
+        view
+    }
+
+    /// Every arm of `executions`, in an order that exercises what it carries between them.
+    ///
+    /// Two things here are deliberate and easy to lose. `OrderAccepted` for order 701 is followed by an
+    /// `OrderCancelled` for the same order, which is *not* in the view: that arm falls back to the `accepted`
+    /// map the earlier result populated, so the two cannot be read independently of each other. And the `Fill`
+    /// carries distinct non-zero `buyerCashCents`, `sellerCashCents`, `makerFeeCents` and `takerFeeCents`, so a
+    /// reader that crossed two of them over would be caught rather than agreeing at zero.
+    fn execution_corpus() -> Vec<Value> {
+        let result = |n: u64| {
+            json!({"inputSequence": n, "resultIndex": 0, "sequencedAt": 1_727_000_000_000_000_000u64,
+                                     "sequencerGroup": 1})
+        };
+        vec![
+            json!({"msg": "OrderAccepted", "result": result(1), "orderId": 701, "accountId": 11, "sessionId": 3,
+                   "clientOrderId": "cl-701", "instrumentId": 10_010, "side": "BUY", "tick": 40, "quantity": 25,
+                   "reservedCents": 1_000}),
+            // Cancelled for an order the view has never seen: only the `accepted` map above can price it.
+            json!({"msg": "OrderCancelled", "result": result(2), "orderId": 701, "accountId": 11,
+                   "instrumentId": 10_010, "cancelledQuantity": 25, "reason": "CLIENT_REQUEST"}),
+            // And one the view does know, which takes the other branch.
+            json!({"msg": "OrderCancelled", "result": result(3), "orderId": 700, "accountId": 7,
+                   "instrumentId": 10_010, "cancelledQuantity": 40, "reason": "EVENT_START"}),
+            json!({"msg": "OrderAmended", "result": result(4), "orderId": 700, "accountId": 7,
+                   "instrumentId": 10_010, "tick": 55, "quantity": 30}),
+            json!({"msg": "OrderReduced", "result": result(5), "orderId": 700, "accountId": 7,
+                   "instrumentId": 10_010, "remainingQuantity": 12}),
+            json!({"msg": "OrderRejected", "result": result(6), "accountId": 11, "sessionId": 3,
+                   "clientOrderId": "cl-702", "originalOrderId": 701, "reason": "DUPLICATE_CLIENT_ORDER_ID"}),
+            json!({"msg": "Fill", "result": result(7), "tradeId": 900, "instrumentId": 10_010, "tick": 40,
+                   "quantity": 9, "makerOrderId": 700, "makerAccountId": 7, "makerRemaining": 3,
+                   "takerOrderId": 701, "takerAccountId": 11, "takerRemaining": 16, "takerSide": "BUY",
+                   "buyerCashCents": 360, "sellerCashCents": 540, "makerFeeCents": 7, "takerFeeCents": 13}),
+            // The other side of the trade, so a reader that has maker and taker the wrong way round shows up.
+            json!({"msg": "Fill", "result": result(8), "tradeId": 901, "instrumentId": 10_010, "tick": 70,
+                   "quantity": 4, "makerOrderId": 701, "makerAccountId": 11, "makerRemaining": 12,
+                   "takerOrderId": 700, "takerAccountId": 7, "takerRemaining": 0, "takerSide": "SELL",
+                   "buyerCashCents": 280, "sellerCashCents": 120, "makerFeeCents": 2, "takerFeeCents": 5}),
+        ]
+    }
+
+    /// The differential harness for `executions`, built before anything in it is read typed.
+    ///
+    /// `executions` is the last of the feed path still going through `serde_json::Value`, and it is the worst
+    /// of it to move: six arms, state carried between them, two callers giving it results from different
+    /// places, and the cash and fee fields of a trade. A field taken from the wrong place there does not fail
+    /// -- a client is told it paid a different amount, and nothing says so.
+    ///
+    /// So this compares the ways of reading the same results and fails if they differ. Today that is frames
+    /// against the JSON they decode to, which guards the filtering in `executions_of`. When a typed reader
+    /// lands, it is one more path through the same corpus, compared the same way.
+    ///
+    /// Both whole and one at a time: the batch is what exercises the `accepted` map that the cancel arm reads,
+    /// and the singles are what name the result that disagreed when one does. Stage 2 taught that an
+    /// end-of-run comparison hides a divergence a later result happens to overwrite.
+    #[test]
+    fn executions_agrees_however_the_results_are_read() {
+        let view = view_for_executions();
+        let corpus = execution_corpus();
+        let frames: Vec<Frame> = corpus.iter().map(Frame::of).collect();
+        // Against what the frames decode to, not the literals above: the schema fills in fields a literal
+        // leaves out, and that difference is not the one being looked for.
+        let decoded: Vec<Value> = frames.iter().map(|f| (**f).clone()).collect();
+
+        let whole_frames = executions_of(&view, &frames, 99);
+        let whole_json = executions(&view, decoded.iter(), 99);
+        assert_eq!(whole_frames, whole_json, "the two readings of the whole unit disagree");
+
+        for (i, (frame, value)) in frames.iter().zip(&decoded).enumerate() {
+            let one_frame = executions_of(&view, std::slice::from_ref(frame), 99);
+            let one_json = executions(&view, [value], 99);
+            assert_eq!(one_frame, one_json, "result {i} reads differently as a frame than as JSON: {value}");
+        }
+
+        // The corpus has to be doing something, or two readings of nothing would agree.
+        assert_eq!(whole_json.len(), 10, "six arms, with a fill counted for each side: {whole_json:?}");
+        let kinds: BTreeSet<&str> = whole_json.iter().filter_map(|(_, e)| e["type"].as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["accepted", "amended", "cancelled", "fill", "rejected", "reduced"].into_iter().collect(),
+            "every arm is covered"
+        );
+        // And the cancel that only the `accepted` map could price carries a price at all.
+        let cancelled_701 = whole_json
+            .iter()
+            .find(|(_, e)| e["type"] == json!("cancelled") && e["orderId"] == json!("701"))
+            .expect("the cancel of the order the view never saw");
+        assert!(
+            cancelled_701.1["price"].is_object(),
+            "priced from what the accept said, since the view has no such order: {:?}",
+            cancelled_701.1
+        );
     }
 }
