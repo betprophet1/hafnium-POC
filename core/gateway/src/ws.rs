@@ -49,7 +49,7 @@ impl Session {
     /// `notify`. None if no session ID could be drawn.
     pub fn open(gateway: &Gateway, outbox: Outbox, notify: Notify) -> Option<Self> {
         let engine_session = session_id()?;
-        let key = gateway.hub().add_session(outbox);
+        let key = gateway.hub_mut().add_session(outbox);
         Some(Self {
             key,
             engine_session,
@@ -138,7 +138,7 @@ pub fn heartbeat_expired(gateway: &Arc<Gateway>, session: &mut Session) {
 
 /// The connection has gone: the session leaves the hub and, if it asked at logon, its orders are cancelled.
 pub fn end(gateway: &Arc<Gateway>, session: &Session) {
-    gateway.hub().remove_session(session.key);
+    gateway.hub_mut().remove_session(session.key);
     gateway.end_rfq_subscription(session.key);
     if session.cancel_on_disconnect {
         cancel_session_orders(gateway, session, "SESSION_DISCONNECT");
@@ -298,12 +298,12 @@ fn respond(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<
                     .filter(|d| (1..=100).contains(d))
                     .ok_or_else(|| ApiError::bad("depth must be from 1 to 100"))? as usize,
             };
-            gateway.hub().subscribe(session.key, &topics, depth);
+            gateway.hub_mut().subscribe(session.key, &topics, depth);
             Ok(Vec::new())
         }
         "unsubscribe" => {
             let topics = topics(only(message, &["op", "id", "topics"])?)?;
-            gateway.hub().unsubscribe(session.key, &topics);
+            gateway.hub_mut().unsubscribe(session.key, &topics);
             Ok(Vec::new())
         }
         "order" | "amend" | "cancel" | "cancelAll" => {
@@ -402,7 +402,7 @@ fn login(gateway: &Gateway, session: &mut Session, message: &Value) -> Result<Ve
     session.credential = Some(credential);
     session.heartbeat = (heartbeat > 0).then(|| Duration::from_secs(heartbeat));
     let (sequence, resumed) = {
-        let mut hub = gateway.hub();
+        let mut hub = gateway.hub_mut();
         hub.log_in(session.key, account);
         (hub.view.sequence, resume_from.map(|from| hub.since(account, from)))
     };

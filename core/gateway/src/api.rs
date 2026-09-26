@@ -12,7 +12,7 @@ use crate::price::{self, PriceError};
 use crate::treasury::Treasury;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 use venue_identity::key;
 use venue_identity::member;
@@ -152,6 +152,17 @@ fn price_error(e: PriceError) -> ApiError {
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Readers of `Gateway::hub` don't block each other: ADR-0002, most of the reactor pool's hot path (order/market
+/// lookups, REST reads) only reads `Hub`, while writes are concentrated in the feed-apply and conflate-flush
+/// threads plus one per-accepted-order write (`result`'s `hub.accept`, below) -- see `hub_mut`.
+fn read_locked<T>(m: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write_locked<T>(m: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A request for quote's ID, as the parlay service chooses them.
@@ -314,7 +325,7 @@ const MAX_ANONYMOUS: usize = 10_000;
 
 pub struct Gateway {
     pub half: Half,
-    hub: Mutex<Hub>,
+    hub: RwLock<Hub>,
     /// Pipelined, so no client waits on another's round trip to the node. The public half has none: nothing it
     /// serves ever reaches the node (blueprint §9).
     ingress: Option<Submit>,
@@ -357,7 +368,7 @@ impl Gateway {
         let metrics = Metrics::unregistered().half(half);
         Self {
             half,
-            hub: Mutex::new(hub),
+            hub: RwLock::new(hub),
             ingress,
             parlays: OnceLock::new(),
             limits,
@@ -441,8 +452,15 @@ impl Gateway {
         self.ingress.as_ref().ok_or_else(|| ApiError::not_found("orders are served on the private half"))
     }
 
-    pub fn hub(&self) -> MutexGuard<'_, Hub> {
-        locked(&self.hub)
+    /// A read of `Hub`: concurrent with every other reader, but not with a writer (`hub_mut`).
+    pub fn hub(&self) -> RwLockReadGuard<'_, Hub> {
+        read_locked(&self.hub)
+    }
+
+    /// A write of `Hub`: excludes every reader and writer alike, same as the old single `Mutex<Hub>` always did.
+    /// Reserved for call sites that actually mutate `Hub` -- see ADR-0002 for which those are.
+    pub fn hub_mut(&self) -> RwLockWriteGuard<'_, Hub> {
+        write_locked(&self.hub)
     }
 
     /// Who a credential is: an API key's, by the identity service (interfaces/gateway/README.md, API keys and
@@ -616,7 +634,7 @@ impl Gateway {
         change: Change,
         notify: Option<Notify>,
     ) -> Option<Result<Pending, ApiError>> {
-        let mut hub = self.hub();
+        let mut hub = self.hub_mut();
         if !hub.unseen(order) {
             return None;
         }
@@ -1056,18 +1074,23 @@ impl Gateway {
 
     /// An `OrderResult` from one input's results.
     fn result(&self, account: u64, results: &[Value]) -> Value {
-        let mut hub = self.hub();
         let sequence = results.iter().find_map(|r| r["result"]["inputSequence"].as_u64()).unwrap_or(0);
-        let executions: Vec<Value> = hub::executions(&hub.view, results, sequence)
-            .into_iter()
-            .filter(|(a, _)| *a == account)
-            .map(|(_, e)| e)
-            .collect();
-        // The client can amend or cancel as soon as it has this reply, which reaches it before the feed does.
-        for r in results.iter().filter(|r| r["msg"] == "OrderAccepted") {
-            let field = |name: &str| r[name].as_u64().unwrap_or(0);
-            hub.accept(field("orderId"), sequence, field("accountId"), field("instrumentId"));
-        }
+        let accepted: Vec<&Value> = results.iter().filter(|r| r["msg"] == "OrderAccepted").collect();
+        // Only a reply that actually accepts a new order mutates `Hub` (`accept`, below). Amends, cancels and
+        // rejects -- the overwhelming majority of traffic under load, ADR-0002 -- only ever read it, so they take
+        // the read lock, not the write lock a naive "always lock for the whole function" would reach for.
+        let executions: Vec<Value> = if accepted.is_empty() {
+            let hub = self.hub();
+            hub::executions(&hub.view, results, sequence).into_iter().filter(|(a, _)| *a == account).map(|(_, e)| e).collect()
+        } else {
+            let mut hub = self.hub_mut();
+            // The client can amend or cancel as soon as it has this reply, which reaches it before the feed does.
+            for r in accepted {
+                let field = |name: &str| r[name].as_u64().unwrap_or(0);
+                hub.accept(field("orderId"), sequence, field("accountId"), field("instrumentId"));
+            }
+            hub::executions(&hub.view, results, sequence).into_iter().filter(|(a, _)| *a == account).map(|(_, e)| e).collect()
+        };
         let outcome = results.iter().find_map(|r| {
             let order = || id(r["orderId"].as_u64().unwrap_or(0));
             match r["msg"].as_str()? {

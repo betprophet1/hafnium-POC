@@ -357,7 +357,7 @@ fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
                 // Carries on where it left off. This is the reader with most to gain from it: its view used to be
                 // rebuilt from the first input on every reconnect, so a moment's network trouble cost the whole
                 // journal, and that cost grew for as long as the venue ran.
-                let at = follower.hub().resume();
+                let at = follower.hub_mut().resume();
                 follower.metrics.feed_connected();
                 at
             },
@@ -365,12 +365,12 @@ fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
                 // The node cannot honour that position — a different journal under the same address — so whatever
                 // this gateway kept is a view of a history that never happened.
                 log::warn("the feed is starting over; the view is being thrown away", &[("half", &half)]);
-                follower.hub().restart();
+                follower.hub_mut().restart();
             },
             |unit| {
                 let record = &unit.input["record"];
                 let (sequence, at) = (record["sequence"].as_u64(), record["sequencedAt"].as_u64());
-                follower.hub().apply(&unit);
+                follower.hub_mut().apply(&unit);
                 follower.metrics.feed_unit(sequence.unwrap_or(0), at.unwrap_or(0), venue_telemetry::wall_ns());
             },
             |e| log::warn("feed connection", &[("half", &half), ("feed", &feed), ("error", &e)]),
@@ -384,7 +384,7 @@ fn conflate(gateway: &Arc<Gateway>) {
     named("gw-conflate", move || loop {
         // Book topics carry at most ten snapshots a second (interface 1 README, market data).
         thread::sleep(Duration::from_millis(100));
-        let mut hub = conflater.hub();
+        let mut hub = conflater.hub_mut();
         hub.flush_books();
         // Amendments and cancels waiting for an order the feed has not delivered are answered once past their wait.
         hub.expire_awaiting();
