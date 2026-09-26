@@ -5,7 +5,7 @@ use crate::limits::monotonic;
 use crate::price;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SendError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -168,11 +168,35 @@ pub struct Outbox {
     /// Messages sent and not yet taken off the queue by whatever serves the session, which takes one off as it takes
     /// each message (`taken`): the backlog the gateway's metrics report.
     waiting: Arc<AtomicU64>,
+    /// Bytes on the queue and not yet taken. `max_write_buffer_size` bounds only what has already reached the
+    /// socket, so without this a session the loops cannot drain fast enough grows this queue without limit --
+    /// the gateway then holds gigabytes for one client rather than dropping it (`reactor::serve_ws`).
+    behind: Arc<AtomicU64>,
+    /// Set the first time the queue would go past `max_behind`, and never cleared: whatever serves the session
+    /// closes it. Sticky because `put` stops queueing at the limit, so the backlog itself falls back under it and
+    /// a reader watching only `behind` would never see that the session had overrun.
+    over: Arc<AtomicBool>,
+    /// How many bytes may wait here before the session is closed. Unbounded unless `with_limit` says otherwise,
+    /// for the outboxes that serve no live client (`reconstruct`, tests).
+    max_behind: u64,
 }
 
 impl Outbox {
     pub fn new(queue: Sender<Queued>, notify: Notify) -> Self {
-        Self { queue, notify, waiting: Arc::new(AtomicU64::new(0)) }
+        Self {
+            queue,
+            notify,
+            waiting: Arc::new(AtomicU64::new(0)),
+            behind: Arc::new(AtomicU64::new(0)),
+            over: Arc::new(AtomicBool::new(false)),
+            max_behind: u64::MAX,
+        }
+    }
+
+    /// The same, closed once `max_behind` bytes wait on it: what a client serving a real connection gets.
+    pub fn with_limit(mut self, max_behind: usize) -> Self {
+        self.max_behind = max_behind as u64;
+        self
     }
 
     pub fn send(&self, message: String) -> Result<(), SendError<Queued>> {
@@ -185,8 +209,20 @@ impl Outbox {
     }
 
     fn put(&self, message: Queued) -> Result<(), SendError<Queued>> {
+        // Past the limit the session is already on its way out, so holding more for it only grows what the
+        // gateway cannot send. The message is dropped rather than queued; a client that reconnects resumes from
+        // `history`, which says through what it missed (`since`, `dropped_through`).
+        let bytes = message.text.len() as u64;
+        if self.over.load(Ordering::Relaxed)
+            || self.behind.load(Ordering::Relaxed).saturating_add(bytes) > self.max_behind
+        {
+            self.over.store(true, Ordering::Relaxed);
+            (self.notify)();
+            return Ok(());
+        }
         self.queue.send(message)?;
         self.waiting.fetch_add(1, Ordering::Relaxed);
+        self.behind.fetch_add(bytes, Ordering::Relaxed);
         (self.notify)();
         Ok(())
     }
@@ -194,6 +230,16 @@ impl Outbox {
     /// The count of messages waiting, shared with whatever takes them off the queue.
     pub fn waiting(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.waiting)
+    }
+
+    /// The bytes waiting, shared with whatever takes them off the queue so its metrics can report the backlog.
+    pub fn behind(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.behind)
+    }
+
+    /// Whether this session has overrun its limit, shared with whatever serves it so it can close the connection.
+    pub fn over(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.over)
     }
 }
 

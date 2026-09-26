@@ -197,6 +197,10 @@ struct Conn {
     queue: Receiver<Queued>,
     /// How many messages the hub has put on `queue` and this loop has not taken (`Outbox::waiting`).
     waiting: Arc<AtomicU64>,
+    /// How many bytes of those are waiting (`Outbox::behind`).
+    behind: Arc<AtomicU64>,
+    /// Whether the hub has had to drop messages for this session because it fell too far behind (`Outbox::over`).
+    over: Arc<AtomicBool>,
     notify: Notify,
     /// Whether the socket may hold input not yet read. The loop is told when new input arrives, not that input is
     /// still there, so a session that stopped reading at its limit remembers it has more to read.
@@ -245,7 +249,7 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, reactors: &Reactors, gateway: &Arc<
         shared.woken.store(false, Ordering::SeqCst);
         let arrived = std::mem::take(&mut *locked(&shared.incoming));
         for stream in arrived {
-            if let Some(token) = take_on(gateway, &poll, shared, &mut conns, &mut free, stream) {
+            if let Some(token) = take_on(gateway, &poll, shared, &mut conns, &mut free, stream, max_behind) {
                 due.push(token);
             }
         }
@@ -293,6 +297,7 @@ fn take_on(
     conns: &mut Vec<Option<Conn>>,
     free: &mut Vec<usize>,
     stream: TcpStream,
+    max_behind: usize,
 ) -> Option<usize> {
     stream.set_nonblocking(true).ok()?;
     let _ = stream.set_nodelay(true);
@@ -312,11 +317,13 @@ fn take_on(
         Arc::new(move || shared.ready(token))
     };
     let (tx, queue) = mpsc::channel();
-    let outbox = Outbox::new(tx, Arc::clone(&notify));
+    let outbox = Outbox::new(tx, Arc::clone(&notify)).with_limit(max_behind);
     conns[token] = Some(Conn {
         socket: Some(Socket::Undecided(stream)),
         session: None,
         waiting: outbox.waiting(),
+        behind: outbox.behind(),
+        over: outbox.over(),
         outbox: Some(outbox),
         queue,
         notify,
@@ -523,6 +530,15 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, origin: &mut 
 
 /// A WebSocket connection: finish its handshake, then read, answer and send.
 fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
+    // A client the hub has had to drop messages for. `queue`'s own check below catches one that has filled the
+    // socket's write buffer, but a client the loops cannot drain fast enough never gets that far: the bytes wait
+    // on the hub's side of the queue instead, which `max_write_buffer_size` cannot see (`Outbox::put`). Its
+    // messages have gaps now, so the session cannot go on -- it reconnects and resumes from `history`.
+    if conn.over.load(Ordering::Relaxed) {
+        log::warn("disconnected a client too far behind on what it has been queued", &[("peer", &conn.origin.peer)]);
+        conn.ending = "too far behind";
+        return false;
+    }
     if matches!(conn.socket, Some(Socket::Handshake(_))) {
         let Some(Socket::Handshake(mid)) = conn.socket.take() else { return false };
         match mid.handshake() {
@@ -599,6 +615,7 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
         }
         while let Ok(message) = conn.queue.try_recv() {
             conn.waiting.fetch_sub(1, Ordering::Relaxed);
+            conn.behind.fetch_sub(message.text.len() as u64, Ordering::Relaxed);
             record_queued(gateway, origin, session, &message);
             if !queue(socket, message.text, ending) {
                 return false;
