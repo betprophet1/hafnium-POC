@@ -198,6 +198,13 @@ C would buy none either while costing real complexity. The work worth doing is o
 
    Cumulatively, from the committed baseline before any of this: **2.0–2.6x** (8 conns 6826 → 18007, 32 conns
    2119 → 4791, 64 conns 1215 → 2342, 128 conns 631 → 1268).
-9. [ ] **Give `venue-sim gwload` one account per connection**, so a gateway benchmark measures the gateway and not an O(N²) fan-out the harness created.
+9. [x] **Give `venue-sim gwload` one account per connection** — done. A gateway only knows the dev tokens its
+   catalogue gave it at startup, so `venue-sim catalogue --accounts N` writes a catalogue with those accounts on
+   the end (seeding funds them like any other), and `gwload --token-prefix` gives connection `i` the token
+   `{prefix}{i}`. Sharing one account now warns, naming the flag. The difference is most of what the sweeps past
+   32 connections were measuring — at 64 connections, same gateway process: **2,900 → 38,412 amendments/s
+   (13.2x)**, p50 16.3ms → 1.4ms, p99 86ms → 3.8ms. Every earlier number in this ADR above ~8 connections is
+   therefore a measurement of the harness's fan-out as much as of the gateway, and should not be read as a
+   gateway capacity figure.
 10. [ ] File a separate follow-up for `GET /v4/account`'s unindexed scan (Non-Goals) — not resolved here.
 11. [ ] Consider whether `Hub::deliver`'s fan-out to every session of one account needs attention on its own merits — only if many concurrent sessions per account is a real client pattern, which nobody has established.
