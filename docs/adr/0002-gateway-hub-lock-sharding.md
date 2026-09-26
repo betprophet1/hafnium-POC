@@ -179,7 +179,21 @@ C would buy none either while costing real complexity. The work worth doing is o
 3. [x] ~~Build an isolated synthetic prototype for Options B and C~~ — dropped. Option A's result shows the lock is not the bottleneck, so modelling a finer-grained version of it answers nothing.
 4. [x] Record real numbers in Prototype Findings — done.
 5. [ ] **Fix the audit backlog bound** (`audit.rs`): `sync_channel` holds batches, not records. Done in this branch; needs review.
-6. [ ] **Decide the audit durability/throughput trade** — the actual capacity question. Options: group commit (one `fsync` per N batches or per interval rather than per batch), faster storage for the audit volume, or a documented relaxation of per-frame durability. Needs a decision from whoever owns the regulatory requirement, not just Engineering.
-7. [ ] **Give `venue-sim gwload` one account per connection**, so a gateway benchmark measures the gateway and not an O(N²) fan-out the harness created.
-8. [ ] File a separate follow-up for `GET /v4/account`'s unindexed scan (Non-Goals) — not resolved here.
-9. [ ] Consider whether `Hub::deliver`'s fan-out to every session of one account needs attention on its own merits — only if many concurrent sessions per account is a real client pattern, which nobody has established.
+6. [x] **Group-commit the audit log** — prototyped and measured on a c6i.8xlarge. The writer used to end a drain
+   as soon as the queue ran dry, so the sync rate followed producer burstiness rather than `BATCH`. It now ends a
+   drain on `BATCH` (raised 1024 → 8192) or `COMMIT_WINDOW` (10ms), flushing to the kernel meanwhile so a killed
+   process still loses nothing. Amendments/s: 6826 → 13795 at 8 connections, 1215 → 2162 at 64, 631 → 1095 at
+   128 — 1.7–2.0x, about 80% of what turning `fsync` off would give, while keeping durability. The writer thread
+   moves from 41.6% CPU blocked on disk to 75.8% running.
+7. [ ] **Confirm the durability window** — group commit widens what a *machine* losing power can lose from one
+   drain to `COMMIT_WINDOW` (10ms). A killed process still loses nothing. This needs whoever owns the regulatory
+   requirement to accept 10ms, or name the number they want; it is not Engineering's call alone.
+8. [ ] **Consider moving record formatting off the writer thread.** With the sync no longer dominating, the
+   writer is CPU-bound at ~76% on building each line, masking it and chaining SHA-256, while the eight reactor
+   threads that produce those records sit at 5%. `Fields`' doc says masking and hashing were deliberately put on
+   the writer to keep the loops fast; that trade was made before there was evidence the loops had capacity to
+   spare and the writer did not. The chain is order-dependent and has to stay sequential, but building and
+   masking the line do not.
+9. [ ] **Give `venue-sim gwload` one account per connection**, so a gateway benchmark measures the gateway and not an O(N²) fan-out the harness created.
+10. [ ] File a separate follow-up for `GET /v4/account`'s unindexed scan (Non-Goals) — not resolved here.
+11. [ ] Consider whether `Hub::deliver`'s fan-out to every session of one account needs attention on its own merits — only if many concurrent sessions per account is a real client pattern, which nobody has established.
