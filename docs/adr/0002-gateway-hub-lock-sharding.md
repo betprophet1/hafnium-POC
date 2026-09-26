@@ -188,12 +188,16 @@ C would buy none either while costing real complexity. The work worth doing is o
 7. [ ] **Confirm the durability window** — group commit widens what a *machine* losing power can lose from one
    drain to `COMMIT_WINDOW` (10ms). A killed process still loses nothing. This needs whoever owns the regulatory
    requirement to accept 10ms, or name the number they want; it is not Engineering's call alone.
-8. [ ] **Consider moving record formatting off the writer thread.** With the sync no longer dominating, the
-   writer is CPU-bound at ~76% on building each line, masking it and chaining SHA-256, while the eight reactor
-   threads that produce those records sit at 5%. `Fields`' doc says masking and hashing were deliberately put on
-   the writer to keep the loops fast; that trade was made before there was evidence the loops had capacity to
-   spare and the writer did not. The chain is order-dependent and has to stay sequential, but building and
-   masking the line do not.
+8. [x] **Move record formatting off the writer thread** — done. A line is `{head}{fields},"prev":"…"}`, and only
+   head and tail depend on where the record lands, so the fields (masking, escaping, per-item digests — the part
+   that reads the whole message) are now rendered in `Audit::record` on the thread that took the record. The
+   writer keeps what only it can know: the number, the chain, the SHA-256 of the line, and the write. Output is
+   byte-identical; `interfaces/tools/audit_verify.py` verifies a 1,089,957-record file written by it. A further
+   +5–27% (8 conns: 14153 → 18007 amendments/s; 128: 1124 → 1268), the writer thread 75.6% → 47.1% CPU and the
+   reactor threads 5.0% → 11.4% each, and resident memory over the sweep 318MB → 106MB.
+
+   Cumulatively, from the committed baseline before any of this: **2.0–2.6x** (8 conns 6826 → 18007, 32 conns
+   2119 → 4791, 64 conns 1215 → 2342, 128 conns 631 → 1268).
 9. [ ] **Give `venue-sim gwload` one account per connection**, so a gateway benchmark measures the gateway and not an O(N²) fan-out the harness created.
 10. [ ] File a separate follow-up for `GET /v4/account`'s unindexed scan (Non-Goals) — not resolved here.
 11. [ ] Consider whether `Hub::deliver`'s fan-out to every session of one account needs attention on its own merits — only if many concurrent sessions per account is a real client pattern, which nobody has established.
