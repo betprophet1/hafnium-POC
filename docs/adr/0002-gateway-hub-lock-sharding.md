@@ -239,6 +239,53 @@ amendment** (four records — what the client sent, what it was sent, and the fr
 gp3 volume does 125 MB/s, so sustaining this rate needs provisioned storage throughput, and retention and
 shipping (`interfaces/tools/audit_ship.py`) become the binding cost long before the gateway runs out of CPU.
 
+## A venue-shaped load: trading, and being watched
+
+The two things the amend measurement leaves out, added to `gwload` (`--mode trade`, `--watchers`) and run on the
+same class of machine. Makers rest a large sell and amend it back to size; takers cross it immediate-or-cancel,
+each against a different account, so these are real fills. Watchers subscribe to the book on the public half and
+only read.
+
+| connections | 4 | 8 | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|---|
+| trading, requests/s | 15073 | 21444 | 24951 | 17863 | 27382 | 20729 | 18943 |
+| trading, fills/s | 26520 | 38212 | 44547 | 31353 | 48351 | 38844 | 35434 |
+| trading, p50 | 237µs | 296µs | 535µs | 937µs | 1.95ms | 4.16ms | 9.25ms |
+| amend-only, requests/s | 21809 | 35804 | 49339 | 52098 | 44536 | 53121 | 58043 |
+| amend-only, p50 | 126µs | 149µs | 207µs | 426µs | 836µs | 1.78ms | 3.56ms |
+
+**Trading costs roughly half the request rate of amending, and two to three times the latency.** Where the
+amend-only load plateaus near 50–58k requests/s, a trading load plateaus around **20–27k requests/s** — while
+doing **35–48k fills/s**, which is the work the amend measurement never had to do. At 128 connections p50 is
+4.2ms trading against 1.8ms amending.
+
+**Market data is close to free at this scale.** With 32 trading connections held constant:
+
+| watchers | 0 | 32 | 128 | 256 |
+|---|---|---|---|---|
+| trading requests/s | 23650 | 15042 | 25212 | 21049 |
+| messages to watchers/s | — | 282 | 1263 | 2217 |
+
+Watcher traffic rises linearly and trading throughput shows no trend against it (the spread is run-to-run noise;
+see the caveats above). That is conflation doing its job: a book topic carries at most ten snapshots a second,
+so a subscriber costs ~10 messages/s no matter how hard the book is being traded. Making market data expensive
+takes tens of thousands of subscribers, not hundreds — a different question from order-entry capacity, and one
+this shape of test can now ask.
+
+**Two things this run turned up on its own.**
+
+- **The slow-consumer disconnect fired for the first time** (`too_far_behind=1`). A maker taking thousands of
+  executions a second is a genuine slow consumer of its own fills. The outbox bound added earlier was written as
+  unproven hardening against a path nothing had exercised; this exercised it, and it did what it was for.
+- **The engine's `small` profile fail-stops under real order flow.** `duplicates` (client order IDs, which never
+  evict) is 262,144 entries and its own comment sizes it for "about thirty-six new orders a second". The amend
+  load places one order per connection and then only amends, so it never approached that; a trading load mints a
+  fresh order per taker request and exhausted the table in about 25 seconds — `engine fail-stop Capacity at
+  input 348086 (spec §18)`, exactly as specified. These runs use `--capacity scale`. Anyone sizing a real group
+  should read that constant as a rate limit, not a memory figure.
+
+The whole sweep wrote **12.9 GB** of audit log in about 200 seconds of load.
+
 ## Action Items
 
 1. [x] Implement `RwLock<Hub>` (Option A) for real, verify it compiles clean and the full test suite passes — done, 97/97.
