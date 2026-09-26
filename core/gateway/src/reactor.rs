@@ -107,8 +107,17 @@ pub struct Reactors {
 
 impl Reactors {
     /// Starts `threads` loops serving connections for `gateway`'s half. A WebSocket client more than `max_behind`
-    /// bytes behind on what it has been sent is disconnected.
-    pub fn start(gateway: &Arc<Gateway>, threads: usize, max_behind: usize) -> std::io::Result<Arc<Self>> {
+    /// bytes behind on what it has been sent is disconnected. `pin_from`, when given, pins each loop's thread to
+    /// its own core starting at that index into `affinity::cores()` (round-robining if there are more threads
+    /// than cores) -- without it, more threads than physical cores buys nothing, since the scheduler is free to
+    /// move a thread off the core whose cache it just warmed. A caller starting two pinned pools (public and
+    /// private) gives them different `pin_from` values so the two do not both claim core 0.
+    pub fn start(
+        gateway: &Arc<Gateway>,
+        threads: usize,
+        max_behind: usize,
+        pin_from: Option<usize>,
+    ) -> std::io::Result<Arc<Self>> {
         let (mut polls, mut loops) = (Vec::new(), Vec::new());
         for _ in 0..threads.max(1) {
             let poll = Poll::new()?;
@@ -122,10 +131,16 @@ impl Reactors {
             polls.push(poll);
         }
         let reactors = Arc::new(Self { loops, next: AtomicUsize::new(0), other: OnceLock::new() });
+        let cores = pin_from.map(|_| crate::affinity::cores()).unwrap_or_default();
+        let base = pin_from.unwrap_or(0);
         for (index, (poll, shared)) in polls.into_iter().zip(&reactors.loops).enumerate() {
             let (gateway, own, reactors) = (Arc::clone(gateway), Arc::clone(shared), Arc::clone(&reactors));
             let name = format!("gw-{}-{index}", gateway.half.name());
-            thread::Builder::new().name(name).spawn(move || run(poll, &own, &reactors, &gateway, max_behind))?;
+            let cores = cores.clone();
+            thread::Builder::new().name(name).spawn(move || {
+                crate::affinity::pin_current_thread(&cores, base + index);
+                run(poll, &own, &reactors, &gateway, max_behind)
+            })?;
         }
         Ok(reactors)
     }

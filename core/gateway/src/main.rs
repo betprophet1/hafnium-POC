@@ -1,6 +1,7 @@
 //! `venue-gateway`: interface 1, the REST and WebSocket gateway, in front of one node. The contract is
 //! `interfaces/gateway/`; this is its first implementation, for the mini venue.
 
+mod affinity;
 mod api;
 mod audit;
 mod bootstrap;
@@ -51,7 +52,7 @@ const USAGE: &str = "usage:
                 [--identity ADDR] [--dev-tokens true] [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
                 [--audit-dir ./gateway-audit] [--audit-instance HOSTNAME] [--audit-fsync true] [--trusted-proxies ADDRS]
                 [--allowed-origins ORIGINS] [--environments FILE] [--from-view FILE]
-                [--metrics ADDR] [--reactor-threads N]
+                [--metrics ADDR] [--reactor-threads N] [--pin-reactor-threads true]
 
 --serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
 /v4/ws_public and GET /v4/markets; private is orders and accounts on /v4/ws_private, /v4/account and /v4/orders,
@@ -80,6 +81,11 @@ VENUE_LOG_FORMAT=json writes the log as JSON lines (deploy/observability/metrics
 --reactor-threads sizes the event-loop pool serving connections; without it, the host's own core count is asked
 (capped at 4, since past that on the hosts this was tuned against, contention between reactor threads for the
 same connections' work outweighs the benefit). Size it explicitly on a host with more to give.
+--pin-reactor-threads true pins each reactor thread to its own core instead of leaving it to the scheduler
+(false by default, matching every host this ran on before it existed). Measured to matter: raising
+--reactor-threads past the physical core count did nothing at all without it, since nothing kept a thread on
+the core whose cache it had warmed. Public and private each pin their own pool to a different range of cores,
+so the two never both claim core 0.
 Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
 struct Args(BTreeMap<String, String>);
@@ -204,6 +210,11 @@ fn run(args: &Args) -> Result<(), Error> {
         .map(|v| v.parse::<usize>())
         .transpose()
         .map_err(|e| format!("--reactor-threads: {e}"))?;
+    let pin_reactor_threads = match args.get("pin-reactor-threads", Some("false"))?.as_str() {
+        "true" => true,
+        "false" => false,
+        other => return Err(format!("--pin-reactor-threads must be true or false, not {other}").into()),
+    };
     let serving = args.get("serve", Some("both"))?;
     let (public, private) = match serving.as_str() {
         "both" => (true, true),
@@ -312,7 +323,7 @@ fn run(args: &Args) -> Result<(), Error> {
         "serving",
         &[("listen", &listener.local_addr()?), ("halves", &serving), ("audit_dir", &audit_dir.display())],
     );
-    serve(&halves, &listener, reactor_threads);
+    serve(&halves, &listener, reactor_threads, pin_reactor_threads);
     Ok(())
 }
 
@@ -386,26 +397,39 @@ const MAX_BEHIND: usize = 4 * 1024 * 1024;
 
 /// Accepts connections for ever and hands each one to an event loop of the half it is for, which serves it whether it
 /// is a WebSocket session or a REST request. `reactor_threads` overrides the auto-detected default (`--reactor-threads`,
-/// `VENUE_REACTOR_THREADS`); `None` keeps auto-detecting.
-fn serve(halves: &Halves, listener: &TcpListener, reactor_threads: Option<usize>) {
-    serve_with(halves, listener, MAX_BEHIND, reactor_threads);
+/// `VENUE_REACTOR_THREADS`); `None` keeps auto-detecting. `pin_reactor_threads` pins each one to its own core
+/// (`--pin-reactor-threads`, `affinity.rs`).
+fn serve(halves: &Halves, listener: &TcpListener, reactor_threads: Option<usize>, pin_reactor_threads: bool) {
+    serve_with(halves, listener, MAX_BEHIND, reactor_threads, pin_reactor_threads);
 }
 
 /// `serve`, with a WebSocket client allowed to fall `max_behind` bytes behind.
-fn serve_with(halves: &Halves, listener: &TcpListener, max_behind: usize, reactor_threads: Option<usize>) {
+fn serve_with(
+    halves: &Halves,
+    listener: &TcpListener,
+    max_behind: usize,
+    reactor_threads: Option<usize>,
+    pin_reactor_threads: bool,
+) {
     // Capped at 4 by default: past that, contention between reactor threads for the same connections' work
     // outweighs the benefit on the hosts this was tuned against. A host with more to give can say so directly
     // rather than wait for a higher default that would need retuning for whatever the next host looks like.
     let threads = reactor_threads.unwrap_or_else(|| thread::available_parallelism().map_or(2, |n| n.get().min(4)));
-    let start = |gateway: &Arc<Gateway>| Reactors::start(gateway, threads, max_behind);
-    let (public, private) =
-        match (halves.public.as_ref().map(start).transpose(), halves.private.as_ref().map(start).transpose()) {
-            (Ok(public), Ok(private)) => (public, private),
-            (Err(e), _) | (_, Err(e)) => {
-                log::error("event loops could not start", &[("error", &e)]);
-                return;
-            }
-        };
+    // Public and private each start their own pool; giving them different offsets into the same core list
+    // keeps the two from both pinning their first thread to core 0 (`Reactors::start`'s own doc comment).
+    let start = |gateway: &Arc<Gateway>, base: usize| {
+        Reactors::start(gateway, threads, max_behind, pin_reactor_threads.then_some(base))
+    };
+    let (public, private) = match (
+        halves.public.as_ref().map(|g| start(g, 0)).transpose(),
+        halves.private.as_ref().map(|g| start(g, threads)).transpose(),
+    ) {
+        (Ok(public), Ok(private)) => (public, private),
+        (Err(e), _) | (_, Err(e)) => {
+            log::error("event loops could not start", &[("error", &e)]);
+            return;
+        }
+    };
     if let (Some(public), Some(private)) = (&public, &private) {
         Reactors::join(public, private);
     }
