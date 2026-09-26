@@ -12,8 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use venue_journal::message_header_codec::MessageHeaderDecoder;
 use venue_journal::side::Side;
 use venue_journal::{
-    book_level_changed_codec, command_applied_codec, event_released_codec, fill_codec, market_state_changed_codec,
-    order_accepted_codec, order_cancelled_codec, order_rejected_codec, ReadBuf,
+    book_level_changed_codec, command_applied_codec, event_released_codec, market_state_changed_codec,
+    order_accepted_codec, position_changed_codec, sleeve_changed_codec, ReadBuf,
 };
 use venue_link::catalogue::Catalogue;
 use venue_link::submit::Notify;
@@ -75,20 +75,23 @@ fn order_accepted_order_id(f: &Frame) -> u64 {
     dec.order_id()
 }
 
-/// The results `executions` has anything to say about. Everything else it ignores, so a frame of any other
-/// kind is filtered out before it is looked at rather than after -- which is the difference between a book
-/// level costing a decode and costing nothing, since a decoded frame is kept once anything asks (ADR-0002).
-const EXECUTION_RESULTS: [u16; 5] = [
-    order_accepted_codec::SBE_TEMPLATE_ID,
-    order_rejected_codec::SBE_TEMPLATE_ID,
-    fill_codec::SBE_TEMPLATE_ID,
-    order_cancelled_codec::SBE_TEMPLATE_ID,
-    venue_journal::order_reduced_codec::SBE_TEMPLATE_ID,
+/// Results `executions` has nothing to say about, skipped before they are looked at rather than after: a frame
+/// is kept decoded once anything asks for it, so filtering here is what lets a book level cost nothing at all
+/// (ADR-0002).
+///
+/// Listed the way round that fails safely. A result missing from here costs a decode and nothing else. The
+/// first cut of this was an allow-list of the results `executions` does answer for, which is the same idea
+/// with the opposite failure: it omitted `OrderAmended`, and an amend confirmation stopped reaching the client
+/// with every test still passing.
+const NOT_EXECUTIONS: [u16; 4] = [
+    book_level_changed_codec::SBE_TEMPLATE_ID,
+    position_changed_codec::SBE_TEMPLATE_ID,
+    sleeve_changed_codec::SBE_TEMPLATE_ID,
+    command_applied_codec::SBE_TEMPLATE_ID,
 ];
 
-/// `executions` over a unit's frames, reading only the ones it answers for.
 pub fn executions_of(view: &View, results: &[Frame], sequence: u64) -> Vec<(u64, Value)> {
-    let wanted = results.iter().filter(|f| EXECUTION_RESULTS.contains(&f.template()));
+    let wanted = results.iter().filter(|f| !NOT_EXECUTIONS.contains(&f.template()));
     executions(view, wanted.map(|f| &**f), sequence)
 }
 
@@ -1176,5 +1179,65 @@ mod tests {
             Some(&(250, 2)),
             "and the moved level is still what the engine said"
         );
+    }
+
+    /// Every result that owes the client an execution must still produce one once the feed path stopped
+    /// decoding frames it has no use for.
+    ///
+    /// `executions_of` skips results before looking at them, which is what makes a book level free. The first
+    /// cut of that skipped by an allow-list of the results `executions` answers for, and the list omitted
+    /// `OrderAmended`: amend confirmations stopped reaching clients and all 98 tests still passed, because
+    /// nothing asserted this. So this asserts it, for every arm rather than the one that broke.
+    #[test]
+    fn every_result_that_owes_an_execution_still_produces_one() {
+        let result = json!({"inputSequence": 3, "resultIndex": 0, "sequencedAt": 0, "sequencerGroup": 1});
+        let owed = [
+            (
+                "accepted",
+                json!({"msg": "OrderAccepted", "result": result, "orderId": 1, "accountId": 7,
+                                "sessionId": 1, "clientOrderId": "c1", "instrumentId": 10_010, "side": "BUY",
+                                "tick": 40, "quantity": 5, "reservedCents": 200}),
+            ),
+            (
+                "rejected",
+                json!({"msg": "OrderRejected", "result": result, "accountId": 7, "sessionId": 1,
+                                "clientOrderId": "c2"}),
+            ),
+            (
+                "amended",
+                json!({"msg": "OrderAmended", "result": result, "orderId": 1, "accountId": 7,
+                               "instrumentId": 10_010}),
+            ),
+            (
+                "cancelled",
+                json!({"msg": "OrderCancelled", "result": result, "orderId": 1, "accountId": 7,
+                                 "instrumentId": 10_010}),
+            ),
+            (
+                "reduced",
+                json!({"msg": "OrderReduced", "result": result, "orderId": 1, "accountId": 7,
+                               "instrumentId": 10_010}),
+            ),
+            (
+                "fill",
+                json!({"msg": "Fill", "result": result, "tradeId": 9, "instrumentId": 10_010, "tick": 40,
+                            "quantity": 2, "makerOrderId": 1, "makerAccountId": 7, "makerRemaining": 3,
+                            "takerOrderId": 2, "takerAccountId": 8, "takerRemaining": 0, "takerSide": "SELL"}),
+            ),
+        ];
+        let view = View::default();
+        for (kind, message) in owed {
+            let frames = [Frame::of(&message)];
+            let out = executions_of(&view, &frames, 3);
+            assert!(
+                out.iter().any(|(_, e)| e["type"] == json!(kind)),
+                "a {kind} execution should reach the client, got {out:?} for {message}"
+            );
+            // And filtering frames before looking at them must change nothing against reading them all.
+            // Compared against the decoded frame rather than the literal above, so that what is being checked
+            // is the filtering and not the schema filling in fields the literal left out.
+            let unfiltered = executions(&view, frames.iter().map(|f| &**f), 3);
+            assert_eq!(out, unfiltered, "filtering frames changed what a {kind} produces");
+        }
     }
 }
