@@ -37,8 +37,14 @@ const USAGE: &str = "usage:
                   [--order-limit N] [--id-window-seconds N]
                   (the last two default from the node's capacity profile: 3/4 of its orders, and its
                   client order ID table's entries / 120 000 seconds)
+  venue-sim catalogue --catalogue FILE --out FILE [--accounts 0] [--token-prefix dev-load-]
+                  [--first-id 9600000] [--cents 100000000]
+                  writes the catalogue with `accounts` more accounts on the end, one per connection a load run
+                  means to make: a gateway only knows the dev tokens its catalogue gave it, so they have to
+                  exist before it starts. Seed from the written file and start the gateway on it, and
+                  `gwload --token-prefix` then has an account per connection.
   venue-sim gwload --gateway ADDR [--token dev-market-maker] [--instrument 10010] [--connections 1] [--seconds 10]
-                  [--instruments 1] [--ingress ADDR]
+                  [--instruments 1] [--ingress ADDR] [--token-prefix PREFIX]
                   the gateway-facing counterpart to `venue-node load`: each connection logs in over
                   /v4/ws_private, places one resting order, then amends it back and forth until the deadline,
                   reporting messages/s and round-trip percentiles the same way.
@@ -134,6 +140,7 @@ fn main() -> ExitCode {
         "taker" => taker(&a),
         "workload" => workload(&a),
         "gwload" => gwload(&a),
+        "catalogue" => catalogue(&a),
         _ => Err(USAGE.into()),
     });
     match outcome {
@@ -278,8 +285,46 @@ fn gwload(args: &Args) -> Result<(), Error> {
         seconds: args.number("seconds", 10)?,
         ingress: args.optional("ingress"),
         instruments: usize::try_from(args.number("instruments", 1)?)?,
+        token_prefix: args.optional("token-prefix").filter(|p| !p.is_empty()),
     };
     gwload::run(config)
+}
+
+/// Writes a catalogue with more accounts on the end, for a load run that wants one per connection. The accounts
+/// are only what `Catalogue::seed` and the gateway need of one: an id, the cents to grant it, and the dev token
+/// that logs in as it.
+fn catalogue(args: &Args) -> Result<(), Error> {
+    let base = args.get("catalogue", None)?;
+    let out = args.get("out", None)?;
+    let accounts = usize::try_from(args.number("accounts", 0)?)?;
+    let prefix = args.get("token-prefix", Some("dev-load-"))?;
+    let first = args.number("first-id", 9_600_000)?;
+    let cents = args.number("cents", 100_000_000)?;
+
+    let text = std::fs::read_to_string(&base).map_err(|e| format!("reading {base}: {e}"))?;
+    let mut doc: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("parsing {base}: {e}"))?;
+    let list = doc["accounts"].as_array_mut().ok_or("the catalogue has no accounts")?;
+    let taken: Vec<u64> = list.iter().filter_map(|a| a["id"].as_u64()).collect();
+    for i in 0..accounts {
+        let id = first + i as u64;
+        if taken.contains(&id) {
+            return Err(format!("account {id} is already in {base}; pass a --first-id past its accounts").into());
+        }
+        list.push(serde_json::json!({
+            "id": id,
+            "name": format!("Load {i}"),
+            "tab": serde_json::Value::Null,
+            "cents": cents,
+            "token": format!("{prefix}{i}"),
+        }));
+    }
+    let total = list.len();
+    std::fs::write(&out, serde_json::to_string_pretty(&doc)?).map_err(|e| format!("writing {out}: {e}"))?;
+    eprintln!(
+        "wrote {out}: {total} accounts, {accounts} of them for load ({prefix}0..{prefix}{})",
+        accounts.max(1) - 1
+    );
+    Ok(())
 }
 
 fn taker(args: &Args) -> Result<(), Error> {

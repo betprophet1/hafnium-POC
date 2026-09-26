@@ -39,6 +39,13 @@ pub struct Config {
     /// How many synthetic markets to spread the load across. 1 (the default) changes nothing: every connection
     /// trades `instrument` exactly as before.
     pub instruments: usize,
+    /// Set to give connection `i` the token `{prefix}{i}` -- one account each -- instead of putting every
+    /// connection on `token`. A venue does not see many connections from one account, and the gateway's own cost
+    /// is quadratic in how many it does: every message for an account is copied to each of its live sessions
+    /// (`Hub::send_to_account`), so N connections sharing one account make N times the messages per request that
+    /// N connections on their own accounts would. Measuring the gateway means not asking it to do that.
+    /// `venue-sim catalogue --accounts N` writes a catalogue holding the accounts these tokens name.
+    pub token_prefix: Option<String>,
 }
 
 /// Instrument rank `k`'s share of the connection population, out of a population where rank 0 is unscaled:
@@ -156,11 +163,27 @@ pub fn run(cfg: Config) -> Result<(), Error> {
         vec![cfg.instrument]
     };
 
+    // Sharing one account across connections costs the gateway a copy of every message per session of that
+    // account, so what a run like that measures is mostly that fan-out. Say so rather than report the number as
+    // if it were the gateway's.
+    if cfg.token_prefix.is_none() && cfg.connections > 2 {
+        eprintln!(
+            "warning: all {} connections log in as one account ({}), which a venue does not see. Every message \
+             for it is copied to each of its {} sessions, so this measures that fan-out as much as the gateway. \
+             Give each connection its own account with --token-prefix (see `venue-sim catalogue`).",
+            cfg.connections, cfg.token, cfg.connections
+        );
+    }
+
     let started = now();
     let deadline = started + Duration::from_secs(cfg.seconds);
     let handles: Vec<_> = (0..cfg.connections)
         .map(|i| {
-            let (gateway, token, instruments) = (cfg.gateway.clone(), cfg.token.clone(), instruments.clone());
+            let token = match &cfg.token_prefix {
+                Some(prefix) => format!("{prefix}{i}"),
+                None => cfg.token.clone(),
+            };
+            let (gateway, instruments) = (cfg.gateway.clone(), instruments.clone());
             thread::spawn(move || {
                 // Seeded from the connection index, so a run is reproducible.
                 let mut rng = Rng::new(i as u64 + 1);
