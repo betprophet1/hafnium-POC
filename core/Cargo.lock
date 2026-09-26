@@ -657,6 +657,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-feedapply"
+version = "0.1.0"
+dependencies = [
+ "mimalloc",
+ "serde_json",
+ "venue-harness",
+ "venue_journal",
+]
+
+[[package]]
 name = "proto-jsonpath"
 version = "0.1.0"
 dependencies = [

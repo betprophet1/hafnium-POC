@@ -1,0 +1,16 @@
+[package]
+name = "proto-feedapply"
+version = "0.1.0"
+description = "Prototype: reading a feed unit through serde_json::Value against reading it typed, for ADR-0002 (docs/adr)"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# The JSON codec the feed path uses today, and the typed SBE codecs it is built on.
+venue-harness = { path = "../../harness" }
+venue_journal = { path = "../../journal" }
+serde_json = "1"
+# The gateway runs on this now (ADR-0002), so the Value path is measured on the allocator it actually has.
+mimalloc = "0.1"

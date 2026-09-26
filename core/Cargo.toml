@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["engine", "gateway", "harness", "identity", "journal", "link", "node", "observer", "parlays", "sim", "store", "telemetry", "treasury", "prototypes/jsonpath", "prototypes/l3book", "prototypes/maskbench", "prototypes/tieredbook"]
+members = ["engine", "gateway", "harness", "identity", "journal", "link", "node", "observer", "parlays", "sim", "store", "telemetry", "treasury", "prototypes/feedapply", "prototypes/jsonpath", "prototypes/l3book", "prototypes/maskbench", "prototypes/tieredbook"]
 
 [workspace.package]
 edition = "2021"
