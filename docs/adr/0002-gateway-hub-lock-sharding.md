@@ -1,8 +1,15 @@
 # ADR-0002: Replacing the gateway's global `Mutex<Hub>`
 
-**Status:** Proposed
+**Status:** Rejected — the premise did not survive measurement. See Prototype Findings.
 **Date:** 2026-09-26
 **Deciders:** core/gateway owners (Engineering)
+
+> **Retraction (2026-09-26, after this ADR was drafted).** The Context below argues that `Mutex<Hub>` is the
+> gateway's throughput ceiling. Measured on dedicated hardware, it is not: swapping it for an `RwLock` changes
+> throughput by 1–2%, which is noise, and the reactor threads that would contend for it sit ~97% idle. The ceiling
+> is the audit log's `fsync`. The Context is kept as written because the state catalogue in it is still accurate
+> and useful, but its conclusion — and the decision that followed from it — are wrong. Read Prototype Findings
+> first.
 
 ## Context
 
@@ -106,13 +113,73 @@ Options B and C's added ceiling only matters if Option A's numbers show write-ex
 
 ## Prototype Findings
 
-*(pending — real local benchmarking of Option A against the actual gateway, and a synthetic lock-contention-shape prototype for Options B and C, using the same `venue-sim gwload` methodology as the cloud testing above, run locally rather than on cloud hardware.)*
+Option A was implemented for real and measured against the unmodified `Mutex<Hub>` on a dedicated
+**c6i.8xlarge** (32 vCPU, Xeon 8375C, otherwise idle), 8 reactor threads pinned to their own cores, the load
+client confined to cores the gateway never touches (`taskset -c 9-15,25-31`). Both builds carried the audit fix
+below, so the only difference between them is the lock. Options B and C were never prototyped: the Option A
+result removed the reason to.
+
+**1. The lock is not the ceiling.** Single instrument, amendments/s:
+
+| connections | 1 | 2 | 4 | 8 | 16 | 32 | 48 | 64 | 96 | 128 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `Mutex<Hub>` | 7938 | 14205 | 11855 | 6761 | 3737 | 2135 | 1545 | 1184 | 835 | 611 |
+| `RwLock<Hub>` + split `result()` | 7560 | 15604 | 11778 | 6785 | 3813 | 2161 | 1550 | 1192 | 824 | 615 |
+
+From four connections upward the two are within 1–2% — indistinguishable. (An earlier ~12% reading favouring
+the `RwLock` came from a shared, heavily oversubscribed dev VM whose load average swung between 2 and 500 during
+testing; it did not reproduce on quiet hardware.)
+
+**2. What the ceiling actually is: the audit log's `fsync`.** Per-thread CPU under 64 connections:
+
+```
+gateway-audit   41.0%  state D   (uninterruptible — blocked on disk)
+gw-priv x8       3.0%  state S   each
+```
+
+The eight reactor threads — the only threads that ever contend for `Hub` — are ~97% idle, waiting on the audit
+writer. `--audit-fsync` defaults to `true`, so the writer syncs to disk once per batch. With it off:
+
+| connections | 2 | 8 | 32 | 64 | 128 |
+|---|---|---|---|---|---|
+| fsync on (amendments/s) | 15604 | 6785 | 2161 | 1192 | 615 |
+| fsync off | 16736 | 18358 | 5260 | 2819 | 1438 |
+
+2.3–2.7x at every count from 8 up, and p99 at 8 connections falls from 6.75ms to 2.04ms. This is not a proposal
+to turn `fsync` off — a venue that must not trade ahead of its audit trail needs that durability — it is where
+the time goes.
+
+**3. Spreading across instruments makes no difference.** Single-instrument and 8-instrument runs are within 2–3%
+at every connection count. The Context's claim that spreading measurably *hurt* (and the cache-locality
+explanation offered for it) does not reproduce on a quiet host; that reading came from contaminated runs.
+
+**4. Two confounds that invalidated the original measurements.**
+
+- **An unbounded audit backlog** (`audit.rs`): `mpsc::sync_channel(CAPACITY)` carries `Vec<Record>` — a *batch* —
+  while `CAPACITY = 65_536` was documented as "records the queue holds". The writer could therefore fall tens of
+  gigabytes behind. At 64 connections the gateway went from 16MB to 2.98GB resident in seconds and stopped
+  answering, rather than pushing back. Because every sweep ran 1→128 connections against one process and never
+  released that memory, every point after the first blow-up — including the whole 8-instrument section, which
+  always ran last — was measured against a crippled gateway. Fixed here: the per-thread batch is bounded by a new
+  `BATCH_BYTES` (256KiB) and the queue holds 256 such batches, ~64MiB, after which a loop waits.
+- **The load generator gives every connection the same token** (`sim/src/gwload.rs`), so all N sessions belong to
+  one account and each private message fans out to all N of them — O(N²) in connections. Most of the apparent
+  "collapse past 16–32 connections" is this, not a gateway limit: counted as deliveries rather than amendments,
+  throughput *rises* and plateaus (~79k/s with `fsync`, ~184k/s without). A benchmark that means to measure the
+  gateway should give each connection its own account.
+
+**Conclusion.** Options A, B and C all target something that is not the bottleneck. Option A is harmless and is
+kept (it is a fair description of which call sites mutate `Hub`), but it buys no measurable throughput, and B and
+C would buy none either while costing real complexity. The work worth doing is on the audit write path.
 
 ## Action Items
 
-1. [ ] Implement `RwLock<Hub>` (Option A) for real in `gateway/src/api.rs`/`hub.rs`, verify it compiles clean and the crate's full test suite still passes.
-2. [ ] Benchmark Option A locally against the unmodified `Mutex<Hub>` baseline, reusing the exact connection-count sweep (1/2/4/8/16/32/48/64/96/128) and single- vs. multi-instrument comparison already run on cloud hardware, for a direct apples-to-apples read.
-3. [ ] Build an isolated synthetic prototype (mirroring `core/prototypes/tieredbook`'s precedent) modeling Options B and C's lock-contention shape — shard count, read/write ratio, cross-shard write frequency matching `Hub::apply`'s real behavior — without wiring either into the live gateway.
-4. [ ] Record real numbers for all three options plus the baseline in Prototype Findings above, and give a concrete recommendation.
-5. [ ] File a separate follow-up for `GET /v4/account`'s unindexed scan (Non-Goals) — not resolved here.
-6. [ ] If Option B or C's prototype numbers justify pursuing one for real, file the `Hub::apply` cross-shard-write restructuring as its own prerequisite piece of work, not a footnote of that implementation.
+1. [x] Implement `RwLock<Hub>` (Option A) for real, verify it compiles clean and the full test suite passes — done, 97/97.
+2. [x] Benchmark Option A against the unmodified `Mutex<Hub>` baseline on the same hardware — done, on a dedicated c6i.8xlarge. No measurable difference.
+3. [x] ~~Build an isolated synthetic prototype for Options B and C~~ — dropped. Option A's result shows the lock is not the bottleneck, so modelling a finer-grained version of it answers nothing.
+4. [x] Record real numbers in Prototype Findings — done.
+5. [ ] **Fix the audit backlog bound** (`audit.rs`): `sync_channel` holds batches, not records. Done in this branch; needs review.
+6. [ ] **Decide the audit durability/throughput trade** — the actual capacity question. Options: group commit (one `fsync` per N batches or per interval rather than per batch), faster storage for the audit volume, or a documented relaxation of per-frame durability. Needs a decision from whoever owns the regulatory requirement, not just Engineering.
+7. [ ] **Give `venue-sim gwload` one account per connection**, so a gateway benchmark measures the gateway and not an O(N²) fan-out the harness created.
+8. [ ] File a separate follow-up for `GET /v4/account`'s unindexed scan (Non-Goals) — not resolved here.
+9. [ ] Consider whether `Hub::deliver`'s fan-out to every session of one account needs attention on its own merits — only if many concurrent sessions per account is a real client pattern, which nobody has established.
