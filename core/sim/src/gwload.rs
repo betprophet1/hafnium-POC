@@ -110,10 +110,12 @@ fn pick_instrument(rng: &mut Rng, instruments: &[u64]) -> u64 {
 /// A `CommandApplied` result's own verdict, so a rejected setup command fails loudly here instead of surfacing
 /// later as a confusing "no such market" from `drive`.
 fn applied(results: &[Value], what: &str) -> Result<(), Error> {
-    let outcome = results.iter().find(|r| r["msg"] == "CommandApplied").map(|r| r["outcome"].clone());
+    let record = results.iter().find(|r| r["msg"] == "CommandApplied");
+    let outcome = record.map(|r| r["outcome"].clone());
     match outcome {
         Some(Value::String(s)) if s == "APPLIED" => Ok(()),
-        other => Err(format!("{what}: {other:?}").into()),
+        // The reason as well as the outcome: "REJECTED" on its own says nothing about what to change.
+        _ => Err(format!("{what}: {}", record.map_or_else(|| "no result".to_string(), ToString::to_string)).into()),
     }
 }
 

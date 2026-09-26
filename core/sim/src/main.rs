@@ -23,6 +23,12 @@ use venue_link::wire::{Error, Ids, Ingress};
 
 const USAGE: &str = "usage:
   venue-sim seed  --ingress ADDR --catalogue FILE [--capacity small]
+                  [--orders-per-second N | --id-window-seconds N]
+                  the client order ID window and the engine's duplicate table are one sizing rule: a group
+                  takes `duplicates / window` new orders a second and then fail-stops, which is about 36/s on
+                  `small` and 2 330/s on `scale` at the two-hour default. Found a venue that will see more on
+                  a shorter window -- no profile is large enough to hold a two-hour window at a high order
+                  rate, and the window can only be shortened by replacing both group parameters.
   venue-sim web   --ingress ADDR --feed ADDR --gateway ADDR --catalogue FILE [--listen 127.0.0.1:8080]
                   [--public-gateway ADDR] [--oracle 127.0.0.1:8082] [--treasury 127.0.0.1:8083] [--from-view FILE]
   venue-sim oracle --ingress ADDR --feed ADDR --catalogue FILE --calendar FILE --database-url URL [--capacity small]
@@ -204,7 +210,28 @@ fn seed(args: &Args) -> Result<(), Error> {
     let mut ingress = Ingress::new(&args.get("ingress", None)?);
     // The order and listing limits are the node's own tables, so this must name the profile the node runs with.
     let profile = venue_link::catalogue::capacity_profile(&args.get("capacity", Some("small"))?)?;
-    let mut inputs = catalogue.seed(&profile)?.into_iter().peekable();
+    // The client order ID window and the duplicate table are one sizing rule: the group can take
+    // `duplicates / window` new orders a second before the table fills and the engine fail-stops. A venue
+    // expecting more says so with --orders-per-second and is founded on a window that fits, since the window
+    // can only be shortened by replacing both group parameters and no profile is large enough to make a
+    // two-hour window hold a high order rate. --id-window-seconds overrides the arithmetic outright.
+    let window = match args.optional("orders-per-second") {
+        Some(rate) => venue_link::catalogue::window_for(
+            &profile,
+            rate.parse::<u64>().map_err(|e| format!("--orders-per-second: {e}"))?,
+        ),
+        None => venue_link::catalogue::CLIENT_ORDER_ID_WINDOW_SECONDS,
+    };
+    let window = args.number("id-window-seconds", window)?;
+    if window < venue_link::catalogue::CLIENT_ORDER_ID_WINDOW_SECONDS {
+        eprintln!(
+            "seeding with a {window}s client order ID window (the default is {}s): the group takes up to {} new \
+             orders a second before its duplicate table fills",
+            venue_link::catalogue::CLIENT_ORDER_ID_WINDOW_SECONDS,
+            profile.duplicates as u64 / window.max(1)
+        );
+    }
+    let mut inputs = catalogue.seed_with(&profile, window)?.into_iter().peekable();
     let mut attempts = 0;
     while let Some(input) = inputs.peek() {
         match ingress.send(input.clone()) {
