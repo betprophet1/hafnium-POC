@@ -638,6 +638,9 @@ impl Live {
                 || {
                     // The node could not honour that position (a different journal under the same address, or
                     // one that no longer goes back that far) — this view is of a history that never happened.
+                    // `eprintln!`, not a return value or a metric: this runs inside a library with no logging of
+                    // its own, and the alternative is a reader silently missing history with nothing to show it.
+                    eprintln!("view feed: resuming was refused; the view is being thrown away");
                     if let Ok(mut v) = me.view.lock() {
                         *v = View::default();
                     }

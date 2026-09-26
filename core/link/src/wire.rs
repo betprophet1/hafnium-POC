@@ -173,9 +173,14 @@ impl Iterator for Frames {
 /// holds — zero to be sent everything, which is what a reader that starts over each time returns. Answering
 /// honestly is what makes a reconnect cost what was missed rather than the whole journal.
 ///
-/// `on_reset` runs when the node is about to send the backlog from the beginning although this reader asked to
-/// resume: its node was replaced, and whatever it kept is a view of a history that never happened. A reader that
-/// always asks for everything never sees it.
+/// `on_reset` runs whenever the node's answer says the position this reader asked for was not honoured — its
+/// node was replaced and whatever it kept is a view of a history that never happened, **or** it asked for
+/// everything and the journal no longer goes back that far (`cut` moved the floor). A reader that always asks
+/// for position 0 used to never see this: the guard here only fired for `resume_from > 0`, on the assumption
+/// that 0 always means "and I got it." It doesn't, once a journal has been cut, and the ack byte for that case
+/// was indistinguishable from a genuine from-genesis serve — so this ran the same as a healthy reconnect while
+/// silently holding a view missing everything before the cut. Every reader without a snapshot pair to restore
+/// from asks for 0 on every fresh start, which is every reader deployed today (§8, `STATE.md`).
 pub fn follow(addr: &str, on_connect: impl FnMut() -> u64, on_reset: impl FnMut(), on_unit: impl FnMut(Unit)) -> ! {
     follow_reporting(addr, on_connect, on_reset, on_unit, |e| eprintln!("feed {addr}: {e}"))
 }
@@ -195,7 +200,7 @@ pub fn follow_reporting(
                 let resume_from = on_connect();
                 match open(&mut stream, resume_from) {
                     Ok(resuming) => {
-                        if resume_from > 0 && !resuming {
+                        if !resuming {
                             on_reset();
                         }
                         if let Err(e) = read_units(stream, &mut on_unit) {

@@ -990,7 +990,17 @@ fn serve_subscriber(
     // every reader founded on a snapshot pair says (`venue-view snapshot`). Refusing that would refuse the whole
     // founding path, which is how `founded_venue.rs` caught this being `>` first.
     let (floor, last) = range(journal.0, journal.1)?;
-    let resume_from = if asked_for >= floor && asked_for <= last { asked_for } else { 0 };
+    // Honoured means exactly one thing: the journal can supply, without a gap, everything after `asked_for` —
+    // which is true when `asked_for` sits at or above the floor and at or below the last real input, and false
+    // otherwise, `asked_for == 0` included. That last part used to be its own case, sent as if honoured: `0` was
+    // never adjusted, so a reader asking for "everything" against a journal `cut` past its own beginning got an
+    // ack byte indistinguishable from one asking a journal that truly starts at sequence 1 — the two cases
+    // share the same wire value, and only a log line here ever said which one had happened. `on_reset` exists
+    // precisely to tell a reader "what you are about to get is not what you assumed"; a reader that always asks
+    // for everything (every reader that has not restored a view from a snapshot pair) could not be told, because
+    // the wire said it had been.
+    let honoured = asked_for >= floor && asked_for <= last;
+    let resume_from = if honoured { asked_for } else { floor };
     let peer = || stream.peer_addr().map_or_else(|_| "unknown".to_string(), |a| a.to_string());
     if asked_for > 0 && asked_for < floor {
         log::warn(
@@ -998,15 +1008,14 @@ fn serve_subscriber(
             &[("peer", &peer()), ("asked_for", &asked_for), ("carried_from", &floor)],
         );
     } else if asked_for == 0 && floor > 0 {
-        // Not refusable with the one byte this handshake has, and not silently wrong either: what follows is a
-        // real backlog, just not the whole history the reader is asking for. A reader founded on a snapshot pair
-        // (`venue-view snapshot`) asks for its own sequence instead and never lands here.
+        // What follows is a real backlog, just not the whole history the reader is asking for. A reader founded
+        // on a snapshot pair (`venue-view snapshot`) asks for its own sequence instead and never lands here.
         log::warn(
             "a subscriber asked for everything, and this journal no longer starts at the beginning",
             &[("peer", &peer()), ("carried_from", &floor)],
         );
     }
-    stream.write_all(&[u8::from(resume_from > 0)])?;
+    stream.write_all(&[u8::from(honoured)])?;
     let mut out = BufWriter::new(stream);
     let mut inputs = BufReader::new(File::open(journal.0)?.take(journal.1));
     let mut outputs = BufReader::new(File::open(results.0)?.take(results.1));
