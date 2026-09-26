@@ -296,6 +296,33 @@ this shape of test can now ask.
 
 The whole sweep wrote **12.9 GB** of audit log in about 200 seconds of load.
 
+### Run twice: how repeatable any of this is
+
+The same sweep again on a second machine, this time on `--capacity small` founded on a 6-second client order ID
+window (`--orders-per-second 40000`) rather than `scale`. It completed with **no fail-stop and the node up at
+every one of the eighteen points**, which is the sizing fix holding over ~3.4M orders rather than one 30-second
+run. Requests/s, first run against second:
+
+| connections | 4 | 8 | 16 | 32 | 64 | 128 | 256 |
+|---|---|---|---|---|---|---|---|
+| trading, `scale` | 15073 | 21444 | 24951 | 17863 | 27382 | 20729 | 18943 |
+| trading, `small` | 15990 | 20876 | 25422 | 20581 | 27706 | 21319 | 19569 |
+| amend-only, `scale` | 21809 | 35804 | 49339 | 52098 | 44536 | 53121 | 58043 |
+| amend-only, `small` | 21320 | 36715 | 50214 | 57212 | 41522 | 52155 | 62098 |
+
+**Most points repeat within about 3%**, so the earlier caveat that these wobble by a third was too pessimistic:
+the spread is real but concentrated. Two other things reproduce exactly. The watcher rates are identical to
+within a message a second (282/1263/2217 against 293/1263/2229) — unsurprising once conflation is doing the
+pacing, but it confirms the market-data result is not luck. And `too_far_behind` is 1 in both runs: the same
+maker-as-slow-consumer disconnect, in the same place.
+
+**The dip at 32 connections and the peak at 64 are in both runs**, on different machines. That makes them a
+property of the system rather than noise. Nothing here explains them, and nothing yet depends on the answer.
+
+**The capacity profile makes no difference to throughput.** `small` matches or slightly beats `scale` at every
+point, so the larger tables buy nothing for a workload that fits in either — worth knowing before anyone
+reaches for a bigger profile expecting speed rather than headroom.
+
 ## Action Items
 
 1. [x] Implement `RwLock<Hub>` (Option A) for real, verify it compiles clean and the full test suite passes — done, 97/97.
