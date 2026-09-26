@@ -29,12 +29,24 @@ pub const FORMAT: &str = "venue-audit/2";
 pub const RENDERER: u32 = 1;
 pub const COMPONENT: &str = "gateway";
 const ZEROS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-/// Records the queue holds: seconds of a busy gateway's private traffic.
-pub const CAPACITY: usize = 65_536;
+/// Batches the queue holds -- batches, not records: what a loop hands over is a `Vec<Record>`, so each place on
+/// the queue is a whole batch of up to `BATCH_BYTES`. At 65_536 places that was tens of gigabytes the writer
+/// could fall behind by, and a gateway whose disk could not keep up grew to gigabytes and stopped answering
+/// rather than pushing back. 256 places of at most 256 KiB is about 64 MiB, a second or two of a busy gateway's
+/// private traffic, after which `send` makes the loop wait (`STALL_WAITS`).
+pub const CAPACITY: usize = 256;
 /// How long a loop waits for room on a full queue, counted in millisecond waits, before the disk is taken to have hung.
 const STALL_WAITS: u32 = 10_000;
 /// Records written between syncs at most.
 const BATCH: usize = 1024;
+/// What one batching thread gathers before it hands the batch over rather than waiting for its loop to come round
+/// to `flush`. A record about a frame holds a copy of that frame, and one pass of a busy loop records every frame
+/// of every connection it serves, so without this the batch is bounded only by how much one pass does: at enough
+/// connections that is gigabytes, held per loop thread.
+const BATCH_BYTES: usize = 256 * 1024;
+/// Counted against `BATCH_BYTES` for each record on top of the copies it owns, so that many small records bound the
+/// batch too, not only a few large ones.
+const RECORD_BYTES: usize = 128;
 /// What the writer holds before it goes to the kernel. A drain writes what was queued and then flushes, so this only
 /// decides how many writes a large drain takes: the full batch of records is about half a megabyte.
 const BUFFER: usize = 256 * 1024;
@@ -107,6 +119,18 @@ impl Fields {
         self.put("sequence", sequence.to_string());
         self.0.push(Item::Digest(text.to_string()));
     }
+
+    /// What this record holds while it waits for the writer: the copies it owns. Names are static and the JSON a
+    /// loop already had is small, so the copied messages are what a batch's size is made of.
+    fn bytes(&self) -> usize {
+        self.0
+            .iter()
+            .map(|item| match item {
+                Item::Wire(_, text) | Item::Digest(text) => text.len(),
+                Item::Json(..) => 0,
+            })
+            .sum()
+    }
 }
 
 impl Default for Fields {
@@ -126,6 +150,8 @@ thread_local! {
     static BATCH_HERE: Cell<bool> = const { Cell::new(false) };
     /// What it has gathered since its last `Audit::flush`.
     static PENDING: RefCell<Vec<Record>> = const { RefCell::new(Vec::new()) };
+    /// What that has cost so far, against `BATCH_BYTES`.
+    static PENDING_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Says that this thread takes records in batches, which an event loop calls once at its start: it then hands a whole
@@ -194,9 +220,18 @@ impl Audit {
         if self.queue.is_none() {
             return;
         }
+        let bytes = fields.bytes().saturating_add(RECORD_BYTES);
         let record = Record { micros: wall_micros(), kind, fields };
         if BATCH_HERE.with(Cell::get) {
             PENDING.with(|pending| pending.borrow_mut().push(record));
+            let held = PENDING_BYTES.with(|n| {
+                n.set(n.get().saturating_add(bytes));
+                n.get()
+            });
+            // Handed over mid-pass rather than held to the end of one: what a pass records has no bound of its own.
+            if held >= BATCH_BYTES {
+                self.flush();
+            }
         } else {
             self.send(vec![record]);
         }
@@ -209,6 +244,7 @@ impl Audit {
             return;
         }
         let batch = PENDING.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+        PENDING_BYTES.with(|n| n.set(0));
         if !batch.is_empty() {
             self.send(batch);
         }
