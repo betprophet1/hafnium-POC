@@ -77,6 +77,10 @@ fn applied(results: &[Value], what: &str) -> Result<(), Error> {
 /// `venue-sim seed` already defines with the same content, so nothing here redefines it (this assumes `seed`
 /// ran first, same as `gwload`'s single-instrument mode already assumes the demo catalogue was seeded). Returns
 /// each instrument's ID, ranked most-popular first: `pick_instrument`'s weighting assumes that order.
+///
+/// Idempotent across repeated calls against the same node (a sweep of runs, each asking for the same `n`, needs
+/// this only once): a rejected `DefineEvent` is read as "a previous call already listed this one", and listing
+/// and opening are skipped rather than retried, since nothing else in a test run claims this event range.
 fn list_instruments(ingress_addr: &str, n: usize) -> Result<Vec<u64>, Error> {
     let mut ingress = Ingress::new(ingress_addr);
     let mut ids = Ids::new('x')?;
@@ -85,14 +89,17 @@ fn list_instruments(ingress_addr: &str, n: usize) -> Result<Vec<u64>, Error> {
         let event = 950_000 + i as u64;
         let instrument = event * 10;
         let fields = json!({"eventId": event, "stateCount": 2, "scheduledStart": 0});
-        applied(&ingress.send(wire::command("DefineEvent", ids.fresh(), fields))?, "DefineEvent")?;
-        let listing = json!({
-            "instrumentId": instrument, "eventId": event, "instrumentClass": "BINARY", "stateMask": 2,
-            "tickTableId": 1, "lotStep": 1, "allocationPolicy": "PRICE_TIME", "positionLimit": 0, "legs": []
-        });
-        applied(&ingress.send(wire::command("ListInstrument", ids.fresh(), listing))?, "ListInstrument")?;
-        let open = json!({"instrumentId": instrument, "state": "OPEN"});
-        applied(&ingress.send(wire::command("SetMarketState", ids.fresh(), open))?, "SetMarketState")?;
+        let results = ingress.send(wire::command("DefineEvent", ids.fresh(), fields))?;
+        let newly_defined = results.iter().any(|r| r["msg"] == "CommandApplied" && r["outcome"] == "APPLIED");
+        if newly_defined {
+            let listing = json!({
+                "instrumentId": instrument, "eventId": event, "instrumentClass": "BINARY", "stateMask": 2,
+                "tickTableId": 1, "lotStep": 1, "allocationPolicy": "PRICE_TIME", "positionLimit": 0, "legs": []
+            });
+            applied(&ingress.send(wire::command("ListInstrument", ids.fresh(), listing))?, "ListInstrument")?;
+            let open = json!({"instrumentId": instrument, "state": "OPEN"});
+            applied(&ingress.send(wire::command("SetMarketState", ids.fresh(), open))?, "SetMarketState")?;
+        }
         listed.push(instrument);
     }
     Ok(listed)
