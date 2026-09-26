@@ -25,6 +25,7 @@ venue-telemetry = { path = "../telemetry" }
 # Pinning a reactor thread to one core (affinity.rs): a safe wrapper over sched_setaffinity, since the
 # workspace forbids unsafe code even outside core/engine.
 core_affinity = "0.8"
+mimalloc = "0.1.52"
 
 [dev-dependencies]
 # The request-path tests run order entry against a real node rather than a stub of one.

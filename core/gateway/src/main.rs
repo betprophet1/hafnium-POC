@@ -27,6 +27,12 @@ use api::{Gateway, Limits};
 use audit::Audit;
 use forwarded::TrustedProxies;
 use hub::Hub;
+/// The feed thread spends about 42% of itself in glibc's `malloc` and `free` (ADR-0002): applying one unit
+/// builds and drops a tree of small, short-lived `serde_json::Value` allocations, which is the pattern glibc's
+/// per-thread arenas serve worst. Swapping the allocator changes no semantics and no code but this line.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use limits::monotonic;
 use metrics::{IngressWatch, Metrics};
 use reactor::Reactors;
