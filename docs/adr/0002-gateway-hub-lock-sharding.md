@@ -323,6 +323,46 @@ property of the system rather than noise. Nothing here explains them, and nothin
 point, so the larger tables buy nothing for a workload that fits in either — worth knowing before anyone
 reaches for a bigger profile expecting speed rather than headroom.
 
+## What applying a unit actually costs, and where it goes
+
+`venue_gateway_feed_apply_duration_seconds` now measures this rather than leaving it to be inferred from `top`.
+On a trading load, both halves applying the same 222,325 units: **private 36.0µs a unit** (p50 24µs, p90 ~78µs,
+p99 ~250µs), **public 19.9µs**. The public half has no subscribers there, so the ~16µs between them is building
+and sending an account's own messages, and the ~20µs both pay is applying the unit to the view. The mean sitting
+half again above the median is a tail — a fill against many resting orders, a tick releasing a whole event — and
+that tail is what a lag spike is made of. A further **~6µs a unit** goes on the feed thread *outside* `apply`,
+decoding each SBE frame into a `serde_json::Value` in `read_units` before `apply` is ever called.
+
+**Profiled** (`perf record` on the busier `gw-feed` thread, 39,426 samples, 64 trading connections,
+`--profile perf` with fat LTO and `target-cpu=native`), self time:
+
+| | share | |
+|---|---|---|
+| `_int_malloc` / `malloc` / `_int_free` / `cfree` / `realloc` | **42%** | allocating and freeing |
+| `__memcmp_evex_movbe` | 12% | comparing JSON object keys |
+| `__memmove_evex_unaligned_erms` | 4% | copying |
+| `BTreeMap::insert`, `String::write_str`, `serde_json` serialize, `drop_in_place<Value>` | ~18% | building and tearing down `Value` trees |
+| `View::apply`, `Hub::apply`, `executions`, `send_to_account` | **~8%** | the venue state change itself |
+
+By object: **60.6% libc, 35.7% venue-gateway**.
+
+**So roughly nine tenths of the feed thread goes on the JSON representation and one tenth on the work.** The
+feed arrives as compact binary SBE, is inflated into `serde_json::Value` trees, walked by string key — that 12%
+in `memcmp` is comparing `"msg"`, `"orderId"`, `"accountId"` inside `BTreeMap<String, Value>` — and then
+serialised back into JSON strings for clients. The allocator churn that produces is the single largest line in
+the profile.
+
+Two things follow, in increasing order of cost:
+
+- **Try a different allocator first.** 42% of the thread is in glibc `malloc`/`free`, whose arena design suits
+  this pattern of many small short-lived allocations poorly. Swapping the global allocator is a few lines and
+  changes no semantics, so it is worth measuring before anything structural.
+- **The structural answer is not to materialise `Value` on the feed path at all.** The journal is SBE and the
+  view wants typed fields; going binary → `Value` → string-keyed walk → typed state is overhead the format does
+  not require. JSON is needed at the client boundary, not for the gateway's own bookkeeping. That is a real
+  piece of work and nothing yet says the ceiling is close enough to justify it — but it is where the 42µs is,
+  and no amount of lock or profile tuning reaches it.
+
 ## Action Items
 
 1. [x] Implement `RwLock<Hub>` (Option A) for real, verify it compiles clean and the full test suite passes — done, 97/97.
