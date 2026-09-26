@@ -354,14 +354,30 @@ the profile.
 
 Two things follow, in increasing order of cost:
 
-- **Try a different allocator first.** 42% of the thread is in glibc `malloc`/`free`, whose arena design suits
-  this pattern of many small short-lived allocations poorly. Swapping the global allocator is a few lines and
-  changes no semantics, so it is worth measuring before anything structural.
+- **A different allocator — done, and it is worth about a third.** 42% of the thread was in glibc
+  `malloc`/`free`, whose arena design suits many small short-lived allocations poorly. `mimalloc` as the global
+  allocator is one line and changes no semantics. Measured on an idle c6i.8xlarge, the same tree with and
+  without it, over ~2.5M units each: **private apply 28.2µs → 20.3µs (−28%), public 15.0µs → 10.5µs (−30%)**.
+  Throughput follows on the load it was aimed at — trading at 32 connections 30,986 → 36,387 requests/s, at 128
+  connections 21,360 → 35,769 — while the amend-only load, cheaper per unit and bounded elsewhere, is a wash.
+  97/97 tests pass. One trade point (64 connections) was lost to a client reset mid-run, so that row is missing
+  rather than bad.
 - **The structural answer is not to materialise `Value` on the feed path at all.** The journal is SBE and the
   view wants typed fields; going binary → `Value` → string-keyed walk → typed state is overhead the format does
   not require. JSON is needed at the client boundary, not for the gateway's own bookkeeping. That is a real
   piece of work and nothing yet says the ceiling is close enough to justify it — but it is where the 42µs is,
-  and no amount of lock or profile tuning reaches it.
+  and no amount of lock or profile tuning reaches it. The allocator above buys back a third of it without
+  touching the shape; the remaining two thirds need the shape changed.
+
+**A faster JSON parser would not help here, and it is worth writing down why.** The obvious reach is for
+something like simdjson, but there is no JSON *text* to parse anywhere on this path: `codec::decode`
+(`harness/src/codec.rs`) reads SBE binary and *constructs* a `serde_json::Value` field by field, and neither
+`wire.rs` nor the codec calls `from_str` or `from_slice` at all. The cost is Value **construction**, **string-keyed
+access** (that 12% in `memcmp` is comparing `"msg"` and `"orderId"` inside a `BTreeMap<String, Value>`) and
+**serialisation** — none of which a parser addresses. Where the gateway does parse client JSON is `ws.rs:221`
+and `rest.rs:85`, on the reactor threads, which sat at ~41% while the feed thread saturated; a faster parser
+could shave those, and there is a redundant re-parse of each outbound frame in `reactor.rs:808` and `:822` worth
+removing first, but neither is the constraint today.
 
 ## Action Items
 
