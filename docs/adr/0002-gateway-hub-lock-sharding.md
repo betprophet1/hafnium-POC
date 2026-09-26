@@ -281,8 +281,18 @@ this shape of test can now ask.
   evict) is 262,144 entries and its own comment sizes it for "about thirty-six new orders a second". The amend
   load places one order per connection and then only amends, so it never approached that; a trading load mints a
   fresh order per taker request and exhausted the table in about 25 seconds — `engine fail-stop Capacity at
-  input 348086 (spec §18)`, exactly as specified. These runs use `--capacity scale`. Anyone sizing a real group
-  should read that constant as a rate limit, not a memory figure.
+  input 348086 (spec §18)`, exactly as specified.
+
+  **This is a rate limit, not a memory figure, and no profile fixes it.** A group takes
+  `duplicates / window` new orders a second: at the two-hour default that is ~36/s on `small`, ~583/s on
+  `launch` and ~2,330/s on `scale`. Twenty thousand orders a second at a two-hour window would want 144 million
+  entries, an order of magnitude past `scale`. The window is the half a deployment chooses, and E-7.4 accepts a
+  shorter one. So `Catalogue::seed_with` now takes the window to found a group on and `venue-sim seed` derives
+  it from `--orders-per-second` (or `--id-window-seconds` outright), leaving the default untouched. Verified: a
+  30-second trading load on `--capacity small` seeded for 20k orders/s ran 516,022 requests and 878,234 fills
+  with no fail-stop. **Anyone sizing a real group has to pick the window against the order rate it will see**,
+  and that is a compliance question as much as an engineering one, since the window is how long a duplicate
+  client order ID is detected (D-12).
 
 The whole sweep wrote **12.9 GB** of audit log in about 200 seconds of load.
 
