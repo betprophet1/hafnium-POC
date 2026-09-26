@@ -821,12 +821,15 @@ fn handle(oracle: &Oracle, stream: TcpStream) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use venue_link::wire::Unit;
+    use venue_link::wire::{Frame, Unit};
 
     fn apply(view: &mut View, msg: Value, at: u64) {
         let mut input = msg;
         input["record"] = json!({"sequence": at, "sequencedAt": at, "sequencerGroup": 1});
-        view.apply(&Unit { input, results: vec![json!({"msg": "CommandApplied", "outcome": "APPLIED"})] });
+        view.apply(&Unit {
+            input: Frame::of(&input),
+            results: vec![Frame::of(&json!({"msg": "CommandApplied", "outcome": "APPLIED"}))],
+        });
     }
 
     #[test]

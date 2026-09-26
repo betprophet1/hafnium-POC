@@ -591,12 +591,13 @@ mod tests {
     use super::*;
     use prometheus_client::encoding::text::encode;
     use serde_json::json;
+    use venue_link::wire::Frame;
 
     const START: u64 = 1_000_000_000_000;
 
     fn unit(sequence: u64, at: u64, mut input: Value, results: Vec<Value>) -> Unit {
         input["record"] = json!({"sequence": sequence, "sequencedAt": at, "sequencerGroup": 1});
-        Unit { input, results }
+        Unit { input: Frame::of(&input), results: results.iter().map(Frame::of).collect() }
     }
 
     fn applied() -> Value {

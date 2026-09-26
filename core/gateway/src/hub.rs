@@ -48,7 +48,9 @@ pub fn ladder(view: &View, instrument: u64) -> &[Row] {
 }
 
 /// The executions an input's results mean for each account, from the view as it was before the input.
-pub fn executions(view: &View, results: &[Value], sequence: u64) -> Vec<(u64, Value)> {
+/// Takes the results as an iterator of `&Value` rather than a slice, so a caller holding feed frames can hand
+/// over what they decode to without collecting them first (`wire::Frame`).
+pub fn executions<'a>(view: &View, results: impl IntoIterator<Item = &'a Value>, sequence: u64) -> Vec<(u64, Value)> {
     let mut out = Vec::new();
     let mut accepted: BTreeMap<u64, (String, u64)> = BTreeMap::new();
     for r in results {
@@ -439,7 +441,7 @@ impl Hub {
     pub fn apply(&mut self, unit: &Unit) {
         let input = &unit.input;
         let sequence = u(&input["record"]["sequence"]);
-        let executions = executions(&self.view, &unit.results, sequence);
+        let executions = executions(&self.view, unit.results.iter().map(|f| &**f), sequence);
         // Markets the engine releases with their events (E-8.4), found before the view forgets them.
         let released: Vec<(u64, Vec<u64>)> = unit
             .results
@@ -921,6 +923,7 @@ fn typed(kind: &str, mut body: Value) -> String {
 mod tests {
     use super::*;
     use std::sync::{mpsc, Arc};
+    use venue_link::wire::Frame;
 
     /// A session's outbox, and what arrives in it.
     fn outbox() -> (Outbox, mpsc::Receiver<Queued>) {
@@ -981,7 +984,10 @@ mod tests {
     /// One unit off the feed: the input with its record header, and the results it produced.
     fn unit(sequence: u64, results: Vec<Value>) -> Unit {
         let record = json!({"sequence": sequence, "sequencedAt": 0, "sequencerGroup": 1});
-        Unit { input: json!({"msg": "NewOrder", "record": record}), results }
+        Unit {
+            input: Frame::of(&json!({"msg": "NewOrder", "record": record})),
+            results: results.iter().map(Frame::of).collect(),
+        }
     }
 
     fn accepted(order: u64) -> Value {
@@ -1050,11 +1056,11 @@ mod tests {
         let (follower, follower_rx) = outbox();
         let follower = hub.add_session(follower);
         hub.subscribe(follower, &["markets".to_string()], 10);
-        let applied = vec![json!({"msg": "CommandApplied", "outcome": "APPLIED"})];
+        let applied = [json!({"msg": "CommandApplied", "outcome": "APPLIED"})];
         let command = |sequence: u64, input: Value| {
             let mut input = input;
             input["record"] = json!({"sequence": sequence, "sequencedAt": sequence, "sequencerGroup": 1});
-            Unit { input, results: applied.clone() }
+            Unit { input: Frame::of(&input), results: applied.iter().map(Frame::of).collect() }
         };
         hub.apply(&command(1, json!({"msg": "DefineEvent", "eventId": 5, "stateCount": 2, "scheduledStart": 0})));
         let list = json!({"msg": "ListInstrument", "instrumentId": 50, "eventId": 5, "instrumentClass": "BINARY",
@@ -1062,8 +1068,11 @@ mod tests {
         hub.apply(&command(2, list));
         assert_eq!(hub.markets(None)["events"].as_array().map(Vec::len), Some(1));
         follower_rx.try_iter().count();
-        let mut tick = unit(3, vec![json!({"msg": "EventReleased", "eventId": 5})]);
-        tick.input["msg"] = json!("TimeTick");
+        let tick = Unit {
+            input: Frame::of(&json!({"msg": "TimeTick",
+                "record": {"sequence": 3, "sequencedAt": 0, "sequencerGroup": 1}})),
+            results: vec![Frame::of(&json!({"msg": "EventReleased", "eventId": 5}))],
+        };
         hub.apply(&tick);
         assert_eq!(hub.markets(None)["events"].as_array().map(Vec::len), Some(0));
         assert!(hub.market(50).is_none());
@@ -1079,7 +1088,7 @@ mod tests {
             "takerSide": "SELL", "mintedPairs": 10, "burnedPairs": 0, "buyerCashCents": -300, "sellerCashCents": -700,
             "makerFeeCents": -3, "takerFeeCents": 15
         });
-        let out = executions(&View::default(), &[fill], 9);
+        let out = executions(&View::default(), [&fill], 9);
         let fee = |account: u64| out.iter().find(|(a, _)| *a == account).map(|(_, e)| e["feeCents"].clone());
         assert_eq!(fee(1), Some(json!(-3)));
         assert_eq!(fee(2), Some(json!(15)));

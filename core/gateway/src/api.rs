@@ -1064,7 +1064,7 @@ impl Gateway {
     fn mass_cancel_result(&self, account: u64, results: &[Value]) -> Value {
         let hub = self.hub();
         let sequence = results.iter().find_map(|r| r["result"]["inputSequence"].as_u64()).unwrap_or(hub.view.sequence);
-        let executions: Vec<Value> = hub::executions(&hub.view, results, sequence)
+        let executions: Vec<Value> = hub::executions(&hub.view, results.iter(), sequence)
             .into_iter()
             .filter(|(a, _)| *a == account)
             .map(|(_, e)| e)
@@ -1081,7 +1081,7 @@ impl Gateway {
         // the read lock, not the write lock a naive "always lock for the whole function" would reach for.
         let executions: Vec<Value> = if accepted.is_empty() {
             let hub = self.hub();
-            hub::executions(&hub.view, results, sequence)
+            hub::executions(&hub.view, results.iter(), sequence)
                 .into_iter()
                 .filter(|(a, _)| *a == account)
                 .map(|(_, e)| e)
@@ -1093,7 +1093,7 @@ impl Gateway {
                 let field = |name: &str| r[name].as_u64().unwrap_or(0);
                 hub.accept(field("orderId"), sequence, field("accountId"), field("instrumentId"));
             }
-            hub::executions(&hub.view, results, sequence)
+            hub::executions(&hub.view, results.iter(), sequence)
                 .into_iter()
                 .filter(|(a, _)| *a == account)
                 .map(|(_, e)| e)

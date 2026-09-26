@@ -628,12 +628,14 @@ impl Live {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::Frame;
 
     fn unit(msg: Value, at: u64, applied: bool) -> Unit {
         let mut input = msg;
         input["record"] = json!({"sequence": at, "sequencedAt": at, "sequencerGroup": 1});
-        let results = if applied { vec![json!({"msg": "CommandApplied", "outcome": "APPLIED"})] } else { Vec::new() };
-        Unit { input, results }
+        let results =
+            if applied { vec![Frame::of(&json!({"msg": "CommandApplied", "outcome": "APPLIED"}))] } else { Vec::new() };
+        Unit { input: Frame::of(&input), results }
     }
 
     #[test]
@@ -670,7 +672,7 @@ mod tests {
         order["record"] = json!({"sequence": 2, "sequencedAt": 2, "sequencerGroup": 1});
         let accepted = json!({"msg": "OrderAccepted", "orderId": 77, "accountId": 10, "instrumentId": 9,
                               "side": "SELL", "tick": 4, "quantity": 10});
-        view.apply(&Unit { input: order, results: vec![accepted] });
+        view.apply(&Unit { input: Frame::of(&order), results: vec![Frame::of(&accepted)] });
         assert_eq!(view.orders[&77].expires_at, Some(5_000));
     }
 
@@ -723,7 +725,10 @@ mod tests {
         let tick = |at: u64, event: u64| {
             let mut input = json!({"msg": "TimeTick"});
             input["record"] = json!({"sequence": at, "sequencedAt": at, "sequencerGroup": 1});
-            Unit { input, results: vec![json!({"msg": "EventReleased", "eventId": event})] }
+            Unit {
+                input: Frame::of(&input),
+                results: vec![Frame::of(&json!({"msg": "EventReleased", "eventId": event}))],
+            }
         };
         view.apply(&tick(6, round));
         assert!(!view.events.contains_key(&round) && !view.instruments.contains_key(&leg));

@@ -36,7 +36,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use venue_link::catalogue::Catalogue;
 use venue_link::view::{Leg, View};
-use venue_link::wire::{self, command, Error, Ids, Ingress, Unit};
+use venue_link::wire::{self, command, Error, Frame, Ids, Ingress, Unit};
 
 /// How close to the wall clock a unit's sequencer time must be for the service to count as caught up. Until then it
 /// is replaying history, and acting on a picture of the past would halt or close a parlay that is fine now.
@@ -196,7 +196,7 @@ impl State {
     }
 
     /// Follows the orders that are quotes through one unit's results, and returns the requester's news.
-    fn track_quotes(&mut self, results: &[Value]) -> Vec<(u64, Value)> {
+    fn track_quotes(&mut self, results: &[Frame]) -> Vec<(u64, Value)> {
         let mut changed: Vec<u64> = Vec::new();
         for r in results {
             let u = |name: &str| r[name].as_u64().unwrap_or(0);
