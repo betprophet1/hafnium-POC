@@ -369,6 +369,37 @@ Two things follow, in increasing order of cost:
   and no amount of lock or profile tuning reaches it. The allocator above buys back a third of it without
   touching the shape; the remaining two thirds need the shape changed.
 
+### Taking `Value` off the feed path: measured
+
+Done in two steps and measured against the commit before them, same machine, both trees built and run back to
+back. `Unit` now carries the SBE bytes (`wire::Frame`) with the JSON shape decoded only if something asks and
+kept once it has been; `View` reads `OrderAccepted`, `Fill` and `BookLevelChanged` straight out of the generated
+decoders; and every reader of a `BookLevelChanged` — the hub's loop, `executions`' input filter, three template
+scans and the view's applied-command check — now takes it typed, so that result is applied without being
+decoded at all.
+
+Both runs applied within 0.1% of the same number of units (2,363,862 against 2,366,023), which makes
+`feed_apply` a controlled comparison rather than an impression:
+
+| | before | after | |
+|---|---|---|---|
+| public apply | 9.94µs | **7.04µs** | −29% |
+| private apply | 18.74µs | **14.09µs** | −25% |
+| busier `gw-feed` thread | 95.4% | **77.0%** | no longer near saturation |
+
+The thread profile is the corroboration: the feed thread was at 95.4% and is now at 77.0%, which is the same
+result seen a second way and the headroom the ceiling was short of.
+
+Throughput is a weaker signal here and is reported as such. Amend-only improved consistently (+18% at 8
+connections, +5% at 32, +9% at 128); the trading numbers moved the other way at 32 connections and one base
+point did not complete at all. Those are single ten-second samples of the metric that has varied by a third
+run to run all through this ADR, against a `feed_apply` figure drawn from 2.36M samples. Read the apply cost,
+not the trade rate.
+
+**What is left.** `Fill` and `OrderAccepted` still decode, because both are read by `executions`, which carries
+state across its arms, serves the node's replies as well as the feed, and maps the cash and fee fields. That is
+worth doing on its own terms, with a differential harness in place first, rather than folded into this.
+
 **A faster JSON parser would not help here, and it is worth writing down why.** The obvious reach is for
 something like simdjson, but there is no JSON *text* to parse anywhere on this path: `codec::decode`
 (`harness/src/codec.rs`) reads SBE binary and *constructs* a `serde_json::Value` field by field, and neither
