@@ -46,6 +46,43 @@ pub struct Config {
     /// N connections on their own accounts would. Measuring the gateway means not asking it to do that.
     /// `venue-sim catalogue --accounts N` writes a catalogue holding the accounts these tokens name.
     pub token_prefix: Option<String>,
+    /// What the connections do. `Amend` is the original measurement: one resting order per connection at a tick
+    /// nothing trades at, amended back and forth, so nothing ever matches. `Trade` is a venue's own shape --
+    /// makers resting liquidity and takers crossing it -- so the matching, the executions and the position and
+    /// sleeve updates a fill causes are all in the measurement rather than absent from it.
+    pub mode: Mode,
+    /// In `Trade`, how many of the connections rest liquidity; the rest take it. Defaults to a quarter.
+    pub makers: Option<usize>,
+    /// Connections that only watch: they subscribe to the book on the *public* half and read what comes. Market
+    /// data is served by the other half, with its own hub, feed thread and loops, so a run without any of these
+    /// leaves all of that idle and measures only order entry.
+    pub watchers: usize,
+    /// Where the public half is, for `watchers`. Defaults to `gateway`, which is right when one process serves
+    /// both halves.
+    pub public_gateway: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Amend,
+    Trade,
+}
+
+/// The tick makers rest on and takers cross at. Away from where anything else quotes, so the two sides meet each
+/// other rather than whatever else the venue happens to be carrying.
+const TRADE_TICK: u64 = 50;
+/// What a maker keeps resting, in contracts. Amended back up to this, so the book never empties under takers.
+const MAKER_SIZE: u64 = 1_000_000;
+
+/// What one connection did, so a run can report fills and messages as well as round trips.
+#[derive(Default)]
+struct Outcome {
+    /// Round trips, in nanoseconds, of whatever requests this connection made.
+    times: Vec<u64>,
+    /// Executions this connection was told about in its own replies.
+    fills: u64,
+    /// Messages a watcher was pushed.
+    received: u64,
 }
 
 /// Instrument rank `k`'s share of the connection population, out of a population where rank 0 is unscaled:
@@ -149,6 +186,84 @@ fn drive(gateway: &str, token: &str, instrument: u64, index: usize, deadline: In
     Ok(times)
 }
 
+/// A maker's run: rest a sell the takers can hit, then keep amending it back up to size. The amend is both the
+/// request being measured and how the book is replenished, so the liquidity never runs out from under the takers.
+fn drive_maker(gateway: &str, token: &str, instrument: u64, index: usize, deadline: Instant) -> Result<Outcome, Error> {
+    let (mut session, _welcome) = Session::open(gateway, token, 30)?;
+    let mut ids = Ids::new('m')?;
+    let mut place = json!({
+        "op": "order", "clientOrderId": ids.fresh(), "instrumentId": instrument.to_string(), "action": "sell",
+        "outcome": "yes", "price": {"tick": TRADE_TICK}, "quantity": MAKER_SIZE, "postOnly": true
+    });
+    place["id"] = json!(format!("make{index}"));
+    let placed = session.request(place)?;
+    if placed["result"]["status"] != "accepted" {
+        return Err(format!("maker {index}: order not accepted: {placed}").into());
+    }
+    let order_id = placed["result"]["orderId"]
+        .as_str()
+        .ok_or_else(|| Error::from("no orderId in the accepted reply"))?
+        .to_string();
+
+    let mut out = Outcome::default();
+    while now() < deadline {
+        let t0 = now();
+        let reply = session.request(
+            json!({"op": "amend", "orderId": order_id, "price": {"tick": TRADE_TICK}, "quantity": MAKER_SIZE}),
+        )?;
+        out.times.push(t0.elapsed().as_nanos() as u64);
+        // A maker whose order has been taken in full has nothing left to amend; rest another.
+        if reply["type"] == "error" || reply["result"]["status"] == json!("rejected") {
+            let mut again = json!({
+                "op": "order", "clientOrderId": ids.fresh(), "instrumentId": instrument.to_string(),
+                "action": "sell", "outcome": "yes", "price": {"tick": TRADE_TICK}, "quantity": MAKER_SIZE,
+                "postOnly": true
+            });
+            again["id"] = json!(format!("remake{index}"));
+            let _ = session.request(again)?;
+        }
+        out.fills += reply["result"]["executions"].as_array().map_or(0, |e| e.len() as u64);
+    }
+    Ok(out)
+}
+
+/// A taker's run: cross the makers' price, immediate-or-cancel so nothing of it ever rests. Every request that
+/// finds liquidity is a fill, which is the whole point -- matching, executions, and the sleeve and position
+/// updates that follow, none of which the amend-only measurement has.
+fn drive_taker(gateway: &str, token: &str, instrument: u64, index: usize, deadline: Instant) -> Result<Outcome, Error> {
+    let (mut session, _welcome) = Session::open(gateway, token, 30)?;
+    let mut ids = Ids::new('t')?;
+    let mut out = Outcome::default();
+    while now() < deadline {
+        let mut take = json!({
+            "op": "order", "clientOrderId": ids.fresh(), "instrumentId": instrument.to_string(), "action": "buy",
+            "outcome": "yes", "price": {"tick": TRADE_TICK}, "quantity": 1, "timeInForce": "IOC"
+        });
+        take["id"] = json!(format!("take{index}"));
+        let t0 = now();
+        let reply = session.request(take)?;
+        out.times.push(t0.elapsed().as_nanos() as u64);
+        if reply["type"] == "error" {
+            return Err(format!("taker {index}: order refused: {reply}").into());
+        }
+        out.fills += reply["result"]["executions"].as_array().map_or(0, |e| e.len() as u64);
+    }
+    Ok(out)
+}
+
+/// A watcher's run: subscribe to the book on the public half and read what the gateway pushes. Sends nothing
+/// after the subscription, so what it costs the gateway is the conflated fan-out rather than order entry.
+fn drive_watcher(public: &str, instruments: &[u64], deadline: Instant) -> Result<Outcome, Error> {
+    let mut market = Session::watch(public)?;
+    let topics: Vec<String> = instruments.iter().map(|i| format!("book.{i}")).collect();
+    market.send(&json!({"op": "subscribe", "topics": topics, "depth": 10}))?;
+    let mut out = Outcome::default();
+    while now() < deadline {
+        out.received += market.poll(Duration::from_millis(50))?.len() as u64;
+    }
+    Ok(out)
+}
+
 fn micros(ns: u64) -> String {
     format!("{}.{:03}", ns / 1000, ns % 1000)
 }
@@ -161,6 +276,13 @@ pub fn run(cfg: Config) -> Result<(), Error> {
         listed
     } else {
         vec![cfg.instrument]
+    };
+
+    // A quarter of the connections rest liquidity by default, which keeps the book stocked for the rest without
+    // spending most of the run on it. At least one, or the takers have nothing to trade against.
+    let makers = match cfg.mode {
+        Mode::Amend => 0,
+        Mode::Trade => cfg.makers.unwrap_or((cfg.connections / 4).max(1)).min(cfg.connections),
     };
 
     // Sharing one account across connections costs the gateway a copy of every message per session of that
@@ -184,24 +306,51 @@ pub fn run(cfg: Config) -> Result<(), Error> {
                 None => cfg.token.clone(),
             };
             let (gateway, instruments) = (cfg.gateway.clone(), instruments.clone());
+            let (mode, makers) = (cfg.mode, makers);
             thread::spawn(move || {
                 // Seeded from the connection index, so a run is reproducible.
                 let mut rng = Rng::new(i as u64 + 1);
                 let instrument = pick_instrument(&mut rng, &instruments);
-                drive(&gateway, &token, instrument, i, deadline).map_err(|e| e.to_string())
+                match mode {
+                    Mode::Amend => drive(&gateway, &token, instrument, i, deadline)
+                        .map(|times| Outcome { times, ..Outcome::default() }),
+                    // Makers first, so the liquidity is resting before the takers start on it.
+                    Mode::Trade if i < makers => drive_maker(&gateway, &token, instrument, i, deadline),
+                    Mode::Trade => drive_taker(&gateway, &token, instrument, i, deadline),
+                }
+                .map_err(|e| e.to_string())
             })
         })
         .collect();
 
+    let public = cfg.public_gateway.clone().unwrap_or_else(|| cfg.gateway.clone());
+    let watching: Vec<_> = (0..cfg.watchers)
+        .map(|_| {
+            let (public, instruments) = (public.clone(), instruments.clone());
+            thread::spawn(move || drive_watcher(&public, &instruments, deadline).map_err(|e| e.to_string()))
+        })
+        .collect();
+
     let mut all = Vec::new();
+    let (mut fills, mut received) = (0_u64, 0_u64);
     for h in handles {
-        all.extend(h.join().map_err(|_| Error::from("a connection thread panicked"))??);
+        let out = h.join().map_err(|_| Error::from("a connection thread panicked"))??;
+        all.extend(out.times);
+        fills += out.fills;
+    }
+    for h in watching {
+        let out = h.join().map_err(|_| Error::from("a watcher thread panicked"))??;
+        received += out.received;
     }
     let elapsed_ms = started.elapsed().as_millis().max(1);
     all.sort_unstable();
     let p = |q: usize| micros(all.get(all.len().saturating_sub(1) * q / 100_000).copied().unwrap_or(0));
-    println!(
-        "{} connection(s) over {} instrument(s), {} amendments in {elapsed_ms} ms: {} messages/s; round trip \u{b5}s p50 {} p90 {} p99 {} p99.9 {} max {}",
+    let what = match cfg.mode {
+        Mode::Amend => "amendments",
+        Mode::Trade => "requests",
+    };
+    print!(
+        "{} connection(s) over {} instrument(s), {} {what} in {elapsed_ms} ms: {} messages/s; round trip \u{b5}s p50 {} p90 {} p99 {} p99.9 {} max {}",
         cfg.connections,
         instruments.len(),
         all.len(),
@@ -212,5 +361,16 @@ pub fn run(cfg: Config) -> Result<(), Error> {
         p(99_900),
         micros(all.last().copied().unwrap_or(0)),
     );
+    if cfg.mode == Mode::Trade {
+        print!("; {makers} maker(s), {fills} fills, {} fills/s", u128::from(fills) * 1000 / elapsed_ms);
+    }
+    if cfg.watchers > 0 {
+        print!(
+            "; {} watcher(s) took {received} messages, {}/s",
+            cfg.watchers,
+            u128::from(received) * 1000 / elapsed_ms
+        );
+    }
+    println!();
     Ok(())
 }

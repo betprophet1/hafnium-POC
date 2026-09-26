@@ -45,6 +45,13 @@ const USAGE: &str = "usage:
                   `gwload --token-prefix` then has an account per connection.
   venue-sim gwload --gateway ADDR [--token dev-market-maker] [--instrument 10010] [--connections 1] [--seconds 10]
                   [--instruments 1] [--ingress ADDR] [--token-prefix PREFIX]
+                  [--mode amend|trade] [--makers N] [--watchers N] [--public-gateway ADDR]
+                  --mode trade makes the connections a venue's own shape instead of one that never trades:
+                  the first --makers of them (a quarter by default) rest a large sell, amending it back up to
+                  size, and the rest cross it immediate-or-cancel, so every taker request is a fill with the
+                  executions and sleeve updates that follow. --watchers N adds N connections that only
+                  subscribe to the book on the public half and read, which is the market-data fan-out the
+                  order-entry measurement leaves out entirely.
                   the gateway-facing counterpart to `venue-node load`: each connection logs in over
                   /v4/ws_private, places one resting order, then amends it back and forth until the deadline,
                   reporting messages/s and round-trip percentiles the same way.
@@ -286,6 +293,17 @@ fn gwload(args: &Args) -> Result<(), Error> {
         ingress: args.optional("ingress"),
         instruments: usize::try_from(args.number("instruments", 1)?)?,
         token_prefix: args.optional("token-prefix").filter(|p| !p.is_empty()),
+        mode: match args.get("mode", Some("amend"))?.as_str() {
+            "amend" => gwload::Mode::Amend,
+            "trade" => gwload::Mode::Trade,
+            other => return Err(format!("--mode must be amend or trade, not {other}").into()),
+        },
+        makers: match args.optional("makers") {
+            Some(m) => Some(usize::try_from(m.parse::<u64>().map_err(|e| format!("--makers: {e}"))?)?),
+            None => None,
+        },
+        watchers: usize::try_from(args.number("watchers", 0)?)?,
+        public_gateway: args.optional("public-gateway").filter(|a| !a.is_empty()),
     };
     gwload::run(config)
 }
