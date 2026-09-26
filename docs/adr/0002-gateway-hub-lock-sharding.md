@@ -172,6 +172,73 @@ explanation offered for it) does not reproduce on a quiet host; that reading cam
 kept (it is a fair description of which call sites mutate `Hub`), but it buys no measurable throughput, and B and
 C would buy none either while costing real complexity. The work worth doing is on the audit write path.
 
+## What the gateway actually does, measured cleanly
+
+Everything above was measured with every connection on one account, which costs the gateway a copy of each
+message per session of that account — so those figures describe the harness as much as the gateway. Re-run on a
+dedicated c6i.8xlarge (32 vCPU, otherwise idle, 8 reactor threads pinned, client confined to cores the gateway
+never touches) with one account per connection, and with the audit fixes below in place, amendments/s:
+
+| connections | 1 | 2 | 4 | 8 | 16 | 32 | 48 | 64 | 96 | 128 | 192 | 256 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| single instrument | 8072 | 15334 | 26092 | 37599 | 51271 | 50294 | 51748 | 41770 | 50522 | 53014 | 58002 | 46187 |
+| spread over 8 | 7493 | 15507 | 26027 | 36731 | 50040 | 54933 | 51193 | 42923 | 50436 | 54361 | 49549 | 52183 |
+
+Round trip, single instrument: p50 118µs at 1 connection, 204µs at 16, 847µs at 64, 1.8ms at 128, 3.4ms at 256;
+p99 154µs at 1, 5.6ms at 16, 7.1ms at 128. Resident memory 278MB at 128 connections, and no client was ever
+dropped for falling behind.
+
+The shape is a normal saturation curve, not the collapse every earlier sweep showed: near-linear to 16
+connections, then a plateau of roughly **50–58k amendments/s** that holds to 256, with p50 growing linearly past
+saturation as requests queue. At 128 connections that is 53,014/s against the 615/s this ADR originally
+recorded — the difference being almost entirely the harness's own fan-out. Spreading across instruments still
+makes no difference at any point, now for a clean reason rather than a contaminated one.
+
+**Where the ceiling sits now.** Per-thread CPU at 128 connections:
+
+```
+gw-feed        89.4%   <- the busiest thread
+gw-feed        66.8%      (the other half's)
+gateway-audit  46.2%
+gw-priv x8   ~40-41% each (3-5% before any of this work)
+```
+
+The reactor pool is finally working, and the audit writer is no longer dominant. The busiest thread is `gw-feed`,
+which runs `Hub::apply`: one thread per half applying every feed unit to the view, in order. So this ADR's
+instinct that `Hub` was implicated was directionally right and its diagnosis was wrong in a way that matters —
+the cost is not contention between readers (they never contended; they were idle), it is that application of the
+feed is **serial by construction**. No lock granularity reaches that. Parallelising it means parallelising the
+ordered application of a sequenced feed, which is a much harder and riskier problem than anything considered
+here, and nothing yet says it is worth attempting.
+
+### What the 50k is not
+
+It is one workload on one machine, and it should not be quoted as the gateway's capacity without these:
+
+- **Nothing trades.** `gwload` places one resting order per connection at a tick chosen so it never fills, then
+  amends its quantity back and forth. So matching, executions, the position and sleeve updates a fill causes and
+  the messages they send are all absent. Fills are the obvious thing to measure next, and they cost more per
+  request than an amendment that touches one order.
+- **Nobody is watching the book.** `gwload` never subscribes to a market-data topic, so the conflated book
+  fan-out — the thing that scales with subscribers rather than with requests — does no work at all here. A venue
+  with market-data clients is a different load.
+- **No cancels, no REST, one order per connection.** The mix is one request type.
+- **One request in flight per connection.** Each connection waits for its reply before sending again. Clients
+  that pipeline would change the shape.
+- **The node is in the loop but was never profiled.** Every amendment goes to the node and back through its
+  feed. Some of this ceiling may be the node's rather than the gateway's; the two were not measured apart.
+- **One 8-second sample per point, no repeats.** The plateau wobbles between 41.8k and 58k, and the 64-connection
+  point sits below both its neighbours. Read it as "about 50k", not as a figure to two significant digits.
+- **It depends on the durability window.** The group commit below is what buys roughly half of this. If the
+  answer to the open question on `COMMIT_WINDOW` is that every batch must be synced, a good part of the
+  throughput goes with it.
+
+**And the audit log is the operational constraint before the CPU is.** Measured: about **1.97 KB of audit per
+amendment** (four records — what the client sent, what it was sent, and the frames derived from the feed), at
+356MB written for 180,882 amendments. At 50k amendments/s that is ~98 MB/s, ~354 GB/hour, ~8.5 TB/day. A default
+gp3 volume does 125 MB/s, so sustaining this rate needs provisioned storage throughput, and retention and
+shipping (`interfaces/tools/audit_ship.py`) become the binding cost long before the gateway runs out of CPU.
+
 ## Action Items
 
 1. [x] Implement `RwLock<Hub>` (Option A) for real, verify it compiles clean and the full test suite passes — done, 97/97.
