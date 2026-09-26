@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,8 +37,15 @@ const ZEROS: &str = "00000000000000000000000000000000000000000000000000000000000
 pub const CAPACITY: usize = 256;
 /// How long a loop waits for room on a full queue, counted in millisecond waits, before the disk is taken to have hung.
 const STALL_WAITS: u32 = 10_000;
-/// Records written between syncs at most.
-const BATCH: usize = 1024;
+/// Records written between syncs at most: the size of one group commit. The sync, not the write, is what costs
+/// -- on network-attached storage it is milliseconds of uninterruptible waiting, and at 1024 it was about 77 of
+/// them a second under load, which measured as ~40% of the writer's thread and capped the whole gateway. Raising
+/// it trades a larger window of records that a machine (not a process -- see `flush`) could lose for proportionally
+/// fewer syncs.
+const BATCH: usize = 8192;
+/// The longest a record waits for its sync when the queue runs dry before `BATCH` is reached, so that a quiet log
+/// is still durable promptly rather than whenever the next record happens to arrive.
+const COMMIT_WINDOW: Duration = Duration::from_millis(10);
 /// What one batching thread gathers before it hands the batch over rather than waiting for its loop to come round
 /// to `flush`. A record about a frame holds a copy of that frame, and one pass of a busy loop records every frame
 /// of every connection it serves, so without this the batch is bounded only by how much one pass does: at enough
@@ -584,6 +591,22 @@ impl Writer {
                             break;
                         }
                         match records.try_recv() {
+                            Ok(next) => {
+                                batch = next;
+                                continue;
+                            }
+                            Err(TryRecvError::Disconnected) => break,
+                            Err(TryRecvError::Empty) => {}
+                        }
+                        // Nothing waiting. What has been written goes to the kernel now, so a gateway that is
+                        // killed loses none of it, but the sync to the disk waits: it is the expensive part, and
+                        // one of them for the records of a whole window beats one for each small batch that
+                        // happens to arrive alone. `COMMIT_WINDOW` is the longest a record waits for it.
+                        self.flush()?;
+                        let Some(rest) = COMMIT_WINDOW.checked_sub(monotonic().duration_since(started)) else {
+                            break;
+                        };
+                        match records.recv_timeout(rest) {
                             Ok(next) => batch = next,
                             Err(_) => break,
                         }
@@ -637,11 +660,17 @@ impl Writer {
     /// after it, a record is in the kernel and survives the gateway being killed, which is what bounds what a signal
     /// can lose to the records of the drain it interrupted. Only the machine going down loses what is not synced.
     fn sync(&mut self) -> io::Result<()> {
-        self.file.flush()?;
+        self.flush()?;
         if self.fsync {
             self.file.get_ref().sync_data()?;
         }
         Ok(())
+    }
+
+    /// Hands what has been written to the kernel without waiting for the disk. This is what bounds what a killed
+    /// gateway loses; only the machine going down loses what has been flushed but not yet synced.
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
     }
 
     fn rotate_if_past_midnight(&mut self, micros: u64) -> io::Result<()> {
