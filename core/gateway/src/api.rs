@@ -1081,7 +1081,11 @@ impl Gateway {
         // the read lock, not the write lock a naive "always lock for the whole function" would reach for.
         let executions: Vec<Value> = if accepted.is_empty() {
             let hub = self.hub();
-            hub::executions(&hub.view, results, sequence).into_iter().filter(|(a, _)| *a == account).map(|(_, e)| e).collect()
+            hub::executions(&hub.view, results, sequence)
+                .into_iter()
+                .filter(|(a, _)| *a == account)
+                .map(|(_, e)| e)
+                .collect()
         } else {
             let mut hub = self.hub_mut();
             // The client can amend or cancel as soon as it has this reply, which reaches it before the feed does.
@@ -1089,7 +1093,11 @@ impl Gateway {
                 let field = |name: &str| r[name].as_u64().unwrap_or(0);
                 hub.accept(field("orderId"), sequence, field("accountId"), field("instrumentId"));
             }
-            hub::executions(&hub.view, results, sequence).into_iter().filter(|(a, _)| *a == account).map(|(_, e)| e).collect()
+            hub::executions(&hub.view, results, sequence)
+                .into_iter()
+                .filter(|(a, _)| *a == account)
+                .map(|(_, e)| e)
+                .collect()
         };
         let outcome = results.iter().find_map(|r| {
             let order = || id(r["orderId"].as_u64().unwrap_or(0));
