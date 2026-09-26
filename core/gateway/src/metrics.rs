@@ -176,6 +176,7 @@ pub struct Metrics {
     refusals: Counters,
     rate_limited: Counters,
     loop_turn: Family<Labels, Histogram>,
+    feed_apply: Family<Labels, Histogram>,
     backlog: Family<Labels, Histogram>,
     slow_consumers: Counters,
     feed_sequence: Family<Labels, Gauge>,
@@ -232,6 +233,7 @@ impl Metrics {
             refusals: Counters::grid(&[("half", HALVES), ("api", APIS), ("reason", REASONS)]),
             rate_limited: Counters::grid(&[("half", HALVES), ("limit", LIMITS)]),
             loop_turn: durations(),
+            feed_apply: durations(),
             backlog: Family::<Labels, Histogram>::new_with_constructor(Histogram::counts as fn() -> Histogram),
             slow_consumers: Counters::grid(&[("half", HALVES)]),
             feed_sequence: Family::default(),
@@ -272,6 +274,11 @@ impl Metrics {
         r.register("venue_gateway_refusals", "Errors sent to clients, by reason", m.refusals.clone());
         r.register("venue_gateway_rate_limited", "Flood limit hits", m.rate_limited.clone());
         r.register("venue_gateway_loop_turn_duration_seconds", "One event loop turn", m.loop_turn.clone());
+        r.register(
+            "venue_gateway_feed_apply_duration_seconds",
+            "Applying one feed unit to the hub: the work of the one thread per half that does it",
+            m.feed_apply.clone(),
+        );
         r.register(
             "venue_gateway_outbound_backlog_messages",
             "Messages queued for a WebSocket connection when its loop came to send them",
@@ -351,6 +358,7 @@ impl Metrics {
             sessions_open: self.sessions_open.get_or_create_owned(&h(&[])),
             http_duration: ROUTES.iter().map(|r| self.http_duration.get_or_create_owned(&h(&[("route", r)]))).collect(),
             loop_turn: self.loop_turn.get_or_create_owned(&h(&[])),
+            feed_apply: self.feed_apply.get_or_create_owned(&h(&[])),
             backlog: self.backlog.get_or_create_owned(&h(&[])),
             feed_sequence: self.feed_sequence.get_or_create_owned(&h(&[])),
             feed_behind: self.feed_behind.get_or_create_owned(&h(&[])),
@@ -380,6 +388,9 @@ pub struct HalfMetrics {
     pub sessions_open: Gauge,
     http_duration: Vec<Histogram>,
     pub loop_turn: Histogram,
+    /// How long one feed unit takes to apply. `feed_behind` says how stale the view is; this says what that
+    /// costs, which is the headroom on the one thread per half that applies every unit (ADR-0002).
+    pub feed_apply: Histogram,
     pub backlog: Histogram,
     feed_sequence: Gauge,
     feed_behind: FloatGauge,

@@ -27,6 +27,7 @@ use api::{Gateway, Limits};
 use audit::Audit;
 use forwarded::TrustedProxies;
 use hub::Hub;
+use limits::monotonic;
 use metrics::{IngressWatch, Metrics};
 use reactor::Reactors;
 use std::collections::BTreeMap;
@@ -370,7 +371,11 @@ fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
             |unit| {
                 let record = &unit.input["record"];
                 let (sequence, at) = (record["sequence"].as_u64(), record["sequencedAt"].as_u64());
+                // Timed from before the lock: all of it is this thread's, and this thread applies every unit
+                // the venue produces, so what it costs is the headroom the whole half has (ADR-0002).
+                let started = monotonic();
                 follower.hub_mut().apply(&unit);
+                follower.metrics.feed_apply.observe_duration(monotonic().duration_since(started));
                 follower.metrics.feed_unit(sequence.unwrap_or(0), at.unwrap_or(0), venue_telemetry::wall_ns());
             },
             |e| log::warn("feed connection", &[("half", &half), ("feed", &feed), ("error", &e)]),
