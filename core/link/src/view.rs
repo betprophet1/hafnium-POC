@@ -8,11 +8,14 @@
 
 use crate::catalogue::Catalogue;
 use crate::named;
-use crate::wire::{self, Unit};
+use crate::wire::{self, Frame, Unit};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
+use venue_journal::message_header_codec::MessageHeaderDecoder;
+use venue_journal::side::Side;
+use venue_journal::{book_level_changed_codec, fill_codec, order_accepted_codec, ReadBuf};
 
 const KEEP: usize = 60;
 
@@ -166,6 +169,33 @@ pub struct ReleasedLeg {
     pub masks: BTreeMap<u64, u64>,
 }
 
+/// What a `Fill` says, however it was read. Both paths build one so that `View::filled` is the only place that
+/// decides what a fill does.
+struct Filled {
+    instrument: u64,
+    tick: u64,
+    quantity: u64,
+    maker: u64,
+    taker: u64,
+    maker_remaining: u64,
+    taker_remaining: u64,
+    maker_account: u64,
+    taker_account: u64,
+    taker_side: String,
+    at: u64,
+}
+
+/// A frame's SBE header, for handing to a generated decoder.
+fn header_of(f: &Frame) -> MessageHeaderDecoder<ReadBuf<'_>> {
+    MessageHeaderDecoder::default().wrap(ReadBuf::new(f.bytes()), 0)
+}
+
+/// A fixed byte array as the string in it: the schema pads with zeroes, as `venue_harness::codec` also trims.
+fn trimmed(b: &[u8]) -> String {
+    let end = b.iter().rposition(|x| *x != 0).map_or(0, |i| i + 1);
+    String::from_utf8_lossy(&b[..end]).into_owned()
+}
+
 fn u(v: &Value) -> u64 {
     v.as_u64().unwrap_or(0)
 }
@@ -288,7 +318,9 @@ impl View {
             _ => {}
         }
         for r in &unit.results {
-            self.result(r);
+            if !self.result_typed(r) {
+                self.result(r);
+            }
         }
         if input["msg"] == "NewOrder" {
             if let Some(expires) = input["expiresAt"].as_u64() {
@@ -358,6 +390,105 @@ impl View {
         }
     }
 
+    /// The results a trading feed is mostly made of, read straight out of the generated SBE decoders instead of
+    /// through `serde_json::Value`: about 857ns a result saved, on the one thread per half that applies every
+    /// unit (ADR-0002, prototypes/feedapply). False for anything not handled here, which `result` then takes
+    /// through the JSON shape as before -- the rest of the schema is listing and settlement traffic, rare
+    /// enough that what it costs does not show.
+    ///
+    /// `view_results_agree` checks the two against each other for every message this handles, because a field
+    /// read from the wrong place here would not fail: it would quietly give the view a different answer from
+    /// the engine's.
+    fn result_typed(&mut self, f: &Frame) -> bool {
+        match f.template() {
+            book_level_changed_codec::SBE_TEMPLATE_ID => {
+                let mut dec = book_level_changed_codec::BookLevelChangedDecoder::default().header(header_of(f), 0);
+                let mut group = dec.result_decoder();
+                dec = group.parent().expect("the result group");
+                let Some(i) = self.instruments.get_mut(&dec.instrument_id()) else { return true };
+                let side = if dec.side() == Side::BUY { &mut i.bids } else { &mut i.asks };
+                let (tick, quantity) = (u64::from(dec.tick()), u64::from(dec.quantity()));
+                if quantity == 0 {
+                    side.remove(&tick);
+                } else {
+                    side.insert(tick, (quantity, u64::from(dec.order_count())));
+                }
+                true
+            }
+            order_accepted_codec::SBE_TEMPLATE_ID => {
+                let mut dec = order_accepted_codec::OrderAcceptedDecoder::default().header(header_of(f), 0);
+                let mut group = dec.result_decoder();
+                dec = group.parent().expect("the result group");
+                let order = OrderView {
+                    account: dec.account_id(),
+                    instrument: dec.instrument_id(),
+                    side: dec.side().to_string(),
+                    tick: u64::from(dec.tick()),
+                    remaining: u64::from(dec.quantity()),
+                    client_order_id: trimmed(&dec.client_order_id()),
+                    filled: 0,
+                    filled_yes_cents: 0,
+                    expires_at: None,
+                };
+                self.orders.insert(dec.order_id(), order);
+                true
+            }
+            fill_codec::SBE_TEMPLATE_ID => {
+                let mut dec = fill_codec::FillDecoder::default().header(header_of(f), 0);
+                let mut group = dec.result_decoder();
+                let at = group.sequenced_at();
+                dec = group.parent().expect("the result group");
+                let filled = Filled {
+                    instrument: dec.instrument_id(),
+                    tick: u64::from(dec.tick()),
+                    quantity: u64::from(dec.quantity()),
+                    maker: dec.maker_order_id(),
+                    taker: dec.taker_order_id(),
+                    maker_remaining: u64::from(dec.maker_remaining()),
+                    taker_remaining: u64::from(dec.taker_remaining()),
+                    maker_account: dec.maker_account_id(),
+                    taker_account: dec.taker_account_id(),
+                    taker_side: dec.taker_side().to_string(),
+                    at,
+                };
+                self.filled(&filled);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Everything a fill does, in one place: the typed path and the JSON one both call this, so neither can
+    /// come to a different answer than the other about what a fill means.
+    fn filled(&mut self, f: &Filled) {
+        // E-2.4: whole cents for a quantity on the lot step, which every fill is.
+        let yes_cents = self
+            .instruments
+            .get(&f.instrument)
+            .and_then(|i| self.ladders.get(&i.table))
+            .and_then(|ladder| ladder.get(usize::try_from(f.tick).ok()?))
+            .map_or(0, |row| {
+                u128::from(f.quantity) * 100 * u128::from(row.numerator) / u128::from(row.denominator.max(1))
+            });
+        for order in [f.maker, f.taker] {
+            if let Some(o) = self.orders.get_mut(&order) {
+                o.filled = o.filled.saturating_add(f.quantity);
+                o.filled_yes_cents = o.filled_yes_cents.saturating_add(u64::try_from(yes_cents).unwrap_or(u64::MAX));
+            }
+        }
+        self.set_remaining(f.maker, f.maker_remaining);
+        self.set_remaining(f.taker, f.taker_remaining);
+        if let Some(i) = self.instruments.get_mut(&f.instrument) {
+            i.last = Some(f.tick);
+        }
+        let trade = json!({
+            "sequence": self.sequence, "atMs": f.at / 1_000_000,
+            "instrument": f.instrument, "tick": f.tick, "quantity": f.quantity, "takerSide": f.taker_side,
+            "maker": f.maker_account, "taker": f.taker_account
+        });
+        keep(&mut self.trades, trade);
+    }
+
     fn result(&mut self, r: &Value) {
         match r["msg"].as_str().unwrap_or("") {
             "MarketStateChanged" => {
@@ -397,37 +528,19 @@ impl View {
                 };
                 self.orders.insert(u(&r["orderId"]), order);
             }
-            "Fill" => {
-                let (quantity, tick) = (u(&r["quantity"]), u(&r["tick"]));
-                let instrument = u(&r["instrumentId"]);
-                // E-2.4: whole cents for a quantity on the lot step, which every fill is.
-                let yes_cents = self
-                    .instruments
-                    .get(&instrument)
-                    .and_then(|i| self.ladders.get(&i.table))
-                    .and_then(|ladder| ladder.get(usize::try_from(tick).ok()?))
-                    .map_or(0, |row| {
-                        u128::from(quantity) * 100 * u128::from(row.numerator) / u128::from(row.denominator.max(1))
-                    });
-                for order in [u(&r["makerOrderId"]), u(&r["takerOrderId"])] {
-                    if let Some(o) = self.orders.get_mut(&order) {
-                        o.filled = o.filled.saturating_add(quantity);
-                        o.filled_yes_cents =
-                            o.filled_yes_cents.saturating_add(u64::try_from(yes_cents).unwrap_or(u64::MAX));
-                    }
-                }
-                self.set_remaining(u(&r["makerOrderId"]), u(&r["makerRemaining"]));
-                self.set_remaining(u(&r["takerOrderId"]), u(&r["takerRemaining"]));
-                if let Some(i) = self.instruments.get_mut(&instrument) {
-                    i.last = Some(u(&r["tick"]));
-                }
-                let trade = json!({
-                    "sequence": self.sequence, "atMs": u(&r["result"]["sequencedAt"]) / 1_000_000,
-                    "instrument": instrument, "tick": r["tick"], "quantity": r["quantity"], "takerSide": r["takerSide"],
-                    "maker": r["makerAccountId"], "taker": r["takerAccountId"]
-                });
-                keep(&mut self.trades, trade);
-            }
+            "Fill" => self.filled(&Filled {
+                instrument: u(&r["instrumentId"]),
+                tick: u(&r["tick"]),
+                quantity: u(&r["quantity"]),
+                maker: u(&r["makerOrderId"]),
+                taker: u(&r["takerOrderId"]),
+                maker_remaining: u(&r["makerRemaining"]),
+                taker_remaining: u(&r["takerRemaining"]),
+                maker_account: u(&r["makerAccountId"]),
+                taker_account: u(&r["takerAccountId"]),
+                taker_side: s(&r["takerSide"]),
+                at: u(&r["result"]["sequencedAt"]),
+            }),
             "OrderCancelled" => {
                 self.orders.remove(&u(&r["orderId"]));
             }
@@ -841,5 +954,73 @@ mod tests {
         assert_eq!(restored.positions, view.positions, "positions did not survive");
         assert_eq!(restored.settled_event, 5, "settled_event did not survive");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The typed reader and the JSON one must make the same view out of the same bytes.
+    ///
+    /// This is the check that makes taking `serde_json::Value` off the feed path safe to do at all. A field
+    /// read from the wrong place in `result_typed` does not fail: the view simply carries a different number
+    /// from the engine's, and nothing says so until someone reconciles a position. So every result the typed
+    /// path claims is applied both ways, to two views seeded alike, and the whole of both is compared.
+    #[test]
+    fn the_typed_reader_and_the_json_one_agree() {
+        // A market with a cent ladder, so a fill's `filled_yes_cents` is a real conversion and not a zero.
+        let seeded = || {
+            let mut view = View { sequence: 4_242, ..View::default() };
+            view.ladders
+                .insert(1, (0..=100).map(|t| Row { numerator: t, denominator: 100, complement: 100 - t }).collect());
+            view.instruments.insert(
+                9_500_000,
+                InstrumentView { event: 7, table: 1, lot: 1, state: "OPEN".into(), ..InstrumentView::default() },
+            );
+            view
+        };
+
+        let at = 1_727_000_000_123_456_789_u64;
+        let result = |sequence: u64| {
+            json!({"inputSequence": sequence, "resultIndex": 0, "sequencedAt": at,
+                                            "sequencerGroup": 1})
+        };
+        let results = [
+            json!({"msg": "OrderAccepted", "result": result(1), "orderId": 900_123, "accountId": 9_600_007,
+                   "sessionId": 42, "clientOrderId": "abc-123", "instrumentId": 9_500_000, "side": "BUY",
+                   "tick": 40, "quantity": 1_000, "reservedCents": 40_000}),
+            json!({"msg": "OrderAccepted", "result": result(2), "orderId": 900_124, "accountId": 9_600_008,
+                   "sessionId": 43, "clientOrderId": "", "instrumentId": 9_500_000, "side": "SELL",
+                   "tick": 60, "quantity": 500, "reservedCents": 20_000}),
+            json!({"msg": "BookLevelChanged", "result": result(3), "instrumentId": 9_500_000, "side": "BUY",
+                   "tick": 40, "quantity": 1_000, "orderCount": 1}),
+            json!({"msg": "BookLevelChanged", "result": result(4), "instrumentId": 9_500_000, "side": "SELL",
+                   "tick": 60, "quantity": 500, "orderCount": 1}),
+            // A level going away, which is the zero-quantity case.
+            json!({"msg": "BookLevelChanged", "result": result(5), "instrumentId": 9_500_000, "side": "SELL",
+                   "tick": 60, "quantity": 0, "orderCount": 0}),
+            // A partial fill, so both sides keep an order with a remaining quantity and a cent conversion.
+            json!({"msg": "Fill", "result": result(6), "tradeId": 55_001, "instrumentId": 9_500_000, "tick": 40,
+                   "quantity": 7, "makerOrderId": 900_123, "makerAccountId": 9_600_007, "makerRemaining": 993,
+                   "takerOrderId": 900_124, "takerAccountId": 9_600_008, "takerRemaining": 493,
+                   "takerSide": "SELL"}),
+            // And one that empties the maker, which is the branch that removes an order rather than reducing it.
+            json!({"msg": "Fill", "result": result(7), "tradeId": 55_002, "instrumentId": 9_500_000, "tick": 40,
+                   "quantity": 993, "makerOrderId": 900_123, "makerAccountId": 9_600_007, "makerRemaining": 0,
+                   "takerOrderId": 900_124, "takerAccountId": 9_600_008, "takerRemaining": 0,
+                   "takerSide": "SELL"}),
+        ];
+        let frames: Vec<Frame> = results.iter().map(Frame::of).collect();
+
+        // Compared after every result, not only at the end: a wrong field often shows for one result and is
+        // then overwritten by a later one, so an end-state check quietly passes. (It did, until this did not.)
+        let (mut typed, mut through_json) = (seeded(), seeded());
+        for (i, f) in frames.iter().enumerate() {
+            assert!(typed.result_typed(f), "the typed path claims every result this test uses: {:?}", &**f);
+            through_json.result(f);
+            let (a, b) =
+                (serde_json::to_value(&typed).expect("a view"), serde_json::to_value(&through_json).expect("a view"));
+            assert_eq!(a, b, "the two readers disagree after result {i}: {:?}", &**f);
+        }
+        // And that the corpus did something, so an agreement of two empty views cannot pass for one.
+        assert_eq!(typed.trades.len(), 2, "both fills were recorded");
+        assert!(typed.orders.is_empty(), "the second fill emptied both orders");
+        assert_eq!(typed.instruments[&9_500_000].last, Some(40), "the last traded tick");
     }
 }
