@@ -216,9 +216,11 @@ pub fn binary_refused() -> String {
 }
 
 /// The messages that answer one text frame straight away. Replies to requests given to the node come later, from
-/// `ready_replies`.
-pub fn handle(gateway: &Gateway, session: &mut Session, text: &str) -> Vec<String> {
-    let Ok(message) = serde_json::from_str::<Value>(text) else {
+/// `ready_replies`. Takes the frame already parsed, because whatever read it off the socket had to look at it
+/// too (`reactor::record_from_client`), and parsing the same bytes twice is not free at a viewer's heartbeat
+/// rate; `None` is a frame that was not JSON at all.
+pub fn handle(gateway: &Gateway, session: &mut Session, message: Option<Value>) -> Vec<String> {
+    let Some(message) = message else {
         let refused = ApiError::bad("not JSON");
         gateway.metrics.ws_message(metrics::OP_UNREADABLE, Some(refused.status));
         return vec![error(&Value::Null, &refused)];

@@ -574,8 +574,11 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
             match socket.read() {
                 Ok(Message::Text(text)) => {
                     session.heard();
-                    record_from_client(gateway, origin, session, text.as_str());
-                    for reply in ws::handle(gateway, session, text.as_str()) {
+                    // Parsed once for both readers of it: the audit only wants to know whether this is a
+                    // heartbeat, and the dispatch wants the message. Viewers send heartbeats all day.
+                    let message = serde_json::from_str::<Value>(text.as_str()).ok();
+                    record_from_client(gateway, origin, session, text.as_str(), message.as_ref());
+                    for reply in ws::handle(gateway, session, message) {
                         record_to_client(gateway, origin, session, &reply, true);
                         if !queue(socket, reply, ending) {
                             return false;
@@ -803,10 +806,8 @@ fn record_refused_upgrade(gateway: &Gateway, conn: &mut Conn) {
 
 /// A text frame from the client. On the public half a heartbeat is not recorded: viewers send them all day, and
 /// nothing about one can be in dispute.
-fn record_from_client(gateway: &Gateway, origin: &Origin, session: &Session, text: &str) {
-    if gateway.half == Half::Public
-        && serde_json::from_str::<Value>(text).is_ok_and(|m| m.get("op").and_then(Value::as_str) == Some("heartbeat"))
-    {
+fn record_from_client(gateway: &Gateway, origin: &Origin, session: &Session, text: &str, message: Option<&Value>) {
+    if gateway.half == Half::Public && message.and_then(|m| m.get("op")).and_then(Value::as_str) == Some("heartbeat") {
         return;
     }
     let mut fields = about(gateway, origin, session.account(), session.api_key(), Some(session.id()));
