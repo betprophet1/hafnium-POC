@@ -38,9 +38,12 @@ const USAGE: &str = "usage:
                   (the last two default from the node's capacity profile: 3/4 of its orders, and its
                   client order ID table's entries / 120 000 seconds)
   venue-sim gwload --gateway ADDR [--token dev-market-maker] [--instrument 10010] [--connections 1] [--seconds 10]
+                  [--instruments 1] [--ingress ADDR]
                   the gateway-facing counterpart to `venue-node load`: each connection logs in over
                   /v4/ws_private, places one resting order, then amends it back and forth until the deadline,
                   reporting messages/s and round-trip percentiles the same way.
+                  --instruments N > 1 spreads connections across N synthetic markets instead of one, most-popular-
+                  first with each one's share roughly half the last (needs --ingress, to list them on first).
 
 The bots are clients of the gateway. --gateway serves the private half (orders, accounts, sessions); --public-gateway,
 the gateway serving the public half (markets, books), defaults to it. The maker subscribes to requests for quote and answers them when its account is an
@@ -273,6 +276,8 @@ fn gwload(args: &Args) -> Result<(), Error> {
         instrument: args.number("instrument", 10010)?,
         connections: usize::try_from(args.number("connections", 1)?)?,
         seconds: args.number("seconds", 10)?,
+        ingress: args.optional("ingress"),
+        instruments: usize::try_from(args.number("instruments", 1)?)?,
     };
     gwload::run(config)
 }
