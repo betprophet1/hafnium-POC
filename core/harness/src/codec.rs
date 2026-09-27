@@ -44,6 +44,7 @@ pub fn encode(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
         Some("SetGroupParameters") => encode_set_group_parameters(v, buf),
         Some("SetAccountControls") => encode_set_account_controls(v, buf),
         Some("SetMakerProtection") => encode_set_maker_protection(v, buf),
+        Some("SetMasterAccount") => encode_set_master_account(v, buf),
         Some("TransferOut") => encode_transfer_out(v, buf),
         Some("TransferIn") => encode_transfer_in(v, buf),
         Some("SetFeeSchedule") => encode_set_fee_schedule(v, buf),
@@ -101,6 +102,7 @@ pub fn decode(buf: &[u8]) -> Result<Value, String> {
         set_group_parameters_codec::SBE_TEMPLATE_ID => decode_set_group_parameters(header, buf),
         set_account_controls_codec::SBE_TEMPLATE_ID => decode_set_account_controls(header, buf),
         set_maker_protection_codec::SBE_TEMPLATE_ID => decode_set_maker_protection(header, buf),
+        set_master_account_codec::SBE_TEMPLATE_ID => decode_set_master_account(header, buf),
         transfer_out_codec::SBE_TEMPLATE_ID => decode_transfer_out(header, buf),
         transfer_in_codec::SBE_TEMPLATE_ID => decode_transfer_in(header, buf),
         set_fee_schedule_codec::SBE_TEMPLATE_ID => decode_set_fee_schedule(header, buf),
@@ -1411,6 +1413,39 @@ fn decode_set_maker_protection<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, bu
     m.insert("eventId".into(), json!(dec.event_id()));
     m.insert("maxContractsFilledPerWindow".into(), json!(dec.max_contracts_filled_per_window()));
     m.insert("windowMillis".into(), json!(dec.window_millis()));
+    let _ = &mut dec;
+    Ok(Value::Object(m))
+}
+
+fn encode_set_master_account(v: &Value, buf: &mut [u8]) -> Result<usize, String> {
+    let mut enc = set_master_account_codec::SetMasterAccountEncoder::default().wrap(WriteBuf::new(buf), message_header_codec::ENCODED_LENGTH);
+    enc = enc.header(0).parent().map_err(sbe_err)?;
+    let cv = &v["record"];
+    let mut c = enc.record_encoder();
+    c.sequence(ju(cv, "sequence") as u64);
+    c.sequenced_at(ju(cv, "sequencedAt") as u64);
+    c.sequencer_group(ju(cv, "sequencerGroup") as u16);
+    enc = c.parent().map_err(sbe_err)?;
+    enc.command_id_zero_padded(js(v, "commandId").as_bytes());
+    enc.account_id(ju(v, "accountId") as u64);
+    enc.master_account_id(ju(v, "masterAccountId") as u64);
+    Ok(enc.get_limit())
+}
+
+fn decode_set_master_account<'a>(header: MessageHeaderDecoder<ReadBuf<'a>>, buf: &'a [u8]) -> Result<Value, String> {
+    let mut m = Map::new();
+    m.insert("msg".into(), json!("SetMasterAccount"));
+    let mut dec = set_master_account_codec::SetMasterAccountDecoder::default().header(header, 0);
+    let mut c = dec.record_decoder();
+    let mut cm = Map::new();
+    cm.insert("sequence".into(), json!(c.sequence()));
+    cm.insert("sequencedAt".into(), json!(c.sequenced_at()));
+    cm.insert("sequencerGroup".into(), json!(c.sequencer_group()));
+    dec = c.parent().map_err(sbe_err)?;
+    m.insert("record".into(), Value::Object(cm));
+    m.insert("commandId".into(), json!(bytes_str(&dec.command_id())));
+    m.insert("accountId".into(), json!(dec.account_id()));
+    m.insert("masterAccountId".into(), json!(dec.master_account_id()));
     let _ = &mut dec;
     Ok(Value::Object(m))
 }

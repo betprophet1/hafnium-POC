@@ -53,11 +53,44 @@ class Source:
         return f"{rest[1]}/{key}" if len(rest) > 1 else key
 
 
+def latest_pair_tag(source):
+    """The newest pair tag under this environment, or None when there are none yet.
+
+    Tags are UTC stamps (`snapshot_publish.py --pair`), so newest is simply greatest. `None` is a real answer
+    and not an error: the first run of a scheduled job has no predecessor, and an uncut journal does not need
+    one. A *cut* journal does, and `venue-view` is what refuses in that case rather than this."""
+    prefix = f"snapshots/{source.environment}/"
+    if not source.s3:
+        directory = Path(source.where) / prefix
+        names = [p.name for p in directory.glob("*.engine.snapshot")] if directory.is_dir() else []
+    else:
+        listing = subprocess.run(
+            ["aws", "s3api", "list-objects-v2", "--bucket", source.bucket(),
+             "--prefix", source.prefixed(prefix), "--query", "Contents[].Key", "--output", "text"],
+            check=True, capture_output=True, text=True).stdout
+        names = [key.rsplit("/", 1)[-1] for key in listing.split() if key.endswith(".engine.snapshot")]
+    tags = sorted(name[: -len(".engine.snapshot")] for name in names)
+    return tags[-1] if tags else None
+
+
+def fetch_pair(source, into, tag=None):
+    """Downloads both halves of a pair into `into`, named as `venue-view` writes them, each verified against its
+    own sidecar. Returns the tag fetched, or None when the environment has no pair yet."""
+    tag = tag or latest_pair_tag(source)
+    if tag is None:
+        return None
+    into = Path(into)
+    into.mkdir(parents=True, exist_ok=True)
+    fetch(source, f"{tag}.engine", into / "engine.snapshot")
+    fetch(source, f"{tag}.view", into / "view.json", suffix="json")
+    return tag
+
+
 class Mismatch(Exception):
     """What came down does not match the digest it was published with."""
 
 
-def fetch(source, tag, out):
+def fetch(source, tag, out, suffix="snapshot"):
     """Downloads the snapshot tagged `tag` to `out`, and its `.sha256` sidecar, comparing the two before
     returning — a corrupted or partial transfer is reported, not handed to a caller as if it were whole."""
     out = Path(out)
@@ -65,7 +98,7 @@ def fetch(source, tag, out):
         sha_file = Path(tmp) / "sha256"
         source.fetch(source.key(tag, "sha256"), sha_file)
         expected = sha_file.read_text().strip()
-        source.fetch(source.key(tag), out)
+        source.fetch(source.key(tag, suffix), out)
         got = digest(out)
         if got != expected:
             out.unlink(missing_ok=True)
@@ -104,6 +137,31 @@ def self_test():
         except ValueError:
             pass
 
+        # A pair comes back whole, and the newest one is found without being named — which is what a scheduled
+        # job needs, since it knows when it is running but not what the last run was called.
+        from snapshot_publish import publish_pair
+
+        made = Path(work) / "pair"
+        made.mkdir()
+        (made / "engine.snapshot").write_bytes(b"the engine's half")
+        (made / "view.json").write_text('{"sequence": 62}')
+        publish_pair(made, Destination(store, "pairs"), "20260101T000000Z")
+        (made / "view.json").write_text('{"sequence": 99}')
+        publish_pair(made, Destination(store, "pairs"), "20260202T000000Z")
+
+        got = Path(work) / "got"
+        tag = fetch_pair(Source(store, "pairs"), got)
+        if tag != "20260202T000000Z":
+            failures.append(f"the newest pair was not the one fetched: {tag}")
+        if (got / "view.json").read_text() != '{"sequence": 99}':
+            failures.append("the fetched pair's view half is not the newest one's")
+        if (got / "engine.snapshot").read_bytes() != b"the engine's half":
+            failures.append("the fetched pair's engine half did not come back whole")
+
+        # An environment with no pair yet is a real answer, not an error: the first scheduled run has none.
+        if fetch_pair(Source(store, "empty"), Path(work) / "nothing") is not None:
+            failures.append("an environment with no pairs claimed to have one")
+
     for failure in failures:
         print(f"self-test: {failure}", file=sys.stderr)
     return 1 if failures else 0
@@ -116,11 +174,24 @@ def main():
     parser.add_argument("--environment", help="which venue this is for: prod, pr-4. Names part of the key.")
     parser.add_argument("--tag", help="the name it was published under: main, pre-load, ...")
     parser.add_argument("--to", help="where to write the snapshot locally")
+    parser.add_argument("--pair", help="a directory to write both halves of a pair into")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
     if args.self_test:
         return self_test()
+    if args.pair:
+        if not args.source or not args.environment:
+            parser.error("--pair needs --from and --environment")
+        try:
+            tag = fetch_pair(Source(args.source, args.environment), args.pair, args.tag)
+        except (Mismatch, subprocess.CalledProcessError, OSError) as e:
+            print(f"not fetched: {e}", file=sys.stderr)
+            return 1
+        # No pair yet is a real answer, not a failure: the first scheduled run has no predecessor, and an uncut
+        # journal does not need one. Exit 0 so the job carries on and `venue-view` decides.
+        print(f"fetched the pair tagged {tag} into {args.pair}" if tag else "no pair published yet")
+        return 0
     if not args.source or not args.environment or not args.tag or not args.to:
         parser.error("--from, --environment, --tag and --to are all needed")
 

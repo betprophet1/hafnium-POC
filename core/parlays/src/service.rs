@@ -321,6 +321,7 @@ pub fn start(catalogue: Catalogue, config: &Config) -> Result<Arc<Service>, Erro
             },
             || {
                 // The node could not honour that position — this view is of a history that never happened.
+                eprintln!("parlays: feed resuming was refused; the view is being thrown away");
                 let mut state = locked(&follower.state);
                 state.view = View::default();
                 state.caught_up = false;

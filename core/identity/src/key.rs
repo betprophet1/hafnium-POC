@@ -147,6 +147,26 @@ pub fn unhex(text: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Entries an allow-list may hold at once (decision G-23): far more than a firm's set of egress addresses needs, and
+/// bounded for the same reason a key's permissions are a fixed set rather than an open one.
+pub const MAX_ALLOWED_IPS: usize = 20;
+
+/// Whether `text` is an address or a network in the form the gateway's `--trusted-proxies` and a key's allow-list
+/// both take (`core/gateway/src/forwarded.rs`): `192.0.2.7`, `10.42.0.0/16`, `2001:db8::/32`. Checked here so a
+/// malformed entry is refused when the key is made, not silently ignored when the gateway later tries to use it.
+pub fn is_ip_or_network(text: &str) -> bool {
+    let (address, prefix) = match text.split_once('/') {
+        Some((address, prefix)) => (address, Some(prefix)),
+        None => (text, None),
+    };
+    let Ok(base) = address.parse::<std::net::IpAddr>() else { return false };
+    let bits = if base.to_canonical().is_ipv4() { 32 } else { 128 };
+    match prefix {
+        None => true,
+        Some(p) => p.parse::<u8>().is_ok_and(|p| p <= bits),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

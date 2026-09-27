@@ -1,0 +1,77 @@
+# Builds the database archiver's image, so the CronJobs that take a verified pg_dump of each database to object
+# storage have something to run. Built from the same PostgreSQL image the server runs — see the Dockerfile, and
+# the check in core/ci.sh that holds the two together.
+name: dbarchive image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "interfaces/tools/db_archive.py"
+      - "interfaces/tools/snapshot_publish.py"
+      - "interfaces/tools/snapshot_fetch.py"
+      - "deploy/images/venue-dbarchive.Dockerfile"
+      - ".github/workflows/dbarchive-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: dbarchive-image
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A registry path may not carry capitals and a GitHub owner may; there is no `lower()` in an expression.
+      - name: The registry path, lower-cased
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/venue-dbarchive" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/images/venue-dbarchive.Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The archiver's own self-test, run in the image that will run it: a tool that cannot check itself where it
+      # is deployed is one whose deployment is untested.
+      - name: The archiver checks itself in the image
+        run: docker run --rm ${{ env.IMAGE }}:${{ github.sha }} --self-test
+
+      # And the one thing the self-test cannot see, because it never reaches a database: pg_dump refuses a server
+      # newer than itself, so an image whose client is older than the server builds and passes everything and then
+      # fails at 02:43. core/ci.sh checks the Dockerfile names the server's image; this checks what that produced.
+      - name: pg_dump is not older than the server
+        run: |
+          server="$(sed -n 's/^ *tag: \([0-9][0-9]*\)\..*/\1/p' deploy/charts/venue-mini/values.yaml | head -1)"
+          client="$(docker run --rm --entrypoint pg_dump ${{ env.IMAGE }}:${{ github.sha }} --version \
+                    | sed -n 's/.* \([0-9][0-9]*\)\..*/\1/p')"
+          echo "server major $server, pg_dump major $client"
+          [ -n "$server" ] && [ "$client" -ge "$server" ] \
+            || { echo "pg_dump $client cannot dump a server on $server"; exit 1; }
+
+      - name: Say what was built
+        run: |
+          {
+            echo "### Database archive image"
+            echo '`${{ env.IMAGE }}:${{ github.sha }}`'
+            echo
+            echo 'Set `database.archive.image.tag` to it.'
+          } >> "$GITHUB_STEP_SUMMARY"

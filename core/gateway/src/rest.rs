@@ -48,29 +48,36 @@ pub(crate) fn bearer(request: &Request) -> Option<&str> {
     request.headers.get("authorization").and_then(|h| h.strip_prefix("Bearer ")).map(str::trim)
 }
 
-/// The request's credential, authenticated, within its flood limit, and holding `permission`.
+/// The request's credential, authenticated, from an address its allow-list permits, within its flood limit, and
+/// holding `permission`. `client` is the address flood protection already resolved the request to (decision G-23):
+/// the client a trusted proxy named, or the connection's own address.
 pub(crate) fn credential(
     gateway: &Gateway,
     request: &Request,
+    client: &str,
     permission: Permissions,
 ) -> Result<Credential, ApiError> {
     let token = bearer(request).ok_or_else(ApiError::unauthorized)?;
     let credential = gateway.authenticate(token)?;
+    credential.require_ip(client)?;
     gateway.rest_rate(credential.account)?;
     credential.require(permission)?;
     Ok(credential)
 }
 
 /// The account of a request whose credential holds `permission`.
-fn account(gateway: &Gateway, request: &Request, permission: Permissions) -> Result<u64, ApiError> {
-    credential(gateway, request, permission).map(|c| c.account)
+fn account(gateway: &Gateway, request: &Request, client: &str, permission: Permissions) -> Result<u64, ApiError> {
+    credential(gateway, request, client, permission).map(|c| c.account)
 }
 
 /// Deposits and withdrawals: the account authenticated and, to move money, allowed to (reading takes only `read`),
 /// then the request passed to the treasury as it came, which validates it and answers in interface 1's terms.
-fn transfer(gateway: &Gateway, request: &Request, notify: &Notify) -> Result<Routed, ApiError> {
+fn transfer(gateway: &Gateway, request: &Request, client: &str, notify: &Notify) -> Result<Routed, ApiError> {
     let needs = if request.method == "GET" { Permissions::READ } else { Permissions::TRANSFERS };
-    let account = account(gateway, request, needs)?;
+    let account = account(gateway, request, client, needs)?;
+    if request.method == "POST" {
+        check_internal_family(gateway, account, request)?;
+    }
     let treasury = gateway.treasury()?;
     if let Some(id) = request.path.trim_matches('/').split('/').nth(2) {
         parse_id(id, "transferId")?;
@@ -79,6 +86,34 @@ fn transfer(gateway: &Gateway, request: &Request, notify: &Notify) -> Result<Rou
     let call =
         treasury.call(account, &request.method, &request.path, &query.join("&"), &request.body, Arc::clone(notify))?;
     Ok(Routed::Service(call))
+}
+
+/// An internal transfer (decisions D-34, G-22) may only move money within the caller's own family of accounts. The
+/// treasury trusts the account in the path and knows nothing about masters or subaccounts, so this is the gateway's
+/// to check, before the request is ever sent on; not required at all for a deposit or a withdrawal.
+fn check_internal_family(gateway: &Gateway, account: u64, request: &Request) -> Result<(), ApiError> {
+    let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+    if body["kind"].as_str() != Some("internal") {
+        return Ok(());
+    }
+    let to = body["toAccountId"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| ApiError::bad("toAccountId must be a decimal string"))?;
+    let (source_master, dest_master) =
+        (gateway.identity.account_master(account)?, gateway.identity.account_master(to)?);
+    // Family: the two share a master, or one of them is the other's master.
+    let family = match (source_master, dest_master) {
+        (Some(a), Some(b)) => a == b,
+        (Some(a), None) => a == to,
+        (None, Some(b)) => b == account,
+        (None, None) => false,
+    };
+    if family {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("an internal transfer must stay within the caller's own family of accounts"))
+    }
 }
 
 fn body(request: &Request) -> Result<Value, ApiError> {
@@ -125,49 +160,49 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, client: &str, notify: &
             Ok(Routed::Now(gateway.hub().book(instrument, depth).ok_or_else(|| ApiError::not_found("no such market"))))
         }
         ("GET", ["v4", "account"]) => {
-            let account = account(gateway, request, Permissions::READ)?;
+            let account = account(gateway, request, client, Permissions::READ)?;
             Ok(Routed::Now(Ok(gateway.hub().account(account))))
         }
         ("POST", ["v4", "orders"]) => {
-            let account = account(gateway, request, Permissions::TRADE)?;
+            let account = account(gateway, request, client, Permissions::TRADE)?;
             Ok(Routed::Later(gateway.place_pending(account, rest_session(account), &body(request)?, later())?))
         }
         ("DELETE", ["v4", "orders"]) => {
-            let account = account(gateway, request, Permissions::TRADE)?;
+            let account = account(gateway, request, client, Permissions::TRADE)?;
             let scope: Map<String, Value> =
                 request.query.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect();
             let body = Value::Object(scope);
             Ok(Routed::Later(gateway.cancel_all_pending(account, rest_session(account), &body, later())?))
         }
         ("PATCH", ["v4", "orders", order]) => {
-            let account = account(gateway, request, Permissions::TRADE)?;
+            let account = account(gateway, request, client, Permissions::TRADE)?;
             let order = parse_id(order, "orderId")?;
             Ok(Routed::Later(gateway.amend_pending(account, rest_session(account), order, &body(request)?, later())?))
         }
         ("DELETE", ["v4", "orders", order]) => {
-            let account = account(gateway, request, Permissions::TRADE)?;
+            let account = account(gateway, request, client, Permissions::TRADE)?;
             let order = parse_id(order, "orderId")?;
             Ok(Routed::Later(gateway.cancel_pending(account, rest_session(account), order, later())?))
         }
         ("POST" | "GET", ["v4", "transfers"]) | ("GET" | "DELETE", ["v4", "transfers", _]) => {
-            transfer(gateway, request, notify)
+            transfer(gateway, request, client, notify)
         }
         ("POST", ["v4", "rfqs"]) => {
-            let account = account(gateway, request, Permissions::TRADE)?;
+            let account = account(gateway, request, client, Permissions::TRADE)?;
             Ok(Routed::Later(gateway.request_quote_pending(account, &body(request)?, later())?))
         }
         ("GET", ["v4", "rfqs"]) => {
-            let account = account(gateway, request, Permissions::RESPOND)?;
+            let account = account(gateway, request, client, Permissions::RESPOND)?;
             Ok(Routed::Later(gateway.open_rfqs_pending(account, later())?))
         }
         ("GET", ["v4", "rfqs", rfq]) => {
-            let account = account(gateway, request, Permissions::READ)?;
+            let account = account(gateway, request, client, Permissions::READ)?;
             Ok(Routed::Later(gateway.rfq_pending(account, rfq, later())?))
         }
         ("POST", ["v4", "rfqs", rfq, "quotes"]) => {
             // A quote is a resting order (trade) given to a request (respond); the account's approval is the parlay
             // service's to check.
-            let credential = credential(gateway, request, Permissions::TRADE)?;
+            let credential = credential(gateway, request, client, Permissions::TRADE)?;
             credential.require(Permissions::RESPOND)?;
             let account = credential.account;
             let mut body = body(request)?;
@@ -192,11 +227,21 @@ fn route_or_refuse(gateway: &Gateway, request: &Request, client: &str, notify: &
         ("GET", ["v4", "members", "me"] | ["v4", "sessions"])
         | ("DELETE", ["v4", "sessions", _] | ["v4", "members", "me", "totp"])
         | ("POST" | "PUT", ["v4", "members", "me", "totp"]) => {
-            Ok(Routed::Service(identity::me(gateway, request, notify)?))
+            Ok(Routed::Service(identity::me(gateway, request, client, notify)?))
         }
         ("GET" | "POST", ["v4", "keys"]) | ("DELETE", ["v4", "keys", _]) => {
-            let credential = credential(gateway, request, Permissions::KEYS)?;
+            let credential = credential(gateway, request, client, Permissions::KEYS)?;
             Ok(Routed::Service(identity::manage(gateway, &credential, request, notify)?))
+        }
+        ("GET" | "POST", ["v4", "subaccounts"]) => {
+            let credential = credential(gateway, request, client, Permissions::KEYS)?;
+            Ok(Routed::Service(identity::subaccounts(gateway, &credential, request, notify)?))
+        }
+        ("GET" | "POST", ["v4", "subaccounts", account_id, "keys"])
+        | ("DELETE", ["v4", "subaccounts", account_id, "keys", _]) => {
+            let credential = credential(gateway, request, client, Permissions::KEYS)?;
+            let account_id = parse_id(account_id, "accountId")?;
+            Ok(Routed::Service(identity::subaccount_keys(gateway, &credential, account_id, request, notify)?))
         }
         _ => Err(ApiError::not_found("no such route")),
     }

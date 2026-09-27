@@ -137,7 +137,14 @@ struct SparseBook<const INLINE: usize> {
 }
 impl<const INLINE: usize> SparseBook<INLINE> {
     fn empty() -> Self {
-        SparseBook { tick: [0; INLINE], qty: [0; INLINE], head: [0; INLINE], tail: [0; INLINE], len: 0, overflow_head: NONE }
+        SparseBook {
+            tick: [0; INLINE],
+            qty: [0; INLINE],
+            head: [0; INLINE],
+            tail: [0; INLINE],
+            len: 0,
+            overflow_head: NONE,
+        }
     }
     fn insert(&mut self, pool: &mut OverflowPool, tick: usize, qty: u32) {
         if (self.len as usize) < INLINE {
@@ -362,7 +369,11 @@ fn bench_demote<const INLINE: usize>(pool_cap: usize, name: &str, levels: &[usiz
     // same way insert+remove was for bench_insert_remove — so one pool survives every timed rep below.
     let check = demote::<INLINE>(&dense, &mut pool);
     for p in 0..=TICKS {
-        assert_eq!(reference.best_below(&ref_pool, p), check.best_below(&pool, p), "demote mismatch at p={p} for {name}");
+        assert_eq!(
+            reference.best_below(&ref_pool, p),
+            check.best_below(&pool, p),
+            "demote mismatch at p={p} for {name}"
+        );
     }
     release(&check, &mut pool);
     let ns = time_ns_per_op(1, || {

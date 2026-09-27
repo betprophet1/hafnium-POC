@@ -86,13 +86,22 @@ checks a file's chain, as `interfaces/tools/audit_verify.py` does. Behind an ing
 under an instance of its own: a gateway whose instance another live process is writing in the same directory does not
 start.
 
-## Deposits and withdrawals
+## Deposits, withdrawals and internal transfers
 
-`POST /v4/transfers` moves money into the account or out of it, `GET /v4/transfers` lists the account's transfers
-and `DELETE /v4/transfers/{transferId}` cancels one the bank has not decided yet. The gateway authenticates the
-account and passes the request to the treasury, which validates it, decides it and answers in the same `Error` form;
-the gateway never holds a transfer. A treasury that does not answer is a 503 whose outcome is unknown, as for an
-order.
+`POST /v4/transfers` moves money into the account, out of it, or (`"kind": "internal"`, decisions D-34, G-22) into
+another account of the same family; `GET /v4/transfers` lists the account's transfers and
+`DELETE /v4/transfers/{transferId}` cancels one the bank has not decided yet. The gateway authenticates the account
+and passes the request to the treasury, which validates it, decides it and answers in the same `Error` form; the
+gateway never holds a transfer. A treasury that does not answer is a 503 whose outcome is unknown, as for an order.
+
+**An internal transfer** (`toAccountId`, no `method`) moves cash between an account and one of its own family:
+itself and its master, itself and a sibling subaccount, or a master and one of its subaccounts — never anywhere
+else. The gateway checks this before the request ever reaches the treasury, asking identity fresh each time (never
+cached the way a credential's verdict is): a request between accounts that do not share a master is 403 `FORBIDDEN`.
+Both accounts must already be known to the treasury (a fresh subaccount opens the same way a fresh member's account
+does, by depositing through its own key); the money moves as a reclaim from the source and a grant to the
+destination (D-34), with no bank leg and nothing sent to the fake bank, so it settles in one step rather than
+waiting on a bank decision.
 
 The treasury owns the authoritative balance (blueprint §5, §11). Money reaches the sequencer group only as sequenced
 sleeve changes the treasury sends (`SleeveAdjust`, spec E-7.2), never as a write by the gateway or a client:
@@ -146,14 +155,22 @@ A request with a valid credential that lacks the permission is refused with HTTP
 key's ID. A missing, unknown, wrong, revoked or expired credential is 401 `UNAUTHORIZED`. Cancel-on-disconnect and a
 missed heartbeat cancel a session's orders whatever its key holds: they protect the account, and are not trading.
 
-**Managing keys** (`/v4/keys`, REST only, needs `keys`). `POST /v4/keys` creates a key with a `label`, `permissions`
-and an optional `expiresAt`, and answers with the key, its `secret` and its `credential`. `GET /v4/keys` lists every
-key of the account, revoked and expired ones included, newest first, without secrets. `DELETE /v4/keys/{keyId}`
-revokes a key at once and for good; revoking one already revoked answers it as it is. Nothing about a key can be
-changed after it is made: a key that should hold something else is replaced. A key that manages keys cannot create a
-key with a permission it does not hold itself, nor one that outlives it: a key made by an expiring key must expire no
-later. Revoking a key does not revoke the keys it created. An account holds at most 20 keys that are neither revoked
-nor expired.
+**Managing keys** (`/v4/keys`, REST only, needs `keys`). `POST /v4/keys` creates a key with a `label`, `permissions`,
+an optional `expiresAt` and an optional `allowedIps`, and answers with the key, its `secret` and its `credential`.
+`GET /v4/keys` lists every key of the account, revoked and expired ones included, newest first, without secrets.
+`DELETE /v4/keys/{keyId}` revokes a key at once and for good; revoking one already revoked answers it as it is.
+Nothing about a key can be changed after it is made: a key that should hold something else is replaced. A key that
+manages keys cannot create a key with a permission it does not hold itself, nor one that outlives it: a key made by
+an expiring key must expire no later. Revoking a key does not revoke the keys it created. An account holds at most 20
+keys that are neither revoked nor expired.
+
+**`allowedIps`** (decision G-23) restricts a key to the addresses or CIDR networks it names (`192.0.2.7`,
+`10.42.0.0/16`), at most 20 entries; omitted or empty, a key works from anywhere, as every key made before this
+existed does. A request from an address not on the list is refused with the same 403 `FORBIDDEN` a missing permission
+gets, worded so a caller cannot tell an off-list address from a key that does not exist. The gateway checks the
+request's real client address the same way it already resolves one for flood protection: the address a trusted proxy
+named, or the connection's own. Checked on REST today; a WebSocket or FIX session's own logon-time check, and closing
+a live session within the same 10-second bound a revocation gets, are not yet built.
 
 **Revocation and expiry take effect within 10 seconds.** A gateway remembers what the identity service said about a
 credential for up to 5 seconds, so a REST call with a key revoked or expired that moment is refused at most 5 seconds
@@ -163,6 +180,31 @@ which cancels its orders if it asked for cancel-on-disconnect. The identity serv
 
 A key's **last use** is kept to within a minute: the identity service records it when a gateway asks about the key,
 which is at most every few seconds while the key is in use.
+
+## Subaccounts
+
+A market maker can organise trading into accounts that share an owner, its **master**, but cannot trade against one
+another (spec/engine/decisions.md, D-33) — a liquidity-provision book and a scalping book, say. A family is two
+levels deep at most: a master may not itself be a subaccount, and an account with subaccounts of its own may not
+become one.
+
+`POST /v4/subaccounts` (REST only, needs `keys`) makes one under the caller's own account, with a `label`; the
+caller's account must not itself be a subaccount. `GET /v4/subaccounts` lists an account's own, oldest first.
+
+Making a subaccount does two things: identity commits it, and the gateway tells the matching engine
+(`SetMasterAccount`, spec E-7.13) so self-match prevention actually protects the family from that moment (D-33). If
+the gateway dies between the two, `POST /v4/subaccounts` answers 503 rather than success, but the subaccount already
+exists in identity, unprotected, until the next minute's reconciliation sweep resends the same command and closes
+the gap on its own (decision G-25) — no restart and no operator needed.
+
+A fresh subaccount has no dev token and no session of its own to make a key with, so the master's own credential
+does it instead: `POST /v4/subaccounts/{accountId}/keys` (and its `GET`/`DELETE`), needing `keys` and that
+`accountId` be one of the caller's own subaccounts — checked fresh against identity on every call, never cached.
+The key it makes belongs to the subaccount, not the master: it does not appear in `GET /v4/keys`, and everything it
+does — trading, transfers, more keys of its own if it holds `keys` — is the subaccount's, not the master's.
+
+Moving money between a master and its subaccounts is an internal transfer (above, decisions D-34, G-22), not a
+special subaccount API of its own.
 
 ## Dev tokens in test environments
 

@@ -452,11 +452,17 @@ impl Gateway {
         self.ingress.as_ref().ok_or_else(|| ApiError::not_found("orders are served on the private half"))
     }
 
+    /// An owned handle to the same ingress, for a caller that needs to reach the sequencer group from a thread of
+    /// its own — orchestrating a service call and a command together, say — rather than borrow one that outlives
+    /// it (`identity.rs`, subaccount creation).
+    pub(crate) fn ingress_handle(&self) -> Result<Submit, ApiError> {
+        self.ingress().cloned()
+    }
+
     /// A read of `Hub`: concurrent with every other reader, but not with a writer (`hub_mut`).
     ///
-    /// Timed, because a reader waiting here is a request stalled behind the conflate flush, which copies a
-    /// book message once per subscriber while holding the write lock. That cost grows with the market-data
-    /// population and shows up as latency rather than CPU, so it is invisible without this (ADR-0002).
+    /// Timed, because a reader waiting here is a request stalled behind a writer -- the feed thread applying
+    /// units, mostly. That shows up as latency rather than CPU, so it is invisible without this (ADR-0002).
     pub fn hub(&self) -> RwLockReadGuard<'_, Hub> {
         let started = monotonic();
         let guard = read_locked(&self.hub);

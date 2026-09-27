@@ -93,7 +93,7 @@ orders and for trades within the group *(D-13)*.
 | Instruments | by `instrumentId`: `eventId`, `instrumentClass`, `tickTableId`, `lotStep`, `allocationPolicy`, `stateMask`, `positionLimit`, `legs`, `marketState` [`LISTED`] |
 | Books | per instrument, per side, per tick: a FIFO of order IDs |
 | Orders | by `orderId`: `accountId`, `sessionId`, `clientOrderId`, `instrumentId`, `side`, `enteredContract`, `tick` (effective limit), `remaining`, `timeInForce`, `expiresAt`, `atEventStart`, `postOnly`, `reduceOnly`, `spendCapRemaining` (or none), `clientOrderGroup` (or none), `lock`, `reserved`, `acceptedAt` (input sequence) |
-| Accounts | by `accountId`: `balance` [0], `reserved` [0] (always the sum of its orders' `reserved`); per instrument `position` [0], `yesLocked` [0], `noLocked` [0]; per event `eventCash` [0], the net cash the event has paid the account, fees included *(D-1, D-28)*; `closedOnly` [false], `selfMatchPrevention` [`CANCEL_INCOMING`] *(D-3)* |
+| Accounts | by `accountId`: `balance` [0], `reserved` [0] (always the sum of its orders' `reserved`); per instrument `position` [0], `yesLocked` [0], `noLocked` [0]; per event `eventCash` [0], the net cash the event has paid the account, fees included *(D-1, D-28)*; `closedOnly` [false], `selfMatchPrevention` [`CANCEL_INCOMING`] *(D-3)*; `masterAccountId` [0 = none] *(D-33)* |
 | Fees | the default schedule: `makerRateMicros` [0], `takerRateMicros` [0] *(D-2)*; overrides by `overrideId`: `priority`, `accountId`, `instrumentId`, `eventId`, `makerRateMicros`, `takerRateMicros`, `expiresAt` (or none) *(D-27)* |
 | Rule limits | by `accountId` (0 is the default for accounts without their own): the four fields of `SetRuleLimits` [all 0 = none]; per account, per second of sequencer time, counts of new orders and of fills |
 | Maker protection | by `(accountId, eventId)` with `eventId` 0 as the account's default: threshold and window; per `(accountId, eventId)` a counter and window start |
@@ -105,6 +105,8 @@ orders and for trades within the group *(D-13)*.
 
 **E-3.2** An account exists from its first mention; until then every field has its initial value. Account 0
 is the exchange's own account, the settlement reserve and the fee account *(D-21)*, and may not submit orders.
+An account's **effective master** is its `masterAccountId` if that is not 0, else the account itself *(D-33)*;
+`masterAccountId` is set by `SetMasterAccount` (E-7.13) and nothing else changes it.
 
 **E-3.3** **Available cash** is `balance − reserved`. Two things make it negative: a void (E-15.5), by taking
 back cash an account has already received *(D-1)*, and a fee, which is charged at fill time without being
@@ -249,6 +251,12 @@ later than `now`. Otherwise stores the override under `overrideId`, replacing an
 `TimeTick` to every resolved event not yet released, whenever it was resolved (E-8.4). A limit applies to later
 listings only: nothing the group already carries is released or changed by a limit below it *(D-29, D-30)*.
 
+**E-7.13 `SetMasterAccount`.** Sets `accountId`'s `masterAccountId` to `masterAccountId`, once. Rejected if
+`accountId` is 0, `masterAccountId` is 0, `accountId` equals `masterAccountId`, `masterAccountId`'s own
+`masterAccountId` is not 0 (a master may not itself be a subaccount), or `accountId` already has a
+`masterAccountId` that is not 0 and differs from this one. Applying the same `accountId` and `masterAccountId`
+again is `APPLIED`, not rejected, and changes nothing *(D-33)*.
+
 ---
 
 ## 8. Time
@@ -378,8 +386,8 @@ stops.
 `min(Q_left, its remaining)`; self-match prevention (E-13.1) applies to each before it fills. An
 order that lock restoration (E-11.4) removed earlier in the walk is skipped.
 
-**E-10.5 Pro-rata allocation.** Self-match prevention is applied to the account's own orders at the tick
-first (E-13.1). If the other orders' total `M` is at most `Q`, each fills completely. Otherwise, measuring
+**E-10.5 Pro-rata allocation.** Self-match prevention is applied first (E-13.1), to every resting order at
+the tick sharing the incoming order's effective master. If the other orders' total `M` is at most `Q`, each fills completely. Otherwise, measuring
 in lots, order `i` with `m_i` lots receives `⌊Q · m_i / M⌋`, and the lots left over go one each to the orders
 with the largest `(Q · m_i) mod M`, ties to the lower order ID. Fills are emitted oldest first; orders
 receiving nothing are not filled. An order that lock restoration shrank during the allocation fills at most its remaining
@@ -527,11 +535,13 @@ with no entries emits nothing.
 
 ## 13. Protections: self-match, auto-pull and order groups
 
-**E-13.1 Self-match prevention.** When the incoming order reaches a resting order of its own account, the
-account's mode decides: `CANCEL_RESTING` removes the resting order (`SELF_MATCH_PREVENTED`) and the walk
-continues; `CANCEL_INCOMING` stops the walk and the incoming order's remainder is cancelled
-(`SELF_MATCH_PREVENTED`) instead of resting; `CANCEL_BOTH` does both. Under pro-rata allocation the account's
-own orders at the tick are handled together, in ascending order ID, before allocation.
+**E-13.1 Self-match prevention.** When the incoming order reaches a resting order whose account shares the
+incoming order's account's effective master (E-3.2) — one account trading against itself is the case where
+both are their own effective master — the incoming order's account's mode decides, as it always has: `CANCEL_RESTING`
+removes the resting order (`SELF_MATCH_PREVENTED`) and the walk continues; `CANCEL_INCOMING` stops the walk
+and the incoming order's remainder is cancelled (`SELF_MATCH_PREVENTED`) instead of resting; `CANCEL_BOTH`
+does both. Under pro-rata allocation every resting order at the tick sharing the incoming order's effective
+master is handled together, in ascending order ID, before allocation *(D-33)*.
 
 **E-13.2 Maker auto-pull.** After a fill, for the maker's account and the instrument's event, using the
 setting for `(account, event)` or else `(account, 0)`: if the window has elapsed

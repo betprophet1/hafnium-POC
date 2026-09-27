@@ -147,9 +147,7 @@ pub mod encoder {
             self.get_buf_mut().put_u8_at(offset, value as u8);
             self
         }
-
     }
-
 } // end encoder
 
 pub mod decoder {
@@ -193,13 +191,7 @@ pub mod decoder {
     }
 
     impl<'a> MassCancelDecoder<'a> {
-        pub fn wrap(
-            mut self,
-            buf: ReadBuf<'a>,
-            offset: usize,
-            acting_block_length: u16,
-            acting_version: u16,
-        ) -> Self {
+        pub fn wrap(mut self, buf: ReadBuf<'a>, offset: usize, acting_block_length: u16, acting_version: u16) -> Self {
             let limit = offset + acting_block_length as usize;
             self.buf = buf;
             self.initial_offset = offset;
@@ -265,8 +257,5 @@ pub mod decoder {
         pub fn cause(&self) -> mass_cancel_cause::MassCancelCause {
             self.get_buf().get_u8_at(self.offset + 43).into()
         }
-
     }
-
 } // end decoder
-

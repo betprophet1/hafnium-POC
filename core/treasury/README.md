@@ -1,21 +1,22 @@
 # venue-treasury
 
 The mini venue's dummy treasury (blueprint §5, §11, §16), for laptops and test clusters only. It owns the money that
-moves in and out of the venue: deposits and withdrawals, a double-entry ledger, and a fake bank in place of real rails.
-Clients reach it through the private half of the gateway (`/v4/transfers`, `interfaces/gateway/README.md`, deposits
-and withdrawals); the gateway authenticates the account and passes the request on, holding nothing.
+moves in and out of the venue: deposits, withdrawals and internal transfers, a double-entry ledger, and a fake bank
+in place of real rails. Clients reach it through the private half of the gateway (`/v4/transfers`,
+`interfaces/gateway/README.md`, deposits, withdrawals and internal transfers); the gateway authenticates the
+account and passes the request on, holding nothing.
 
 ## What happens to a transfer
 
-| | Deposit | Withdrawal |
-|---|---|---|
-| Requested | handed to the fake bank: `pending` | `SleeveAdjust RECLAIM` to the sequencer group; if applied, handed to the fake bank: `pending`; if rejected, `failed` with `insufficient_available_cash` |
-| The bank settles | `SleeveAdjust GRANT`, then `settled` | `settled` |
-| The bank fails | `failed`, `declined_by_bank` | `SleeveAdjust GRANT` back, then `failed`, `returned_by_bank` |
-| Cancelled before the bank decides | `cancelled` | `SleeveAdjust GRANT` back, then `cancelled` |
+| | Deposit | Withdrawal | Internal (D-34, G-22) |
+|---|---|---|---|
+| Requested | handed to the fake bank: `pending` | `SleeveAdjust RECLAIM` to the sequencer group; if applied, handed to the fake bank: `pending`; if rejected, `failed` with `insufficient_available_cash` | `SleeveAdjust RECLAIM` from the source; if applied, `SleeveAdjust GRANT` to the destination at once — no bank leg; if the reclaim is rejected, `failed` with `insufficient_available_cash` |
+| The bank settles | `SleeveAdjust GRANT`, then `settled` | `settled` | n/a — settles as soon as the grant applies |
+| The bank fails | `failed`, `declined_by_bank` | `SleeveAdjust GRANT` back, then `failed`, `returned_by_bank` | n/a — a grant of a positive amount is never refused (E-7.2) |
+| Cancelled before the bank decides | `cancelled` | `SleeveAdjust GRANT` back, then `cancelled` | never cancellable: there is no bank step to cancel while it is in flight, and it is usually already settled by the time a client could ask |
 
 Once the bank has decided a transfer it cannot be cancelled (`409 TRANSFER_NOT_CANCELLABLE`), whether or not its notice
-has reached the treasury yet.
+has reached the treasury yet. An internal transfer is never cancellable at all.
 
 A reclaim or grant carries a command ID fixed by the transfer (`T` + the book's nonce + the transfer ID + `r` or
 `g`), so sending it again after a restart is answered `DUPLICATE` (spec E-7.1) and moves nothing twice. A duplicate
@@ -32,6 +33,7 @@ Integer cents, debits positive, every posting balanced, so all balances sum to z
 | `bank:fbo_omnibus` | the fake bank's FBO omnibus: the seed's grants and deposits settled, less withdrawals paid out |
 | `transit:deposits` | deposits the bank has settled and the sequencer group has not granted yet |
 | `transit:withdrawals` | withdrawals reclaimed and not yet paid out or granted back |
+| `transit:internal_transfers` | internal transfers reclaimed from their source and not yet granted to their destination (D-34, G-22); no bank or FBO leg, but still needed, for the same reason the other two are: the reclaim and the grant are two commands applied at two moments, so the ledger needs somewhere to hold the money balanced in between |
 
 The seed's grants are posted once, when a book is created, as money the fake bank holds for each account, so the
 omnibus always equals the customers' cash plus what is in transit (§11's invariant). Trading moves cash inside the

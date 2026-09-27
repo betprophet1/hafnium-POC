@@ -182,6 +182,14 @@ fn route(store: &Store, request: &Request) -> Result<Value, Refusal> {
         ("POST", ["v1", "accounts", id, "keys"]) => store.create(account(id)?, &json_body(request)?, now),
         ("GET", ["v1", "accounts", id, "keys"]) => Ok(store.list(account(id)?)),
         ("DELETE", ["v1", "accounts", id, "keys", key_id]) => store.revoke(account(id)?, key_id, now),
+        // Subaccounts (decisions D-33, G-21, G-22): a family sharing an owner, its master, but not a book.
+        ("POST", ["v1", "accounts", id, "subaccounts"]) => {
+            store.create_subaccount(account(id)?, &json_body(request)?, now)
+        }
+        ("GET", ["v1", "accounts", id, "subaccounts"]) => store.list_subaccounts(account(id)?),
+        ("GET", ["v1", "accounts", id]) => store.account_family(account(id)?),
+        // Venue-wide, for the gateway's own reconciliation (`reconcile_subaccounts`), not a client route.
+        ("GET", ["v1", "subaccounts"]) => store.all_subaccounts(),
         _ => Err(Refusal::not_found("no such route")),
     }
 }
@@ -525,5 +533,42 @@ mod tests {
             404
         );
         assert_eq!(call(&a, "GET", "/v1/nowhere", None).0, 404);
+    }
+
+    #[test]
+    fn subaccounts_are_made_and_listed_over_http_and_cannot_nest() {
+        let settings = Settings {
+            catalogue: concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/charts/venue-mini/files/markets.json").into(),
+            show_mail: false,
+        };
+        let records = crate::records(&crate::Storage::Memory(crate::records::Memory::default())).expect("records");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+        let a = listener.local_addr().expect("an address").to_string();
+        crate::start(&settings, records, listener).expect("started");
+
+        assert_eq!(call(&a, "GET", "/v1/accounts/1", None).1["masterAccountId"], Value::Null);
+        let (status, created) = call(&a, "POST", "/v1/accounts/1/subaccounts", Some(&json!({"label": "scalping"})));
+        assert_eq!(status, 200, "{created}");
+        assert_eq!(created["masterAccountId"], json!("1"));
+        let sub = created["accountId"].as_str().expect("an id").to_string();
+
+        assert_eq!(call(&a, "GET", &format!("/v1/accounts/{sub}"), None).1["masterAccountId"], json!("1"));
+        let (status, listed) = call(&a, "GET", "/v1/accounts/1/subaccounts", None);
+        assert_eq!((status, &listed["subaccounts"][0]["accountId"]), (200, &json!(sub)), "{listed}");
+
+        // A subaccount cannot itself be a master.
+        let path = format!("/v1/accounts/{sub}/subaccounts");
+        assert_eq!(call(&a, "POST", &path, Some(&json!({"label": "nested"}))).0, 400);
+        assert_eq!(
+            call(&a, "POST", "/v1/accounts/99999/subaccounts", Some(&json!({"label": "x"}))).0,
+            404,
+            "no such master account"
+        );
+
+        // Venue-wide, for the gateway's own reconciliation: every subaccount, whoever its master is.
+        let (status, all) = call(&a, "GET", "/v1/subaccounts", None);
+        assert_eq!((status, &all["subaccounts"][0]["accountId"]), (200, &json!(sub)), "{all}");
+        assert_eq!(all["subaccounts"][0]["masterAccountId"], json!("1"));
+        assert_eq!(all["subaccounts"].as_array().map(Vec::len), Some(1), "account 1 is a master, not listed here");
     }
 }

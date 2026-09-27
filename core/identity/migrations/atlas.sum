@@ -1,5 +1,7 @@
-h1:MGzcboHYsNEyW0tfJY4/TxSex3dKpEcRU04a4UFJ7OY=
+h1:4HYlAsI9C7xRex6x8ss7YMa4huqX4lJVt+2Y8udF4e8=
 20260917000001_accounts_and_keys.sql h1:RgAJ6xtc8+K6LOJOeGNxCec8VQ33wTCZm+nKFMVODmQ=
 20260918000001_members_and_sessions.sql h1:w6/n7TbeVa5F/yTaxDkS9HBaV98KNJKvCcmzTub32G0=
 20260918000002_member_security.sql h1:VVWfDSnkb0cr9h8ucr/UaFsMI9bLJqJcShnhoxAb2Tk=
 20260918000003_member_staff.sql h1:pc+c0QDtpekh/z32yK++Y5ovzNCuLwBDzZtAYHWsKe8=
+20260925000001_key_ip_allowlist.sql h1:KbKqrsF3fSFD5q46mpWZHtOiGWydD/yt7TjZpewWacI=
+20260925000002_subaccounts.sql h1:KTs8D0btFDRm482z7zGgrbejQY2JSzY6iS7Sbu6CsvQ=

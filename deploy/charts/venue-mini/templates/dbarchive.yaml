@@ -1,0 +1,103 @@
+{{- if .Values.database.archive.enabled }}
+{{- $name := include "venue-mini.fullname" . }}
+{{- $a := .Values.database.archive }}
+{{- if not $a.to }}{{ fail "database.archive.to: say where database dumps go" }}{{ end }}
+{{- if not $a.environment }}{{ fail "database.archive.environment: names the prefix one venue's dumps live under" }}{{ end }}
+{{- $services := splitList " " (include "venue-mini.databaseServices" .) | compact }}
+{{- range $service := $services }}
+---
+# Takes a verified `pg_dump` of one database to object storage (interfaces/tools/db_archive.py). Nothing is ever
+# deleted, here or in the database.
+#
+# This is **not** a retention job, and turning it into one would be a mistake. The four venue databases are
+# deliberately append-only — each installs a trigger that raises on DELETE and TRUNCATE and REVOKEs those
+# privileges, with tests asserting the refusal — and they are not a capacity problem either: measured
+# 2026-09-25, all four together held about 4 MB after half a day of trading, against the engine journal's
+# 35 MB/hour. What was missing was not pruning but a *copy*: the journal ships to S3 and the audit log ships to
+# S3, while the ledger and the identity records existed only on one node's local disk.
+#
+# Deciding what may eventually be removed from a store is interface 29 (`interfaces/catalogue.toml`,
+# "Stores &rarr; retention archive"), which is planned, unbuilt, and has to answer to the legal-hold register.
+#
+# One CronJob per database rather than one that loops: a dump that fails for the oracle should not stop the
+# treasury's from being taken, and each gets its own retries and its own visible failure.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}-dbarchive-{{ $service }}
+  labels:
+    {{- include "venue-mini.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: dbarchive
+spec:
+  schedule: {{ $a.schedule | quote }}
+  # Never two dumps of one database at once: they would race for the same key and the loser's bytes would be
+  # what survives, with both runs reporting success.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 1
+  # Kept, because a backup that stopped being taken is only visible in what it said when it failed — and unlike
+  # the audit shipper, nothing downstream fills up to make the silence obvious.
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            {{- include "venue-mini.labels" $ | nindent 12 }}
+            app.kubernetes.io/component: dbarchive
+        spec:
+          restartPolicy: OnFailure
+          {{- with ($a.image.pullSecrets | default $.Values.image.pullSecrets) }}
+          imagePullSecrets:
+            {{- range . }}
+            - name: {{ . | quote }}
+            {{- end }}
+          {{- end }}
+          {{- include "venue-mini.scheduling" $ | nindent 10 }}
+          securityContext:
+            {{- include "venue-mini.podSecurity" $ | nindent 12 }}
+          containers:
+            - name: dbarchive
+              image: "{{ $a.image.repository }}:{{ $a.image.tag | default $.Chart.AppVersion }}"
+              imagePullPolicy: {{ $a.image.pullPolicy }}
+              args:
+                - --database
+                - {{ $service | quote }}
+                - --to
+                - {{ $a.to | quote }}
+                - --environment
+                - {{ $a.environment | quote }}
+              env:
+                # The connection URL, with the service's generated password. `db_archive.py` reads it from here
+                # and passes the password to pg_dump in PGPASSWORD, never in argv, so it is not in `ps`.
+                {{- include "venue-mini.databaseEnv" (dict "ctx" $ "service" $service) | nindent 16 }}
+                # No AWS credentials: the instance role, through the metadata service, as the audit shipper does.
+                - name: AWS_REGION
+                  value: {{ $a.region | quote }}
+                # The CLI writes its cache under HOME, and the root filesystem is read-only.
+                - name: HOME
+                  value: /tmp
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 64Mi
+                # pg_dump streams, but the dump is written to /tmp whole before it is uploaded, and the AWS CLI
+                # keeps multipart buffers in flight on top of a Python interpreter.
+                limits:
+                  memory: 512Mi
+              securityContext:
+                {{- include "venue-mini.containerSecurity" $ | nindent 16 }}
+              volumeMounts:
+                # The dump is written here, so this has to be big enough to hold one whole. An emptyDir is on the
+                # node's disk, which is the same disk the journal lives on: size it against the database, and
+                # know that it is the node's free space being borrowed for the length of the run.
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: {{ $a.scratchSize | quote }}
+{{- end }}
+{{- end }}

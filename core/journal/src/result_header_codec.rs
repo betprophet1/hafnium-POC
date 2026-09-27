@@ -2,8 +2,8 @@
 
 use crate::*;
 
-pub use encoder::ResultHeaderEncoder;
 pub use decoder::ResultHeaderDecoder;
+pub use encoder::ResultHeaderEncoder;
 
 pub const ENCODED_LENGTH: usize = 22;
 
@@ -16,7 +16,10 @@ pub mod encoder {
         offset: usize,
     }
 
-    impl<'a, P> Writer<'a> for ResultHeaderEncoder<P> where P: Writer<'a> + Default {
+    impl<'a, P> Writer<'a> for ResultHeaderEncoder<P>
+    where
+        P: Writer<'a> + Default,
+    {
         #[inline]
         fn get_buf_mut(&mut self) -> &mut WriteBuf<'a> {
             if let Some(parent) = self.parent.as_mut() {
@@ -27,7 +30,10 @@ pub mod encoder {
         }
     }
 
-    impl<'a, P> ResultHeaderEncoder<P> where P: Writer<'a> + Default {
+    impl<'a, P> ResultHeaderEncoder<P>
+    where
+        P: Writer<'a> + Default,
+    {
         pub fn wrap(mut self, parent: P, offset: usize) -> Self {
             self.parent = Some(parent);
             self.offset = offset;
@@ -111,9 +117,8 @@ pub mod encoder {
         pub fn nullify_optional_fields(&mut self) -> &mut Self {
             self
         }
-
     }
-} // end encoder mod 
+} // end encoder mod
 
 pub mod decoder {
     use super::*;
@@ -124,21 +129,30 @@ pub mod decoder {
         offset: usize,
     }
 
-    impl<'a, P> ActingVersion for ResultHeaderDecoder<P> where P: Reader<'a> + ActingVersion + Default {
+    impl<'a, P> ActingVersion for ResultHeaderDecoder<P>
+    where
+        P: Reader<'a> + ActingVersion + Default,
+    {
         #[inline]
         fn acting_version(&self) -> u16 {
             self.parent.as_ref().unwrap().acting_version()
         }
     }
 
-    impl<'a, P> Reader<'a> for ResultHeaderDecoder<P> where P: Reader<'a> + Default {
+    impl<'a, P> Reader<'a> for ResultHeaderDecoder<P>
+    where
+        P: Reader<'a> + Default,
+    {
         #[inline]
         fn get_buf(&self) -> &ReadBuf<'a> {
             self.parent.as_ref().expect("parent missing").get_buf()
         }
     }
 
-    impl<'a, P> ResultHeaderDecoder<P> where P: Reader<'a> + Default {
+    impl<'a, P> ResultHeaderDecoder<P>
+    where
+        P: Reader<'a> + Default,
+    {
         pub fn wrap(mut self, parent: P, offset: usize) -> Self {
             self.parent = Some(parent);
             self.offset = offset;
@@ -175,6 +189,5 @@ pub mod decoder {
         pub fn sequencer_group(&self) -> u16 {
             self.get_buf().get_u16_at(self.offset + 20)
         }
-
     }
-} // end decoder mod 
+} // end decoder mod

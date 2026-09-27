@@ -202,18 +202,14 @@ pub(crate) struct Command {
 impl Command {
     /// The reclaim or grant a transfer's stage waits on, if it waits on one.
     pub(crate) fn for_transfer(nonce: u32, t: &Transfer) -> Option<Self> {
-        let (what, reason) = match t.stage {
-            Stage::Reclaiming => ('r', "RECLAIM"),
-            Stage::Granting { .. } => ('g', "GRANT"),
+        let (what, reason, account) = match t.stage {
+            Stage::Reclaiming => ('r', "RECLAIM", t.account),
+            // A deposit or withdrawal grants back to the account it moved; an internal transfer grants to its
+            // destination, which is a different account from the one it reclaimed.
+            Stage::Granting { .. } => ('g', "GRANT", t.to_account.unwrap_or(t.account)),
             _ => return None,
         };
-        Some(Self {
-            transfer: t.id,
-            command_id: command_id(nonce, t.id, what),
-            account: t.account,
-            cents: t.amount,
-            reason,
-        })
+        Some(Self { transfer: t.id, command_id: command_id(nonce, t.id, what), account, cents: t.amount, reason })
     }
 }
 
@@ -239,11 +235,12 @@ pub(crate) fn command_id(nonce: u32, transfer: u64, what: char) -> String {
     format!("T{nonce:08x}{transfer:06x}{what}")
 }
 
-/// The ledger account that holds a transfer's money between the bank and the sequencer group.
+/// The ledger account that holds a transfer's money between its two steps.
 const fn in_transit(kind: Kind) -> &'static str {
     match kind {
         Kind::Deposit => ledger::DEPOSITS_IN_TRANSIT,
         Kind::Withdrawal => ledger::WITHDRAWALS_IN_TRANSIT,
+        Kind::Internal => ledger::INTERNAL_TRANSFERS_IN_TRANSIT,
     }
 }
 
@@ -421,7 +418,7 @@ impl Treasury {
     /// for it to get past its quick stages (`wait_quick`) before answering.
     pub fn request(&self, account: u64, body: &Value, now: u64) -> Result<u64, Refusal> {
         let fields = body.as_object().ok_or_else(|| Refusal::bad("the body must be a JSON object"))?;
-        const FIELDS: [&str; 4] = ["clientTransferId", "kind", "amountCents", "method"];
+        const FIELDS: [&str; 5] = ["clientTransferId", "kind", "amountCents", "method", "toAccountId"];
         if let Some(k) = fields.keys().find(|k| !FIELDS.contains(&k.as_str())) {
             return Err(Refusal::bad(format!("unknown field {k}")));
         }
@@ -431,24 +428,52 @@ impl Treasury {
         }
         let kind = Kind::parse(text(fields, "kind")?)
             .ok_or_else(|| Refusal::bad(format!("kind must be one of {}", Kind::NAMES.join(", "))))?;
-        let method = Method::parse(text(fields, "method")?)
-            .ok_or_else(|| Refusal::bad(format!("method must be one of {}", Method::NAMES.join(", "))))?;
+        // A deposit or withdrawal settles through the bank and must say how; an internal transfer never reaches the
+        // bank (decisions D-34, G-22) and must not name one.
+        let method = match (kind, fields.get("method")) {
+            (Kind::Internal, None) => None,
+            (Kind::Internal, Some(_)) => return Err(Refusal::bad("an internal transfer has no method")),
+            (_, _) => Some(
+                Method::parse(text(fields, "method")?)
+                    .ok_or_else(|| Refusal::bad(format!("method must be one of {}", Method::NAMES.join(", "))))?,
+            ),
+        };
         let max = self.config.max_cents;
         let amount = fields
             .get("amountCents")
             .and_then(Value::as_u64)
             .filter(|a| (1..=max).contains(a))
             .ok_or_else(|| Refusal::bad(format!("amountCents must be an integer from 1 to {max}")))?;
+        let to_account = match (kind, fields.get("toAccountId")) {
+            (Kind::Internal, Some(v)) => {
+                let to = v
+                    .as_str()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .ok_or_else(|| Refusal::bad("toAccountId must be a decimal string"))?;
+                if to == account {
+                    return Err(Refusal::bad("toAccountId must not be the account making the transfer"));
+                }
+                Some(to)
+            }
+            (Kind::Internal, None) => return Err(Refusal::bad("an internal transfer needs toAccountId")),
+            (_, None) => None,
+            (_, Some(_)) => return Err(Refusal::bad("toAccountId is only for an internal transfer")),
+        };
         let mut inner = locked(&self.inner);
         // A deposit is how an account the catalogue never named first appears. The member exists, the sequencer
         // group already knows the account — it refuses their orders for want of a sleeve, not for want of an
         // account — and this is the money arriving, recorded like any other deposit: whose it is, how much, by
         // which method, and every state it passed through.
         //
-        // A withdrawal is not. Nothing can be taken out of an account that has never had anything put in, and
-        // refusing here is what stops a mistyped account number opening one and being paid.
+        // A withdrawal is not, and neither is an internal transfer's source or destination: nothing can be taken
+        // out of, or moved into, an account that has never had anything put in, and refusing here is what stops a
+        // mistyped account number opening one and being paid.
         if kind == Kind::Withdrawal {
             self.known(&inner, account)?;
+        }
+        if let Some(to) = to_account {
+            self.known(&inner, account)?;
+            self.known(&inner, to)?;
         }
         self.fresh(&mut inner).map_err(|e| {
             eprintln!("treasury: {e}");
@@ -456,7 +481,7 @@ impl Treasury {
         })?;
         if let Some(&id) = inner.by_client.get(&(account, client_id.to_string())) {
             let t = &inner.transfers[&id];
-            return if (t.kind, t.amount, t.method) == (kind, amount, method) {
+            return if (t.kind, t.amount, t.method, t.to_account) == (kind, amount, method, to_account) {
                 Ok(id)
             } else {
                 Err(Refusal::new(
@@ -484,8 +509,9 @@ impl Treasury {
             updated: now,
             stage: match kind {
                 Kind::Deposit => Stage::ToBank,
-                Kind::Withdrawal => Stage::Reclaiming,
+                Kind::Withdrawal | Kind::Internal => Stage::Reclaiming,
             },
+            to_account,
             in_doubt: None,
         };
         self.commit(&mut inner, transfer, &[], now).map_err(|e| {
@@ -537,6 +563,15 @@ impl Treasury {
             }
             Kind::Withdrawal => {
                 t.stage = Stage::Granting { then: State::Cancelled, reason: Some(Reason::CancelledByClient) };
+            }
+            // Never reached: an internal transfer is never in ToBank or AtBank (it has no bank leg), so the guard
+            // above already refuses it. Kept exhaustive rather than assumed, since the guard is what makes it true.
+            Kind::Internal => {
+                return Err(Refusal::new(
+                    409,
+                    "TRANSFER_NOT_CANCELLABLE",
+                    format!("transfer {id} is internal and has no bank step to cancel"),
+                ));
             }
         }
         self.commit(&mut inner, t, &[], now).map_err(|e| {
@@ -744,6 +779,14 @@ impl Treasury {
                 t.stage = Stage::Granting { then: State::Failed, reason: Some(Reason::ReturnedByBank) };
                 None
             }
+            // Never reached: an internal transfer never enters ToBank or AtBank (`request`, `apply`), so no notice
+            // is ever awaited for one. Kept exhaustive rather than assumed.
+            (_, Kind::Internal) => {
+                return Err(format!(
+                    "transfer {}: an internal transfer reached the bank, which should be impossible",
+                    t.id
+                ));
+            }
         })
     }
 
@@ -808,7 +851,10 @@ impl Treasury {
     ) -> Result<(), String> {
         let Some(mut t) = inner.transfers.get(&command.transfer).cloned() else { return Ok(()) };
         let outcome = outcome.map_err(|e| format!("the sequencer group did not answer: {e}"))?;
-        let customer = ledger::customer(t.account);
+        // Reclaiming always moves `account`'s money; granting moves it into `to_account` for an internal transfer,
+        // and back into `account` for a deposit or a withdrawal returned unsettled.
+        let source = ledger::customer(t.account);
+        let destination = ledger::customer(t.to_account.unwrap_or(t.account));
         let mut postings = Vec::new();
         match (t.stage, outcome) {
             // Retryable, and meant to be: the feed has not reached the first outcome yet. `step` takes the other
@@ -821,11 +867,20 @@ impl Treasury {
                 return self.commit(inner, t, &[], now);
             }
             (Stage::Reclaiming, Adjusted::Applied(sequence)) => {
-                postings.push((
-                    "withdrawal reclaimed from the sleeve",
-                    Posting::moving(t.amount, &customer, ledger::WITHDRAWALS_IN_TRANSIT)?,
-                ));
-                (t.sequence, t.stage) = (Some(sequence), Stage::ToBank);
+                // A deposit is never in Reclaiming (`request` assigns it ToBank instead), so only these two kinds
+                // are possible; handled explicitly rather than assumed, in case that ever stops being true.
+                let (memo, next) = match t.kind {
+                    Kind::Withdrawal => ("withdrawal reclaimed from the sleeve", Stage::ToBank),
+                    // An internal transfer never goes to the bank: once reclaimed, it heads straight for its
+                    // destination (decisions D-34, G-22), the way a settled deposit heads for `Granting` too.
+                    Kind::Internal => (
+                        "internal transfer reclaimed from the source",
+                        Stage::Granting { then: State::Settled, reason: None },
+                    ),
+                    Kind::Deposit => return Err(format!("transfer {}: a deposit cannot be in Reclaiming", t.id)),
+                };
+                postings.push((memo, Posting::moving(t.amount, &source, in_transit(t.kind))?));
+                (t.sequence, t.stage) = (Some(sequence), next);
             }
             (Stage::Reclaiming, Adjusted::Rejected(reason)) => {
                 if reason != "insufficient_sleeve" {
@@ -837,8 +892,9 @@ impl Treasury {
                 let memo = match t.kind {
                     Kind::Deposit => "deposit granted to the sleeve",
                     Kind::Withdrawal => "withdrawal returned to the sleeve",
+                    Kind::Internal => "internal transfer granted to the destination",
                 };
-                postings.push((memo, Posting::moving(t.amount, in_transit(t.kind), &customer)?));
+                postings.push((memo, Posting::moving(t.amount, in_transit(t.kind), &destination)?));
                 (t.state, t.reason, t.sequence, t.stage) = (then, reason, Some(sequence), Stage::Done);
             }
             (Stage::Granting { .. }, Adjusted::Rejected(reason)) => {
@@ -1188,7 +1244,87 @@ pub(crate) mod tests {
             treasury.request(99, &body("x", "withdrawal", 1, "dummy_bank"), 1_000).map_err(|r| r.status),
             Err(404)
         );
+        // An internal transfer (decisions D-34, G-22) has no method and needs a destination that is not itself.
+        assert_eq!(
+            refused(json!({"clientTransferId": "i", "kind": "internal", "amountCents": 1})),
+            Err(400),
+            "no toAccountId"
+        );
+        assert_eq!(
+            refused(json!({"clientTransferId": "i", "kind": "internal", "amountCents": 1, "toAccountId": "1",
+                           "method": "dummy_bank"})),
+            Err(400),
+            "an internal transfer has no method"
+        );
+        assert_eq!(
+            refused(
+                json!({"clientTransferId": "i", "kind": "internal", "amountCents": 1, "toAccountId": ACCOUNT.to_string()})
+            ),
+            Err(400),
+            "cannot transfer to itself"
+        );
+        assert_eq!(
+            treasury
+                .request(
+                    ACCOUNT,
+                    &json!({"clientTransferId": "i", "kind": "internal", "amountCents": 1, "toAccountId": "99"}),
+                    1_000
+                )
+                .unwrap_err()
+                .status,
+            404,
+            "an unknown destination"
+        );
+        // A deposit or withdrawal must name a method.
+        assert_eq!(
+            refused(json!({"clientTransferId": "x", "kind": "deposit", "amountCents": 1})),
+            Err(400),
+            "a deposit needs a method"
+        );
         assert_eq!(treasury.list(ACCOUNT, 10).expect("a list")["transfers"], json!([]));
+    }
+
+    #[test]
+    fn an_internal_transfer_moves_money_between_two_accounts_with_no_bank_leg() {
+        let p = Memory::default();
+        let treasury = open(&p);
+        let mut group = Group::default();
+        group.sleeves.insert(ACCOUNT, 1_000);
+        let to = json!({"clientTransferId": "i1", "kind": "internal", "amountCents": 400, "toAccountId": "1"});
+        let id = treasury.request(ACCOUNT, &to, 1_000).expect("requested");
+        // One step settles it whole: unlike a deposit or withdrawal, an internal transfer never waits on the bank,
+        // so nothing here has a delay for `step`'s own loop to wait out.
+        treasury.step(&mut group, 1_000);
+        assert_eq!(group.sleeves[&ACCOUNT], 600, "reclaimed from the source");
+        assert_eq!(state(&treasury, id), ("settled".into(), Value::Null));
+        assert_eq!(*group.sleeves.get(&1).unwrap_or(&0), 400, "granted to the destination's sleeve");
+        // The FBO omnibus never moves: the money stays inside the venue the whole way (decisions D-34, G-22).
+        assert_eq!(treasury.balance(FBO), 50_000);
+        assert_eq!(treasury.balance(&customer(ACCOUNT)), -49_600, "owes the source 400 less");
+        assert_eq!(treasury.balance(&customer(1)), -400, "owes the destination 400 more");
+        assert_eq!(treasury.balance(crate::ledger::INTERNAL_TRANSFERS_IN_TRANSIT), 0, "nothing left in transit");
+        let trial = treasury.trial_balance();
+        assert_eq!(trial["total"], "0", "{trial}");
+
+        // Not cancellable: there is no bank step to cancel while it is in flight, and none once it has settled.
+        assert_eq!(treasury.cancel(ACCOUNT, id, 1_500).unwrap_err().code, "TRANSFER_NOT_CANCELLABLE");
+    }
+
+    #[test]
+    fn an_internal_transfer_beyond_available_cash_is_refused_and_moves_nothing() {
+        let p = Memory::default();
+        let treasury = open(&p);
+        let mut group = Group::default();
+        group.sleeves.insert(ACCOUNT, 100);
+        let to = json!({"clientTransferId": "i2", "kind": "internal", "amountCents": 400, "toAccountId": "1"});
+        let id = treasury.request(ACCOUNT, &to, 1_000).expect("requested");
+        run(&treasury, &mut group, 1_500);
+        assert_eq!(state(&treasury, id), ("failed".into(), json!("insufficient_available_cash")));
+        assert_eq!(group.sleeves[&ACCOUNT], 100, "nothing was reclaimed");
+        assert_eq!(*group.sleeves.get(&1).unwrap_or(&0), 0, "nothing was granted");
+        assert_eq!((treasury.balance(&customer(ACCOUNT)), treasury.balance(&customer(1))), (-50_000, 0));
+        let trial = treasury.trial_balance();
+        assert_eq!(trial["total"], "0", "{trial}");
     }
 
     #[test]

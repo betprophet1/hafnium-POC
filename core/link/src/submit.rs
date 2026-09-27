@@ -100,6 +100,9 @@ fn fail_pending(pending: &Mutex<VecDeque<Answer>>, watch: &Watcher) {
     }
 }
 
+/// Cheap to clone: another handle to the same queue, for a caller that needs to reach the sequencer group from a
+/// thread of its own rather than borrow one that outlives it.
+#[derive(Clone)]
 pub struct Submit {
     queue: SyncSender<Request>,
     watch: Watcher,
