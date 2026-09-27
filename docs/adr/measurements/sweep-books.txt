@@ -1,0 +1,14 @@
+client fd limit 1048576, 32 vCPU, ports 1024	65535
+=== retail=0 ===
+32 connection(s) over 8 instrument(s), 2848021 requests in 60179 ms: 47325 messages/s; round trip µs p50 506.883 p90 780.876 p99 4560.921 p99.9 4963.083 max 146549.170; 8 maker(s), 76870 fills, 1277 fills/s; 1073174 taker orders, 76870 traded (1:13), 965843 cancels; 8 watcher(s) took 19152 messages, 318/s
+    client_load=1.40 1.03 0.43  client_sockets=44
+=== retail=1024 ===
+32 connection(s) over 8 instrument(s), 2676131 requests in 60198 ms: 44455 messages/s; round trip µs p50 569.838 p90 925.381 p99 3739.996 p99.9 4880.477 max 128113.221; 8 maker(s), 75251 fills, 1250 fills/s; 1072204 taker orders, 75251 traded (1:14), 964970 cancels; 1024 retail took 902310 messages, 14989/s (881 each), sent 6080 orders, 6080 fills, p50 3110.591 p99 63144.275, 0 dropped; 8 watcher(s) took 18366 messages, 305/s
+    client_load=1.39 1.07 0.49  client_sockets=1305
+=== retail=4096 ===
+32 connection(s) over 8 instrument(s), 2505018 requests in 60358 ms: 41502 messages/s; round trip µs p50 602.253 p90 972.754 p99 3830.378 p99.9 5767.716 max 162665.469; 8 maker(s), 70226 fills, 1163 fills/s; 1016494 taker orders, 70226 traded (1:14), 914833 cancels; 4096 retail took 3244262 messages, 53750/s (792 each), sent 24257 orders, 24257 fills, p50 4360.791 p99 55610.617, 0 dropped; 8 watcher(s) took 16496 messages, 273/s
+    client_load=2.00 1.31 0.62  client_sockets=4278
+=== retail=16384 ===
+32 connection(s) over 8 instrument(s), 2207611 requests in 60999 ms: 36190 messages/s; round trip µs p50 629.849 p90 1135.329 p99 4447.520 p99.9 16623.819 max 210050.086; 8 maker(s), 62545 fills, 1025 fills/s; 900021 taker orders, 62545 traded (1:14), 810006 cancels; 16384 retail took 10660039 messages, 174757/s (650 each), sent 96397 orders, 96384 fills, p50 6312.406 p99 73806.652, 0 dropped; 8 watcher(s) took 13720 messages, 224/s
+    client_load=8.60 3.28 1.34  client_sockets=16676
+SWEEPDONE

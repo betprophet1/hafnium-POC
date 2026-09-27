@@ -13,10 +13,15 @@ checkable against what was actually run. Everything here is from a throwaway c6i
 | `rep-{prestage,lazy,typed}-{4,5,6}.txt` | The bisect over that same load: `ea4724c` → `0bf4a7b` (lazy `Frame`) → `f982b3a` (typed `View`). Attributed the apparent loss to `0bf4a7b`. |
 | `prof-{prestage,lazy}.txt` | Whole-process `perf` profiles under the old load: per-thread CPU, self time by symbol, by object, by thread, plus the 70-second load result and `feed_apply`. |
 | `results-{prestage,head}.txt` | Full connection ladders (4→256) for trading, amend-only and watchers, on the old load. 8-second runs. |
+| `sweep-epoll.txt`, `sweep-books.txt` | Retail population sweeps from a separate client machine: the first with every customer on all eight books, the second with the corrected model (retail on two weighted books, eight API clients on all of them). |
+| `sweep-2host.txt` | The same before the epoll client, kept because its `client_load` column is what showed the generator, not the gateway, was the limit. |
+| `lockdelta-16384.txt`, `lockdelta-16384-after.txt`, `lockdelta-books.txt` | Lock cost as before/after deltas over one 60s run: conflate hold, fan-out, read wait and feed-apply. In order: before the fan-out fix, after it, and after the subscription model was corrected too. |
+| `retail.txt` | The first retail sweep, with the generator and the gateway sharing one box. Client-bound above ~1,024; kept only because the corrections reference it. |
 
 ## The scripts
 
-`real.sh` / `allreal.sh` produce the representative runs; `prof.sh` the profiles. `real_agg.py`,
+`real.sh` / `allreal.sh` produce the representative runs; `prof.sh` the profiles; `launch2.sh` /
+`provision2.sh` / `server-up.sh` / `client-sweep.sh` the two-host runs, and `lockdelta.sh` the lock deltas. `real_agg.py`,
 `aggregate.py`, `aggregate3.py` and `bisect_agg.py` aggregate the corresponding files — run them from this
 directory.
 
@@ -30,3 +35,9 @@ directory.
 - **8-second runs overstate throughput by roughly a third** against the same load run for 60 seconds.
 - The `1:N` in a `real-*` line is the *achieved* order-to-trade ratio, not what was asked for. Eight
   connections over eight books give 1:20, because the exponentially unpopular books get takers and no maker.
+- **In `sweep-epoll.txt` and everything before it, every retail customer subscribes to all eight books**, which
+  is an API client's shape rather than an app user's, so their fan-out cost is overstated by roughly the number
+  of books. `sweep-books.txt` and `lockdelta-books.txt` use the corrected model: retail on two weighted books,
+  `--watchers` on all of them.
+- **`retail.txt` and `sweep-2host.txt` are client-bound above about a thousand customers**, which the
+  `client_load` column shows. Only the runs made with the epoll pool (`21b9beb` onward) measure the gateway.

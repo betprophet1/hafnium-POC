@@ -2,7 +2,10 @@
 
 **Status:** Rejected — the premise did not survive measurement. See Prototype Findings.
 **Superseded in part:** several measurements below are retracted; see Retraction 2 and [What a representative
-load says](#what-a-representative-load-says-2026-09-27).
+load says](#what-a-representative-load-says-2026-09-27). The rejection itself is narrower than it reads: the
+lock *does* matter, on the write side, once the venue has market-data subscribers — see [The lock does
+matter](#the-lock-does-matter-on-the-write-side-with-customers-on-the-venue-2026-09-27). Neither of this
+ADR's options was the fix.
 **Date:** 2026-09-26
 **Deciders:** core/gateway owners (Engineering)
 
@@ -538,6 +541,121 @@ unproven rather than established.
 (`rep-*.txt`), both whole-process profiles (`prof-*.txt`), the full connection ladders (`results-*.txt`), and
 the scripts that produced and aggregated them.
 
+## The lock does matter — on the write side, with customers on the venue (2026-09-27)
+
+This ADR is Rejected because swapping `Mutex<Hub>` for `RwLock<Hub>` changed throughput by 1–2%. That holds.
+What it does not establish, and what the wording above implies, is that *the lock* does not matter. It does.
+Every run behind the rejection had no market-data subscribers, and two of the three things that hold the hub's
+write lock are proportional to work those runs never asked for.
+
+### How the question came up
+
+A venue's population is a handful of market makers carrying the order flow and a large number of customers who
+watch and trade rarely. Nothing here could express that: every load had every connection trading, and the most
+ever run was 256 connections. Building it (`--retail`, `2adfa71` onward) turned up a 28% trading cost at 16,384
+customers and p99 past 800ms **while the machine sat at 16% CPU**. Idle cores and rising latency is the shape of
+waiting, not of work.
+
+Two attempts to name the cause from reading the code were wrong before one was right, so the answer came from
+two histograms instead: `venue_gateway_conflate_hold_duration_seconds` (how long a flush holds the write lock)
+and `venue_gateway_hub_read_wait_duration_seconds` (how long a request waited for the read lock).
+
+### What they said
+
+Before/after deltas over single 60-second runs, 8 books, 32 trading connections:
+
+| | no subscribers | 16,384 subscribers |
+|---|---|---|
+| conflate flush, write-lock hold | 6.7µs | **122,473µs** |
+| feed-apply, private (write lock) | 13.5µs × 2.8M = **63% of wall** | 16.7µs × 2.3M = **65% of wall** |
+| request wait for the read lock | 36.5µs | 49.0µs |
+
+Two separate findings, and only the second was the one being looked for.
+
+**`Hub::apply` holds the write lock about two thirds of every second, with no subscribers at all.** It is called
+per feed unit on the one thread per half that applies them, and at these rates that is most of the time. This is
+what the reactor threads' 36–50µs read waits queue behind, and it is the honest answer to why order latency is
+what it is. Nothing in this ADR's options would have touched it: `RwLock` does not help when the contention is a
+writer, and sharding a lock does not help when one holder wants most of it.
+
+**The conflate flush grows from 6.7µs to 122ms as subscribers arrive.** `flush_books` copied each book message
+once per subscriber — `message.to_string()` per session in `send_to_topic` — inside the write lock. At 16,384
+subscribers that is ~131,000 allocate-and-copy operations per flush. The cycle is 100ms, so flushes could not
+keep up: 276 in 60 seconds, **4.6/s where the interface promises 10**. Customers were not merely waiting; they
+were getting market data at under half the advertised rate, which is why per-client delivery fell as the
+population grew. That was read as the gateway saturating. It was the publisher falling behind.
+
+### The fix, and what it was worth
+
+Neither sharding nor a different lock type. Two changes (`da43b0a`):
+
+- **Build each message once.** `Queued.text` is an `Arc<str>`, built once per topic and handed out by reference.
+  The copy into a socket's buffer still happens, but on whichever reactor thread serves that session rather than
+  on the one thread holding the lock. Every fan-out does this now — executions to an account's sessions, parlay
+  deliveries, transfers.
+- **Split the flush.** `take_dirty` mutates and is microseconds; `publish_books` only reads, so it runs under a
+  read lock while the feed thread and every request carry on. `take_dirty` returns the view's sequence with the
+  levels so a message still carries the sequence its levels are as of — the fan-out now happens after the write
+  lock is dropped, and a later sequence would tell a client it holds changes it was never sent.
+
+At 16,384 customers:
+
+| | before | after |
+|---|---|---|
+| conflate write-lock hold | 122,473µs | **9.7µs** |
+| fan-out, now under a read lock | — | 41,017µs |
+| flushes per 60s | 276 (4.6/s) | **435 (7.3/s)** |
+| retail order p50 | 13.9ms | **6.3ms** |
+
+Four orders of magnitude off the exclusive hold. Conflation recovers from 4.6 Hz toward the promised 10, and a
+customer's order comes back in less than half the time.
+
+### The load this is measured on
+
+Two corrections were needed before any of it meant anything.
+
+**The generator had to stop being the bottleneck.** A thread per customer costs a wake-up per customer per poll
+interval: at 24,576 customers the client reached a load average of 6,465 on 32 vCPU while the venue it was
+measuring sat at 16%, and per-customer delivery fell — the harness starving, read as the gateway saturating.
+Putting the client on its own machine did not help, because threads were the wrong axis. `retail::run`
+(`21b9beb`) gives a few workers thousands of sockets each through epoll; at 16,384 customers client load went
+from 1,947 to 8.0 and the measured trading rate rose from 20,763 to 34,922 for the same load. Everything the
+earlier run attributed to the gateway at that size was the client.
+
+**And retail had to stop subscribing to everything.** Each customer was subscribed to every book on the venue,
+which is an API client's shape, not an app user's. Since fan-out costs one message per subscriber per topic,
+that overstated retail's cost by roughly the number of books. `--retail-books` (default 2, `891998b`) draws each
+customer's books with the same exponential weighting the connections use; `--watchers` still takes all of them
+and is the API-customer shape. Running both gives the mix.
+
+### Capacity with customers on the venue
+
+c6i.8xlarge server, separate c6i.8xlarge client, 32 trading connections, 8 API clients on all books, retail on
+two weighted books each, 60-second runs:
+
+| customers | trading msg/s | market data out | per customer | retail order p50 |
+|---|---|---|---|---|
+| 0 | 47,325 | — | — | — |
+| 1,024 | 44,455 (−6%) | 14,989/s | 881 | 3.1ms |
+| 4,096 | 41,502 (−12%) | 53,750/s | 792 | 4.4ms |
+| 16,384 | **36,190 (−24%)** | 174,757/s | 650 | 6.3ms |
+
+No disconnects at any size; 1.1GB resident at 16,384; the client had headroom throughout. **16,384 concurrent
+customers cost about a quarter of the trading rate**, and the gateway was not the limit — one client machine runs
+out of ephemeral ports near 30,000 connections before the venue runs out of anything.
+
+### What is still open
+
+- **`Hub::apply`'s write lock, two thirds of every second.** Untouched, and now the largest known source of
+  order latency. Whatever is done about it, the answer is not this ADR's options.
+- **The fan-out is still 41ms a flush.** Off the critical section, but the reason conflation runs at 7.3 Hz
+  rather than 10. Reaching 10 means a cheaper per-recipient send or spreading it across threads.
+- **Whether market makers can opt out of conflation.** Ten snapshots a second is fine for an app and not for a
+  maker. Trades are already unconflated (`hub.rs:712`, sent from `apply`); only the book is batched. The options
+  are a faster tier for some credentials, an unconflated book subscription, or letting professional flow follow
+  the SBE feed directly. That is a client-contract change and belongs in its own ADR — but it now has a cost
+  basis, and the `Arc<str>` change makes a faster tier considerably cheaper than it would have been.
+
 ## Action Items
 
 1. [x] Implement `RwLock<Hub>` (Option A) for real, verify it compiles clean and the full test suite passes — done, 97/97.
@@ -588,6 +706,24 @@ the scripts that produced and aggregated them.
     `hub::tests::executions_agrees_however_the_results_are_read`) and typed `View::result`, so that no reader
     builds a `Value`; abandoning means removing `Frame`, the typed readers and the harness. What is not
     defensible is leaving it half-done *and* believing it bought something.
-15. [ ] **Re-measure the amend-only and market-data sections on 60-second runs.** Only the trading load was
+15. [x] **Find out what a venue-sized customer population costs** — done. `--retail` models customers who watch
+    and trade rarely, multiplexed over epoll workers so the generator is not the bottleneck, on their own
+    machine. 16,384 concurrent customers cost about a quarter of the trading rate, with no disconnects; the
+    ceiling found was the client's ephemeral ports near 30,000 connections, not the gateway.
+16. [x] **Measure what holds the hub's locks** — done, with two histograms rather than a third guess from
+    reading the code. `Hub::apply` holds the write lock about two thirds of every second with no subscribers
+    at all; the conflate flush grew from 6.7us to 122ms at 16,384 subscribers.
+17. [x] **Take the fan-out off the write lock and stop copying per subscriber** — done (`da43b0a`). Exclusive
+    hold 122ms -> 9.7us, conflation 4.6Hz -> 7.3Hz, retail order p50 13.9ms -> 6.3ms.
+18. [ ] **`Hub::apply`'s write lock.** Two thirds of every second, untouched, and now the largest known source
+    of order latency. Needs its own investigation; neither Option A nor B/C addresses a single writer that
+    wants the lock most of the time.
+19. [ ] **The remaining 41ms fan-out.** Under a read lock now, so it excludes nobody, but it is why conflation
+    runs at 7.3Hz rather than the 10 the interface promises.
+20. [ ] **Decide whether market makers can opt out of conflation.** Ten snapshots a second suits an app and not
+    a maker. Trades are already unconflated; only the book is batched. A faster tier per credential, an
+    unconflated subscription, or letting professional flow follow the SBE feed directly — a client-contract
+    change, so its own ADR.
+21. [ ] **Re-measure the amend-only and market-data sections on 60-second runs.** Only the trading load was
     redone. The amend ladder, the watcher table and the audit-per-amendment figure are all still 8-second
     single samples, and the trading redo showed short runs overstate by about a third.
