@@ -74,6 +74,14 @@ pub struct Config {
     /// 256 subscribers market data looked free (ADR-0002); whether that holds at thousands is the thing this
     /// exists to answer rather than extrapolate.
     pub retail: usize,
+    /// How many books a retail client watches, drawn with the same exponential weighting the connections
+    /// use, so the popular book gets most of the subscribers and the tail gets few.
+    ///
+    /// Retail comes through an app and follows a handful of markets; it was subscribing to every book on the
+    /// venue, which is an API customer's shape, not a customer's. Since the fan-out cost is per subscriber
+    /// per topic, that overstated retail's cost by the number of books and understated the concentration on
+    /// the popular one. `--watchers`, which does subscribe to all of them, is the API-customer shape.
+    pub retail_books: usize,
     /// Workers sharing the retail population, each owning `2 * retail / workers` sockets through epoll.
     /// Defaults to the machine's parallelism, which is the right shape: the work is reading sockets, and one
     /// worker per core with thousands of sockets each is what keeps the cost proportional to the traffic.
@@ -122,13 +130,13 @@ struct Outcome {
 /// Instrument rank `k`'s share of the connection population, out of a population where rank 0 is unscaled:
 /// integer-only (the workspace forbids float arithmetic), halving every rank so the shape is exponential
 /// without needing division to stay proportional.
-fn weight(k: usize) -> u64 {
+pub fn weight(k: usize) -> u64 {
     (1_u64 << 32).checked_shr(k.min(32) as u32).unwrap_or(0).max(1)
 }
 
 /// Draws one instrument, weighted so index 0 is the most popular. `instruments` is assumed ranked
 /// most-popular-first, which is exactly the order `list_instruments` returns them in.
-fn pick_instrument(rng: &mut Rng, instruments: &[u64]) -> u64 {
+pub fn pick_instrument(rng: &mut Rng, instruments: &[u64]) -> u64 {
     let total: u64 = (0..instruments.len()).map(weight).sum();
     let mut at = rng.below(total.max(1));
     for (k, &id) in instruments.iter().enumerate() {
@@ -462,6 +470,7 @@ pub fn run(cfg: Config) -> Result<(), Error> {
             deadline,
             order_every: Duration::from_secs(cfg.retail_order_seconds.max(1)),
             tick: TRADE_TICK,
+            books: cfg.retail_books.max(1),
             workers: cfg.retail_workers.max(1),
         };
         Some(thread::spawn(move || retail::run(pool)))

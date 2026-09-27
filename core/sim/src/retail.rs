@@ -13,6 +13,8 @@
 //! and a logged-in session on the private half. They read the book continuously and send an order every so
 //! often.
 
+use crate::bots::Rng;
+use crate::gwload::pick_instrument;
 use crate::session::{monotonic, Session};
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token};
@@ -44,8 +46,23 @@ pub struct Config {
     pub deadline: Instant,
     pub order_every: Duration,
     pub tick: u64,
+    /// How many books each client watches, weighted so the popular one gets most of them.
+    pub books: usize,
     /// How many workers share the population. Sockets per worker is `2 * tokens / workers`.
     pub workers: usize,
+}
+
+/// One worker's share of the population: its own clients, and the settings they all share.
+struct Plan {
+    public: String,
+    gateway: String,
+    tokens: Vec<String>,
+    instruments: Vec<u64>,
+    deadline: Instant,
+    order_every: Duration,
+    tick: u64,
+    books: usize,
+    seed: u64,
 }
 
 /// One customer, as a worker sees it.
@@ -78,15 +95,23 @@ pub fn run(cfg: Config) -> Result<Outcome, Error> {
     let handles: Vec<_> = cfg
         .tokens
         .chunks(per)
-        .map(|chunk| {
-            let tokens: Vec<String> = chunk.to_vec();
-            let (public, gateway) = (cfg.public.clone(), cfg.gateway.clone());
-            let instruments = cfg.instruments.clone();
-            let (deadline, order_every, tick) = (cfg.deadline, cfg.order_every, cfg.tick);
+        .enumerate()
+        .map(|(chunk_index, chunk)| {
+            let plan = Plan {
+                public: cfg.public.clone(),
+                gateway: cfg.gateway.clone(),
+                tokens: chunk.to_vec(),
+                instruments: cfg.instruments.clone(),
+                deadline: cfg.deadline,
+                order_every: cfg.order_every,
+                tick: cfg.tick,
+                books: cfg.books,
+                // Seeded from where this chunk starts, so a run is reproducible and two workers do not draw
+                // the same books for their first client.
+                seed: (chunk_index * per) as u64 + 1,
+            };
             // Small stacks: a worker holds thousands of sessions but needs almost no stack itself.
-            thread::Builder::new()
-                .stack_size(1024 * 1024)
-                .spawn(move || worker(&public, &gateway, &tokens, &instruments, deadline, order_every, tick))
+            thread::Builder::new().stack_size(1024 * 1024).spawn(move || worker(plan))
         })
         .collect::<std::io::Result<Vec<_>>>()?;
 
@@ -111,26 +136,32 @@ pub fn run(cfg: Config) -> Result<Outcome, Error> {
 
 /// One worker: connect its share, then read whatever epoll says is ready until the deadline.
 #[allow(clippy::too_many_lines)]
-fn worker(
-    public: &str,
-    gateway: &str,
-    tokens: &[String],
-    instruments: &[u64],
-    deadline: Instant,
-    order_every: Duration,
-    tick: u64,
-) -> Result<Outcome, Error> {
+fn worker(plan: Plan) -> Result<Outcome, Error> {
+    let Plan { public, gateway, tokens, instruments, deadline, order_every, tick, books, seed } = plan;
+    let (public, gateway) = (public.as_str(), gateway.as_str());
+    let (tokens, instruments) = (tokens.as_slice(), instruments.as_slice());
     let mut out = Outcome::default();
     let mut poll = Poll::new()?;
     let mut clients: Vec<Option<Client>> = Vec::with_capacity(tokens.len());
-    let topics: Vec<String> = instruments.iter().map(|i| format!("book.{i}")).collect();
-    // The most popular book is where retail is, which is the point of the exponential weighting elsewhere.
+    let mut rng = Rng::new(seed);
+    // Where a retail client trades: the most popular book, which is where retail is.
     let instrument = instruments.first().copied().unwrap_or_default();
 
     // Connecting is blocking: the handshake, the subscribe and the login are all request/response, and
     // spreading the starts a little keeps thousands of logins from arriving as one burst the gateway's
     // logon limit would refuse.
     for (i, token) in tokens.iter().enumerate() {
+        // A few books each, drawn by popularity rather than all of them: an app user follows a handful of
+        // markets. Duplicates are dropped rather than redrawn, so an unlucky client watches fewer -- which is
+        // also true of real ones.
+        let mut chosen: Vec<String> = Vec::with_capacity(books);
+        for _ in 0..books.min(instruments.len()) {
+            let topic = format!("book.{}", pick_instrument(&mut rng, instruments));
+            if !chosen.contains(&topic) {
+                chosen.push(topic);
+            }
+        }
+        let topics = chosen;
         let connect = || -> Result<Client, Error> {
             let mut market = Session::watch(public)?;
             market.send(&json!({"op": "subscribe", "topics": topics, "depth": 10}))?;

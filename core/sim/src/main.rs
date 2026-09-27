@@ -333,6 +333,7 @@ fn gwload(args: &Args) -> Result<(), Error> {
         orders_per_trade: args.number("orders-per-trade", 10)?,
         retail: usize::try_from(args.number("retail", 0)?)?,
         retail_order_seconds: args.number("retail-order-seconds", 10)?,
+        retail_books: usize::try_from(args.number("retail-books", 2)?)?,
         retail_workers: usize::try_from(
             args.number("retail-workers", std::thread::available_parallelism().map_or(8, |n| n.get() as u64))?,
         )?,
