@@ -53,6 +53,12 @@ pub struct Config {
     pub mode: Mode,
     /// In `Trade`, how many of the connections rest liquidity; the rest take it. Defaults to a quarter.
     pub makers: Option<usize>,
+    /// In `Trade`, how many orders a non-maker connection sends for each one that crosses. 1 means every order
+    /// trades, which was the original behaviour and is far busier in fills than any real venue; 10 (the
+    /// default) means nine rest near the touch and are cancelled again for every one that matches. This decides
+    /// the mix of results the feed carries -- fills against accepts, book levels and cancels -- so it decides
+    /// what a measurement taken on this load is a measurement of.
+    pub orders_per_trade: u64,
     /// Connections that only watch: they subscribe to the book on the *public* half and read what comes. Market
     /// data is served by the other half, with its own hub, feed thread and loops, so a run without any of these
     /// leaves all of that idle and measures only order entry.
@@ -83,6 +89,12 @@ struct Outcome {
     fills: u64,
     /// Messages a watcher was pushed.
     received: u64,
+    /// New orders this connection sent, and how many of them matched anything. Reported as a ratio so a run
+    /// says what mix it actually achieved rather than what it was asked for.
+    orders: u64,
+    traded: u64,
+    /// Cancels sent to pull a resting order before replacing it.
+    cancels: u64,
 }
 
 /// Instrument rank `k`'s share of the connection population, out of a population where rank 0 is unscaled:
@@ -188,6 +200,15 @@ fn drive(gateway: &str, token: &str, instrument: u64, index: usize, deadline: In
     Ok(times)
 }
 
+/// Fills among a reply's executions. `executions` carries every kind -- an `accepted` for an order that
+/// merely rested, a `cancelled`, an `amended` -- so counting the array counts order acknowledgements as
+/// trades. It reported 189,264 "fills" for 80,233 taker orders that can each match at most once.
+fn fills_in(reply: &Value) -> u64 {
+    reply["result"]["executions"]
+        .as_array()
+        .map_or(0, |e| e.iter().filter(|x| x["type"] == json!("fill")).count() as u64)
+}
+
 /// A maker's run: rest a sell the takers can hit, then keep amending it back up to size. The amend is both the
 /// request being measured and how the book is replenished, so the liquidity never runs out from under the takers.
 fn drive_maker(gateway: &str, token: &str, instrument: u64, index: usize, deadline: Instant) -> Result<Outcome, Error> {
@@ -224,31 +245,85 @@ fn drive_maker(gateway: &str, token: &str, instrument: u64, index: usize, deadli
             again["id"] = json!(format!("remake{index}"));
             let _ = session.request(again)?;
         }
-        out.fills += reply["result"]["executions"].as_array().map_or(0, |e| e.len() as u64);
+        out.fills += fills_in(&reply);
     }
     Ok(out)
 }
 
-/// A taker's run: cross the makers' price, immediate-or-cancel so nothing of it ever rests. Every request that
-/// finds liquidity is a fill, which is the whole point -- matching, executions, and the sleeve and position
-/// updates that follow, none of which the amend-only measurement has.
-fn drive_taker(gateway: &str, token: &str, instrument: u64, index: usize, deadline: Instant) -> Result<Outcome, Error> {
+/// A taker's run: mostly quoting near the touch without trading, crossing once every `orders_per_trade`.
+///
+/// The first cut of this crossed on *every* request, so the load was one order to one trade at a single price
+/// level. That is not what a venue carries: the great majority of what reaches an exchange rests, is amended
+/// or is cancelled, and only a small fraction ever matches. It also quietly decides what is being measured,
+/// because the results differ per message -- a trade means two `Fill`s, two accounts and their positions and
+/// sleeves, while a resting order means an `OrderAccepted` and a `BookLevelChanged`. Measuring the feed path
+/// on a one-to-one load weights it towards fills far past anything real (ADR-0002).
+///
+/// So: `orders_per_trade - 1` post-only buys a tick or three behind the makers' ask, each cancelled before the
+/// next goes on, then one immediate-or-cancel at the ask that actually trades. The passive orders sit at three
+/// ticks rather than one so the book has depth to move rather than a single level toggling.
+///
+/// The achieved ratio is counted and reported rather than assumed, because whether an order rests or trades is
+/// the venue's decision, not this harness's.
+fn drive_taker(
+    gateway: &str,
+    token: &str,
+    instrument: u64,
+    index: usize,
+    deadline: Instant,
+    orders_per_trade: u64,
+) -> Result<Outcome, Error> {
     let (mut session, _welcome) = Session::open(gateway, token, 30)?;
     let mut ids = Ids::new('t')?;
     let mut out = Outcome::default();
+    let mut n: u64 = 0;
+    // The passive order currently resting, to be pulled before the next one goes on.
+    let mut resting: Option<String> = None;
     while now() < deadline {
-        let mut take = json!({
-            "op": "order", "clientOrderId": ids.fresh(), "instrumentId": instrument.to_string(), "action": "buy",
-            "outcome": "yes", "price": {"tick": TRADE_TICK}, "quantity": 1, "timeInForce": "IOC"
-        });
-        take["id"] = json!(format!("take{index}"));
+        n += 1;
+        let crossing = orders_per_trade <= 1 || n.is_multiple_of(orders_per_trade);
+        let order = if crossing {
+            json!({
+                "op": "order", "clientOrderId": ids.fresh(), "instrumentId": instrument.to_string(),
+                "action": "buy", "outcome": "yes", "price": {"tick": TRADE_TICK}, "quantity": 1,
+                "timeInForce": "IOC"
+            })
+        } else {
+            // A tick or three behind the ask, so it rests instead of matching. Post-only, so if it ever would
+            // cross the venue rejects it rather than silently turning this into another trade.
+            let tick = TRADE_TICK - 1 - (n % 3);
+            json!({
+                "op": "order", "clientOrderId": ids.fresh(), "instrumentId": instrument.to_string(),
+                "action": "buy", "outcome": "yes", "price": {"tick": tick}, "quantity": 1, "postOnly": true
+            })
+        };
+        let mut order = order;
+        order["id"] = json!(format!("take{index}"));
         let t0 = now();
-        let reply = session.request(take)?;
+        let reply = session.request(order)?;
         out.times.push(t0.elapsed().as_nanos() as u64);
         if reply["type"] == "error" {
             return Err(format!("taker {index}: order refused: {reply}").into());
         }
-        out.fills += reply["result"]["executions"].as_array().map_or(0, |e| e.len() as u64);
+        out.orders += 1;
+        let filled = fills_in(&reply);
+        out.fills += filled;
+        if filled > 0 {
+            out.traded += 1;
+        }
+        if !crossing {
+            // Pull the previous one and remember this one, so the book churns near the touch instead of
+            // growing until the group's order capacity stops the run.
+            if let Some(previous) = resting.replace(reply["result"]["orderId"].as_str().unwrap_or_default().to_string())
+            {
+                if !previous.is_empty() {
+                    let t1 = now();
+                    let _ = session.request(json!({"op": "cancel", "orderId": previous}))?;
+                    out.times.push(t1.elapsed().as_nanos() as u64);
+                    out.cancels += 1;
+                }
+            }
+        }
     }
     Ok(out)
 }
@@ -308,7 +383,7 @@ pub fn run(cfg: Config) -> Result<(), Error> {
                 None => cfg.token.clone(),
             };
             let (gateway, instruments) = (cfg.gateway.clone(), instruments.clone());
-            let (mode, makers) = (cfg.mode, makers);
+            let (mode, makers, orders_per_trade) = (cfg.mode, makers, cfg.orders_per_trade.max(1));
             thread::spawn(move || {
                 // Seeded from the connection index, so a run is reproducible.
                 let mut rng = Rng::new(i as u64 + 1);
@@ -318,7 +393,7 @@ pub fn run(cfg: Config) -> Result<(), Error> {
                         .map(|times| Outcome { times, ..Outcome::default() }),
                     // Makers first, so the liquidity is resting before the takers start on it.
                     Mode::Trade if i < makers => drive_maker(&gateway, &token, instrument, i, deadline),
-                    Mode::Trade => drive_taker(&gateway, &token, instrument, i, deadline),
+                    Mode::Trade => drive_taker(&gateway, &token, instrument, i, deadline, orders_per_trade),
                 }
                 .map_err(|e| e.to_string())
             })
@@ -335,10 +410,14 @@ pub fn run(cfg: Config) -> Result<(), Error> {
 
     let mut all = Vec::new();
     let (mut fills, mut received) = (0_u64, 0_u64);
+    let (mut orders, mut traded, mut cancels) = (0_u64, 0_u64, 0_u64);
     for h in handles {
         let out = h.join().map_err(|_| Error::from("a connection thread panicked"))??;
         all.extend(out.times);
         fills += out.fills;
+        orders += out.orders;
+        traded += out.traded;
+        cancels += out.cancels;
     }
     for h in watching {
         let out = h.join().map_err(|_| Error::from("a watcher thread panicked"))??;
@@ -365,6 +444,10 @@ pub fn run(cfg: Config) -> Result<(), Error> {
     );
     if cfg.mode == Mode::Trade {
         print!("; {makers} maker(s), {fills} fills, {} fills/s", u128::from(fills) * 1000 / elapsed_ms);
+        // What mix the run actually got, not what it was asked for: whether an order rests or matches is the
+        // venue's decision. `1:N` reads as one order in N having traded.
+        let ratio = orders.checked_div(traded).unwrap_or(orders);
+        print!("; {orders} taker orders, {traded} traded (1:{ratio}), {cancels} cancels");
     }
     if cfg.watchers > 0 {
         print!(

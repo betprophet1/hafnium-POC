@@ -329,6 +329,7 @@ fn gwload(args: &Args) -> Result<(), Error> {
             Some(m) => Some(usize::try_from(m.parse::<u64>().map_err(|e| format!("--makers: {e}"))?)?),
             None => None,
         },
+        orders_per_trade: args.number("orders-per-trade", 10)?,
         watchers: usize::try_from(args.number("watchers", 0)?)?,
         public_gateway: args.optional("public-gateway").filter(|a| !a.is_empty()),
     };
