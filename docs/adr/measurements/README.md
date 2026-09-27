@@ -16,6 +16,8 @@ checkable against what was actually run. Everything here is from a throwaway c6i
 | `sweep-epoll.txt`, `sweep-books.txt` | Retail population sweeps from a separate client machine: the first with every customer on all eight books, the second with the corrected model (retail on two weighted books, eight API clients on all of them). |
 | `sweep-2host.txt` | The same before the epoll client, kept because its `client_load` column is what showed the generator, not the gateway, was the limit. |
 | `lockdelta-16384.txt`, `lockdelta-16384-after.txt`, `lockdelta-books.txt` | Lock cost as before/after deltas over one 60s run: conflate hold, fan-out, read wait and feed-apply. In order: before the fan-out fix, after it, and after the subscription model was corrected too. |
+| `conflate-profile.txt` | `perf` on the public `gw-conflate` thread at 16,384 subscribers: the profile that found `eventfd_write` at 51.7% and cleared the btree lookup of suspicion. |
+| `lockdelta-wake.txt` | Lock cost after the wake coalescing: fan-out 10.7ms, conflation 9.2/s. |
 | `retail.txt` | The first retail sweep, with the generator and the gateway sharing one box. Client-bound above ~1,024; kept only because the corrections reference it. |
 
 ## The scripts

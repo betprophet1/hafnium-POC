@@ -1,0 +1,13 @@
+1 connection(s) over 8 instrument(s), 6894 amendments in 1011 ms: 6818 messages/s; round trip µs p50 138.474 p90 152.058 p99 177.562 p99.9 862.526 max 1028.359
+32 connection(s) over 8 instrument(s), 2535194 requests in 60922 ms: 41613 messages/s; round trip µs p50 513.934 p90 925.225 p99 4731.580 p99.9 12654.367 max 210992.260; 8 maker(s), 68523 fills, 1124 fills/s; 961598 taker orders, 68523 traded (1:14), 865427 cancels; 16384 retail took 13535912 messages, 222184/s (826 each), sent 96649 orders, 96575 fills, p50 4125.523 p99 56251.326, 0 dropped; 8 watcher(s) took 17340 messages, 284/s
+--- lock cost over one 60s run at retail=16384 ---
+  conflate_hold  public   n=      554  mean       8.6us  total    0.00s  =    0.0% of wall time
+  conflate_hold  private  n=      613  mean      26.6us  total    0.02s  =    0.0% of wall time
+  conflate_publish public   n=      554  mean   10743.9us  total    5.95s  =    9.9% of wall time
+  conflate_publish private  n=      613  mean      50.5us  total    0.03s  =    0.1% of wall time
+  hub_read_wait  public   n=      554  mean       3.8us  total    0.00s  =    0.0% of wall time
+  hub_read_wait  private  n=  4238892  mean      40.5us  total  171.82s  =  286.4% of wall time
+  feed_apply     public   n=  2648275  mean      10.8us  total   28.50s  =   47.5% of wall time
+  feed_apply     private  n=  2648275  mean      15.1us  total   40.12s  =   66.9% of wall time
+
+[exited with code 0]

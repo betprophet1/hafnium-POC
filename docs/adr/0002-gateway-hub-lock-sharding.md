@@ -644,12 +644,84 @@ No disconnects at any size; 1.1GB resident at 16,384; the client had headroom th
 customers cost about a quarter of the trading rate**, and the gateway was not the limit — one client machine runs
 out of ephemeral ports near 30,000 connections before the venue runs out of anything.
 
+### Waking: half the fan-out was syscalls
+
+With the copy and the lock dealt with, a flush was still 41ms, and conflation ran at 7.3 flushes a second
+rather than ten. Profiling the public `gw-conflate` thread at 16,384 subscribers said where it went, and it was
+not where reading `send_to_topic` suggested:
+
+| | inclusive | self |
+|---|---|---|
+| `write` (libc) | 60.8% | 1.1% |
+| → `ksys_write` → `vfs_write` → **`eventfd_write`** | **51.7%** | 0.4% |
+| → `_raw_spin_unlock_irq` | 50.9% | **47.6%** |
+| `Outbox::put` | 24.2% | 24.2% |
+| `send<Queued>` (inlined) | 4.3% | — |
+
+Not one btree symbol: the per-subscriber `sessions` lookup, which was the suspicion going in, does not appear.
+Neither does the channel node allocation, at 4.3%. **Over half of a flush was waking reactor threads, one
+`eventfd` write at a time.**
+
+`Shared::nudge` does coalesce — it writes only if no wake is outstanding — but the loop clears `woken` *before*
+it processes its work (`reactor.rs:249`), which is right for liveness: anything queued after that point must
+wake it again. The guarantee is therefore one wake per loop per poll iteration, not one per flush. A loop busy
+draining a fan-out re-arms on every pass, and the sender takes another syscall each time. The comment at
+`reactor.rs:11` — a book reaching five thousand subscribers costs each loop one wakeup, not five thousand — is
+true of a quiet loop and not of one in the middle of a flush.
+
+Coalescing at the sender is the contained fix; the alternative, clearing `woken` only immediately before
+blocking, is a correctness-sensitive edit to the reactor's check-then-block.
+
+**The first attempt was wrong, and wrong in a way worth recording.** It deduplicated the deferred wakes on
+`Outbox::notify`, on the assumption that this was the loop's waker. It is not: `take_on` builds it per
+connection, as `Arc::new(move || shared.ready(token))` capturing that connection's token. So `Arc::ptr_eq`
+never matched, the list grew to one entry per subscriber, and the scan went quadratic — about 134 million
+pointer comparisons at 16,384 subscribers. The flush went from 41ms to **180ms**, conflation to 3.7/s, and
+market data per customer from 644 to 314. It was committed before it was measured (`02cea37`), and the test
+did not catch it because it gave every session the same closure, which made the mistake invisible.
+
+The decomposition it missed: marking a connection ready is per connection, waking its loop is per loop.
+`Shared` now holds one `wake` — its own nudge, built with `Arc::new_cyclic` so every connection on that loop
+shares the same `Arc` — and `take_on` hands each `Outbox` both halves (`0e65299`). `a_topic_wakes_each_loop_
+once_however_many_subscribe` now builds the pair the way the reactor does, and fails if the deduplication goes
+back to the per-connection closure.
+
+### Where the fan-out ended up
+
+16,384 customers, retail on two weighted books, eight API clients on all of them, 60-second runs:
+
+| | at the start | `Arc` + read lock | + coalesced wakes |
+|---|---|---|---|
+| conflate write-lock hold | 122,473µs | 18.5µs | **8.6µs** |
+| fan-out, under a read lock | — | 41,017µs | **10,744µs** |
+| flushes per 60s | 276 (4.6/s) | 435 (7.3/s) | **554 (9.2/s)** |
+| retail order p50 | 13.9ms | 7.8ms | **4.1ms** |
+| public `feed_apply` | 22.3µs | 15.8µs | **10.8µs** |
+
+The exclusive hold is gone as a factor, the fan-out is a quarter of what it was, and conflation runs at 9.2
+flushes a second against the ten the interface promises. A customer's order comes back in 4.1ms where it took
+13.9ms.
+
+**What none of it touched:** `hub_read_wait` on the private half is 40.5µs, where it started. That is
+`Hub::apply` holding the private write lock **67% of every second**, and it is now the largest known source of
+order latency by a distance.
+
+### On method
+
+Four mechanisms were named from reading the code in this stretch — the double decode, the conflate lock at zero
+subscribers, the per-subscriber map lookup, and the per-connection waker — and all four were wrong. Every
+histogram and profile was right. The fan-out work only converged because each step was measured before the next
+was designed, and the one step that skipped that (`02cea37`) is the one that regressed by 4.4x. Anything
+proposed for `Hub::apply` should be profiled first.
+
 ### What is still open
 
-- **`Hub::apply`'s write lock, two thirds of every second.** Untouched, and now the largest known source of
-  order latency. Whatever is done about it, the answer is not this ADR's options.
-- **The fan-out is still 41ms a flush.** Off the critical section, but the reason conflation runs at 7.3 Hz
-  rather than 10. Reaching 10 means a cheaper per-recipient send or spreading it across threads.
+- **`Hub::apply`'s write lock, two thirds of every second.** Still untouched after the fan-out work, still
+  40.5µs of read wait, and now the largest known source of order latency by a distance. Whatever is done about
+  it, the answer is not this ADR's options — and on this ADR's record it should be profiled before it is
+  designed.
+- ~~**The fan-out is still 41ms a flush.**~~ Done: 10.7ms, and conflation at 9.2 Hz. What remains of it is
+  `Outbox::put` itself, which at 24% of the profile is the irreducible part and would need threads to divide.
 - **Whether market makers can opt out of conflation.** Ten snapshots a second is fine for an app and not for a
   maker. Trades are already unconflated (`hub.rs:712`, sent from `apply`); only the book is batched. The options
   are a faster tier for some credentials, an unconflated book subscription, or letting professional flow follow
