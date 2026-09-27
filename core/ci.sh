@@ -69,7 +69,12 @@ step "Rust: format and lints on handwritten crates; build and test the workspace
 (cd "$CORE" && cargo fmt --check "${HANDWRITTEN[@]}" -p proto-l3book -p proto-maskbench)
 (cd "$CORE" && cargo clippy "${HANDWRITTEN[@]}" --all-targets -- -D warnings)
 (cd "$CORE" && cargo clippy -p venue-engine --features dry-run-oracle -- -D warnings)
-(cd "$CORE" && cargo test --workspace)
+# Each gateway test starts a node of its own -- a full audit-writing Hub and feed, several threads apiece -- and
+# libtest runs as many of one binary's tests concurrently as the machine has cores unless told otherwise. Left
+# unbounded on a memory-constrained machine, that grew the gateway test binary to 8GB resident and got it
+# OOM-killed, taking two unrelated processes on the same machine down with it. Defaulted here rather than left
+# as advice to remember by hand; a caller with room can still raise it.
+(cd "$CORE" && RUST_TEST_THREADS="${RUST_TEST_THREADS:-4}" cargo test --workspace)
 
 step "Rust engine against normative scenarios and differential vectors"
 # With the oracle, every fill check (E-10.9) is answered twice and a disagreement fails the run.
