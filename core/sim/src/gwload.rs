@@ -78,7 +78,12 @@ pub enum Mode {
 /// other rather than whatever else the venue happens to be carrying.
 const TRADE_TICK: u64 = 50;
 /// What a maker keeps resting, in contracts. Amended back up to this, so the book never empties under takers.
-const MAKER_SIZE: u64 = 1_000_000;
+///
+/// Sized to what the takers actually consume between amends, not to "large". It was 1,000,000, which at tick
+/// 50 reserves about half of a load account's 100,000,000 cents; a maker re-posting before the previous order
+/// was fully out then hit `insufficient_sleeve` and killed the run. Eight-second runs never reached it, which
+/// is its own argument for measuring over a minute.
+const MAKER_SIZE: u64 = 10_000;
 
 /// What one connection did, so a run can report fills and messages as well as round trips.
 #[derive(Default)]
@@ -411,13 +416,30 @@ pub fn run(cfg: Config) -> Result<(), Error> {
     let mut all = Vec::new();
     let (mut fills, mut received) = (0_u64, 0_u64);
     let (mut orders, mut traded, mut cancels) = (0_u64, 0_u64, 0_u64);
+    // A connection the gateway hangs up on is a result, not a reason to throw the run away. It disconnects a
+    // client that falls too far behind what it has been queued, and a maker taking thousands of executions a
+    // second is a genuine slow consumer of its own fills. Count them, report them, and measure the rest --
+    // failing the whole run here means a 60-second measurement is lost to one dropped session.
+    let mut dropped = 0_usize;
+    let mut first_error: Option<String> = None;
     for h in handles {
-        let out = h.join().map_err(|_| Error::from("a connection thread panicked"))??;
-        all.extend(out.times);
-        fills += out.fills;
-        orders += out.orders;
-        traded += out.traded;
-        cancels += out.cancels;
+        match h.join().map_err(|_| Error::from("a connection thread panicked"))? {
+            Ok(out) => {
+                all.extend(out.times);
+                fills += out.fills;
+                orders += out.orders;
+                traded += out.traded;
+                cancels += out.cancels;
+            }
+            Err(e) => {
+                dropped += 1;
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    if all.is_empty() {
+        let why = first_error.unwrap_or_else(|| "no connection completed".into());
+        return Err(format!("every connection failed; first: {why}").into());
     }
     for h in watching {
         let out = h.join().map_err(|_| Error::from("a watcher thread panicked"))??;
@@ -448,6 +470,9 @@ pub fn run(cfg: Config) -> Result<(), Error> {
         // venue's decision. `1:N` reads as one order in N having traded.
         let ratio = orders.checked_div(traded).unwrap_or(orders);
         print!("; {orders} taker orders, {traded} traded (1:{ratio}), {cancels} cancels");
+    }
+    if dropped > 0 {
+        print!("; {dropped} connection(s) dropped: {}", first_error.as_deref().unwrap_or(""));
     }
     if cfg.watchers > 0 {
         print!(
