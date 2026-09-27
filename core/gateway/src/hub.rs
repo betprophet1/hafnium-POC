@@ -321,6 +321,13 @@ pub struct Queued {
     pub derived: Option<Derived>,
 }
 
+/// Whether `put` wakes the loop serving the session, or leaves that to the caller (`send_deferred`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    Now,
+    Deferred,
+}
+
 /// Where a session's messages go: its queue, and a way to tell whatever serves the session that something is waiting
 /// there, so nothing has to keep looking.
 #[derive(Clone)]
@@ -362,7 +369,26 @@ impl Outbox {
     }
 
     pub fn send(&self, message: impl Into<Arc<str>>) -> Result<(), SendError<Queued>> {
-        self.put(Queued { text: message.into(), derived: None })
+        self.put(Queued { text: message.into(), derived: None }, Wake::Now)
+    }
+
+    /// Queue without waking the loop that serves this session, for a caller fanning one message out to many
+    /// sessions: it wakes each loop once at the end instead of once per session.
+    ///
+    /// Waking is a write to the loop's eventfd, and the coalescing in `Shared::nudge` only holds while a wake
+    /// is outstanding -- a loop clears that flag before it processes its work, so a loop busy draining a
+    /// fan-out re-arms on every pass and takes another syscall each time. Over half of a 41ms flush at
+    /// sixteen thousand subscribers was `eventfd_write` (ADR-0002, docs/adr/measurements/conflate-profile.txt).
+    ///
+    /// The caller **must** call `notifier` for every session it defers, or the message waits for that loop's
+    /// next timeout.
+    pub fn send_deferred(&self, message: impl Into<Arc<str>>) -> Result<(), SendError<Queued>> {
+        self.put(Queued { text: message.into(), derived: None }, Wake::Deferred)
+    }
+
+    /// How to wake the loop serving this session, for a caller that deferred.
+    pub fn notifier(&self) -> &Notify {
+        &self.notify
     }
 
     /// A frame rendered from the results of `sequence`, which the journal holds.
@@ -372,10 +398,10 @@ impl Outbox {
         kind: &'static str,
         sequence: u64,
     ) -> Result<(), SendError<Queued>> {
-        self.put(Queued { text: message.into(), derived: Some(Derived { kind, sequence }) })
+        self.put(Queued { text: message.into(), derived: Some(Derived { kind, sequence }) }, Wake::Now)
     }
 
-    fn put(&self, message: Queued) -> Result<(), SendError<Queued>> {
+    fn put(&self, message: Queued, wake: Wake) -> Result<(), SendError<Queued>> {
         // Past the limit the session is already on its way out, so holding more for it only grows what the
         // gateway cannot send. The message is dropped rather than queued; a client that reconnects resumes from
         // `history`, which says through what it missed (`since`, `dropped_through`).
@@ -384,13 +410,19 @@ impl Outbox {
             || self.behind.load(Ordering::Relaxed).saturating_add(bytes) > self.max_behind
         {
             self.over.store(true, Ordering::Relaxed);
-            (self.notify)();
+            // Still deferred if the caller asked: it will wake this loop with the rest, and a session on its
+            // way out does not need waking sooner than the others.
+            if wake == Wake::Now {
+                (self.notify)();
+            }
             return Ok(());
         }
         self.queue.send(message)?;
         self.waiting.fetch_add(1, Ordering::Relaxed);
         self.behind.fetch_add(bytes, Ordering::Relaxed);
-        (self.notify)();
+        if wake == Wake::Now {
+            (self.notify)();
+        }
         Ok(())
     }
 
@@ -892,10 +924,22 @@ impl Hub {
     /// One message, every subscriber. The `Arc` is the point: this runs once per topic per flush over every
     /// session subscribed to it, so a copy here is a copy per subscriber.
     fn send_to_topic(&self, topic: &str, message: &Arc<str>) {
+        // One wake per loop, not per subscriber. There are a handful of loops and thousands of subscribers,
+        // so the scan for "have I already got this one" is a few pointer comparisons against a syscall.
+        let mut loops: Vec<&Notify> = Vec::new();
         for key in self.by_topic.get(topic).into_iter().flatten() {
             if let Some(s) = self.sessions.get(key) {
-                let _ = s.tx.send(Arc::clone(message));
+                let _ = s.tx.send_deferred(Arc::clone(message));
+                let notify = s.tx.notifier();
+                if !loops.iter().any(|seen| Arc::ptr_eq(seen, notify)) {
+                    loops.push(notify);
+                }
             }
+        }
+        // Per topic rather than per flush: a flush is every book that moved, and holding the first topic's
+        // messages until the last one had been fanned out would add the whole flush to their delay.
+        for notify in loops {
+            notify();
         }
     }
 
@@ -1499,5 +1543,55 @@ mod tests {
             "priced from what the accept said, since the view has no such order: {:?}",
             cancelled_701.1
         );
+    }
+
+    /// Everyone subscribed gets the message, and each loop is woken once rather than once per subscriber.
+    ///
+    /// Waking is an `eventfd` write, and over half of a 41ms flush at sixteen thousand subscribers was those
+    /// syscalls (ADR-0002). `send_to_topic` therefore queues without waking and wakes each loop at the end,
+    /// which makes a forgotten wake a message that sits until the loop's next timeout rather than an error.
+    /// Both halves of that are asserted here: the delivery, and the count.
+    #[test]
+    fn a_topic_wakes_each_loop_once_however_many_subscribe() {
+        let mut hub = hub();
+        // Two loops, five sessions: four on the first and one on the second, as a reactor pool would have it.
+        let woken = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+        let notifies: Vec<Notify> = woken
+            .iter()
+            .map(|count| {
+                let count = Arc::clone(count);
+                Arc::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }) as Notify
+            })
+            .collect();
+
+        let mut receivers = Vec::new();
+        for i in 0..5 {
+            let (tx, rx) = mpsc::channel();
+            let loop_of = usize::from(i == 4);
+            let key = hub.add_session(Outbox::new(tx, Arc::clone(&notifies[loop_of])));
+            hub.subscribe(key, &["book.10010".to_string()], 10);
+            receivers.push(rx);
+        }
+        // Subscribing sends each session the book as it stands, which is a wake of its own; only what the
+        // flush does is under test.
+        for count in &woken {
+            count.store(0, Ordering::SeqCst);
+        }
+        for rx in &receivers {
+            while rx.try_recv().is_ok() {}
+        }
+
+        hub.dirty.entry(10_010).or_default().insert((true, 40), (250, 2));
+        let (dirty, sequence) = hub.take_dirty();
+        hub.publish_books(dirty, sequence);
+
+        for (i, rx) in receivers.iter().enumerate() {
+            let got = rx.try_recv().expect("every subscriber is sent the book that moved");
+            assert!(got.text.contains("\"type\":\"book\""), "subscriber {i} got {}", got.text);
+        }
+        assert_eq!(woken[0].load(Ordering::SeqCst), 1, "the loop with four subscribers is woken once");
+        assert_eq!(woken[1].load(Ordering::SeqCst), 1, "and the loop with one, once");
     }
 }
