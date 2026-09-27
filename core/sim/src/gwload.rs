@@ -63,6 +63,18 @@ pub struct Config {
     /// data is served by the other half, with its own hub, feed thread and loops, so a run without any of these
     /// leaves all of that idle and measures only order entry.
     pub watchers: usize,
+    /// Retail clients: the population a venue actually has most of. Each holds a market-data subscription on
+    /// the public half *and* a logged-in session on the private half, reads the book continuously, and sends
+    /// one order every `retail_order_seconds`. Two sockets each, which is what a real client costs.
+    ///
+    /// This is a different question from `connections`. Order entry is dominated by a handful of makers, but
+    /// conflation caps a topic's *rate*, not its *fan-out*: every one of the ten snapshots a second is copied
+    /// to every subscriber, so the outbound work is linear in this number while the inbound work is not. At
+    /// 256 subscribers market data looked free (ADR-0002); whether that holds at thousands is the thing this
+    /// exists to answer rather than extrapolate.
+    pub retail: usize,
+    /// How often a retail client sends an order. Mostly listening means this is seconds, not milliseconds.
+    pub retail_order_seconds: u64,
     /// Where the public half is, for `watchers`. Defaults to `gateway`, which is right when one process serves
     /// both halves.
     pub public_gateway: Option<String>,
@@ -335,6 +347,68 @@ fn drive_taker(
 
 /// A watcher's run: subscribe to the book on the public half and read what the gateway pushes. Sends nothing
 /// after the subscription, so what it costs the gateway is the conflated fan-out rather than order entry.
+/// A retail client: listens to the book, and now and then trades.
+///
+/// Both halves at once, from one thread, because that is what one customer is -- a market-data subscription
+/// and a session that can send an order -- and because the interesting cost is the pair. The thread spends
+/// almost all of its time blocked in the market-data read, so thousands of these are cheap on the client side
+/// provided their stacks are small; `spawn_small` is what makes that true.
+fn drive_retail(
+    public: &str,
+    gateway: &str,
+    token: &str,
+    instruments: &[u64],
+    deadline: Instant,
+    order_every: Duration,
+    tick: u64,
+) -> Result<Outcome, Error> {
+    let mut market = Session::watch(public)?;
+    let topics: Vec<String> = instruments.iter().map(|i| format!("book.{i}")).collect();
+    market.send(&json!({"op": "subscribe", "topics": topics, "depth": 10}))?;
+    let (mut session, _welcome) = Session::open(gateway, token, 30)?;
+    let mut ids = Ids::new('r')?;
+    let mut out = Outcome::default();
+    let mut last_order = now();
+    // One book each, the most popular by construction: retail follows the crowd, and spreading these evenly
+    // would contradict the whole point of the exponential weighting.
+    let instrument = instruments.first().copied().unwrap_or_default();
+    while now() < deadline {
+        out.received += market.poll(Duration::from_millis(50))?.len() as u64;
+        if last_order.elapsed() < order_every {
+            continue;
+        }
+        last_order = now();
+        let mut order = json!({
+            "op": "order", "clientOrderId": ids.fresh(), "instrumentId": instrument.to_string(),
+            "action": "buy", "outcome": "yes", "price": {"tick": tick}, "quantity": 1, "timeInForce": "IOC"
+        });
+        order["id"] = json!("retail");
+        let t0 = now();
+        let reply = session.request(order)?;
+        out.times.push(t0.elapsed().as_nanos() as u64);
+        if reply["type"] == "error" {
+            return Err(format!("retail order refused: {reply}").into());
+        }
+        out.orders += 1;
+        let filled = fills_in(&reply);
+        out.fills += filled;
+        if filled > 0 {
+            out.traded += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// A thread with a small stack. The default is 8 MiB of reserved address space each, which is fine for tens of
+/// threads and not for tens of thousands; these block on a socket read and need almost none of it.
+fn spawn_small<F, T>(f: F) -> std::io::Result<thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    thread::Builder::new().stack_size(256 * 1024).spawn(f)
+}
+
 fn drive_watcher(public: &str, instruments: &[u64], deadline: Instant) -> Result<Outcome, Error> {
     let mut market = Session::watch(public)?;
     let topics: Vec<String> = instruments.iter().map(|i| format!("book.{i}")).collect();
@@ -409,9 +483,27 @@ pub fn run(cfg: Config) -> Result<(), Error> {
     let watching: Vec<_> = (0..cfg.watchers)
         .map(|_| {
             let (public, instruments) = (public.clone(), instruments.clone());
-            thread::spawn(move || drive_watcher(&public, &instruments, deadline).map_err(|e| e.to_string()))
+            spawn_small(move || drive_watcher(&public, &instruments, deadline).map_err(|e| e.to_string()))
         })
-        .collect();
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    // Retail accounts come after the trading connections in the catalogue, so the two populations never share
+    // one: `venue-sim catalogue --accounts N` must have been given at least `connections + retail`.
+    let retailing: Vec<_> = (0..cfg.retail)
+        .map(|i| {
+            let (public, gateway) = (public.clone(), cfg.gateway.clone());
+            let instruments = instruments.clone();
+            let token = match &cfg.token_prefix {
+                Some(prefix) => format!("{prefix}{}", cfg.connections + i),
+                None => cfg.token.clone(),
+            };
+            let every = Duration::from_secs(cfg.retail_order_seconds.max(1));
+            spawn_small(move || {
+                drive_retail(&public, &gateway, &token, &instruments, deadline, every, TRADE_TICK)
+                    .map_err(|e| e.to_string())
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
 
     let mut all = Vec::new();
     let (mut fills, mut received) = (0_u64, 0_u64);
@@ -445,6 +537,25 @@ pub fn run(cfg: Config) -> Result<(), Error> {
         let out = h.join().map_err(|_| Error::from("a watcher thread panicked"))??;
         received += out.received;
     }
+    // Retail is reported apart from the trading connections: mixing a client that sends one order every few
+    // seconds into the same latency pool as a maker sending thousands would hide both.
+    let mut retail_times = Vec::new();
+    let (mut retail_orders, mut retail_fills, mut retail_dropped) = (0_u64, 0_u64, 0_usize);
+    let mut retail_received = 0_u64;
+    for h in retailing {
+        match h.join().map_err(|_| Error::from("a retail thread panicked"))? {
+            Ok(out) => {
+                retail_received += out.received;
+                retail_times.extend(out.times);
+                retail_orders += out.orders;
+                retail_fills += out.fills;
+            }
+            Err(e) => {
+                retail_dropped += 1;
+                first_error.get_or_insert(e);
+            }
+        }
+    }
     let elapsed_ms = started.elapsed().as_millis().max(1);
     all.sort_unstable();
     let p = |q: usize| micros(all.get(all.len().saturating_sub(1) * q / 100_000).copied().unwrap_or(0));
@@ -470,6 +581,23 @@ pub fn run(cfg: Config) -> Result<(), Error> {
         // venue's decision. `1:N` reads as one order in N having traded.
         let ratio = orders.checked_div(traded).unwrap_or(orders);
         print!("; {orders} taker orders, {traded} traded (1:{ratio}), {cancels} cancels");
+    }
+    if cfg.retail > 0 {
+        retail_times.sort_unstable();
+        let rp = |q: usize| {
+            micros(retail_times.get(retail_times.len().saturating_sub(1) * q / 100_000).copied().unwrap_or(0))
+        };
+        // The market data they were pushed is the number this role exists to produce: conflation caps a
+        // topic's rate, not its fan-out, so this is the term that grows with the population.
+        print!(
+            "; {} retail took {retail_received} messages, {}/s ({} each), sent {retail_orders} orders, \
+             {retail_fills} fills, p50 {} p99 {}, {retail_dropped} dropped",
+            cfg.retail,
+            u128::from(retail_received) * 1000 / elapsed_ms,
+            retail_received / (cfg.retail.max(1) as u64),
+            rp(50_000),
+            rp(99_000)
+        );
     }
     if dropped > 0 {
         print!("; {dropped} connection(s) dropped: {}", first_error.as_deref().unwrap_or(""));

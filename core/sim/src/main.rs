@@ -330,6 +330,8 @@ fn gwload(args: &Args) -> Result<(), Error> {
             None => None,
         },
         orders_per_trade: args.number("orders-per-trade", 10)?,
+        retail: usize::try_from(args.number("retail", 0)?)?,
+        retail_order_seconds: args.number("retail-order-seconds", 10)?,
         watchers: usize::try_from(args.number("watchers", 0)?)?,
         public_gateway: args.optional("public-gateway").filter(|a| !a.is_empty()),
     };
