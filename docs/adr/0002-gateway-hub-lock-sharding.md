@@ -1,15 +1,34 @@
 # ADR-0002: Replacing the gateway's global `Mutex<Hub>`
 
 **Status:** Rejected — the premise did not survive measurement. See Prototype Findings.
+**Superseded in part:** several measurements below are retracted; see Retraction 2 and [What a representative
+load says](#what-a-representative-load-says-2026-09-27).
 **Date:** 2026-09-26
 **Deciders:** core/gateway owners (Engineering)
 
-> **Retraction (2026-09-26, after this ADR was drafted).** The Context below argues that `Mutex<Hub>` is the
+> **Retraction 1 (2026-09-26, after this ADR was drafted).** The Context below argues that `Mutex<Hub>` is the
 > gateway's throughput ceiling. Measured on dedicated hardware, it is not: swapping it for an `RwLock` changes
 > throughput by 1–2%, which is noise, and the reactor threads that would contend for it sit ~97% idle. The ceiling
 > is the audit log's `fsync`. The Context is kept as written because the state catalogue in it is still accurate
 > and useful, but its conclusion — and the decision that followed from it — are wrong. Read Prototype Findings
 > first.
+>
+> **Retraction 2 (2026-09-27). Three of the measurements below are wrong, and the load they were taken on was
+> not representative.** In short:
+>
+> 1. **Every `fills/s` figure in this ADR is about 2.4× too high.** The harness counted the length of
+>    `result.executions`, which carries an `accepted` for an order that merely rested, a `cancelled`, an
+>    `amended` — not only fills. Fixed in `2adfa71`.
+> 2. **"Taking `Value` off the feed path" claims −29% / −25% on apply cost. It is not reproducible.** That
+>    measurement was taken between `f16227f` and `b1d2d1e`, exactly the window in which an allow-list bug was
+>    silently dropping `OrderAmended` — so the gateway was skipping work, not doing it faster.
+> 3. **Every trading number was taken on a load where every order traded, at one price level, on one book**,
+>    in 8–10 second runs. A venue carries the opposite shape. Re-measured on a representative load, conclusions
+>    drawn from the old one reverse.
+>
+> The corrected numbers, and what survived, are in **[What a representative load
+> says](#what-a-representative-load-says-2026-09-27)**. Read that section before quoting any figure from this
+> document.
 
 ## Context
 
@@ -241,6 +260,12 @@ shipping (`interfaces/tools/audit_ship.py`) become the binding cost long before 
 
 ## A venue-shaped load: trading, and being watched
 
+> **Superseded (2026-09-27).** This section calls its load "venue-shaped". It is not. Every taker order crossed,
+> so the mix was **one order to one trade**, at **one price level**, on **one book**, in **8-second** runs. A
+> venue is the other way round: most of what arrives rests, is amended or cancelled, and a small fraction
+> matches. The `fills/s` column is additionally inflated ~2.4× by the counter bug. Kept for the record; the
+> replacement is [What a representative load says](#what-a-representative-load-says-2026-09-27).
+
 The two things the amend measurement leaves out, added to `gwload` (`--mode trade`, `--watchers`) and run on the
 same class of machine. Makers rest a large sell and amend it back to size; takers cross it immediate-or-cancel,
 each against a different account, so these are real fills. Watchers subscribe to the book on the public half and
@@ -371,6 +396,17 @@ Two things follow, in increasing order of cost:
 
 ### Taking `Value` off the feed path: measured
 
+> **Retracted (2026-09-27). The −29% / −25% below does not reproduce, and it was measured on a bugged tree.**
+> `f16227f` (19:37) introduced an allow-list that silently dropped `OrderAmended`; this measurement ran
+> 19:41–19:54 and was recorded at 19:55; the bug was fixed at 20:11 in `b1d2d1e`. For the whole measurement
+> window the gateway was not building or sending amend executions at all, so on an amend-heavy sweep it was
+> skipping work rather than doing it faster.
+>
+> Re-measured against `ea4724c` (the commit before this work) with both trees free of that bug, n=3 interleaved,
+> the same apply cost comes out **−1% public / −9% private** on the old sweep, and **−0.1% public / +3.3%
+> private** on a representative load — that is, no effect. See [What a representative load
+> says](#what-a-representative-load-says-2026-09-27).
+
 Done in two steps and measured against the commit before them, same machine, both trees built and run back to
 back. `Unit` now carries the SBE bytes (`wire::Frame`) with the JSON shape decoded only if something asks and
 kept once it has been; `View` reads `OrderAccepted`, `Fill` and `BookLevelChanged` straight out of the generated
@@ -410,6 +446,98 @@ and `rest.rs:85`, on the reactor threads, which sat at ~41% while the feed threa
 could shave those, and there is a redundant re-parse of each outbound frame in `reactor.rs:808` and `:822` worth
 removing first, but neither is the constraint today.
 
+## What a representative load says (2026-09-27)
+
+Everything above measures a load that does not look like a venue, and two of its numbers came from broken
+counting. This section is what replaces them.
+
+### What was wrong with the load
+
+`gwload --mode trade` had makers resting at one tick and takers sending immediate-or-cancel orders at that same
+tick, so **every taker order crossed**: one order to one trade, at a single price level, on a single book,
+measured in 8–10 second runs. Real order flow is the other way round — the great majority of what reaches an
+exchange rests, is amended or is cancelled, and only a fraction matches.
+
+That is not a cosmetic difference for this ADR, because the results a message produces differ by kind. A trade
+is two `Fill`s, two accounts, their positions and their sleeves; a resting order is an `OrderAccepted` and a
+`BookLevelChanged`. The whole argument here is about which templates the feed path decodes, so a load that
+over-weights fills by an order of magnitude is measuring the wrong mixture of exactly the thing in question.
+
+`--orders-per-trade N` (default 10) now sends N−1 post-only buys a tick or three behind the ask, each cancelled
+before the next, then one crossing order. Books come from `--instruments 8`, whose exponential weighting
+(`2^32 >> rank`, halving per rank) already existed and simply had never been used for a trading run. The
+achieved ratio is counted and printed rather than assumed — eight connections over eight books give 1:20, not
+1:10, because the unpopular books get takers and no maker.
+
+### Two counting bugs, both fixed
+
+- **`fills` counted every execution kind.** `result.executions` carries `accepted`, `cancelled` and `amended`
+  as well as `fill`, and the harness took the array's length: 189,264 "fills" reported for 80,233 taker orders
+  that can each match at most once. The true figure was 78,557. **Every `fills/s` number above this section is
+  about 2.4× too high.** Fixed in `2adfa71`.
+- **`MAKER_SIZE` was 1,000,000 contracts**, reserving about half a load account's 100,000,000 cents, so a maker
+  re-posting hit `insufficient_sleeve` partway through a minute. Now 10,000. Fixed in `a1eaf16`.
+
+Neither was reachable in an 8-second run. Nor were the gateway's slow-consumer disconnects, which used to fail
+a whole run through one `?` and are now counted and reported.
+
+### Capacity
+
+c6i.8xlarge (32 vCPU), 8 pinned reactor threads, one account per connection, 8 books, ~10 orders per trade,
+**60-second** runs, three replicates:
+
+| connections | messages/s | p50 | fills/s | achieved ratio |
+|---|---|---|---|---|
+| 32 | **50,645 ±894** | 489µs | 1,373 | 1:13 |
+| 128 | **56,947 ±665** | 1,999µs | 2,098 | 1:10 |
+
+No dropped connections, no fail-stops. Audit writes ~105 MB/s, under a default gp3 volume's 125 MB/s but not by
+much — it remains the operational limit that arrives before CPU does.
+
+**Run length matters as much as shape.** The identical load gives 38.5k over ten seconds and 27.8k over seventy.
+A third of the short-run figure does not survive going the distance. Quote the 60-second numbers.
+
+### The stages 2+3 question, settled
+
+With a representative load, the tree carrying `Frame` and the typed readers and the tree before them are
+indistinguishable. Same box, same load generator and node, only the gateway binary swapped, n=3 interleaved:
+
+| | pre-stage `ea4724c` | `74dbc71` | delta |
+|---|---|---|---|
+| 32 conns | 49,209 ±1124 | 50,645 ±894 | +2.9% |
+| 128 conns | 57,904 ±492 | 56,947 ±665 | −1.7% |
+| feed_apply public | 6.34µs | 6.33µs | −0.1% |
+| feed_apply private | 13.33µs | 13.77µs | +3.3% |
+
+Within ±3% everywhere.
+
+This matters because the unrepresentative load said otherwise, loudly, and nearly caused a revert. On the 1:1
+single-book load the same comparison showed **−25.1% at 32 trading connections**, a bisect attributed it to
+`0bf4a7b` (the lazy `Frame` itself rather than the typed readers), and a whole-process profile confirmed the
+cost was real: `feed_apply` private +11.4% and public +26.7%, appearing as +12% p50 latency rather than CPU
+saturation, with `Hub::apply` self time going 0.78% → 2.18%. All of that was reproducible and all of it was an
+artifact of the load. The lazy `Frame` only pays for itself where a reader never asks for the `Value`, and on a
+1:1 fill-dominated load almost every frame is asked for; on a realistic mix enough of them are not.
+
+The lesson worth keeping is procedural: **before drawing a conclusion from a load test, ask what mix of results
+it puts on the feed.** Three separate wrong conclusions here — that stages 2+3 were worth 25%, that they cost
+25%, and that the answer was to revert — all came from not asking.
+
+### What this leaves
+
+`74dbc71` removes a genuine double read (`executions_of` built a `Value` for `Fill` and `OrderAccepted`, which
+`View::result_typed` then re-read from the bytes). It is correct and slightly reduces variance, but it does not
+move throughput measurably, and it was committed with a rationale these numbers do not support.
+
+Nothing in the `Value`-removal line has been shown to pay for itself on a representative load, and nothing has
+been shown to cost anything either. It is neutral. Finishing it — typed `executions` and typed `View::result`,
+so no reader builds a `Value` at all — remains the only version of it with a case, and that case is now
+unproven rather than established.
+
+**Raw data.** `docs/adr/measurements/`: six 60-second replicates (`real-*.txt`), the earlier 10-second rounds
+(`rep-*.txt`), both whole-process profiles (`prof-*.txt`), the full connection ladders (`results-*.txt`), and
+the scripts that produced and aggregated them.
+
 ## Action Items
 
 1. [x] Implement `RwLock<Hub>` (Option A) for real, verify it compiles clean and the full test suite passes — done, 97/97.
@@ -446,3 +574,20 @@ removing first, but neither is the constraint today.
    gateway capacity figure.
 10. [ ] File a separate follow-up for `GET /v4/account`'s unindexed scan (Non-Goals) — not resolved here.
 11. [ ] Consider whether `Hub::deliver`'s fan-out to every session of one account needs attention on its own merits — only if many concurrent sessions per account is a real client pattern, which nobody has established.
+12. [x] **Make the trading load representative** — done (`2adfa71`, `a1eaf16`). Every taker order used to cross,
+    at one price level on one book, in 8-second runs. `--orders-per-trade` (default 10) now rests and cancels
+    most orders near the touch, `--instruments 8` spreads them over books with the exponential popularity that
+    already existed, and runs are 60 seconds. Two harness bugs only a minute-long run reached: `fills` counted
+    every execution kind (so every `fills/s` figure above is ~2.4× too high) and `MAKER_SIZE` exhausted an
+    account's sleeve mid-run. A dropped connection no longer fails the whole run.
+13. [x] **Re-measure stages 2+3 on that load** — done. Pre-stage and HEAD are within ±3% on throughput and on
+    apply cost: the change is neutral, not the −29%/−25% win this ADR claimed and not the −25% loss the
+    unrepresentative load showed. The proposal to revert `0bf4a7b..HEAD` is withdrawn.
+14. [ ] **Decide whether to finish or abandon the `Value` removal.** Half-done is measurably neutral, so there
+    is no urgency either way. Finishing means typed `executions` (its differential harness is
+    `hub::tests::executions_agrees_however_the_results_are_read`) and typed `View::result`, so that no reader
+    builds a `Value`; abandoning means removing `Frame`, the typed readers and the harness. What is not
+    defensible is leaving it half-done *and* believing it bought something.
+15. [ ] **Re-measure the amend-only and market-data sections on 60-second runs.** Only the trading load was
+    redone. The amend ladder, the watcher table and the audit-per-amendment figure are all still 8-second
+    single samples, and the trading redo showed short runs overstate by about a third.

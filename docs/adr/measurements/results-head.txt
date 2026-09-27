@@ -1,0 +1,90 @@
+wrote /home/ubuntu/venue/run/load.json: 516 accounts, 512 of them for load (dev-load-0..dev-load-511)
+seed: rc=0 applied=537 refused=0
+seeding with a 6s client order ID window (the default is 7200s): the group takes up to 43690 new orders a second before its duplicate table fills
+## venue-shaped load, pid=10093, 32 vCPU
+## A: trading (makers resting, takers crossing), no watchers
+=== trade conns=4 ===
+4 connection(s) over 1 instrument(s), 141804 requests in 8158 ms: 17382 messages/s; round trip µs p50 195.893 p90 279.995 p99 1211.796 p99.9 2308.330 max 11886.023; 1 maker(s), 247370 fills, 30322 fills/s
+    rss_kB=54928 node=up
+=== trade conns=8 ===
+8 connection(s) over 1 instrument(s), 170936 requests in 8099 ms: 21105 messages/s; round trip µs p50 311.115 p90 486.919 p99 2376.313 p99.9 3461.258 max 8932.123; 2 maker(s), 304161 fills, 37555 fills/s
+    rss_kB=66396 node=up
+=== trade conns=16 ===
+16 connection(s) over 1 instrument(s), 195184 requests in 8089 ms: 24129 messages/s; round trip µs p50 579.558 p90 937.896 p99 2412.379 p99.9 3153.167 max 9291.864; 4 maker(s), 344890 fills, 42636 fills/s
+    rss_kB=76648 node=up
+=== trade conns=32 ===
+32 connection(s) over 1 instrument(s), 180010 requests in 8528 ms: 21108 messages/s; round trip µs p50 1079.949 p90 1790.796 p99 2519.763 p99.9 121395.237 max 124879.627; 8 maker(s), 302368 fills, 35455 fills/s
+    rss_kB=101484 node=up
+=== trade conns=64 ===
+64 connection(s) over 1 instrument(s), 233321 requests in 8435 ms: 27661 messages/s; round trip µs p50 1991.537 p90 3349.771 p99 4374.407 p99.9 5143.115 max 67804.119; 16 maker(s), 397894 fills, 47171 fills/s
+    rss_kB=144240 node=up
+=== trade conns=128 ===
+128 connection(s) over 1 instrument(s), 234014 requests in 8084 ms: 28947 messages/s; round trip µs p50 4067.957 p90 6090.216 p99 8672.509 p99.9 10111.721 max 75674.243; 32 maker(s), 403095 fills, 49863 fills/s
+    rss_kB=228660 node=up
+=== trade conns=256 ===
+256 connection(s) over 1 instrument(s), 235984 requests in 8104 ms: 29119 messages/s; round trip µs p50 8272.653 p90 10803.801 p99 17016.319 p99.9 19642.040 max 96576.314; 64 maker(s), 408526 fills, 50410 fills/s
+    rss_kB=406680 node=up
+## B: amend-only at the same counts, for comparison
+=== amend conns=4 ===
+4 connection(s) over 1 instrument(s), 167951 amendments in 8041 ms: 20886 messages/s; round trip µs p50 117.283 p90 141.426 p99 240.394 p99.9 3304.093 max 165988.857
+    rss_kB=373112 node=up
+=== amend conns=8 ===
+8 connection(s) over 1 instrument(s), 311212 amendments in 8058 ms: 38621 messages/s; round trip µs p50 147.578 p90 187.617 p99 4329.086 p99.9 4426.360 max 5501.403
+    rss_kB=357024 node=up
+=== amend conns=16 ===
+16 connection(s) over 1 instrument(s), 398113 amendments in 8062 ms: 49381 messages/s; round trip µs p50 219.068 p90 307.112 p99 4738.565 p99.9 5655.959 max 9892.463
+    rss_kB=363856 node=up
+=== amend conns=32 ===
+32 connection(s) over 1 instrument(s), 433026 amendments in 8056 ms: 53751 messages/s; round trip µs p50 414.636 p90 555.001 p99 5631.293 p99.9 5992.353 max 40964.863
+    rss_kB=374260 node=up
+=== amend conns=64 ===
+64 connection(s) over 1 instrument(s), 374291 amendments in 8433 ms: 44384 messages/s; round trip µs p50 823.689 p90 1058.439 p99 6057.640 p99.9 129918.851 max 131005.399
+    rss_kB=393384 node=up
+=== amend conns=128 ===
+128 connection(s) over 1 instrument(s), 471582 amendments in 8084 ms: 58335 messages/s; round trip µs p50 1691.423 p90 5199.129 p99 6853.470 p99.9 7613.161 max 52240.718
+    rss_kB=455960 node=up
+=== amend conns=256 ===
+256 connection(s) over 1 instrument(s), 503319 amendments in 8079 ms: 62299 messages/s; round trip µs p50 3397.317 p90 6926.327 p99 8706.499 p99.9 10092.891 max 71614.226
+    rss_kB=304832 node=up
+## C: market data -- 32 trading connections, watchers rising
+=== trade conns=32 watchers=0 ===
+32 connection(s) over 1 instrument(s), 210029 requests in 8513 ms: 24671 messages/s; round trip µs p50 1143.572 p90 1841.463 p99 2485.302 p99.9 3113.672 max 24535.949; 8 maker(s), 371309 fills, 43616 fills/s
+    rss_kB=322840 node=up
+=== trade conns=32 watchers=32 ===
+32 connection(s) over 1 instrument(s), 149303 requests in 8259 ms: 18077 messages/s; round trip µs p50 1156.523 p90 1849.954 p99 2679.446 p99.9 123430.387 max 153671.475; 8 maker(s), 266987 fills, 32326 fills/s; 32 watcher(s) took 2432 messages, 294/s
+    rss_kB=324236 node=up
+=== trade conns=32 watchers=128 ===
+32 connection(s) over 1 instrument(s), 218908 requests in 8484 ms: 25802 messages/s; round trip µs p50 1094.301 p90 1786.751 p99 2396.107 p99.9 3000.536 max 38192.774; 8 maker(s), 377024 fills, 44439 fills/s; 128 watcher(s) took 10496 messages, 1237/s
+    rss_kB=338544 node=up
+=== trade conns=32 watchers=256 ===
+32 connection(s) over 1 instrument(s), 206081 requests in 8541 ms: 24128 messages/s; round trip µs p50 1165.958 p90 1878.094 p99 2589.677 p99.9 3306.812 max 20371.606; 8 maker(s), 366191 fills, 42874 fills/s; 256 watcher(s) took 20725 messages, 2426/s
+    rss_kB=341488 node=up
+=== per-thread CPU: 64 trading + 128 watching ===
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+  10102 ubuntu    20   0 5863420 362072   4000 S  78.2   0.6   1:53.14 gw-feed
+  10096 ubuntu    20   0 5863420 362072   4000 S  58.3   0.6   1:26.47 gw-feed
+  10095 ubuntu    20   0 5863420 362072   4000 R  26.7   0.6   0:51.43 gateway+
+  10114 ubuntu    20   0 5863420 362072   4000 R  24.4   0.6   0:41.14 gw-priv+
+  10115 ubuntu    20   0 5863420 362072   4000 R  23.2   0.6   0:42.40 gw-priv+
+  10117 ubuntu    20   0 5863420 362072   4000 S  23.0   0.6   0:42.15 gw-priv+
+  10118 ubuntu    20   0 5863420 362072   4000 S  22.8   0.6   0:41.97 gw-priv+
+  10116 ubuntu    20   0 5863420 362072   4000 R  21.8   0.6   0:42.19 gw-priv+
+  10119 ubuntu    20   0 5863420 362072   4000 R  21.6   0.6   0:39.74 gw-priv+
+  10120 ubuntu    20   0 5863420 362072   4000 S  21.2   0.6   0:39.78 gw-priv+
+  10121 ubuntu    20   0 5863420 362072   4000 S  20.8   0.6   0:40.01 gw-priv+
+  10098 ubuntu    20   0 5863420 362072   4000 S  13.0   0.6   0:34.69 link-su+
+  10100 ubuntu    20   0 5863420 362072   4000 S  12.6   0.6   0:26.99 link-re+
+  10097 ubuntu    20   0 5863420 362072   4000 S   0.2   0.6   0:00.15 gw-conf+
+  10105 ubuntu    20   0 5863420 362072   4000 S   0.2   0.6   0:00.10 gw-publ+
+  10106 ubuntu    20   0 5863420 362072   4000 S   0.2   0.6   0:00.11 gw-publ+
+  10108 ubuntu    20   0 5863420 362072   4000 S   0.2   0.6   0:00.10 gw-publ+
+final_rss_kB=382144
+too_far_behind=0
+audit_bytes=15513181432
+fail_stops=0
+=== feed_apply (compare: public 7.04us / private 14.09us at stages 2+3) ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 72.979074565
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 5868061
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 129.24814245
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 5868061
+DONE
