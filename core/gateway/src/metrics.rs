@@ -105,6 +105,25 @@ pub enum Api {
 }
 const APIS: &[&str] = &["rest", "ws"];
 
+/// The feed results worth counting separately when asking which of them still cost a `serde_json::Value`.
+/// Anything else lands in `other`, which is the signal that this list wants extending.
+pub const RESULTS: &[&str] = &[
+    "book_level_changed",
+    "order_accepted",
+    "order_cancelled",
+    "order_amended",
+    "order_reduced",
+    "order_rejected",
+    "fill",
+    "position_changed",
+    "sleeve_changed",
+    "command_applied",
+    "other",
+];
+
+/// Whether the feed path turned that result into a `Value`.
+const DECODED: &[&str] = &["true", "false"];
+
 const REASONS: &[&str] = &["auth", "permission", "rate_limit", "validation", "not_found", "unavailable", "other"];
 
 /// Why a status is a refusal, as an index into `REASONS`; none for a success.
@@ -174,6 +193,7 @@ pub struct Metrics {
     http_duration: Family<Labels, Histogram>,
     ws_messages: Counters,
     refusals: Counters,
+    feed_results: Counters,
     rate_limited: Counters,
     loop_turn: Family<Labels, Histogram>,
     feed_apply: Family<Labels, Histogram>,
@@ -234,6 +254,7 @@ impl Metrics {
             http_duration: durations(),
             ws_messages: Counters::grid(&[("half", HALVES), ("op", OPS), ("outcome", OUTCOMES)]),
             refusals: Counters::grid(&[("half", HALVES), ("api", APIS), ("reason", REASONS)]),
+            feed_results: Counters::grid(&[("half", HALVES), ("result", RESULTS), ("decoded", DECODED)]),
             rate_limited: Counters::grid(&[("half", HALVES), ("limit", LIMITS)]),
             loop_turn: durations(),
             feed_apply: durations(),
@@ -278,6 +299,13 @@ impl Metrics {
             m.ws_messages.clone(),
         );
         r.register("venue_gateway_refusals", "Errors sent to clients, by reason", m.refusals.clone());
+        r.register(
+            "venue_gateway_feed_results",
+            "Results the feed carried, by kind, and whether applying the unit turned one into a \
+             `serde_json::Value`. Which kinds still cost a decode, and how many of them there are, is what \
+             decides whether finishing the typed migration is worth it (ADR-0002)",
+            m.feed_results.clone(),
+        );
         r.register("venue_gateway_rate_limited", "Flood limit hits", m.rate_limited.clone());
         r.register("venue_gateway_loop_turn_duration_seconds", "One event loop turn", m.loop_turn.clone());
         r.register(
@@ -477,6 +505,14 @@ impl HalfMetrics {
                 .refusals
                 .inc(Counters::index(&[self.half, api as usize, reason], &[HALVES.len(), APIS.len(), REASONS.len()]));
         }
+    }
+
+    /// One result the feed carried: which kind, and whether anything asked for its JSON shape.
+    pub fn feed_result(&self, result: usize, decoded: bool) {
+        self.all.feed_results.inc(Counters::index(
+            &[self.half, result, usize::from(!decoded)],
+            &[HALVES.len(), RESULTS.len(), DECODED.len()],
+        ));
     }
 
     pub fn ws_message(&self, op: usize, refused_with: Option<u16>) {

@@ -365,6 +365,30 @@ fn start_half(gateway: Gateway, feed: &str, feed_batch: usize) -> Arc<Gateway> {
     gateway
 }
 
+/// Which of `metrics::RESULTS` a template is. Anything unlisted is `other`, whose count going up is the sign
+/// that the list needs another entry rather than that nothing is being missed.
+fn result_kind(template: u16) -> usize {
+    use venue_journal::{
+        book_level_changed_codec as book, command_applied_codec as applied, fill_codec as fill,
+        order_accepted_codec as accepted, order_amended_codec as amended, order_cancelled_codec as cancelled,
+        order_reduced_codec as reduced, order_rejected_codec as rejected, position_changed_codec as position,
+        sleeve_changed_codec as sleeve,
+    };
+    let names = [
+        book::SBE_TEMPLATE_ID,
+        accepted::SBE_TEMPLATE_ID,
+        cancelled::SBE_TEMPLATE_ID,
+        amended::SBE_TEMPLATE_ID,
+        reduced::SBE_TEMPLATE_ID,
+        rejected::SBE_TEMPLATE_ID,
+        fill::SBE_TEMPLATE_ID,
+        position::SBE_TEMPLATE_ID,
+        sleeve::SBE_TEMPLATE_ID,
+        applied::SBE_TEMPLATE_ID,
+    ];
+    names.iter().position(|id| *id == template).unwrap_or(names.len())
+}
+
 /// Keeps the hub's view of the venue current from the node's feed, reconnecting for ever.
 fn follow_feed(gateway: &Arc<Gateway>, feed: String, feed_batch: usize) {
     let follower = Arc::clone(gateway);
@@ -399,6 +423,14 @@ fn follow_feed(gateway: &Arc<Gateway>, feed: String, feed_batch: usize) {
                     let mut hub = follower.hub_mut();
                     for unit in units.iter() {
                         hub.apply(unit);
+                    }
+                }
+                // Which results still cost a `Value`, counted after applying so it reflects what the readers
+                // actually asked for. `template` and `decoded` are both header reads, so counting is cheap
+                // and, unlike a profile, says which *kind* of result the decoding is spent on (ADR-0002).
+                for unit in units.iter() {
+                    for result in &unit.results {
+                        follower.metrics.feed_result(result_kind(result.template()), result.decoded());
                     }
                 }
                 // Charged per unit, so the histogram still says what one unit costs however they were
