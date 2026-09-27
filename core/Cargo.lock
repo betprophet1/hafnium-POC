@@ -629,6 +629,10 @@ name = "proto-maskbench"
 version = "0.1.0"
 
 [[package]]
+name = "proto-tieredbook"
+version = "0.1.0"
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"

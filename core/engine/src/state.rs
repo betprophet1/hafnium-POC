@@ -12,6 +12,15 @@ use venue_journal::time_in_force::TimeInForce;
 /// Marks the end of an intrusive list.
 pub const NONE: u32 = u32::MAX;
 
+/// ADR-0001 (`docs/adr`): inline capacity for a book's sparse-tier levels, before any spill into the shared
+/// overflow pool. Pinned from `core/prototypes/tieredbook`'s measurements.
+pub const SPARSE_INLINE: usize = 8;
+
+/// ADR-0001: a sparse book promotes to the dense per-tick pool the instant its occupied-tick count would
+/// exceed this. Pinned from the same prototype (keeps sparse-path scan cost under ~0.5% of the matching
+/// budget with real margin).
+pub const PROMOTE_ABOVE: usize = 32;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TickRow {
     pub numerator: u32,
@@ -58,10 +67,23 @@ pub struct Instrument {
     pub position_limit: u32,
     pub market_state: MarketState,
     pub next_in_event: u32,
-    /// Level pool index of this book's BUY levels; SELL levels follow them.
+    /// Level pool index of this book's BUY levels; SELL levels follow them. Meaningless while `!dense`.
     pub levels_start: u32,
-    /// Bitmap pool index of this book's BUY occupancy words; SELL words follow them.
+    /// Bitmap pool index of this book's BUY occupancy words; SELL words follow them. Meaningless while `!dense`.
     pub bits_start: u32,
+    /// ADR-0001: whether this book's levels live in the shared dense pool (`levels_start`/`bits_start`, one
+    /// slot per tick per side, occupied or not) or inline/overflow below. Every book lists sparse and promotes
+    /// once its occupied-tick count would exceed `PROMOTE_ABOVE`; demotion is not implemented (ADR-0001 Action
+    /// Item 2's staleness sweep is design-only so far).
+    pub dense: bool,
+    /// Occupied entries held in `sparse[..sparse_len]`, in no particular order; a level found here or in the
+    /// overflow chain is removed rather than zeroed once its count reaches 0, so the count is always a
+    /// book's true occupied-tick total, not table.len.
+    pub sparse_len: u8,
+    pub sparse: [SparseEntry; SPARSE_INLINE],
+    /// First slot of this book's overflow chain, threaded through the shared pool's own `next` field, or
+    /// `NONE`. Only touched once `sparse_len` reaches `SPARSE_INLINE`.
+    pub overflow_head: u32,
 }
 
 impl Instrument {
@@ -77,6 +99,33 @@ pub struct Level {
     pub count: u32,
     pub head: u32,
     pub tail: u32,
+}
+
+impl Level {
+    /// A level nothing rests at yet — `count: 0` with no order slot for either end, the same shape
+    /// `commands.rs` already gives every dense slot at listing time.
+    pub const EMPTY: Level = Level { quantity: 0, count: 0, head: NONE, tail: NONE };
+}
+
+/// One occupied (side, tick) held inline on a sparse book, or spilled into the shared overflow pool
+/// (ADR-0001). `side` doubles as the "is this slot free" flag in `OverflowEntry` (`Side::NullVal` = free).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SparseEntry {
+    pub side: Side,
+    pub tick: u16,
+    pub level: Level,
+}
+
+/// One shared, externally-owned pool entry for occupied ticks beyond `SPARSE_INLINE` (ADR-0001): an intrusive
+/// singly-linked free list, exactly the pattern the `orders` slab already uses (`book.rs`'s
+/// `alloc_order`/`free_slot`) — `next` is the free chain when unused, a book's own overflow chain when it
+/// isn't.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OverflowEntry {
+    pub side: Side,
+    pub tick: u16,
+    pub level: Level,
+    pub next: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -227,7 +276,19 @@ pub enum Undo {
     EventCash(EventCashKey, Option<i64>),
     MakerCounter(HoldingKey, Option<WindowCounter>),
     Group((u64, u32), Option<OrderGroup>),
-    Scalars { next_trade: u64, free_order: u32, resting_orders: u32 },
+    /// ADR-0001: an instrument's whole record, logged before any sparse-tier or dense-flag write touches it —
+    /// the same whole-struct approach `Order` already gets, since a book's tier state is small and all of it
+    /// (`dense`, `sparse`, `sparse_len`, `overflow_head`) can change together in one promotion.
+    Instrument(u32, Instrument),
+    /// ADR-0001: one shared overflow pool slot, logged before it's written — the same per-slot approach
+    /// `Bits` already gets.
+    Overflow(u32, OverflowEntry),
+    Scalars {
+        next_trade: u64,
+        free_order: u32,
+        resting_orders: u32,
+        overflow_free: u32,
+    },
 }
 
 impl Default for Undo {
@@ -258,8 +319,14 @@ pub struct Capacities {
     pub tick_rows: usize,
     pub events: usize,
     pub instruments: usize,
-    /// Price levels across all books, both sides: twice the sum of every book's tick table length.
+    /// Price levels across all books, both sides: twice the sum of every book's tick table length. Only
+    /// dense (promoted) books draw from this pool (ADR-0001) — a book lists sparse and never touches it at
+    /// all unless its occupied-tick count exceeds `PROMOTE_ABOVE`.
     pub levels: usize,
+    /// ADR-0001: overflow entries for sparse books' occupied ticks beyond `SPARSE_INLINE`, shared across
+    /// every book that has not promoted. Sized generously against `instruments * (PROMOTE_ABOVE -
+    /// SPARSE_INLINE)`, the worst case before a book would promote instead, rounded to a power of two.
+    pub overflow: usize,
     pub accounts: usize,
     pub holdings: usize,
     pub orders: usize,
@@ -292,6 +359,7 @@ impl Capacities {
             events: 1_024,
             instruments: 1_024,
             levels: 131_072,
+            overflow: 32_768,
             accounts: 4_096,
             holdings: 16_384,
             orders: 16_384,
@@ -323,6 +391,7 @@ impl Capacities {
             events: 4_096,
             instruments: 2_048,
             levels: 524_288,
+            overflow: 65_536,
             accounts: 262_144,
             holdings: 2_097_152,
             orders: 262_144,
@@ -346,6 +415,7 @@ impl Capacities {
             events: 16_384,
             instruments: 8_192,
             levels: 2_097_152,
+            overflow: 262_144,
             accounts: 1_048_576,
             holdings: 8_388_608,
             orders: 1_048_576,
@@ -383,6 +453,8 @@ pub struct Memory<'a> {
     pub levels: &'a mut [Level],
     /// Occupancy words: `levels / 64` rounded up, plus one per book side.
     pub level_bits: &'a mut [u64],
+    /// ADR-0001: shared overflow entries for sparse books, `overflow` slots exactly (a pool, not a map).
+    pub overflow: &'a mut [OverflowEntry],
     pub accounts: &'a mut [Account],
     pub account_index: &'a mut [Slot<u64, u32>],
     pub holdings: &'a mut [Slot<HoldingKey, Holding>],

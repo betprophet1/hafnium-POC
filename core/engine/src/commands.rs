@@ -348,8 +348,6 @@ impl<'a> Engine<'a> {
     fn apply_listing<S: ResultSink>(&mut self, input: &[u8], sink: &mut S) -> Result<(), FailStop> {
         let dec = list_instrument_codec::ListInstrumentDecoder::default().header(header(input), 0);
         let table = *self.tick_tables.get(&dec.tick_table_id()).ok_or(FailStop::MalformedCommand)?;
-        let per_side = usize::from(table.len);
-        let words = per_side.div_ceil(64);
         // A slot a release freed first, else a new one (E-18.3).
         let slot = if self.free_instrument != NONE {
             self.free_instrument as usize
@@ -358,18 +356,12 @@ impl<'a> Engine<'a> {
         } else {
             return Err(FailStop::Capacity);
         };
-        // The book's levels and occupancy words go at the end of their pools; if releases have left the room in
-        // holes, the pools are compacted first, so a listing never fails for room the group does not carry.
-        if self.levels_used + 2 * per_side > self.levels.len()
-            || self.level_bits_used + 2 * words > self.level_bits.len()
-        {
-            if self.levels_carried + 2 * per_side > self.levels.len()
-                || self.level_bits_carried + 2 * words > self.level_bits.len()
-            {
-                return Err(FailStop::Capacity);
-            }
-            self.compact_levels()?;
-        }
+        // ADR-0001: every book lists sparse -- no dense `levels`/`level_bits` *reservation* (`levels_used`,
+        // the bump-allocator high-water mark) at listing time at all. It promotes on its own, the instant its
+        // occupied-tick count would exceed `PROMOTE_ABOVE` (`book.rs`'s `level_set`/`promote`), and only then
+        // does it actually draw from the dense pool (`levels_dense`). `levels_carried` (E-6.5's policy total,
+        // below) still counts every listed book at its full table width regardless of tier, unchanged from
+        // before this ADR -- that's what `maxPriceLevels` bounds.
         let free_next = self.instruments[slot].next_in_event;
         let mut inst = Instrument {
             in_use: true,
@@ -383,15 +375,13 @@ impl<'a> Engine<'a> {
             position_limit: dec.position_limit(),
             market_state: MarketState::LISTED,
             next_in_event: NONE,
-            levels_start: self.levels_used as u32,
-            bits_start: self.level_bits_used as u32,
+            levels_start: 0,
+            bits_start: 0,
+            dense: false,
+            sparse_len: 0,
+            sparse: [SparseEntry::default(); SPARSE_INLINE],
+            overflow_head: NONE,
         };
-        for l in &mut self.levels[self.levels_used..self.levels_used + 2 * per_side] {
-            *l = Level { quantity: 0, count: 0, head: NONE, tail: NONE };
-        }
-        for w in &mut self.level_bits[self.level_bits_used..self.level_bits_used + 2 * words] {
-            *w = 0;
-        }
         // Link into the event's instruments, ascending by ID.
         let event = self.events.get_mut(&inst.event_id).ok_or(FailStop::MalformedCommand)?;
         let mut prev = NONE;
@@ -415,10 +405,8 @@ impl<'a> Engine<'a> {
             self.free_instrument = free_next;
         }
         self.instruments_carried += 1;
-        self.levels_used += 2 * per_side;
-        self.levels_carried += 2 * per_side;
-        self.level_bits_used += 2 * words;
-        self.level_bits_carried += 2 * words;
+        self.levels_carried += 2 * usize::from(table.len);
+        self.level_bits_carried += 2 * usize::from(table.len).div_ceil(64);
         self.emitter.emit(sink, &Out::MarketStateChanged { instrument_id: inst.id, state: MarketState::LISTED })
     }
 
@@ -426,10 +414,12 @@ impl<'a> Engine<'a> {
     /// holes releases left (E-8.4, E-18.3). Only a listing that does not fit at the end of a pool calls this, so its
     /// cost, the used part of the pools, is paid by a command and never by a tick. No order, touch or undo record
     /// holds a level index across inputs: queues link order slots, and orders find their level from their book.
-    fn compact_levels(&mut self) -> Result<(), FailStop> {
+    pub(crate) fn compact_levels(&mut self) -> Result<(), FailStop> {
         let mut n = 0usize;
+        // ADR-0001: a sparse book's `levels_start`/`bits_start` are meaningless -- it owns no dense slice to
+        // move. Only a promoted (dense) book participates in compaction.
         for (slot, inst) in self.instruments[..self.instruments_used].iter().enumerate() {
-            if inst.in_use {
+            if inst.in_use && inst.dense {
                 *self.scratch.get_mut(n).ok_or(FailStop::Capacity)? = (u64::from(inst.levels_start), slot as u64);
                 n += 1;
             }
@@ -450,7 +440,7 @@ impl<'a> Engine<'a> {
             levels_at += levels;
             bits_at += words;
         }
-        if levels_at != self.levels_carried || bits_at != self.level_bits_carried {
+        if levels_at != self.levels_dense || bits_at != self.level_bits_dense {
             return Err(FailStop::Inconsistent);
         }
         self.levels_used = levels_at;

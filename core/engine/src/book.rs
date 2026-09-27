@@ -91,6 +91,25 @@ impl<'a> Engine<'a> {
         Ok(&mut self.level_bits[index])
     }
 
+    /// ADR-0001: an instrument's whole record, logged once (whole-struct, like [`Self::order_w`]) before any
+    /// sparse-tier or dense-flag write touches it.
+    fn instrument_w(&mut self, slot: u32) -> Result<&mut Instrument, FailStop> {
+        if self.dry {
+            let old = self.instruments[slot as usize];
+            self.push_undo(Undo::Instrument(slot, old))?;
+        }
+        Ok(&mut self.instruments[slot as usize])
+    }
+
+    /// ADR-0001: one shared overflow pool slot, logged before it's written (like [`Self::bits_w`]).
+    fn overflow_w(&mut self, slot: u32) -> Result<&mut OverflowEntry, FailStop> {
+        if self.dry {
+            let old = self.overflow[slot as usize];
+            self.push_undo(Undo::Overflow(slot, old))?;
+        }
+        Ok(&mut self.overflow[slot as usize])
+    }
+
     pub(crate) fn account_w(&mut self, slot: u32) -> Result<&mut Account, FailStop> {
         if self.dry {
             let old = self.accounts[slot as usize];
@@ -185,6 +204,7 @@ impl<'a> Engine<'a> {
             next_trade: self.next_trade,
             free_order: self.free_order,
             resting_orders: self.resting_orders,
+            overflow_free: self.overflow_free,
         };
         self.push_undo(scalars)
     }
@@ -198,6 +218,8 @@ impl<'a> Engine<'a> {
                 Undo::Order(slot, o) => self.orders[slot as usize] = o,
                 Undo::Level(i, l) => self.levels[i as usize] = l,
                 Undo::Bits(i, w) => self.level_bits[i as usize] = w,
+                Undo::Instrument(slot, inst) => self.instruments[slot as usize] = inst,
+                Undo::Overflow(i, e) => self.overflow[i as usize] = e,
                 Undo::Account(slot, a) => self.accounts[slot as usize] = a,
                 Undo::Holding(key, old) => restore(&mut self.holdings, key, old)?,
                 Undo::OrderIndex(id, old) => restore(&mut self.order_index, id, old)?,
@@ -209,10 +231,11 @@ impl<'a> Engine<'a> {
                 Undo::EventCash(key, old) => restore(&mut self.event_cash, key, old)?,
                 Undo::MakerCounter(key, old) => restore(&mut self.maker_counters, key, old)?,
                 Undo::Group(key, old) => restore(&mut self.order_groups, key, old)?,
-                Undo::Scalars { next_trade, free_order, resting_orders } => {
+                Undo::Scalars { next_trade, free_order, resting_orders, overflow_free } => {
                     self.next_trade = next_trade;
                     self.free_order = free_order;
                     self.resting_orders = resting_orders;
+                    self.overflow_free = overflow_free;
                 }
             }
         }
@@ -261,14 +284,17 @@ impl<'a> Engine<'a> {
         Ok((cap / per_lot) as u64 * lot)
     }
 
-    // ------------------------------------------------------------------ levels and occupancy
-
-    pub(crate) fn level_idx(&self, instrument_slot: u32, side: Side, tick: u16) -> usize {
-        crate::level_index(&self.instruments[instrument_slot as usize], side, tick)
-    }
+    // ------------------------------------------------------------------ levels and occupancy (ADR-0001)
+    //
+    // A dense book's levels live in the shared `levels`/`level_bits` pools, indexed by `crate::level_index`,
+    // exactly as before. A sparse book's occupied ticks live inline on its `Instrument`
+    // (`sparse[..sparse_len]`) and, once that fills, in the shared `overflow` pool -- an intrusive free list,
+    // the same pattern the order slab already uses (`Self::alloc_order`/`Self::free_slot`, below). `level` and
+    // `level_set` are the only entry points either tier goes through; every other place in the engine reads
+    // or writes a book's level through them and never has to know which tier it is in.
 
     pub(crate) fn level(&self, instrument_slot: u32, side: Side, tick: u16) -> Level {
-        self.levels[self.level_idx(instrument_slot, side, tick)]
+        crate::read_level(self.instruments, self.levels, self.overflow, instrument_slot, side, tick)
     }
 
     fn side_words(&self, instrument_slot: u32, side: Side) -> (usize, usize) {
@@ -282,17 +308,242 @@ impl<'a> Engine<'a> {
         (base + usize::from(tick) / 64, 1u64 << (tick % 64))
     }
 
+    /// How many ticks a sparse book currently has occupied, inline and overflow together. Meaningless (and
+    /// never called) on a dense book.
+    fn occupied_count(&self, instrument_slot: u32) -> usize {
+        let inst = &self.instruments[instrument_slot as usize];
+        let mut n = inst.sparse_len as usize;
+        let mut cur = inst.overflow_head;
+        while cur != NONE {
+            n += 1;
+            cur = self.overflow[cur as usize].next;
+        }
+        n
+    }
+
+    /// Writes a book's level at `(side, tick)`, creating the entry if it did not already exist and removing
+    /// it if `value.count` is now 0 -- the only two ways a sparse book's occupied-tick count changes. A
+    /// brand-new entry that would push a sparse book's occupied-tick count past `PROMOTE_ABOVE` promotes it
+    /// to dense first.
+    /// `pub(crate)`: also used by `snapshot.rs`'s `read_books` to place a restored book's occupied ticks,
+    /// deriving tier the same way live trading would have (ADR-0001) rather than reading it from the
+    /// snapshot.
+    pub(crate) fn level_set(
+        &mut self,
+        instrument_slot: u32,
+        side: Side,
+        tick: u16,
+        value: Level,
+    ) -> Result<(), FailStop> {
+        if self.instruments[instrument_slot as usize].dense {
+            let li = crate::level_index(&self.instruments[instrument_slot as usize], side, tick);
+            let was_occupied = self.levels[li].count > 0;
+            *self.level_w(li)? = value;
+            let now_occupied = value.count > 0;
+            if was_occupied != now_occupied {
+                let (w, bit) = self.word_index(instrument_slot, side, tick);
+                if now_occupied {
+                    *self.bits_w(w)? |= bit;
+                } else {
+                    *self.bits_w(w)? &= !bit;
+                }
+            }
+            return Ok(());
+        }
+        let inst = self.instruments[instrument_slot as usize];
+        for i in 0..inst.sparse_len as usize {
+            if inst.sparse[i].side == side && inst.sparse[i].tick == tick {
+                return if value.count == 0 {
+                    self.sparse_remove_inline(instrument_slot, i)
+                } else {
+                    self.instrument_w(instrument_slot)?.sparse[i].level = value;
+                    Ok(())
+                };
+            }
+        }
+        let (mut prev, mut cur) = (NONE, inst.overflow_head);
+        while cur != NONE {
+            let e = self.overflow[cur as usize];
+            if e.side == side && e.tick == tick {
+                return if value.count == 0 {
+                    self.overflow_remove(instrument_slot, prev, cur)
+                } else {
+                    *self.overflow_w(cur)? = OverflowEntry { level: value, ..e };
+                    Ok(())
+                };
+            }
+            prev = cur;
+            cur = e.next;
+        }
+        // Not found: a brand-new occupied tick. Nothing ever clears a level that was never created, so
+        // `value.count` is always > 0 on this path.
+        if self.occupied_count(instrument_slot) + 1 > PROMOTE_ABOVE {
+            self.promote(instrument_slot)?;
+            let li = crate::level_index(&self.instruments[instrument_slot as usize], side, tick);
+            *self.level_w(li)? = value;
+            let (w, bit) = self.word_index(instrument_slot, side, tick);
+            *self.bits_w(w)? |= bit;
+            return Ok(());
+        }
+        if (inst.sparse_len as usize) < SPARSE_INLINE {
+            let i = inst.sparse_len as usize;
+            let iw = self.instrument_w(instrument_slot)?;
+            iw.sparse[i] = SparseEntry { side, tick, level: value };
+            iw.sparse_len += 1;
+        } else {
+            let slot = self.overflow_alloc()?;
+            let head = self.instruments[instrument_slot as usize].overflow_head;
+            *self.overflow_w(slot)? = OverflowEntry { side, tick, level: value, next: head };
+            self.instrument_w(instrument_slot)?.overflow_head = slot;
+        }
+        Ok(())
+    }
+
+    /// Removes a sparse book's `i`-th inline entry by swap-remove: the order occupied ticks sit in is never
+    /// meaningful, the same reasoning the overflow and order-slab free lists already rely on.
+    fn sparse_remove_inline(&mut self, instrument_slot: u32, i: usize) -> Result<(), FailStop> {
+        let iw = self.instrument_w(instrument_slot)?;
+        let last = iw.sparse_len as usize - 1;
+        iw.sparse[i] = iw.sparse[last];
+        iw.sparse_len = last as u8;
+        Ok(())
+    }
+
+    /// Unlinks and frees one entry from a sparse book's overflow chain.
+    fn overflow_remove(&mut self, instrument_slot: u32, prev: u32, cur: u32) -> Result<(), FailStop> {
+        let next = self.overflow[cur as usize].next;
+        if prev == NONE {
+            self.instrument_w(instrument_slot)?.overflow_head = next;
+        } else {
+            self.overflow_w(prev)?.next = next;
+        }
+        self.overflow_free_slot(cur)
+    }
+
+    fn overflow_alloc(&mut self) -> Result<u32, FailStop> {
+        let slot = self.overflow_free;
+        if slot == NONE {
+            return Err(FailStop::Capacity);
+        }
+        self.overflow_free = self.overflow[slot as usize].next;
+        Ok(slot)
+    }
+
+    /// `pub(crate)`: also used by `settle.rs`'s `release_due` to return a released sparse book's overflow
+    /// chain, since nothing else ever frees it.
+    pub(crate) fn overflow_free_slot(&mut self, slot: u32) -> Result<(), FailStop> {
+        let free = self.overflow_free;
+        *self.overflow_w(slot)? = OverflowEntry { next: free, ..OverflowEntry::default() };
+        self.overflow_free = slot;
+        Ok(())
+    }
+
+    /// Promotes a sparse book to dense: reserves a fresh slice of the shared `levels`/`level_bits` pools
+    /// (compacting first if it does not fit at the end, exactly as `commands.rs`'s `apply_listing` used to do
+    /// unconditionally at listing time), copies every occupied entry into it, and frees the book's overflow
+    /// chain. Only called from `level_set`, at the point a sparse book's occupied-tick count is exactly
+    /// `PROMOTE_ABOVE` and one more entry is about to be added -- the `entries` buffer is sized for exactly
+    /// that many.
+    fn promote(&mut self, instrument_slot: u32) -> Result<(), FailStop> {
+        let (per_side, words) = {
+            let inst = &self.instruments[instrument_slot as usize];
+            (usize::from(inst.table.len), inst.words_per_side())
+        };
+        if self.levels_used + 2 * per_side > self.levels.len()
+            || self.level_bits_used + 2 * words > self.level_bits.len()
+        {
+            if self.levels_dense + 2 * per_side > self.levels.len()
+                || self.level_bits_dense + 2 * words > self.level_bits.len()
+            {
+                return Err(FailStop::Capacity);
+            }
+            self.compact_levels()?;
+        }
+        let (levels_start, bits_start) = (self.levels_used, self.level_bits_used);
+        for l in &mut self.levels[levels_start..levels_start + 2 * per_side] {
+            *l = Level::EMPTY;
+        }
+        for w in &mut self.level_bits[bits_start..bits_start + 2 * words] {
+            *w = 0;
+        }
+        self.levels_used += 2 * per_side;
+        self.levels_dense += 2 * per_side;
+        self.level_bits_used += 2 * words;
+        self.level_bits_dense += 2 * words;
+        // Collect every occupied entry before touching the instrument: freeing the overflow chain below
+        // invalidates its own `next` links, so nothing here can read from `self.instruments`/`self.overflow`
+        // once that starts.
+        let mut entries = [(Side::NullVal, 0u16, Level::EMPTY); PROMOTE_ABOVE];
+        let mut n = 0usize;
+        {
+            let inst = &self.instruments[instrument_slot as usize];
+            for e in &inst.sparse[..inst.sparse_len as usize] {
+                entries[n] = (e.side, e.tick, e.level);
+                n += 1;
+            }
+        }
+        let mut cur = self.instruments[instrument_slot as usize].overflow_head;
+        while cur != NONE {
+            let e = self.overflow[cur as usize];
+            entries[n] = (e.side, e.tick, e.level);
+            n += 1;
+            let next = e.next;
+            self.overflow_free_slot(cur)?;
+            cur = next;
+        }
+        {
+            let iw = self.instrument_w(instrument_slot)?;
+            iw.dense = true;
+            iw.levels_start = levels_start as u32;
+            iw.bits_start = bits_start as u32;
+            iw.sparse_len = 0;
+            iw.overflow_head = NONE;
+        }
+        for &(side, tick, level) in &entries[..n] {
+            let li = crate::level_index(&self.instruments[instrument_slot as usize], side, tick);
+            *self.level_w(li)? = level;
+            let (w, bit) = self.word_index(instrument_slot, side, tick);
+            *self.bits_w(w)? |= bit;
+        }
+        Ok(())
+    }
+
     /// The best tick on one side: the highest bid or the lowest ask.
     pub(crate) fn best(&self, instrument_slot: u32, side: Side) -> Option<u16> {
-        let (base, words) = self.side_words(instrument_slot, side);
-        let bits = &self.level_bits[base..base + words];
-        if side == Side::BUY {
-            let (i, w) = bits.iter().enumerate().rev().find(|(_, w)| **w != 0)?;
-            Some((i * 64 + 63 - w.leading_zeros() as usize) as u16)
-        } else {
-            let (i, w) = bits.iter().enumerate().find(|(_, w)| **w != 0)?;
-            Some((i * 64 + w.trailing_zeros() as usize) as u16)
+        let inst = &self.instruments[instrument_slot as usize];
+        if inst.dense {
+            let (base, words) = self.side_words(instrument_slot, side);
+            let bits = &self.level_bits[base..base + words];
+            return if side == Side::BUY {
+                let (i, w) = bits.iter().enumerate().rev().find(|(_, w)| **w != 0)?;
+                Some((i * 64 + 63 - w.leading_zeros() as usize) as u16)
+            } else {
+                let (i, w) = bits.iter().enumerate().find(|(_, w)| **w != 0)?;
+                Some((i * 64 + w.trailing_zeros() as usize) as u16)
+            };
         }
+        let mut best: Option<u16> = None;
+        let mut consider = |tick: u16| {
+            best = Some(match best {
+                None => tick,
+                Some(b) if side == Side::BUY => b.max(tick),
+                Some(b) => b.min(tick),
+            });
+        };
+        for e in &inst.sparse[..inst.sparse_len as usize] {
+            if e.side == side {
+                consider(e.tick);
+            }
+        }
+        let mut cur = inst.overflow_head;
+        while cur != NONE {
+            let e = &self.overflow[cur as usize];
+            if e.side == side {
+                consider(e.tick);
+            }
+            cur = e.next;
+        }
+        best
     }
 
     /// The best opposite tick an order of `side` with limit `limit` crosses (E-10.1).
@@ -325,8 +576,8 @@ impl<'a> Engine<'a> {
     pub(crate) fn rest(&mut self, slot: u32) -> Result<(), FailStop> {
         let o = self.orders[slot as usize];
         self.touch_level(o.instrument_slot, o.side, o.tick)?;
-        let li = self.level_idx(o.instrument_slot, o.side, o.tick);
-        let tail = self.levels[li].tail;
+        let old = self.level(o.instrument_slot, o.side, o.tick);
+        let tail = old.tail;
         {
             let w = self.order_w(slot)?;
             w.prev = tail;
@@ -336,15 +587,13 @@ impl<'a> Engine<'a> {
         if tail != NONE {
             self.order_w(tail)?.next = slot;
         }
-        let l = self.level_w(li)?;
-        if l.head == NONE {
-            l.head = slot;
-        }
-        l.tail = slot;
-        l.quantity = l.quantity.checked_add(u64::from(o.remaining)).ok_or(FailStop::Overflow)?;
-        l.count = l.count.checked_add(1).ok_or(FailStop::Overflow)?;
-        let (w, bit) = self.word_index(o.instrument_slot, o.side, o.tick);
-        *self.bits_w(w)? |= bit;
+        let new = Level {
+            quantity: old.quantity.checked_add(u64::from(o.remaining)).ok_or(FailStop::Overflow)?,
+            count: old.count.checked_add(1).ok_or(FailStop::Overflow)?,
+            head: if old.head == NONE { slot } else { old.head },
+            tail: slot,
+        };
+        self.level_set(o.instrument_slot, o.side, o.tick, new)?;
         let account = self.account_w(o.account_slot)?;
         let old_head = account.first_order;
         account.first_order = slot;
@@ -379,20 +628,14 @@ impl<'a> Engine<'a> {
         if o.next != NONE {
             self.order_w(o.next)?.prev = o.prev;
         }
-        let li = self.level_idx(o.instrument_slot, o.side, o.tick);
-        let l = self.level_w(li)?;
-        if l.head == slot {
-            l.head = o.next;
-        }
-        if l.tail == slot {
-            l.tail = o.prev;
-        }
-        l.quantity = l.quantity.checked_sub(u64::from(o.remaining)).ok_or(FailStop::Inconsistent)?;
-        l.count = l.count.checked_sub(1).ok_or(FailStop::Inconsistent)?;
-        if l.count == 0 {
-            let (w, bit) = self.word_index(o.instrument_slot, o.side, o.tick);
-            *self.bits_w(w)? &= !bit;
-        }
+        let old = self.level(o.instrument_slot, o.side, o.tick);
+        let new = Level {
+            quantity: old.quantity.checked_sub(u64::from(o.remaining)).ok_or(FailStop::Inconsistent)?,
+            count: old.count.checked_sub(1).ok_or(FailStop::Inconsistent)?,
+            head: if old.head == slot { o.next } else { old.head },
+            tail: if old.tail == slot { o.prev } else { old.tail },
+        };
+        self.level_set(o.instrument_slot, o.side, o.tick, new)?;
         if o.account_prev != NONE {
             self.order_w(o.account_prev)?.account_next = o.account_next;
         } else {
@@ -414,10 +657,10 @@ impl<'a> Engine<'a> {
         let o = self.orders[slot as usize];
         if o.in_use {
             self.touch_level(o.instrument_slot, o.side, o.tick)?;
-            let li = self.level_idx(o.instrument_slot, o.side, o.tick);
-            let l = self.level_w(li)?;
-            let without = l.quantity.checked_sub(u64::from(o.remaining)).ok_or(FailStop::Inconsistent)?;
-            l.quantity = without.checked_add(u64::from(remaining)).ok_or(FailStop::Overflow)?;
+            let old = self.level(o.instrument_slot, o.side, o.tick);
+            let without = old.quantity.checked_sub(u64::from(o.remaining)).ok_or(FailStop::Inconsistent)?;
+            let quantity = without.checked_add(u64::from(remaining)).ok_or(FailStop::Overflow)?;
+            self.level_set(o.instrument_slot, o.side, o.tick, Level { quantity, ..old })?;
         }
         self.order_w(slot)?.remaining = remaining;
         Ok(())

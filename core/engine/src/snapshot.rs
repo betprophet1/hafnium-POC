@@ -25,7 +25,7 @@ use crate::emit::{AtEventStart, MarketState, Side};
 use crate::fixed::FixedMap;
 use crate::state::{
     Account, Duplicate, Event, FeeOverride, FeeRates, Holding, Instrument, Level, MakerSetting, Order, OrderGroup,
-    RuleLimits, TickRow, TickTable, WindowCounter, NONE,
+    RuleLimits, SparseEntry, TickRow, TickTable, WindowCounter, NONE, SPARSE_INLINE,
 };
 use crate::{Engine, FailStop};
 use venue_journal::allocation_policy::AllocationPolicy;
@@ -138,6 +138,25 @@ fn tick_table_id(tables: &FixedMap<'_, u32, TickTable>, wanted: TickTable) -> Op
         }
     });
     found
+}
+
+/// Writes one occupied tick's queue, head first: the count, then each order's ID. Walks the FIFO rather than
+/// trusting a `count` aggregate, which a decoder rebuilds (E-20.6) regardless of which tier wrote it.
+fn write_queue(w: &mut Writer<'_>, orders: &[Order], head: u32) -> Result<(), FailStop> {
+    let mut queued = 0usize;
+    let mut at = head;
+    while at != NONE {
+        queued += 1;
+        at = orders.get(at as usize).ok_or(FailStop::Inconsistent)?.next;
+    }
+    w.count(queued)?;
+    let mut at = head;
+    while at != NONE {
+        let o = orders.get(at as usize).ok_or(FailStop::Inconsistent)?;
+        w.u64(o.id)?;
+        at = o.next;
+    }
+    Ok(())
 }
 
 impl Engine<'_> {
@@ -303,7 +322,7 @@ impl Engine<'_> {
     /// Written after the orders, not with the instruments, because a book names orders and a decoder reading one
     /// has to have them already. Time priority is the one ordering here that no key can carry (E-20.4).
     fn write_books(&mut self, w: &mut Writer<'_>) -> Result<(), FailStop> {
-        let Self { instrument_index, instruments, levels, orders, scratch, .. } = self;
+        let Self { instrument_index, instruments, levels, overflow, orders, scratch, .. } = self;
         let mut n = 0;
         instrument_index.for_each(|&id, &slot| {
             scratch[n] = (id, u64::from(slot));
@@ -314,35 +333,52 @@ impl Engine<'_> {
             let inst: &Instrument = instruments.get(slot as usize).ok_or(FailStop::Inconsistent)?;
             let ticks = usize::from(inst.table.len);
             for side in 0..2u8 {
-                // Count the occupied ticks first: the count precedes the entries, and a level is occupied when it
-                // has a head, whatever its aggregates say.
-                let base = inst.levels_start as usize + usize::from(side) * ticks;
-                let occupied = levels
-                    .get(base..base + ticks)
-                    .ok_or(FailStop::Inconsistent)?
-                    .iter()
-                    .filter(|l| l.head != NONE)
-                    .count();
-                w.count(occupied)?;
-                for tick in 0..ticks {
-                    let level = &levels[base + tick];
-                    if level.head == NONE {
-                        continue;
+                if inst.dense {
+                    // Count the occupied ticks first: the count precedes the entries, and a level is occupied
+                    // when it has a head, whatever its aggregates say.
+                    let base = inst.levels_start as usize + usize::from(side) * ticks;
+                    let occupied = levels
+                        .get(base..base + ticks)
+                        .ok_or(FailStop::Inconsistent)?
+                        .iter()
+                        .filter(|l| l.head != NONE)
+                        .count();
+                    w.count(occupied)?;
+                    for tick in 0..ticks {
+                        let head = levels[base + tick].head;
+                        if head == NONE {
+                            continue;
+                        }
+                        w.u16(u16::try_from(tick).map_err(|_| FailStop::Overflow)?)?;
+                        write_queue(w, orders, head)?;
                     }
-                    w.u16(u16::try_from(tick).map_err(|_| FailStop::Overflow)?)?;
-                    // Walk the FIFO rather than trusting `count`, which is an aggregate a decoder rebuilds.
-                    let mut queued = 0usize;
-                    let mut at = level.head;
-                    while at != NONE {
-                        queued += 1;
-                        at = orders.get(at as usize).ok_or(FailStop::Inconsistent)?.next;
+                } else {
+                    // ADR-0001: a sparse book's occupied ticks aren't already in tick order (the inline array
+                    // is swap-remove-ordered, the overflow chain is push-order), so they're gathered and
+                    // sorted here -- ticks ascending is part of the format's determinism (E-20.2), not an
+                    // implementation detail either representation is free to skip.
+                    let mut entries = [(0u16, NONE); crate::state::PROMOTE_ABOVE];
+                    let mut m = 0usize;
+                    for e in &inst.sparse[..inst.sparse_len as usize] {
+                        if e.side as u8 == side {
+                            entries[m] = (e.tick, e.level.head);
+                            m += 1;
+                        }
                     }
-                    w.count(queued)?;
-                    let mut at = level.head;
-                    while at != NONE {
-                        let o = orders.get(at as usize).ok_or(FailStop::Inconsistent)?;
-                        w.u64(o.id)?;
-                        at = o.next;
+                    let mut cur = inst.overflow_head;
+                    while cur != NONE {
+                        let e = &overflow[cur as usize];
+                        if e.side as u8 == side {
+                            entries[m] = (e.tick, e.level.head);
+                            m += 1;
+                        }
+                        cur = e.next;
+                    }
+                    entries[..m].sort_unstable();
+                    w.count(m)?;
+                    for &(tick, head) in &entries[..m] {
+                        w.u16(tick)?;
+                        write_queue(w, orders, head)?;
                     }
                 }
             }
@@ -897,23 +933,15 @@ impl Engine<'_> {
             let position_limit = r.u32()?;
             let market_state = known(MarketState::from(r.u8()?), MarketState::NullVal)?;
             let table = *self.tick_tables.get(&table_id).ok_or(Refused::Malformed)?;
-
-            let per_side = usize::from(table.len);
-            let words = per_side.div_ceil(64);
-            let (levels_start, bits_start) = (self.levels_used, self.level_bits_used);
-            if levels_start + 2 * per_side > self.levels.len() || bits_start + 2 * words > self.level_bits.len() {
-                return Err(Refused::TooLarge);
-            }
             let slot = self.instruments_used;
             if slot >= self.instruments.len() {
                 return Err(Refused::TooLarge);
             }
-            for l in &mut self.levels[levels_start..levels_start + 2 * per_side] {
-                *l = Level { quantity: 0, count: 0, head: NONE, tail: NONE };
-            }
-            for w in &mut self.level_bits[bits_start..bits_start + 2 * words] {
-                *w = 0;
-            }
+            // ADR-0001: a restored instrument lists sparse, exactly like a fresh `ListInstrument` does --
+            // no dense reservation here. `read_books` places each occupied tick through `level_set`, which
+            // decides dense-vs-sparse (and promotes if warranted) the same way live trading would have. This
+            // is also what keeps E-20.7/D-31's "a restored engine has more room than the one it came from,
+            // never less" true: restoring never reserves more of the dense pool than the book actually used.
             self.instruments[slot] = Instrument {
                 in_use: true,
                 id,
@@ -926,16 +954,21 @@ impl Engine<'_> {
                 position_limit,
                 market_state,
                 next_in_event: NONE,
-                levels_start: u32::try_from(levels_start).map_err(|_| Refused::TooLarge)?,
-                bits_start: u32::try_from(bits_start).map_err(|_| Refused::TooLarge)?,
+                levels_start: 0,
+                bits_start: 0,
+                dense: false,
+                sparse_len: 0,
+                sparse: [SparseEntry::default(); SPARSE_INLINE],
+                overflow_head: NONE,
             };
             self.instruments_used = slot + 1;
-            self.levels_used = levels_start + 2 * per_side;
-            self.level_bits_used = bits_start + 2 * words;
-            // What E-6.5 counts against the listing limits, recomputed rather than carried (E-20.6).
+            // What E-6.5 counts against the listing limits, recomputed rather than carried (E-20.6). Every
+            // listed book counts here at its full table width regardless of tier (ADR-0001), matching
+            // `apply_listing`; `levels_dense`/`level_bits_dense` (actual pool usage) are only touched by
+            // `read_books`'s `level_set` calls, same as promotion is during live trading.
             self.instruments_carried += 1;
-            self.levels_carried += 2 * per_side;
-            self.level_bits_carried += 2 * words;
+            self.levels_carried += 2 * usize::from(table.len);
+            self.level_bits_carried += 2 * usize::from(table.len).div_ceil(64);
             let slot32 = u32::try_from(slot).map_err(|_| Refused::TooLarge)?;
             self.instrument_index.insert(id, slot32).map_err(|_| Refused::TooLarge)?;
 
@@ -1061,21 +1094,24 @@ impl Engine<'_> {
         Ok(())
     }
 
-    /// The queues, which is where an order's time priority comes back. The level's aggregates and the occupancy
-    /// bitmap are counted as the queue is walked rather than read (E-20.6).
+    /// The queues, which is where an order's time priority comes back. The level's aggregates are counted as
+    /// the queue is walked rather than read (E-20.6). Each occupied tick is placed through `level_set`
+    /// (ADR-0001), which decides dense-vs-sparse and promotes exactly as live trading would have — a restored
+    /// book's tier is derived here, the same way its level aggregates always were, not read from the
+    /// snapshot.
     fn read_books(&mut self, r: &mut Reader<'_>) -> Result<(), Refused> {
         for slot in 0..self.instruments_used {
             let inst = self.instruments[slot];
             let ticks = usize::from(inst.table.len);
-            let words = inst.words_per_side();
-            for side in 0..2usize {
-                let base = inst.levels_start as usize + side * ticks;
+            for side_u8 in 0..2u8 {
+                let side = if side_u8 == 0 { Side::BUY } else { Side::SELL };
                 for _ in 0..r.count()? {
-                    let tick = usize::from(r.u16()?);
-                    if tick >= ticks {
+                    let tick = r.u16()?;
+                    if usize::from(tick) >= ticks {
                         return Err(Refused::Malformed);
                     }
                     let mut previous = NONE;
+                    let mut head = NONE;
                     let (mut quantity, mut count) = (0u64, 0u32);
                     for _ in 0..r.count()? {
                         let id = r.u64()?;
@@ -1083,8 +1119,8 @@ impl Engine<'_> {
                         let o = &mut self.orders[order as usize];
                         // A book may only name its own orders, on its own side, at its own tick.
                         if o.instrument_slot as usize != slot
-                            || usize::from(o.tick) != tick
-                            || (o.side as u8 as usize) != side
+                            || o.tick != tick
+                            || o.side != side
                             || o.prev != NONE
                             || o.next != NONE
                         {
@@ -1094,7 +1130,7 @@ impl Engine<'_> {
                         quantity = quantity.checked_add(u64::from(o.remaining)).ok_or(Refused::Malformed)?;
                         count = count.checked_add(1).ok_or(Refused::Malformed)?;
                         if previous == NONE {
-                            self.levels[base + tick].head = order;
+                            head = order;
                         } else {
                             self.orders[previous as usize].next = order;
                         }
@@ -1104,12 +1140,11 @@ impl Engine<'_> {
                         // A level was named with nothing in it; the encoder only writes occupied ones.
                         return Err(Refused::Malformed);
                     }
-                    let level = &mut self.levels[base + tick];
-                    level.tail = previous;
-                    level.quantity = quantity;
-                    level.count = count;
-                    let word = inst.bits_start as usize + side * words + tick / 64;
-                    self.level_bits[word] |= 1u64 << (tick % 64);
+                    let level = Level { quantity, count, head, tail: previous };
+                    self.level_set(slot as u32, side, tick, level).map_err(|e| match e {
+                        FailStop::Capacity => Refused::TooLarge,
+                        _ => Refused::Malformed,
+                    })?;
                 }
             }
         }
