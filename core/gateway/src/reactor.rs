@@ -82,6 +82,9 @@ struct Shared {
     incoming: Mutex<Vec<TcpStream>>,
     /// Whether a wake is already on its way.
     woken: AtomicBool,
+    /// This loop's nudge, as one `Arc` every connection on it shares. Its identity is what lets a fan-out
+    /// group sessions by loop and wake each once.
+    wake: Notify,
 }
 
 impl Shared {
@@ -92,8 +95,14 @@ impl Shared {
     }
 
     fn ready(&self, token: usize) {
-        locked(&self.ready).push(token);
+        self.ready_quiet(token);
         self.nudge();
+    }
+
+    /// Mark a connection ready without the syscall. For a caller fanning one message out to thousands of
+    /// sessions: each still has to be marked, but the loop only has to be woken once (`Outbox::send_deferred`).
+    fn ready_quiet(&self, token: usize) {
+        locked(&self.ready).push(token);
     }
 }
 
@@ -122,11 +131,21 @@ impl Reactors {
         for _ in 0..threads.max(1) {
             let poll = Poll::new()?;
             let waker = Waker::new(poll.registry(), WAKER)?;
-            loops.push(Arc::new(Shared {
-                waker,
-                ready: Mutex::new(Vec::new()),
-                incoming: Mutex::new(Vec::new()),
-                woken: AtomicBool::new(false),
+            // Cyclic because the loop's nudge is the loop's own: one `Arc<dyn Fn>` per loop, handed to every
+            // connection on it, so a fan-out can group its sessions by loop identity and wake each once.
+            loops.push(Arc::new_cyclic(|weak: &std::sync::Weak<Shared>| {
+                let me = weak.clone();
+                Shared {
+                    waker,
+                    ready: Mutex::new(Vec::new()),
+                    incoming: Mutex::new(Vec::new()),
+                    woken: AtomicBool::new(false),
+                    wake: Arc::new(move || {
+                        if let Some(shared) = me.upgrade() {
+                            shared.nudge();
+                        }
+                    }),
+                }
             }));
             polls.push(poll);
         }
@@ -316,8 +335,15 @@ fn take_on(
         let shared = Arc::clone(shared);
         Arc::new(move || shared.ready(token))
     };
+    // Split for the fan-out: marking a connection ready is per connection, waking its loop is per loop. The
+    // waker is the loop's own `Arc`, shared by every connection on it, so a fan-out can tell which sessions
+    // belong to the same loop and wake it once (ADR-0002).
+    let mark: Notify = {
+        let shared = Arc::clone(shared);
+        Arc::new(move || shared.ready_quiet(token))
+    };
     let (tx, queue) = mpsc::channel();
-    let outbox = Outbox::new(tx, Arc::clone(&notify)).with_limit(max_behind);
+    let outbox = Outbox::new(tx, Arc::clone(&notify)).with_limit(max_behind).waking(mark, Arc::clone(&shared.wake));
     conns[token] = Some(Conn {
         socket: Some(Socket::Undecided(stream)),
         session: None,

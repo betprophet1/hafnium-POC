@@ -348,6 +348,11 @@ pub struct Outbox {
     /// How many bytes may wait here before the session is closed. Unbounded unless `with_limit` says otherwise,
     /// for the outboxes that serve no live client (`reconstruct`, tests).
     max_behind: u64,
+    /// The fan-out pair, when whatever serves this session provided one: `mark` records that this connection
+    /// has something waiting, and `wake` is its loop's nudge -- one `Arc` shared by every session on that
+    /// loop, so its identity says which sessions can be woken together. Without it `send_deferred` falls
+    /// back to `notify`, which does both.
+    fanout: Option<(Notify, Notify)>,
 }
 
 impl Outbox {
@@ -359,7 +364,15 @@ impl Outbox {
             behind: Arc::new(AtomicU64::new(0)),
             over: Arc::new(AtomicBool::new(false)),
             max_behind: u64::MAX,
+            fanout: None,
         }
+    }
+
+    /// Supply the split pair a fan-out needs: marking this connection ready, and waking its loop.
+    #[must_use]
+    pub fn waking(mut self, mark: Notify, wake: Notify) -> Self {
+        self.fanout = Some((mark, wake));
+        self
     }
 
     /// The same, closed once `max_behind` bytes wait on it: what a client serving a real connection gets.
@@ -383,12 +396,19 @@ impl Outbox {
     /// The caller **must** call `notifier` for every session it defers, or the message waits for that loop's
     /// next timeout.
     pub fn send_deferred(&self, message: impl Into<Arc<str>>) -> Result<(), SendError<Queued>> {
-        self.put(Queued { text: message.into(), derived: None }, Wake::Deferred)
+        self.put(Queued { text: message.into(), derived: None }, Wake::Deferred)?;
+        // Still has to be marked ready -- that part is per connection. Only the syscall is deferred.
+        if let Some((mark, _)) = &self.fanout {
+            mark();
+        }
+        Ok(())
     }
 
-    /// How to wake the loop serving this session, for a caller that deferred.
+    /// This session's loop's nudge, for a caller that deferred. Sessions on one loop return the same `Arc`,
+    /// which is what makes one wake per loop possible; a session with no fan-out pair returns its own
+    /// `notify` and is simply woken on its own.
     pub fn notifier(&self) -> &Notify {
-        &self.notify
+        self.fanout.as_ref().map_or(&self.notify, |(_, wake)| wake)
     }
 
     /// A frame rendered from the results of `sequence`, which the journal holds.
@@ -1548,15 +1568,22 @@ mod tests {
     /// Everyone subscribed gets the message, and each loop is woken once rather than once per subscriber.
     ///
     /// Waking is an `eventfd` write, and over half of a 41ms flush at sixteen thousand subscribers was those
-    /// syscalls (ADR-0002). `send_to_topic` therefore queues without waking and wakes each loop at the end,
-    /// which makes a forgotten wake a message that sits until the loop's next timeout rather than an error.
-    /// Both halves of that are asserted here: the delivery, and the count.
+    /// syscalls (ADR-0002). `send_to_topic` therefore marks each connection ready without waking, then wakes
+    /// each distinct loop once, which makes a forgotten wake a message that sits until the loop's next
+    /// timeout rather than an error.
+    ///
+    /// Built the way the reactor builds it, which is what the first attempt at this got wrong: the
+    /// per-connection closure is its own `Arc` -- it captures that connection's token -- and only the loop's
+    /// nudge is shared. Deduplicating on the per-connection closure therefore never matches, so it woke every
+    /// session anyway and turned the scan quadratic; the flush went from 41ms to 180ms. Hence a distinct
+    /// `mark` per session here, a shared `wake` per loop, and a count of each.
     #[test]
     fn a_topic_wakes_each_loop_once_however_many_subscribe() {
         let mut hub = hub();
         // Two loops, five sessions: four on the first and one on the second, as a reactor pool would have it.
         let woken = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
-        let notifies: Vec<Notify> = woken
+        let marked = Arc::new(AtomicU64::new(0));
+        let wakes: Vec<Notify> = woken
             .iter()
             .map(|count| {
                 let count = Arc::clone(count);
@@ -1567,18 +1594,26 @@ mod tests {
             .collect();
 
         let mut receivers = Vec::new();
-        for i in 0..5 {
+        for i in 0..5_u64 {
             let (tx, rx) = mpsc::channel();
-            let loop_of = usize::from(i == 4);
-            let key = hub.add_session(Outbox::new(tx, Arc::clone(&notifies[loop_of])));
+            let on = usize::from(i == 4);
+            // Distinct per connection, as `take_on` makes it.
+            let mark: Notify = {
+                let marked = Arc::clone(&marked);
+                Arc::new(move || {
+                    marked.fetch_add(1, Ordering::SeqCst);
+                })
+            };
+            let outbox = Outbox::new(tx, Arc::clone(&mark)).waking(mark, Arc::clone(&wakes[on]));
+            let key = hub.add_session(outbox);
             hub.subscribe(key, &["book.10010".to_string()], 10);
             receivers.push(rx);
         }
-        // Subscribing sends each session the book as it stands, which is a wake of its own; only what the
-        // flush does is under test.
+        // Subscribing sends each session the book as it stands, which wakes it; only the flush is under test.
         for count in &woken {
             count.store(0, Ordering::SeqCst);
         }
+        marked.store(0, Ordering::SeqCst);
         for rx in &receivers {
             while rx.try_recv().is_ok() {}
         }
@@ -1591,6 +1626,7 @@ mod tests {
             let got = rx.try_recv().expect("every subscriber is sent the book that moved");
             assert!(got.text.contains("\"type\":\"book\""), "subscriber {i} got {}", got.text);
         }
+        assert_eq!(marked.load(Ordering::SeqCst), 5, "every connection is still marked ready, one by one");
         assert_eq!(woken[0].load(Ordering::SeqCst), 1, "the loop with four subscribers is woken once");
         assert_eq!(woken[1].load(Ordering::SeqCst), 1, "and the loop with one, once");
     }
