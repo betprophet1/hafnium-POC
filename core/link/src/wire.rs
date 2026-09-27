@@ -199,10 +199,42 @@ pub fn follow(addr: &str, on_connect: impl FnMut() -> u64, on_reset: impl FnMut(
 /// process that logs in its own format.
 pub fn follow_reporting(
     addr: &str,
+    on_connect: impl FnMut() -> u64,
+    on_reset: impl FnMut(),
+    mut on_unit: impl FnMut(Unit),
+    on_error: impl FnMut(&str),
+) -> ! {
+    follow_batched(
+        addr,
+        on_connect,
+        on_reset,
+        move |units: &mut Vec<Unit>| {
+            for unit in units.drain(..) {
+                on_unit(unit);
+            }
+        },
+        on_error,
+        1,
+    )
+}
+
+/// The same, handing over whatever units are already there rather than one at a time.
+///
+/// For a reader that pays something per batch as well as per unit. The gateway takes the hub's write lock
+/// around `apply`, and releasing it wakes every reader queued on it: a futex wake was 26% of the feed
+/// thread's time, once per unit at tens of thousands of units a second (ADR-0002,
+/// docs/adr/measurements/apply-profile.txt). Applying several units under one acquisition divides that.
+///
+/// A batch ends when the reader has nothing already buffered, so a quiet feed still hands over one unit at a
+/// time and waits for nothing. `most` caps it, because the whole batch is one hold of whatever lock the
+/// caller takes, and a reader queued behind it waits for all of it.
+pub fn follow_batched(
+    addr: &str,
     mut on_connect: impl FnMut() -> u64,
     mut on_reset: impl FnMut(),
-    mut on_unit: impl FnMut(Unit),
+    mut on_units: impl FnMut(&mut Vec<Unit>),
     mut on_error: impl FnMut(&str),
+    most: usize,
 ) -> ! {
     loop {
         match TcpStream::connect(addr) {
@@ -213,7 +245,7 @@ pub fn follow_reporting(
                         if resume_from > 0 && !resuming {
                             on_reset();
                         }
-                        if let Err(e) = read_units(stream, &mut on_unit) {
+                        if let Err(e) = read_units(stream, &mut on_units, most.max(1)) {
                             on_error(&format!("{e}; reconnecting"));
                         }
                     }
@@ -235,9 +267,10 @@ fn open(stream: &mut TcpStream, resume_from: u64) -> Result<bool, Error> {
     Ok(answer[0] != 0)
 }
 
-fn read_units(stream: TcpStream, on_unit: &mut impl FnMut(Unit)) -> Result<(), Error> {
+fn read_units(stream: TcpStream, on_units: &mut impl FnMut(&mut Vec<Unit>), most: usize) -> Result<(), Error> {
     let mut reader = BufReader::new(stream);
     let mut frame = Vec::new();
+    let mut batch: Vec<Unit> = Vec::with_capacity(most);
     loop {
         let Some(n) = read_frame(&mut reader, &mut frame)? else { return Err("the feed ended".into()) };
         let input = Frame::new(frame[..n].to_vec());
@@ -249,7 +282,13 @@ fn read_units(stream: TcpStream, on_unit: &mut impl FnMut(Unit)) -> Result<(), E
                 None => return Err("the feed ended inside a unit".into()),
             }
         }
-        on_unit(Unit { input, results });
+        batch.push(Unit { input, results });
+        // Hand over as soon as there is nothing already read: a quiet feed never waits for a batch to fill,
+        // and a busy one batches by however far ahead it happens to be. Nothing here blocks to make a batch.
+        if batch.len() >= most || reader.buffer().is_empty() {
+            on_units(&mut batch);
+            batch.clear();
+        }
     }
 }
 

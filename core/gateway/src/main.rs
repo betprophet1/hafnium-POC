@@ -263,6 +263,12 @@ fn run(args: &Args) -> Result<(), Error> {
     // genesis: that venue's journal holds no inputs at all, so a hub that asked for everything would be sent
     // nothing and serve an empty venue. Loaded once, before either half, so a bad path fails the process rather
     // than leaving one half up and wrong.
+    // How many feed units one acquisition of the hub's write lock applies. 1 is one per unit, which is what
+    // this was: releasing that lock wakes every reader queued on it, and the futex wake was 26% of the feed
+    // thread's time at tens of thousands of units a second (ADR-0002). Larger divides that, at the cost of a
+    // reader waiting for a whole batch rather than one unit -- which is why it is a dial and was measured
+    // rather than guessed. A batch never waits to fill: it is only ever what the feed had already sent.
+    let feed_batch = usize::try_from(args.number("feed-batch", 16)?)?;
     let founding = match args.optional("from-view").filter(|p| !p.is_empty()) {
         Some(path) => {
             venue_link::view::View::load(std::path::Path::new(&path)).map_err(|e| format!("--from-view {path}: {e}"))?
@@ -278,7 +284,7 @@ fn run(args: &Args) -> Result<(), Error> {
             let gateway = Gateway::public(Hub::founded_on(Catalogue::load(&catalogue_file)?, founding.clone()), limits)
                 .with_origins(origins.clone())
                 .with_metrics(metrics.half(api::Half::Public));
-            Some(start_half(gateway.with_audit(audit.clone()).with_trusted_proxies(proxies.clone()), &feed))
+            Some(start_half(gateway.with_audit(audit.clone()).with_trusted_proxies(proxies.clone()), &feed, feed_batch))
         } else {
             None
         },
@@ -309,7 +315,7 @@ fn run(args: &Args) -> Result<(), Error> {
             if !treasury.is_empty() {
                 gateway = gateway.with_treasury(&treasury);
             }
-            let half = start_half(gateway, &feed);
+            let half = start_half(gateway, &feed, feed_batch);
             if !treasury.is_empty() {
                 treasury::follow_updates(&half, treasury);
             }
@@ -343,9 +349,9 @@ struct Halves {
 
 /// A half that follows the node's feed and sends its book subscribers what changed, and keeps checking the API keys
 /// its sessions use when it verifies keys.
-fn start_half(gateway: Gateway, feed: &str) -> Arc<Gateway> {
+fn start_half(gateway: Gateway, feed: &str, feed_batch: usize) -> Arc<Gateway> {
     let gateway = Arc::new(gateway);
-    follow_feed(&gateway, feed.to_string());
+    follow_feed(&gateway, feed.to_string(), feed_batch);
     conflate(&gateway);
     if gateway.identity.serves_keys() {
         identity::keep_checking(&gateway);
@@ -354,11 +360,11 @@ fn start_half(gateway: Gateway, feed: &str) -> Arc<Gateway> {
 }
 
 /// Keeps the hub's view of the venue current from the node's feed, reconnecting for ever.
-fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
+fn follow_feed(gateway: &Arc<Gateway>, feed: String, feed_batch: usize) {
     let follower = Arc::clone(gateway);
     named("gw-feed", move || {
         let half = follower.half.name();
-        wire::follow_reporting(
+        wire::follow_batched(
             &feed,
             || {
                 // Carries on where it left off. This is the reader with most to gain from it: its view used to be
@@ -374,17 +380,36 @@ fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
                 log::warn("the feed is starting over; the view is being thrown away", &[("half", &half)]);
                 follower.hub_mut().restart();
             },
-            |unit| {
-                let record = &unit.input["record"];
-                let (sequence, at) = (record["sequence"].as_u64(), record["sequencedAt"].as_u64());
+            |units: &mut Vec<venue_link::wire::Unit>| {
+                // One acquisition for the batch. Releasing this lock wakes every reader queued on it, and
+                // that futex wake was 26% of this thread's time when it happened once a unit at tens of
+                // thousands of units a second (ADR-0002). The batch is only ever what the feed had already
+                // sent, so nothing waits to fill one.
+                //
                 // Timed from before the lock: all of it is this thread's, and this thread applies every unit
-                // the venue produces, so what it costs is the headroom the whole half has (ADR-0002).
+                // the venue produces, so what it costs is the headroom the whole half has.
                 let started = monotonic();
-                follower.hub_mut().apply(&unit);
-                follower.metrics.feed_apply.observe_duration(monotonic().duration_since(started));
-                follower.metrics.feed_unit(sequence.unwrap_or(0), at.unwrap_or(0), venue_telemetry::wall_ns());
+                {
+                    let mut hub = follower.hub_mut();
+                    for unit in units.iter() {
+                        hub.apply(unit);
+                    }
+                }
+                // Charged per unit, so the histogram still says what one unit costs however they were
+                // batched, and the two are comparable across a change to the batch size.
+                let each = monotonic().duration_since(started) / u32::try_from(units.len().max(1)).unwrap_or(1);
+                for unit in units.iter() {
+                    follower.metrics.feed_apply.observe_duration(each);
+                    let record = &unit.input["record"];
+                    follower.metrics.feed_unit(
+                        record["sequence"].as_u64().unwrap_or(0),
+                        record["sequencedAt"].as_u64().unwrap_or(0),
+                        venue_telemetry::wall_ns(),
+                    );
+                }
             },
             |e| log::warn("feed connection", &[("half", &half), ("feed", &feed), ("error", &e)]),
+            feed_batch,
         );
     });
 }
