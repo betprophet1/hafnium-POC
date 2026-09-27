@@ -191,7 +191,7 @@ fn header_of(f: &Frame) -> MessageHeaderDecoder<ReadBuf<'_>> {
 }
 
 /// A fixed byte array as the string in it: the schema pads with zeroes, as `venue_harness::codec` also trims.
-fn trimmed(b: &[u8]) -> String {
+pub fn trimmed(b: &[u8]) -> String {
     let end = b.iter().rposition(|x| *x != 0).map_or(0, |i| i + 1);
     String::from_utf8_lossy(&b[..end]).into_owned()
 }

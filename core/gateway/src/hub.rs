@@ -12,12 +12,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use venue_journal::message_header_codec::MessageHeaderDecoder;
 use venue_journal::side::Side;
 use venue_journal::{
-    book_level_changed_codec, command_applied_codec, event_released_codec, market_state_changed_codec,
+    book_level_changed_codec, command_applied_codec, event_released_codec, fill_codec, market_state_changed_codec,
     order_accepted_codec, position_changed_codec, sleeve_changed_codec, ReadBuf,
 };
 use venue_link::catalogue::Catalogue;
 use venue_link::submit::Notify;
-use venue_link::view::{InstrumentView, Row, View};
+use venue_link::view::{trimmed, InstrumentView, Row, View};
 use venue_link::wire::{Frame, Unit};
 
 /// Private messages kept per account for sessions resuming by sequence.
@@ -90,15 +90,127 @@ const NOT_EXECUTIONS: [u16; 4] = [
     command_applied_codec::SBE_TEMPLATE_ID,
 ];
 
+/// The same, from feed frames, reading the two a trading load is made of straight out of the decoders.
+///
+/// `Fill` and `OrderAccepted` are handled here rather than through the JSON shape because this runs *before*
+/// `View::apply`, which reads those same two frames typed. Going through `&**f` decoded each of them into a
+/// `serde_json::Value` that the view then ignored -- the full construction *plus* a typed re-read, which is
+/// more work than not having the typed readers at all. Measured on a c6i.8xlarge, n=3 interleaved: it cost
+/// 25% of the request rate at 32 trading connections (ADR-0002, docs/adr/measurements).
+///
+/// The other four arms stay on the JSON path: they are listing and lifecycle traffic, rare next to fills, and
+/// each one kept typed is another place for a field to be read from the wrong offset. `accepted` is shared
+/// across both kinds of arm, because an `OrderCancelled` for an order the view has never seen is priced from
+/// what the `OrderAccepted` before it said.
+///
+/// `executions_agrees_however_the_results_are_read` checks this against `executions` over every arm, which is
+/// what the harness was built for: the typed reading and the JSON one of the same results, compared.
 pub fn executions_of(view: &View, results: &[Frame], sequence: u64) -> Vec<(u64, Value)> {
-    let wanted = results.iter().filter(|f| !NOT_EXECUTIONS.contains(&f.template()));
-    executions(view, wanted.map(|f| &**f), sequence)
+    let mut out = Vec::new();
+    let mut accepted: BTreeMap<u64, (String, u64)> = BTreeMap::new();
+    for f in results {
+        let template = f.template();
+        if NOT_EXECUTIONS.contains(&template) {
+            continue;
+        }
+        if template == order_accepted_codec::SBE_TEMPLATE_ID {
+            accepted_execution(view, f, sequence, &mut accepted, &mut out);
+        } else if template == fill_codec::SBE_TEMPLATE_ID {
+            fill_executions(view, f, sequence, &mut out);
+        } else {
+            execution(view, f, sequence, &mut accepted, &mut out);
+        }
+    }
+    out
+}
+
+/// An `OrderAccepted`, read typed. Also records what the order was, for a cancel later in the same unit.
+fn accepted_execution(
+    view: &View,
+    f: &Frame,
+    sequence: u64,
+    accepted: &mut BTreeMap<u64, (String, u64)>,
+    out: &mut Vec<(u64, Value)>,
+) {
+    let mut dec = order_accepted_codec::OrderAcceptedDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    let (order, tick, side) = (dec.order_id(), u64::from(dec.tick()), dec.side().to_string());
+    let quantity = u64::from(dec.quantity());
+    accepted.insert(order, (side.clone(), tick));
+    let mut e = json!({"type": "accepted", "sequence": id(sequence), "orderId": id(order),
+                       "instrumentId": id(dec.instrument_id())});
+    e["clientOrderId"] = json!(trimmed(&dec.client_order_id()));
+    e["side"] = json!(side.to_lowercase());
+    e["price"] = price::quote(ladder(view, dec.instrument_id()), tick);
+    e["quantity"] = json!(quantity);
+    e["remaining"] = json!(quantity);
+    out.push((dec.account_id(), e));
+}
+
+/// A `Fill`, read typed: one execution for each side of the trade, each with its own cash and fee.
+fn fill_executions(view: &View, f: &Frame, sequence: u64, out: &mut Vec<(u64, Value)>) {
+    let mut dec = fill_codec::FillDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    let instrument = dec.instrument_id();
+    let price = price::quote(ladder(view, instrument), u64::from(dec.tick()));
+    let (quantity, trade) = (u64::from(dec.quantity()), dec.trade_id());
+    let taker_buys = dec.taker_side() == Side::BUY;
+    let (buyer_cash, seller_cash) = (dec.buyer_cash_cents(), dec.seller_cash_cents());
+    let parties = [
+        (
+            "maker",
+            dec.maker_account_id(),
+            dec.maker_order_id(),
+            dec.maker_remaining(),
+            !taker_buys,
+            dec.maker_fee_cents(),
+        ),
+        (
+            "taker",
+            dec.taker_account_id(),
+            dec.taker_order_id(),
+            dec.taker_remaining(),
+            taker_buys,
+            dec.taker_fee_cents(),
+        ),
+    ];
+    for (role, account, order, remaining, buys, fee) in parties {
+        let mut e = json!({"type": "fill", "sequence": id(sequence), "orderId": id(order),
+                           "instrumentId": id(instrument)});
+        e["side"] = json!(if buys { "buy" } else { "sell" });
+        e["price"] = price.clone();
+        e["quantity"] = json!(quantity);
+        e["remaining"] = json!(u64::from(remaining));
+        e["tradeId"] = id(trade);
+        e["role"] = json!(role);
+        e["cashCents"] = json!(if buys { buyer_cash } else { seller_cash });
+        // Charged on top of the cash change, to the maker and taker at their own rates (spec E-10.11).
+        e["feeCents"] = json!(fee);
+        out.push((account, e));
+    }
 }
 
 pub fn executions<'a>(view: &View, results: impl IntoIterator<Item = &'a Value>, sequence: u64) -> Vec<(u64, Value)> {
     let mut out = Vec::new();
     let mut accepted: BTreeMap<u64, (String, u64)> = BTreeMap::new();
     for r in results {
+        execution(view, r, sequence, &mut accepted, &mut out);
+    }
+    out
+}
+
+/// One result's executions, through the JSON shape. The whole of `executions`, and the four rarer arms of
+/// `executions_of`, so that the two cannot drift apart on a message neither reads typed.
+fn execution(
+    view: &View,
+    r: &Value,
+    sequence: u64,
+    accepted: &mut BTreeMap<u64, (String, u64)>,
+    out: &mut Vec<(u64, Value)>,
+) {
+    {
         let instrument = u(&r["instrumentId"]);
         let quote = |tick: u64| price::quote(ladder(view, instrument), tick);
         let base = |kind: &str, order: Value| json!({"type": kind, "sequence": id(sequence), "orderId": order, "instrumentId": id(instrument)});
@@ -173,7 +285,6 @@ pub fn executions<'a>(view: &View, results: impl IntoIterator<Item = &'a Value>,
             _ => {}
         }
     }
-    out
 }
 
 /// Takes a session out of one entry of an index, dropping the entry once it is empty.
