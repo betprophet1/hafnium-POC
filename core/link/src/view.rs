@@ -16,8 +16,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use venue_journal::message_header_codec::MessageHeaderDecoder;
 use venue_journal::side::Side;
 use venue_journal::{
-    book_level_changed_codec, command_applied_codec, fill_codec, order_accepted_codec, position_changed_codec,
-    sleeve_changed_codec, ReadBuf,
+    book_level_changed_codec, command_applied_codec, fill_codec, order_accepted_codec, order_amended_codec,
+    order_cancelled_codec, order_reduced_codec, position_changed_codec, sleeve_changed_codec, ReadBuf,
 };
 
 const KEEP: usize = 60;
@@ -439,6 +439,32 @@ impl View {
                     expires_at: None,
                 };
                 self.orders.insert(dec.order_id(), order);
+                true
+            }
+            // The order lifecycle, which `executions` reads too -- both had to be typed for either to save
+            // anything, since one decode serves the whole unit (ADR-0002).
+            order_cancelled_codec::SBE_TEMPLATE_ID => {
+                let mut dec = order_cancelled_codec::OrderCancelledDecoder::default().header(header_of(f), 0);
+                let mut group = dec.result_decoder();
+                dec = group.parent().expect("the result group");
+                self.orders.remove(&dec.order_id());
+                true
+            }
+            order_reduced_codec::SBE_TEMPLATE_ID => {
+                let mut dec = order_reduced_codec::OrderReducedDecoder::default().header(header_of(f), 0);
+                let mut group = dec.result_decoder();
+                dec = group.parent().expect("the result group");
+                self.set_remaining(dec.order_id(), u64::from(dec.remaining_quantity()));
+                true
+            }
+            order_amended_codec::SBE_TEMPLATE_ID => {
+                let mut dec = order_amended_codec::OrderAmendedDecoder::default().header(header_of(f), 0);
+                let mut group = dec.result_decoder();
+                dec = group.parent().expect("the result group");
+                if let Some(o) = self.orders.get_mut(&dec.order_id()) {
+                    o.tick = u64::from(dec.tick());
+                    o.remaining = u64::from(dec.quantity());
+                }
                 true
             }
             // The two most numerous results the hub does not want at all: `executions` skips both, so before

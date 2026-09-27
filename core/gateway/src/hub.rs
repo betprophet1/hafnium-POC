@@ -13,8 +13,8 @@ use venue_journal::message_header_codec::MessageHeaderDecoder;
 use venue_journal::side::Side;
 use venue_journal::{
     book_level_changed_codec, collateral_released_codec, command_applied_codec, event_released_codec, fill_codec,
-    market_state_changed_codec, order_accepted_codec, position_changed_codec, settlement_payout_codec,
-    sleeve_changed_codec, ReadBuf,
+    market_state_changed_codec, order_accepted_codec, order_amended_codec, order_cancelled_codec, order_reduced_codec,
+    order_rejected_codec, position_changed_codec, settlement_payout_codec, sleeve_changed_codec, ReadBuf,
 };
 use venue_link::catalogue::Catalogue;
 use venue_link::submit::Notify;
@@ -118,6 +118,14 @@ pub fn executions_of(view: &View, results: &[Frame], sequence: u64) -> Vec<(u64,
             accepted_execution(view, f, sequence, &mut accepted, &mut out);
         } else if template == fill_codec::SBE_TEMPLATE_ID {
             fill_executions(view, f, sequence, &mut out);
+        } else if template == order_cancelled_codec::SBE_TEMPLATE_ID {
+            cancelled_execution(view, f, sequence, &accepted, &mut out);
+        } else if template == order_amended_codec::SBE_TEMPLATE_ID {
+            amended_execution(view, f, sequence, &mut out);
+        } else if template == order_reduced_codec::SBE_TEMPLATE_ID {
+            reduced_execution(f, sequence, &mut out);
+        } else if template == order_rejected_codec::SBE_TEMPLATE_ID {
+            rejected_execution(f, sequence, &mut out);
         } else {
             execution(view, f, sequence, &mut accepted, &mut out);
         }
@@ -200,6 +208,76 @@ pub fn executions<'a>(view: &View, results: impl IntoIterator<Item = &'a Value>,
         execution(view, r, sequence, &mut accepted, &mut out);
     }
     out
+}
+
+/// An `OrderCancelled`, read typed. Priced from the view, or from what an `OrderAccepted` earlier in the same
+/// unit said when the view has never seen the order -- which is why `accepted` is threaded through the whole
+/// loop rather than rebuilt per arm.
+fn cancelled_execution(
+    view: &View,
+    f: &Frame,
+    sequence: u64,
+    accepted: &BTreeMap<u64, (String, u64)>,
+    out: &mut Vec<(u64, Value)>,
+) {
+    let mut dec = order_cancelled_codec::OrderCancelledDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    let (order, instrument) = (dec.order_id(), dec.instrument_id());
+    let mut e = json!({"type": "cancelled", "sequence": id(sequence), "orderId": id(order),
+                       "instrumentId": id(instrument)});
+    e["quantity"] = json!(dec.cancelled_quantity());
+    e["reason"] = json!(dec.reason().to_string().to_lowercase());
+    let known = view.orders.get(&order).map(|o| (o.side.clone(), o.tick)).or_else(|| accepted.get(&order).cloned());
+    if let Some((side, tick)) = known {
+        e["side"] = json!(side.to_lowercase());
+        e["price"] = price::quote(ladder(view, instrument), tick);
+    }
+    out.push((dec.account_id(), e));
+}
+
+/// An `OrderAmended`, read typed. The side comes from the view, which holds the order this amends.
+fn amended_execution(view: &View, f: &Frame, sequence: u64, out: &mut Vec<(u64, Value)>) {
+    let mut dec = order_amended_codec::OrderAmendedDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    let (order, instrument) = (dec.order_id(), dec.instrument_id());
+    let quantity = u64::from(dec.quantity());
+    let mut e = json!({"type": "amended", "sequence": id(sequence), "orderId": id(order),
+                       "instrumentId": id(instrument)});
+    if let Some(o) = view.orders.get(&order) {
+        e["side"] = json!(o.side.to_lowercase());
+    }
+    e["price"] = price::quote(ladder(view, instrument), u64::from(dec.tick()));
+    e["quantity"] = json!(quantity);
+    e["remaining"] = json!(quantity);
+    out.push((dec.account_id(), e));
+}
+
+/// An `OrderReduced`, read typed. Nothing here needs the view.
+fn reduced_execution(f: &Frame, sequence: u64, out: &mut Vec<(u64, Value)>) {
+    let mut dec = order_reduced_codec::OrderReducedDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    let mut e = json!({"type": "reduced", "sequence": id(sequence), "orderId": id(dec.order_id()),
+                       "instrumentId": id(dec.instrument_id())});
+    e["remaining"] = json!(dec.remaining_quantity());
+    out.push((dec.account_id(), e));
+}
+
+/// An `OrderRejected`, read typed. `originalOrderId` is optional in the schema -- absent when the engine never
+/// gave the order an id -- and the JSON path renders that absence as null, so the decoder's `None` has to
+/// become `Value::Null` rather than `id(0)`.
+fn rejected_execution(f: &Frame, sequence: u64, out: &mut Vec<(u64, Value)>) {
+    let mut dec = order_rejected_codec::OrderRejectedDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    let original = dec.original_order_id().map_or(Value::Null, id);
+    let mut e = json!({"type": "rejected", "sequence": id(sequence), "orderId": original,
+                       "instrumentId": id(dec.instrument_id())});
+    e["clientOrderId"] = json!(trimmed(&dec.client_order_id()));
+    e["reason"] = json!(dec.reason().to_string().to_lowercase());
+    out.push((dec.account_id(), e));
 }
 
 /// One result's executions, through the JSON shape. The whole of `executions`, and the four rarer arms of
@@ -1543,6 +1621,12 @@ mod tests {
                    "instrumentId": 10_010, "remainingQuantity": 12}),
             json!({"msg": "OrderRejected", "result": result(6), "accountId": 11, "sessionId": 3,
                    "clientOrderId": "cl-702", "originalOrderId": 701, "reason": "DUPLICATE_CLIENT_ORDER_ID"}),
+            // And one the engine never gave an id, because `originalOrderId` is optional in the schema and
+            // its absence renders as null rather than zero. Without this the corpus never exercised the
+            // absent case: typing the arm as `id(unwrap_or(0))` passed, and would have told a client that a
+            // rejected order had id "0".
+            json!({"msg": "OrderRejected", "result": result(6), "accountId": 11, "sessionId": 3,
+                   "clientOrderId": "cl-703", "reason": "MALFORMED"}),
             json!({"msg": "Fill", "result": result(7), "tradeId": 900, "instrumentId": 10_010, "tick": 40,
                    "quantity": 9, "makerOrderId": 700, "makerAccountId": 7, "makerRemaining": 3,
                    "takerOrderId": 701, "takerAccountId": 11, "takerRemaining": 16, "takerSide": "BUY",
@@ -1589,7 +1673,7 @@ mod tests {
         }
 
         // The corpus has to be doing something, or two readings of nothing would agree.
-        assert_eq!(whole_json.len(), 10, "six arms, with a fill counted for each side: {whole_json:?}");
+        assert_eq!(whole_json.len(), 11, "six arms, a fill counted for each side, two rejections: {whole_json:?}");
         let kinds: BTreeSet<&str> = whole_json.iter().filter_map(|(_, e)| e["type"].as_str()).collect();
         assert_eq!(
             kinds,
