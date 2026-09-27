@@ -7,6 +7,7 @@ mod client;
 mod gwload;
 mod oracle;
 mod resolution;
+mod retail;
 mod session;
 mod web;
 mod workload;
@@ -332,6 +333,9 @@ fn gwload(args: &Args) -> Result<(), Error> {
         orders_per_trade: args.number("orders-per-trade", 10)?,
         retail: usize::try_from(args.number("retail", 0)?)?,
         retail_order_seconds: args.number("retail-order-seconds", 10)?,
+        retail_workers: usize::try_from(
+            args.number("retail-workers", std::thread::available_parallelism().map_or(8, |n| n.get() as u64))?,
+        )?,
         watchers: usize::try_from(args.number("watchers", 0)?)?,
         public_gateway: args.optional("public-gateway").filter(|a| !a.is_empty()),
     };
