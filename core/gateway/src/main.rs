@@ -265,10 +265,16 @@ fn run(args: &Args) -> Result<(), Error> {
     // than leaving one half up and wrong.
     // How many feed units one acquisition of the hub's write lock applies. 1 is one per unit, which is what
     // this was: releasing that lock wakes every reader queued on it, and the futex wake was 26% of the feed
-    // thread's time at tens of thousands of units a second (ADR-0002). Larger divides that, at the cost of a
-    // reader waiting for a whole batch rather than one unit -- which is why it is a dial and was measured
-    // rather than guessed. A batch never waits to fill: it is only ever what the feed had already sent.
-    let feed_batch = usize::try_from(args.number("feed-batch", 16)?)?;
+    // thread's time at tens of thousands of units a second (ADR-0002).
+    //
+    // 8 from measurement, not from the profile's 26%. Batching buys far less than that share suggests --
+    // `futex_wake` wakes every queued reader in one call, so fewer releases mean more readers woken per
+    // release rather than less work. At 16,384 customers: 1 -> 37,878 req/s, 8 -> 39,384, 32 -> 39,460, so
+    // almost all of a 4% gain is there by 8. Past it only the tail moves, and the wrong way: retail p99 was
+    // 65.0ms at 1, 58.6ms at 8 and 106.5ms at 32, which is a reader waiting out a longer hold.
+    //
+    // A batch never waits to fill: it is only ever what the feed had already sent.
+    let feed_batch = usize::try_from(args.number("feed-batch", 8)?)?;
     let founding = match args.optional("from-view").filter(|p| !p.is_empty()) {
         Some(path) => {
             venue_link::view::View::load(std::path::Path::new(&path)).map_err(|e| format!("--from-view {path}: {e}"))?
