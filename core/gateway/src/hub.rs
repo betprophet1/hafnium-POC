@@ -12,8 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use venue_journal::message_header_codec::MessageHeaderDecoder;
 use venue_journal::side::Side;
 use venue_journal::{
-    book_level_changed_codec, command_applied_codec, event_released_codec, fill_codec, market_state_changed_codec,
-    order_accepted_codec, position_changed_codec, sleeve_changed_codec, ReadBuf,
+    book_level_changed_codec, collateral_released_codec, command_applied_codec, event_released_codec, fill_codec,
+    market_state_changed_codec, order_accepted_codec, position_changed_codec, settlement_payout_codec,
+    sleeve_changed_codec, ReadBuf,
 };
 use venue_link::catalogue::Catalogue;
 use venue_link::submit::Notify;
@@ -728,46 +729,88 @@ impl Hub {
                 self.dirty.entry(dec.instrument_id()).or_default().insert(level, moved);
                 continue;
             }
-            let instrument = u(&r["instrumentId"]);
-            match r["msg"].as_str().unwrap_or("") {
-                "PositionChanged" => accounts
-                    .entry(u(&r["accountId"]))
-                    .or_default()
-                    .push(json!({"instrumentId": id(instrument), "position": r["position"]})),
-                "SleeveChanged" => {
-                    accounts.entry(u(&r["accountId"])).or_default();
+            // Dispatched on the template, and every field read out of the decoder.
+            //
+            // This match used to be on `r["msg"]`, with `r["instrumentId"]` read just above it -- two index
+            // operations that decode the whole frame into a `serde_json::Value` before anything knows whether
+            // this arm wants it. It ran for every result of every unit, which meant the typed readers
+            // elsewhere were reading a frame that had already been decoded here: `order_accepted` and `fill`
+            // were counted as decoded despite both having typed paths, and `sleeve_changed` -- the single
+            // most numerous result, whose arm needs one field -- was decoded in full 2.24M times a minute.
+            // Measured: 5.35M of 7.24M results decoded, against 1.89M that did not (ADR-0002,
+            // docs/adr/measurements/feed-mix.txt).
+            //
+            // The accepts, cancels, amends, reduces and rejects have no arm here at all, so with the
+            // dispatch typed they are never looked at again.
+            match r.template() {
+                position_changed_codec::SBE_TEMPLATE_ID => {
+                    let mut dec = position_changed_codec::PositionChangedDecoder::default().header(header_of(r), 0);
+                    let mut group = dec.result_decoder();
+                    dec = group.parent().expect("the result group");
+                    accounts
+                        .entry(dec.account_id())
+                        .or_default()
+                        .push(json!({"instrumentId": id(dec.instrument_id()), "position": dec.position()}));
                 }
-                "SettlementPayout" if u(&r["accountId"]) != 0 => {
+                sleeve_changed_codec::SBE_TEMPLATE_ID => {
+                    let mut dec = sleeve_changed_codec::SleeveChangedDecoder::default().header(header_of(r), 0);
+                    let mut group = dec.result_decoder();
+                    dec = group.parent().expect("the result group");
+                    accounts.entry(dec.account_id()).or_default();
+                }
+                settlement_payout_codec::SBE_TEMPLATE_ID => {
+                    let mut dec = settlement_payout_codec::SettlementPayoutDecoder::default().header(header_of(r), 0);
+                    let mut group = dec.result_decoder();
+                    dec = group.parent().expect("the result group");
+                    let (account, instrument) = (dec.account_id(), dec.instrument_id());
+                    if account == 0 {
+                        continue;
+                    }
                     let event = if instrument == 0 { settled_event } else { event_of(&self.view, instrument) };
                     let payout = json!({
                         "type": "payout", "sequence": id(sequence), "eventId": id(event), "instrumentId": id(instrument),
-                        "kind": lower(&r["kind"]), "positionClosed": r["positionClosed"], "cents": r["cents"]
+                        "kind": dec.kind().to_string().to_lowercase(), "positionClosed": dec.position_closed(),
+                        "cents": dec.cents()
                     });
-                    self.send_to_account(u(&r["accountId"]), sequence, "payout", payout.to_string());
+                    self.send_to_account(account, sequence, "payout", payout.to_string());
                 }
                 // A set burn: complete sets the account held went back as cash (spec E-14.3), which would
                 // otherwise show only as positions falling and cash rising.
-                "CollateralReleased" => {
+                collateral_released_codec::SBE_TEMPLATE_ID => {
+                    let mut dec =
+                        collateral_released_codec::CollateralReleasedDecoder::default().header(header_of(r), 0);
+                    let mut group = dec.result_decoder();
+                    dec = group.parent().expect("the result group");
                     let release = json!({
-                        "type": "release", "sequence": id(sequence), "eventId": id(u(&r["eventId"])),
-                        "kind": lower(&r["kind"]), "cents": r["cents"]
+                        "type": "release", "sequence": id(sequence), "eventId": id(dec.event_id()),
+                        "kind": dec.kind().to_string().to_lowercase(), "cents": dec.cents()
                     });
-                    self.send_to_account(u(&r["accountId"]), sequence, "release", release.to_string());
+                    self.send_to_account(dec.account_id(), sequence, "release", release.to_string());
                 }
-                "Fill" => {
+                fill_codec::SBE_TEMPLATE_ID => {
+                    let mut dec = fill_codec::FillDecoder::default().header(header_of(r), 0);
+                    let mut group = dec.result_decoder();
+                    let at = group.sequenced_at();
+                    dec = group.parent().expect("the result group");
+                    let instrument = dec.instrument_id();
                     let trade = json!({
                         "type": "trade", "sequence": id(sequence), "instrumentId": id(instrument),
-                        "tradeId": id(u(&r["tradeId"])), "price": self.quote(instrument, u(&r["tick"])),
-                        "quantity": r["quantity"], "takerSide": lower(&r["takerSide"]),
-                        "at": price::format_timestamp(u(&r["result"]["sequencedAt"]))
+                        "tradeId": id(dec.trade_id()), "price": self.quote(instrument, u64::from(dec.tick())),
+                        "quantity": dec.quantity(), "takerSide": dec.taker_side().to_string().to_lowercase(),
+                        "at": price::format_timestamp(at)
                     });
                     self.send_to_topic(&format!("trades.{instrument}"), &Arc::from(trade.to_string()));
                 }
-                "MarketStateChanged" => {
+                market_state_changed_codec::SBE_TEMPLATE_ID => {
+                    let mut dec =
+                        market_state_changed_codec::MarketStateChangedDecoder::default().header(header_of(r), 0);
+                    let mut group = dec.result_decoder();
+                    dec = group.parent().expect("the result group");
+                    let instrument = dec.instrument_id();
                     let event = self.view.instruments.get(&instrument).map_or(0, |i| i.event);
                     let market = json!({
                         "type": "market", "sequence": id(sequence), "eventId": id(event),
-                        "instrumentId": id(instrument), "state": lower(&r["state"])
+                        "instrumentId": id(instrument), "state": dec.state().to_string().to_lowercase()
                     });
                     self.send_to_topic("markets", &Arc::from(market.to_string()));
                 }
@@ -1629,5 +1672,50 @@ mod tests {
         assert_eq!(marked.load(Ordering::SeqCst), 5, "every connection is still marked ready, one by one");
         assert_eq!(woken[0].load(Ordering::SeqCst), 1, "the loop with four subscribers is woken once");
         assert_eq!(woken[1].load(Ordering::SeqCst), 1, "and the loop with one, once");
+    }
+
+    /// The results a trading venue is mostly made of, applied without any of them being decoded.
+    ///
+    /// `Hub::apply` used to dispatch on `r["msg"]`, having read `r["instrumentId"]` just above it, for every
+    /// result of every unit. Both index a `Frame`, so both decode it -- which meant the typed readers
+    /// elsewhere were reading frames this loop had already turned into a `serde_json::Value`. Measured on a
+    /// realistic load: 5.35M of 7.24M results decoded, `order_accepted` and `fill` among them despite both
+    /// having typed paths, and `sleeve_changed` -- the most numerous result of all, whose arm wants one
+    /// field -- decoded 2.24M times a minute (ADR-0002, docs/adr/measurements/feed-mix.txt).
+    ///
+    /// So this asserts the negative, which is the only way that mistake is visible: nothing here may be
+    /// decoded. An accept, a cancel and an amend have no arm in the hub's loop at all; a book level, a
+    /// sleeve and a position have typed ones in the hub or the view. `Frame::decoded` reports it.
+    #[test]
+    fn a_units_results_are_applied_without_decoding_them() {
+        let mut hub = hub();
+        let result = |n: u64| json!({"inputSequence": n, "resultIndex": 0, "sequencedAt": 0, "sequencerGroup": 1});
+        let results: Vec<Frame> = [
+            json!({"msg": "OrderAccepted", "result": result(9), "orderId": 5, "accountId": 7, "sessionId": 1,
+                   "clientOrderId": "c", "instrumentId": 10_010, "side": "BUY", "tick": 40, "quantity": 5,
+                   "reservedCents": 200}),
+            json!({"msg": "BookLevelChanged", "result": result(9), "instrumentId": 10_010, "side": "BUY",
+                   "tick": 40, "quantity": 250, "orderCount": 2}),
+            json!({"msg": "SleeveChanged", "result": result(9), "accountId": 7, "availableCents": 900,
+                   "reservedCents": 100}),
+            json!({"msg": "PositionChanged", "result": result(9), "accountId": 7, "instrumentId": 10_010,
+                   "position": 5}),
+        ]
+        .iter()
+        .map(Frame::of)
+        .collect();
+        let input = Frame::of(&json!({"msg": "NewOrder",
+            "record": {"sequence": 9, "sequencedAt": 0, "sequencerGroup": 1}}));
+        let unit = Unit { input, results };
+
+        hub.apply(&unit);
+
+        for (i, frame) in unit.results.iter().enumerate() {
+            assert!(!frame.decoded(), "result {i} (template {}) should not have been decoded", frame.template());
+        }
+        // And it did the work: the level is kept for the flush, and the view took the sleeve and position.
+        assert_eq!(hub.dirty.get(&10_010).and_then(|l| l.get(&(true, 40))), Some(&(250, 2)));
+        assert_eq!(hub.view.sleeves.get(&7), Some(&(900, 100)));
+        assert_eq!(hub.view.positions.get(&(7, 10_010)), Some(&5));
     }
 }

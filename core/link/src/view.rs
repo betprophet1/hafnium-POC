@@ -15,7 +15,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use venue_journal::message_header_codec::MessageHeaderDecoder;
 use venue_journal::side::Side;
-use venue_journal::{book_level_changed_codec, command_applied_codec, fill_codec, order_accepted_codec, ReadBuf};
+use venue_journal::{
+    book_level_changed_codec, command_applied_codec, fill_codec, order_accepted_codec, position_changed_codec,
+    sleeve_changed_codec, ReadBuf,
+};
 
 const KEEP: usize = 60;
 
@@ -436,6 +439,27 @@ impl View {
                     expires_at: None,
                 };
                 self.orders.insert(dec.order_id(), order);
+                true
+            }
+            // The two most numerous results the hub does not want at all: `executions` skips both, so before
+            // this the only thing decoding them was falling through to `result`. `sleeve_changed` alone was
+            // 2.24M decodes a minute, for two integers (ADR-0002, docs/adr/measurements/feed-mix.txt).
+            sleeve_changed_codec::SBE_TEMPLATE_ID => {
+                let mut dec = sleeve_changed_codec::SleeveChangedDecoder::default().header(header_of(f), 0);
+                let mut group = dec.result_decoder();
+                dec = group.parent().expect("the result group");
+                self.sleeves.insert(dec.account_id(), (dec.available_cents(), dec.reserved_cents()));
+                true
+            }
+            position_changed_codec::SBE_TEMPLATE_ID => {
+                let mut dec = position_changed_codec::PositionChangedDecoder::default().header(header_of(f), 0);
+                let mut group = dec.result_decoder();
+                dec = group.parent().expect("the result group");
+                let key = (dec.account_id(), dec.instrument_id());
+                match dec.position() {
+                    0 => self.positions.remove(&key),
+                    p => self.positions.insert(key, p),
+                };
                 true
             }
             fill_codec::SBE_TEMPLATE_ID => {
@@ -1005,6 +1029,16 @@ mod tests {
                    "quantity": 7, "makerOrderId": 900_123, "makerAccountId": 9_600_007, "makerRemaining": 993,
                    "takerOrderId": 900_124, "takerAccountId": 9_600_008, "takerRemaining": 493,
                    "takerSide": "SELL"}),
+            // The two the hub skips entirely, so `result_typed` is the only thing that reads them: a sleeve
+            // both ways round, and a position both set and cleared, since zero is the branch that removes.
+            json!({"msg": "SleeveChanged", "result": result(6), "accountId": 9_600_007,
+                   "availableCents": 123_456, "reservedCents": 7_890}),
+            json!({"msg": "PositionChanged", "result": result(6), "accountId": 9_600_007,
+                   "instrumentId": 9_500_000, "position": 42}),
+            json!({"msg": "PositionChanged", "result": result(6), "accountId": 9_600_008,
+                   "instrumentId": 9_500_000, "position": -17}),
+            json!({"msg": "PositionChanged", "result": result(6), "accountId": 9_600_008,
+                   "instrumentId": 9_500_000, "position": 0}),
             // And one that empties the maker, which is the branch that removes an order rather than reducing it.
             json!({"msg": "Fill", "result": result(7), "tradeId": 55_002, "instrumentId": 9_500_000, "tick": 40,
                    "quantity": 993, "makerOrderId": 900_123, "makerAccountId": 9_600_007, "makerRemaining": 0,
