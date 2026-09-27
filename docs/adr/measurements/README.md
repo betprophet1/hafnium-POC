@@ -18,6 +18,10 @@ checkable against what was actually run. Everything here is from a throwaway c6i
 | `lockdelta-16384.txt`, `lockdelta-16384-after.txt`, `lockdelta-books.txt` | Lock cost as before/after deltas over one 60s run: conflate hold, fan-out, read wait and feed-apply. In order: before the fan-out fix, after it, and after the subscription model was corrected too. |
 | `conflate-profile.txt` | `perf` on the public `gw-conflate` thread at 16,384 subscribers: the profile that found `eventfd_write` at 51.7% and cleared the btree lookup of suspicion. |
 | `lockdelta-wake.txt` | Lock cost after the wake coalescing: fan-out 10.7ms, conflation 9.2/s. |
+| `apply-profile.txt` | `perf` on the private `gw-feed` thread: `futex_wake` at 26%, which led to the batching. |
+| `batch-sweep.txt` | `--feed-batch` at 1, 8 and 32, the whole venue rebuilt per arm. |
+| `feed-mix.txt`, `feed-mix-after.txt`, `feed-mix-final.txt` | Which results the feed decoded, by kind: before the dispatch fix (5.35M of 7.24M), after it (1.72M), and after the order lifecycle was typed (20,085). |
+| `lockdelta-typed.txt`, `lockdelta-final.txt` | Lock costs at those last two points. |
 | `retail.txt` | The first retail sweep, with the generator and the gateway sharing one box. Client-bound above ~1,024; kept only because the corrections reference it. |
 
 ## The scripts

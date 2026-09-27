@@ -728,6 +728,111 @@ proposed for `Hub::apply` should be profiled first.
   the SBE feed directly. That is a client-contract change and belongs in its own ADR — but it now has a cost
   basis, and the `Arc<str>` change makes a faster tier considerably cheaper than it would have been.
 
+## Taking `Value` off the feed path, actually (2026-09-27)
+
+The section above leaves `Hub::apply` holding the private write lock about two thirds of every second, with
+requests queued behind it at ~50µs. This is what that turned out to be, and it is not what any of the earlier
+attempts assumed.
+
+### Batching the lock acquisitions: 4%
+
+Profiling the private feed thread put `futex_wake` at 26% inclusive — releasing the hub's write lock and waking
+every reader queued on it, once per unit at tens of thousands of units a second. Nothing else dominated:
+allocator ~11%, `serde_json` ~9%, `BTreeMap` ~6.5%, `Hub::apply` itself 2.5%.
+
+So `wire::follow_batched` hands over whatever units the feed had already sent and the gateway applies them
+under one acquisition. A batch never waits to fill, so a quiet feed is unchanged.
+
+| batch | trading | feed_apply | read wait | retail p99 |
+|---|---|---|---|---|
+| 1 | 37,878/s | 15.7µs | 51.1µs | 65.0ms |
+| **8** | **39,384/s** | **14.7µs** | 50.1µs | **58.6ms** |
+| 32 | 39,460/s | 14.5µs | 50.7µs | 106.5ms |
+
+**4%, not 26%.** `futex_wake` wakes every queued reader in one call, so fewer releases mean more readers per
+release rather than less work. Default 8: almost all of the gain, and past it the tail moves the wrong way.
+
+### Counting what a profile cannot
+
+Which results still cost a `Value` is not a question a profile answers — it attributes to `serialize` and the
+allocator, not to the kind of message. `venue_gateway_feed_results_total{half,result,decoded}` counts every
+result by kind and whether applying the unit decoded it. On a realistic load, per half, per minute:
+
+| result | count | decoded |
+|---|---|---|
+| `sleeve_changed` | 2,240,709 | yes |
+| `book_level_changed` | 1,894,427 | **no** |
+| `order_accepted` | 1,021,456 | yes |
+| `order_cancelled` | 858,317 | yes |
+| `order_amended` | 720,363 | yes |
+| `position_changed` | 326,278 | yes |
+| `fill` | 163,139 | yes |
+
+**5.35M of 7.24M decoded — only 26% avoided a `Value`.** Two things nobody had said out loud: `sleeve_changed`
+is the most numerous result on the feed and the biggest single decoder, and `order_accepted` and `fill` were
+being decoded *despite* having typed readers in both `executions_of` and `View::result_typed`.
+
+### One dispatch was paying for all of it
+
+`Hub::apply` read `r["instrumentId"]` and then matched on `r["msg"]`, for every result of every unit. Both
+index a `Frame`, so both decode it in full — before anything knows whether this arm wants the result at all.
+Every typed reader downstream was reading a frame this loop had already turned into a `Value`.
+
+**That is why stages 2+3 measured neutral.** The typed paths were real and correct; the decode had already
+happened.
+
+Dispatching on `r.template()` and reading each arm from the decoder (`856f79e`), plus `SleeveChanged` and
+`PositionChanged` in `View::result_typed` — accepts, cancels, amends, reduces and rejects have no arm in that
+loop at all, so they stopped being looked at:
+
+| | before | after |
+|---|---|---|
+| results decoded | 5.35M | **1.72M** (−68%) |
+| trading | 39,384/s | **43,870/s** (+11.4%) |
+| feed_apply private | 14.7µs | **13.0µs** |
+| feed_apply public | 12.4µs | **10.7µs** |
+| read wait | 50.1µs | **43.6µs** |
+
+The largest single gain of the whole effort, from deleting a dispatch rather than adding typed readers.
+
+### Finishing it: correct, and free
+
+`order_cancelled` and `order_amended` were the last of the volume, and needed typing in *both* `executions_of`
+and `View::result` — one decode serves the whole unit, so either alone would have changed nothing (`a37864d`).
+
+That leaves **20,085 of 7.68M results decoded: 99.7% of the feed never becomes a `Value`.** The performance
+difference was **nothing measurable** — 43,380/s against 43,870/s, 12.9µs against 13.0µs, both inside
+single-run variance. 1.7M decodes a minute is about 2.8% of one thread, which this measurement cannot resolve.
+
+Worth having for what it is — no `Value` on the hot path, and the shape the code was always meant to have —
+but the honest accounting is that the dispatch fix was the win and this was the tidy-up.
+
+### Where the latency ended up
+
+Across the whole of this ADR's second half, at 16,384 customers:
+
+| | before the fan-out work | now |
+|---|---|---|
+| conflate write-lock hold | 122,473µs | **8.4µs** |
+| fan-out per flush | (inside the hold) | 15,728µs, under a read lock |
+| retail order p50 | 13.9ms | **3.9ms** |
+| trading | 36,190/s | **43,380/s** |
+| request wait for the read lock | 51.1µs | **42.9µs** |
+| results decoded per minute | 5.35M | **20,085** |
+
+`Hub::apply` still holds the private write lock ~59% of every second. That is now the work itself — applying
+the venue's state changes — rather than decoding, waking or lock churn, all of which have been measured and
+removed. Getting below it means requests not needing the writer's lock at all, which is a structural question
+and a different ADR.
+
+### What this cost in wrong turns
+
+Worth recording, because the pattern was consistent. Mechanisms named from reading the code: the double decode,
+the conflate lock at zero subscribers, the per-subscriber map lookup, the per-connection waker, `OrderCancelled`
+as the main decoder. **All five wrong.** Every histogram, profile and counter: right. The one change committed
+before it was measured regressed by 4.4x, and the counter that finally found the dispatch loop took an hour to
+write and answered in one run what four readings of the code had got wrong.
+
 ## Action Items
 
 1. [x] Implement `RwLock<Hub>` (Option A) for real, verify it compiles clean and the full test suite passes — done, 97/97.
@@ -773,11 +878,9 @@ proposed for `Hub::apply` should be profiled first.
 13. [x] **Re-measure stages 2+3 on that load** — done. Pre-stage and HEAD are within ±3% on throughput and on
     apply cost: the change is neutral, not the −29%/−25% win this ADR claimed and not the −25% loss the
     unrepresentative load showed. The proposal to revert `0bf4a7b..HEAD` is withdrawn.
-14. [ ] **Decide whether to finish or abandon the `Value` removal.** Half-done is measurably neutral, so there
-    is no urgency either way. Finishing means typed `executions` (its differential harness is
-    `hub::tests::executions_agrees_however_the_results_are_read`) and typed `View::result`, so that no reader
-    builds a `Value`; abandoning means removing `Frame`, the typed readers and the harness. What is not
-    defensible is leaving it half-done *and* believing it bought something.
+14. [x] **Decide whether to finish or abandon the `Value` removal** — finished. 99.7% of feed results
+    never become a `Value`. The win was not the typed readers but deleting the JSON dispatch in `Hub::apply`
+    that decoded every result before them; the last arms were free.
 15. [x] **Find out what a venue-sized customer population costs** — done. `--retail` models customers who watch
     and trade rarely, multiplexed over epoll workers so the generator is not the bottleneck, on their own
     machine. 16,384 concurrent customers cost about a quarter of the trading rate, with no disconnects; the
@@ -787,11 +890,14 @@ proposed for `Hub::apply` should be profiled first.
     at all; the conflate flush grew from 6.7us to 122ms at 16,384 subscribers.
 17. [x] **Take the fan-out off the write lock and stop copying per subscriber** — done (`da43b0a`). Exclusive
     hold 122ms -> 9.7us, conflation 4.6Hz -> 7.3Hz, retail order p50 13.9ms -> 6.3ms.
-18. [ ] **`Hub::apply`'s write lock.** Two thirds of every second, untouched, and now the largest known source
-    of order latency. Needs its own investigation; neither Option A nor B/C addresses a single writer that
+18. [ ] **`Hub::apply`'s write lock, ~59% of every second.** Everything removable around it has been:
+    decoding (99.7% gone), waking (batched), and the fan-out (off the write lock). What is left is the venue's
+    own state changes. Getting below it means requests not needing the writer's lock, which is structural and
+    belongs in a fresh ADR rather than this one — neither Option A nor B/C addresses a single writer that
     wants the lock most of the time.
-19. [ ] **The remaining 41ms fan-out.** Under a read lock now, so it excludes nobody, but it is why conflation
-    runs at 7.3Hz rather than the 10 the interface promises.
+19. [ ] **The remaining fan-out, ~11-16ms a flush.** Under a read lock, so it excludes nobody, but it is why
+    conflation runs at 7-9Hz rather than the 10 the interface promises. What is left is `Outbox::put` itself,
+    which would need dividing across threads rather than making cheaper.
 20. [ ] **Decide whether market makers can opt out of conflation.** Ten snapshots a second suits an app and not
     a maker. Trades are already unconflated; only the book is batched. A faster tier per credential, an
     unconflated subscription, or letting professional flow follow the SBE feed directly — a client-contract
@@ -799,3 +905,10 @@ proposed for `Hub::apply` should be profiled first.
 21. [ ] **Re-measure the amend-only and market-data sections on 60-second runs.** Only the trading load was
     redone. The amend ladder, the watcher table and the audit-per-amendment figure are all still 8-second
     single samples, and the trading redo showed short runs overstate by about a third.
+22. [x] **Batch the feed's lock acquisitions** — done, `--feed-batch` default 8 (`7cdf9aa`, `c743c8d`). Worth
+    4%, against the 26% the profile's `futex_wake` share suggested: one `futex_wake` wakes every queued
+    reader, so fewer releases means more readers woken per release rather than less work done.
+23. [x] **Count which results still cost a `Value`, and stop them** — done (`86e6f32`, `856f79e`, `a37864d`).
+    The counter found what four readings of the code had not: `sleeve_changed` was the biggest decoder, and
+    `order_accepted` and `fill` were decoded despite having typed readers, because one JSON dispatch in
+    `Hub::apply` decoded every result before them. 5.35M decodes a minute down to 20,085.

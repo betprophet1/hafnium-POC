@@ -1,0 +1,47 @@
+gw-feed tid=6048 cpu_ticks=2673
+gw-feed tid=6054 cpu_ticks=3896
+profiling tid=6054 (the busier feed thread)
+[ perf record: Woken up 20 times to write data ]
+[ perf record: Captured and wrote 5.664 MB /home/ubuntu/venue/run/apply.data (148274 samples) ]
+=== self time, flat ===
+    23.04%  gw-feed  [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     4.27%  gw-feed  venue-gateway      [.] mi_free
+     3.39%  gw-feed  venue-gateway      [.] _mi_page_malloc_zero
+     3.19%  gw-feed  venue-gateway      [.] <alloc::string::String as core::fmt::Write>::write_str
+     2.93%  gw-feed  venue-gateway      [.] alloc::collections::btree::map::BTreeMap<K,V,A>::insert
+     2.65%  gw-feed  [kernel.kallsyms]  [k] finish_task_switch.isra.0
+     2.52%  gw-feed  venue-gateway      [.] venue_gateway::hub::Hub::apply
+     2.42%  gw-feed  venue-gateway      [.] <&mut serde_json::ser::Serializer<W,F> as serde_core::ser::Serializer>::serialize_str
+     2.20%  gw-feed  venue-gateway      [.] mi_theap_malloc_aligned
+     2.10%  gw-feed  venue-gateway      [.] alloc::collections::btree::map::BTreeMap<K,V,A>::insert
+     2.09%  gw-feed  venue-gateway      [.] serde_json::value::ser::<impl serde_core::ser::Serialize for serde_json::value::Value>::serialize
+     1.99%  gw-feed  venue-gateway      [.] venue_link::wire::follow_reporting
+     1.96%  gw-feed  [kernel.kallsyms]  [k] _raw_spin_unlock_irq
+     1.85%  gw-feed  venue-gateway      [.] venue_gateway::hub::Hub::send_to_account
+     1.63%  gw-feed  libc.so.6          [.] 0x00000000001986a5
+     1.51%  gw-feed  venue-gateway      [.] alloc::collections::btree::map::IntoIter<K,V,A>::dying_next
+     1.49%  gw-feed  venue-gateway      [.] serde_json::value::ser::<impl serde_core::ser::Serialize for serde_json::value::Value>::serialize
+     1.48%  gw-feed  venue-gateway      [.] venue_link::view::View::apply
+     1.44%  gw-feed  venue-gateway      [.] <std::sys::sync::rwlock::futex::RwLock>::write_contended
+     1.27%  gw-feed  venue-gateway      [.] venue_gateway::hub::Outbox::put
+     1.19%  gw-feed  venue-gateway      [.] mi_malloc_aligned
+     1.08%  gw-feed  venue-gateway      [.] core::ptr::drop_in_place<serde_json::value::Value>
+     0.98%  gw-feed  libc.so.6          [.] 0x00000000001986b7
+     0.97%  gw-feed  libc.so.6          [.] 0x0000000000198c40
+     0.95%  gw-feed  [kernel.kallsyms]  [k] do_syscall_64
+     0.83%  gw-feed  venue-gateway      [.] mi_theap_umalloc
+[ perf record: Woken up 714 times to write data ]
+[ perf record: Captured and wrote 178.984 MB /home/ubuntu/venue/run/apply-g.data (22193 samples) ]
+=== inclusive, by caller ===
+    36.24%     0.00%  gw-feed  [kernel.kallsyms]  [.] entry_SYSCALL_64_after_hwframe
+    36.17%     0.88%  gw-feed  [kernel.kallsyms]  [.] do_syscall_64
+    35.28%     0.14%  gw-feed  [kernel.kallsyms]  [.] x64_sys_call
+    30.43%     0.53%  gw-feed  libc.so.6          [.] syscall
+    29.15%     0.14%  gw-feed  [kernel.kallsyms]  [.] __x64_sys_futex
+    29.05%     0.10%  gw-feed  [kernel.kallsyms]  [.] do_futex
+    26.07%     0.42%  gw-feed  [kernel.kallsyms]  [.] futex_wake
+    24.11%     0.19%  gw-feed  [kernel.kallsyms]  [.] wake_up_q
+    23.89%     0.09%  gw-feed  [kernel.kallsyms]  [.] try_to_wake_up
+    23.81%    23.73%  gw-feed  [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     4.32%     4.32%  gw-feed  venue-gateway      [.] mi_free
+APPLYDONE
