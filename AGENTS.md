@@ -74,8 +74,8 @@ python3 spec/engine/reference/fuzz.py --seeds 50 --steps 300           # invaria
 `./check` must pass before a change is proposed. Set `ENGINE_REQUIRED=1` once work package WP-5 has landed.
 Its last step, the FIX adapter's integration test, runs only once `adapters/fix/bootstrap.sh` has fetched the Java
 toolchain and is skipped otherwise; a change that touches the gateway's private half or `adapters/fix/` should run
-it. Each gateway test starts a node of its own, so on a machine short of memory limit them with
-`RUST_TEST_THREADS=4`.
+it. Each gateway test starts a node of its own, so `core/ci.sh` defaults `RUST_TEST_THREADS=4` for the workspace
+test step; raise it on a machine with room, or set it yourself when running `cargo test` outside `./check`.
 
 ## Changing the specification
 
