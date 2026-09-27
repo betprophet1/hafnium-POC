@@ -57,6 +57,7 @@ impl Node {
                 || {
                     // The node could not honour that position — everything recorded here is of a history that
                     // never happened.
+                    eprintln!("treasury: feed resuming was refused; the reconciliation window is being thrown away");
                     *journal.lock().unwrap_or_else(PoisonError::into_inner) = Journal::default();
                 },
                 |unit| {

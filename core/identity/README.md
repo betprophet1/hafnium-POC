@@ -18,7 +18,8 @@ key used from somewhere new, and the people who own accounts, which this service
 | Secret | 64 lower-case hex digits (256 bits), from `/dev/urandom`, answered once when the key is made. |
 | Credential | `<keyId>.<secret>`, which clients send wherever a token goes. |
 | Kept as | `SHA-256("venue-api-key/1:" + keyId + ":" + secret)`, compared in constant time. |
-| Permissions | `read` (every key), `trade`, `transfers`, `keys`. |
+| Permissions | `read` (every key), `trade`, `transfers`, `keys`, `respond`. |
+| Allow-list | addresses and CIDR networks it may be used from (decision G-23), at most 20; empty means unrestricted. |
 | Also | a label, when it was made, an optional expiry, when it was revoked, the key that made it, its last use. |
 
 At most 20 keys of an account are neither revoked nor expired at once. A key cannot be changed, only revoked.
@@ -61,11 +62,30 @@ interface 1's terms (`Key`, `KeyCreated`, `Keys`, `Error`), so the gateway passe
 | `POST /v1/accounts/{accountId}/keys` | makes a key: a `KeyRequest`, plus `createdBy` (a key ID) when a key asked; answers `KeyCreated` |
 | `GET /v1/accounts/{accountId}/keys` | every key of the account, newest first |
 | `DELETE /v1/accounts/{accountId}/keys/{keyId}` | revokes a key; one already revoked is answered as it is |
+| `POST /v1/accounts/{accountId}/subaccounts` | makes a subaccount of `accountId`, which must exist and not itself be a subaccount: `{"label"}`; answers `{"accountId", "masterAccountId", "label"}` |
+| `GET /v1/accounts/{accountId}/subaccounts` | every subaccount of `accountId`, oldest first |
+| `GET /v1/accounts/{accountId}` | `{"accountId", "masterAccountId"}` (null if `accountId` is not a subaccount), or 404; how the gateway checks two accounts share a family before an internal transfer (interfaces/gateway/decisions.md, G-22) |
+| `GET /v1/subaccounts` | every subaccount in the environment, whoever its master is; not a client route, but how the gateway reconciles the engine's own record of masters against identity's (interfaces/gateway/decisions.md, G-25) |
 | `POST /v1/members` | signs a member up: `email`, `password`, optional `displayName`; makes their account and answers with a session |
 | `POST /v1/sessions` | logs a member in: `email` and `password`, answered as signing up is |
 | `DELETE /v1/sessions/{sessionId}` | ends a session; one already ended is answered as it is |
 | `POST /v1/verify` | `{"credential": "<id>.<secret>"}` for a key or a session: `{"keyId", "sessionId", "accountId", "permissions", "expiresAt"}` — whichever it was is named and the other is null — or 401 `UNAUTHORIZED` for an unknown, wrong, revoked, ended or expired credential; notes the use |
 | `GET /healthz` | |
+
+## Subaccounts
+
+An account may carry a `master_account_id` (decisions D-33, G-21): a way for a firm to organise trading into
+accounts that share an owner but cannot trade against one another, while still being able to move money between
+themselves (an internal transfer, interfaces/gateway/README.md). Set once, when the subaccount is made, and never
+reassigned. A family is two levels deep at most, enforced by the records themselves (`migrations/`) as well as by
+this service: a master may not itself be a subaccount, and an account with subaccounts of its own may not become
+one.
+
+This service trusts the account in the path, so it is the gateway's to decide who may create a subaccount, or a
+key of one (both need `keys` on the master's own credential — `/v4/subaccounts` and
+`/v4/subaccounts/{accountId}/keys`, interfaces/gateway/README.md). A subaccount is numbered from the same floor as
+a member's own account and is otherwise an ordinary account: its own keys, its own permissions, its own rule limits
+and positions once it trades.
 
 ## Members
 

@@ -174,9 +174,9 @@ class Fuzzer:
             return dict(msg="SetVenueMode", commandId=self.next_cmd(), mode="NORMAL"), None
         kind = r.choices(
             ["new", "cancel", "amend", "mass", "batch", "sweep", "tick", "grant", "reclaim", "controls",
-             "protect", "group", "reset", "market", "phase", "venue", "limits", "params", "seed", "fees",
-             "override", "unoverride", "listing", "resolve", "relist"],
-            [40, 10, 8, 2, 4, 3, 8, 2, 2, 1, 3, 3, 1, 2, 1, 1, 1, 1, 1, 1, 2, 1, 1, 0.5, 4])[0]
+             "master", "protect", "group", "reset", "market", "phase", "venue", "limits", "params", "seed",
+             "fees", "override", "unoverride", "listing", "resolve", "relist"],
+            [40, 10, 8, 2, 4, 3, 8, 2, 2, 1, 1, 3, 3, 1, 2, 1, 1, 1, 1, 1, 1, 2, 1, 1, 0.5, 4])[0]
         if kind == "new":
             e = self.order_fields(a)
             e.pop("entryType")
@@ -252,6 +252,10 @@ class Fuzzer:
             return dict(msg="SetAccountControls", commandId=self.next_cmd(), accountId=a,
                         closedOnly=r.choice(["FALSE", "FALSE", "TRUE"]),
                         selfMatchPrevention=r.choice(["CANCEL_RESTING", "CANCEL_INCOMING", "CANCEL_BOTH"])), None
+        if kind == "master":                                         # E-7.13, D-33: 0 and self are rejected on purpose
+            b = r.choice(ACCOUNTS)
+            return dict(msg="SetMasterAccount", commandId=self.next_cmd(), accountId=a,
+                        masterAccountId=r.choice([0, a, b])), None
         if kind == "protect":
             return dict(msg="SetMakerProtection", commandId=self.next_cmd(), accountId=a,
                         eventId=r.choice([0] + list(STATES)), maxContractsFilledPerWindow=r.randint(0, 30),

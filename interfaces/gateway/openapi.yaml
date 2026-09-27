@@ -479,6 +479,123 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/RateLimited' }
         '503': { $ref: '#/components/responses/IdentityUnavailable' }
+  /v4/subaccounts:
+    post:
+      operationId: createSubaccount
+      security:
+        - apiKey: [keys]
+        - devToken: []
+      tags: [subaccounts]
+      summary: Make a subaccount of the caller's account (decisions D-33, G-21)
+      description: |
+        Needs `keys`, like managing keys: a subaccount is a delegation of the master's identity, and gets keys of its
+        own once it exists. The master's own account may not itself be a subaccount.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubaccountRequest' }
+      responses:
+        '200':
+          description: The new subaccount.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subaccount' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/IdentityUnavailable' }
+    get:
+      operationId: listSubaccounts
+      security:
+        - apiKey: [keys]
+        - devToken: []
+      tags: [subaccounts]
+      summary: Every subaccount of the caller's account, oldest first
+      responses:
+        '200':
+          description: The subaccounts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subaccounts' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/IdentityUnavailable' }
+  /v4/subaccounts/{accountId}/keys:
+    post:
+      operationId: createSubaccountKey
+      security:
+        - apiKey: [keys]
+        - devToken: []
+      tags: [subaccounts]
+      summary: Make a key for one of the caller's subaccounts (decisions D-33, G-21)
+      description: |
+        The only way to give a fresh subaccount its first key: it has no dev token and no session of its own to make
+        one with. Refused with `FORBIDDEN` unless `accountId` is one of the caller's own subaccounts, checked fresh
+        against identity on every call.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/KeyRequest' }
+      responses:
+        '200':
+          description: The new key, with its secret and credential.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KeyCreated' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/IdentityUnavailable' }
+    get:
+      operationId: listSubaccountKeys
+      security:
+        - apiKey: [keys]
+        - devToken: []
+      tags: [subaccounts]
+      summary: Every API key of one of the caller's subaccounts, newest first
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+      responses:
+        '200':
+          description: The keys, without their secrets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Keys' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/IdentityUnavailable' }
+  /v4/subaccounts/{accountId}/keys/{keyId}:
+    delete:
+      operationId: revokeSubaccountKey
+      security:
+        - apiKey: [keys]
+        - devToken: []
+      tags: [subaccounts]
+      summary: Revoke one of a subaccount's API keys, for good
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/KeyId'
+      responses:
+        '200':
+          description: The key, revoked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Key' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/IdentityUnavailable' }
 components:
   securitySchemes:
     apiKey:
@@ -523,6 +640,11 @@ components:
       in: path
       required: true
       schema: { $ref: '#/components/schemas/KeyId' }
+    AccountId:
+      name: accountId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
   responses:
     BadRequest:
       description: Refused at the edge; nothing was journaled.
@@ -753,7 +875,7 @@ components:
         orders: { type: array, items: { $ref: '#/components/schemas/RestingOrder' } }
     TransferRequest:
       type: object
-      required: [clientTransferId, kind, amountCents, method]
+      required: [clientTransferId, kind, amountCents]
       additionalProperties: false
       properties:
         clientTransferId:
@@ -762,12 +884,19 @@ components:
           maxLength: 32
           pattern: '^[!-~]+$'
           description: Printable ASCII, unique per account. Never reusable, even by a transfer that failed.
-        kind: { type: string, enum: [deposit, withdrawal] }
+        kind: { type: string, enum: [deposit, withdrawal, internal] }
         amountCents:
           type: integer
           minimum: 1
           description: An environment may refuse an amount above its per-transfer limit with `BAD_REQUEST`.
-        method: { $ref: '#/components/schemas/TransferMethod' }
+        method:
+          allOf: [{ $ref: '#/components/schemas/TransferMethod' }]
+          description: Required for `deposit` and `withdrawal`; must be absent for `internal` (decisions D-34, G-22).
+        toAccountId:
+          allOf: [{ $ref: '#/components/schemas/Id' }]
+          description: |
+            Required for `internal`, forbidden otherwise: the destination, which must share a master with the
+            caller's account (or be its master, or its subaccount). Refused with `FORBIDDEN` otherwise.
     TransferMethod:
       type: string
       enum: [dummy_bank, dummy_instant, dummy_failing]
@@ -791,13 +920,20 @@ components:
         withdrawal from available cash. `cancelled_by_client`: a cancel request.
     Transfer:
       type: object
-      required: [transferId, clientTransferId, kind, amountCents, method, state, reason, sequence, createdAt, updatedAt]
+      required:
+        [transferId, clientTransferId, kind, amountCents, method, toAccountId, state, reason, sequence, createdAt,
+         updatedAt]
       properties:
         transferId: { $ref: '#/components/schemas/Id' }
         clientTransferId: { type: string }
-        kind: { type: string, enum: [deposit, withdrawal] }
+        kind: { type: string, enum: [deposit, withdrawal, internal] }
         amountCents: { type: integer, minimum: 1 }
-        method: { $ref: '#/components/schemas/TransferMethod' }
+        method:
+          oneOf: [{ $ref: '#/components/schemas/TransferMethod' }, { type: 'null' }]
+          description: Null for `internal`, which never reaches the bank (decisions D-34, G-22).
+        toAccountId:
+          oneOf: [{ $ref: '#/components/schemas/Id' }, { type: 'null' }]
+          description: Set only for `internal`.
         state: { $ref: '#/components/schemas/TransferState' }
         reason:
           oneOf: [{ $ref: '#/components/schemas/TransferReason' }, { type: 'null' }]
@@ -898,9 +1034,15 @@ components:
           type: string
           format: date-time
           description: When the key stops working, in UTC (`Z`), in the future. Omitted, it works until revoked.
+        allowedIps:
+          type: array
+          items: { type: string }
+          description: |
+            Addresses and CIDR networks (`192.0.2.7`, `10.42.0.0/16`) this key may be used from (decision G-23).
+            Omitted or empty means unrestricted. Set once, at most 20 entries; changed only by revoking and remaking.
     Key:
       type: object
-      required: [keyId, label, permissions, createdAt, expiresAt, revokedAt, lastUsedAt, createdBy]
+      required: [keyId, label, permissions, createdAt, expiresAt, revokedAt, lastUsedAt, createdBy, allowedIps]
       properties:
         keyId: { $ref: '#/components/schemas/KeyId' }
         label: { type: string }
@@ -916,6 +1058,10 @@ components:
           type: [string, 'null']
           pattern: '^ak_[0-9a-f]{16}$'
           description: The key that created this one, or null when a dev token or an operator did.
+        allowedIps:
+          type: array
+          items: { type: string }
+          description: Addresses and networks this key may be used from (decision G-23). Empty means unrestricted.
     KeyCreated:
       allOf:
         - $ref: '#/components/schemas/Key'
@@ -934,6 +1080,29 @@ components:
       required: [keys]
       properties:
         keys: { type: array, items: { $ref: '#/components/schemas/Key' }, description: Newest first. }
+    SubaccountRequest:
+      type: object
+      required: [label]
+      additionalProperties: false
+      properties:
+        label:
+          type: string
+          minLength: 1
+          maxLength: 64
+          pattern: '^[ -~]+$'
+          description: What the subaccount is for, in the owner's words. Printable ASCII.
+    Subaccount:
+      type: object
+      required: [accountId, masterAccountId, label]
+      properties:
+        accountId: { $ref: '#/components/schemas/Id' }
+        masterAccountId: { $ref: '#/components/schemas/Id' }
+        label: { type: string }
+    Subaccounts:
+      type: object
+      required: [subaccounts]
+      properties:
+        subaccounts: { type: array, items: { $ref: '#/components/schemas/Subaccount' }, description: Oldest first. }
     RfqId:
       type: string
       pattern: '^[0-9a-z]{1,32}$'

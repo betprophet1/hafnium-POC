@@ -153,7 +153,7 @@ guarantees = "By no other route (&sect;4), so every one of them replays"
 format = "SBE: service commands"
 status = "specified"
 spec = "interfaces/sbe/venue-journal.xml"
-messages = ["ActivateProtocol", "SleeveAdjust", "DefineTickTable", "DefineEvent", "ListInstrument", "SetEventPhase", "SetMarketState", "SetVenueMode", "ResolveEvent", "ExpireParlay", "SetRuleLimits", "SetGroupParameters", "SetAccountControls", "SetMakerProtection", "SetFeeSchedule", "SetFeeOverride", "RemoveFeeOverride", "SetListingParameters", "TransferOut", "TransferIn"]
+messages = ["ActivateProtocol", "SleeveAdjust", "DefineTickTable", "DefineEvent", "ListInstrument", "SetEventPhase", "SetMarketState", "SetVenueMode", "ResolveEvent", "ExpireParlay", "SetRuleLimits", "SetGroupParameters", "SetAccountControls", "SetMakerProtection", "SetMasterAccount", "SetFeeSchedule", "SetFeeOverride", "RemoveFeeOverride", "SetListingParameters", "TransferOut", "TransferIn"]
 
 [[interface]]
 id = 15

@@ -63,15 +63,27 @@ fn node_with(prepare: impl FnOnce(&Path)) -> (SocketAddr, PathBuf) {
     (feed, dir)
 }
 
-/// Reads whole frames until the node goes quiet, and returns the sequence each unit's input carries.
+/// Reads whole frames until the node goes quiet, and returns the sequence each unit's input carries. Every call
+/// site in this file expects the position it asks for to be honoured — `honoured_backlog` below is for the one
+/// call that deliberately does not (fetching a cut journal's backlog by asking for everything, which position 0
+/// no longer is), and `honoured()` further down is for a test that only cares about the ack byte itself.
 fn sequences(feed: SocketAddr, resume_from: u64) -> Vec<u64> {
+    let (honoured, backlog) = honoured_backlog(feed, resume_from);
+    assert!(honoured, "the node did not honour resuming from {resume_from}");
+    backlog
+}
+
+/// As `sequences`, but says whether the position was honoured instead of asserting it — for the one legitimate
+/// case in this file where it is not: reading a cut journal's backlog by asking for everything, which the fix
+/// this file guards against is precisely that `asked_for == 0` no longer means "and you get it."
+fn honoured_backlog(feed: SocketAddr, resume_from: u64) -> (bool, Vec<u64>) {
     let mut stream = TcpStream::connect(feed).expect("the feed accepts");
     stream.write_all(&resume_from.to_le_bytes()).expect("the position is sent");
     stream.flush().expect("flushed");
     // The node answers whether it is honouring the position before any unit.
     let mut answer = [0u8; 1];
     stream.read_exact(&mut answer).expect("the node answers");
-    assert_eq!(answer[0] != 0, resume_from > 0, "the node did not do what it said with {resume_from}");
+    let honoured = answer[0] != 0;
     stream.set_read_timeout(Some(Duration::from_millis(1500))).expect("a read timeout");
 
     let mut bytes = Vec::new();
@@ -104,7 +116,7 @@ fn sequences(feed: SocketAddr, resume_from: u64) -> Vec<u64> {
         }
         at += len;
     }
-    out
+    (honoured, out)
 }
 
 #[test]
@@ -229,9 +241,25 @@ fn a_reader_holding_through_the_cut_point_is_honoured() {
 #[test]
 fn a_position_a_cut_journal_still_carries_is_honoured() {
     let (feed, _dir) = cut_node();
-    let after = sequences(feed, 0);
+    // Asking this journal for 0 is not honoured either — trap 6.21/6.22's territory, and
+    // `asking_for_everything_against_a_cut_journal_is_not_honoured` below is the test for it. Fetching the
+    // backlog to find `carried` has to go through `honoured_backlog`, not `sequences`, because this one call is
+    // the exception to every other in this file: the position it asks for is not honoured, on purpose.
+    let (honoured_at_zero, after) = honoured_backlog(feed, 0);
+    assert!(!honoured_at_zero, "asking a cut journal for everything was honoured");
     let carried = after.iter().copied().find(|&s| s > 62).expect("the cut journal carries something after 62");
     assert!(honoured(feed, carried), "a position the journal still carries ({carried}) was refused");
+}
+
+/// The gap this file exists to close. A reader with no snapshot pair to restore from asks for position 0 on
+/// every fresh start — which is every reader deployed today (`STATE.md` §8) — and used to be told it had been
+/// honoured even when the journal had been cut out from under it: `asked_for == 0` was never adjusted, so its ack
+/// byte was indistinguishable from a genuine from-genesis serve. A reader that cannot tell the difference cannot
+/// throw its view away, so it never should have been told it got everything at all.
+#[test]
+fn asking_for_everything_against_a_cut_journal_is_not_honoured() {
+    let (feed, _dir) = cut_node();
+    assert!(!honoured(feed, 0), "a cut journal claimed to honour a reader asking for everything");
 }
 
 // The other half of the bound — that a snapshot sitting physically last does not drag the *upper* bound below

@@ -68,6 +68,7 @@ pub fn accounts(catalogue: &Catalogue) -> Vec<Account> {
                 id: a["id"].as_u64()?,
                 name: a["name"].as_str().unwrap_or("").to_string(),
                 dev_token: a["token"].as_str().map(str::to_string),
+                master: None,
             })
         })
         .collect()

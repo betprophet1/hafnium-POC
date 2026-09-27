@@ -482,10 +482,39 @@ impl View {
         results: &std::path::Path,
         at: Option<u64>,
     ) -> Result<Self, wire::Error> {
-        let mut view = Self::default();
+        Self::replayed_from(None, journal, results, at)
+    }
+
+    /// The same, but carrying on from a view that already exists rather than from nothing.
+    ///
+    /// This is what a journal that has been `cut` needs, and the reason is worth being exact about. A view is
+    /// built by applying every unit in order from an empty state; a cut journal no longer carries the units
+    /// before its snapshot. Replaying one from `default()` does not fail — it quietly produces a view holding
+    /// only what happened after the cut, with every event, instrument and position from before it missing.
+    /// There is no signal: the resulting view's `sequence` is still the sequence that was asked for, so even a
+    /// check against the engine half agrees. A wrong view that verifies is worse than no view.
+    ///
+    /// So a caller with a cut journal passes the previously published view, and the units between its sequence
+    /// and `at` are applied to it. The cost is proportional to what has happened since — which is the point of
+    /// keeping snapshots at all — and `pair::take` is what refuses the combination that would silently lie.
+    pub fn replayed_from(
+        base: Option<Self>,
+        journal: &std::path::Path,
+        results: &std::path::Path,
+        at: Option<u64>,
+    ) -> Result<Self, wire::Error> {
+        let from = base.as_ref().map_or(0, |view| view.sequence);
+        let mut view = base.unwrap_or_default();
         for unit in wire::replayed_units(journal, results)? {
-            if at.is_some_and(|stop| u(&unit.input["record"]["sequence"]) > stop) {
+            let unit = unit?;
+            let sequence = u(&unit.input["record"]["sequence"]);
+            if at.is_some_and(|stop| sequence > stop) {
                 break;
+            }
+            // Everything the base view already accounts for is skipped, exactly as a restored engine skips the
+            // inputs its snapshot covers.
+            if sequence <= from {
+                continue;
             }
             view.apply(&unit);
         }
@@ -609,6 +638,9 @@ impl Live {
                 || {
                     // The node could not honour that position (a different journal under the same address, or
                     // one that no longer goes back that far) — this view is of a history that never happened.
+                    // `eprintln!`, not a return value or a metric: this runs inside a library with no logging of
+                    // its own, and the alternative is a reader silently missing history with nothing to show it.
+                    eprintln!("view feed: resuming was refused; the view is being thrown away");
                     if let Ok(mut v) = me.view.lock() {
                         *v = View::default();
                     }

@@ -39,6 +39,19 @@ Production puts the engine behind Aeron Cluster instead (WP-10). This node never
 Journal files, result logs and the TCP ingress all use one framing: a little-endian `u32` length, then that many
 bytes of SBE (`interfaces/sbe/venue-journal.xml`), message header first.
 
+There are two length bounds, not one. An input is bounded by its schema — no arrangement of fields makes a
+`PlaceOrder` large — so inputs are held to `MAX_FRAME`, 64 KiB, which is far above any of them and refuses a
+garbage length cheaply. A `Snapshot` is not bounded that way: it is the engine's whole logical state, and it
+grows with the venue, so it is held to `MAX_SNAPSHOT_FRAME` (16 MiB, the buffer `snapshots::compute` already
+encodes into). Only template 53 gets the larger bound; anything else past 64 KiB is still refused, on the way
+out and on the way in. On the way in the template is read from the header's first four bytes *before* the
+length is honoured, so a garbage length still costs four bytes rather than an allocation.
+
+This matters more than a limit usually does. A real venue's state passed 64 KiB somewhere between its 30,000th
+and 60,000th input — a few hours of demo traffic — and from there `snapshot` and `embed-snapshot` both failed
+with nothing to say but `frame longer than MAX_FRAME`. Since a journal with no snapshot in it can never be
+`cut`, the disk this was all meant to stop filling filled anyway, and nothing said why.
+
 On the ingress a connection sends client messages or commands with a zeroed record header. For each input it
 receives the input's results, then an empty frame. Only the sender receives an input's results, and only after
 the input is journaled (E-17.4 without a quorum). Sequencer events and anything that is not a journal input close
@@ -54,6 +67,12 @@ instead (`Snapshot`, template 53), which is what D-32 asks for — a journal wit
 cut, because recovery has nowhere to begin but sequence 1. A `Snapshot` frame is not an input: every reader that
 walks a journal frame by frame (a full replay, recovery, a subscriber's backlog) skips it by template id, exactly
 as it skips one embedded earlier when computing a later one.
+
+Taking a snapshot **restores from the latest embedded one** when the journal has it, rather than replaying from
+genesis. That is an optimisation on an ordinary journal and a necessity on a cut one: a cut journal's first real
+input is no longer sequence 1, so a fresh engine fail-stops on E-4.1 at the first input it applies. E-20.9 is
+what says the two routes give the same state. Against the live venue the difference was 60 seconds of replay
+versus 3.6.
 
 `venue-node recover JOURNAL RESULTS [--snapshot-out FILE]` restores from the latest embedded snapshot and replays
 only what follows it — the single-journal-file version of `replay-from` (which does the same from a snapshot
@@ -100,7 +119,50 @@ and refuse or fall back cleanly rather than attempting a doomed replay; `recover
 `core/node/tests/cut_journal.rs` checks a cut-and-recovered node reaches the same tail a full replay would have,
 sequence for sequence and byte for byte in the result log, and that a refused cut changes nothing.
 
-Shipping what is cut to object storage is not built yet.
+**Archiving what is cut, rather than deleting it.** `cut-journal` on its own *discards* the stretch before the
+snapshot, and that stretch is the only copy of it. Three steps make it an archive instead:
+
+```sh
+venue-node export-cut ./venue-data/journal.sbe ./venue-data/results.sbe ./segment
+interfaces/tools/journal_ship.py ./segment --to s3://BUCKET --environment prod
+venue-node cut-journal ./venue-data/journal.sbe ./venue-data/results.sbe --require-shipped ./segment
+venue-node restore-cut ./segment ./venue-data/journal.sbe ./venue-data/results.sbe ./restored
+```
+
+`export-cut` writes out exactly what a cut would remove and **changes neither file**, so it is safe against a
+node that is still serving and the archive can be proven long before anything is discarded. It is the complement
+of the cut's own filter, frame for frame and byte for byte, so the two cannot drift apart. It refuses on the same
+grounds a cut would — no snapshot, or a result log not yet trusted that far — which *is* the readiness test a
+journal needs: an audit file is ready when it is closed and its day is over, but a journal has no such marker and
+only a sequence means anything. It also refuses a directory that already holds a segment, since overwriting one
+is how an unshipped archive gets lost.
+
+`journal_ship.py` uploads both halves with `.sha256` sidecars under `journals/{environment}/`, reads them back
+and compares, and only then writes a `shipped.json` receipt. It shares `snapshot_publish.py`'s verified upload
+rather than reimplementing that care.
+
+**Reading it back.** `venue-node restore-cut SEGMENT_DIR JOURNAL RESULTS OUT_DIR` puts an archived segment
+back in front of the journal it was cut from. An archive nobody has ever read back is bytes rather than a
+record, so this exists as much to be *tested* as to be run.
+
+The restored journal is **not** byte-identical to the one that was cut, and must not be expected to be: `embed`
+appends wherever the file ends, so the original carried its `Snapshot` at the tail, after inputs with higher
+sequences, while a restored journal carries it between the segment and what followed. Position has never meant
+anything in a journal (§3.7). What holds is that a **replay of the restored journal produces the same result
+log as a replay of the original**, byte for byte — the same shape of equivalence E-20.9 uses for snapshots, and
+what `core/node/tests/restore_cut.rs` checks.
+
+It refuses a segment that is not the one this journal was cut at, in both directions: the segment's last input
+must be the sequence the journal's snapshot was taken at, and the journal's own first input must be the one
+after. That guard matters because the mistake it prevents leaves a **well-formed file** — every frame valid,
+every length agreeing — with a gap or an overlap spliced into the middle of the history, which a replay would
+only discover as a fail-stop somewhere confusing.
+
+`--require-shipped` is what closes the loop: the cut refuses unless the receipt is for **this** snapshot and
+names **these** bytes. The case it exists for is not a forged receipt but an honest stale one — a segment
+exported and shipped at sequence 30, after which the venue ran on and embedded a newer snapshot at 62. Every
+artifact checks out individually, and cutting to 62 against that segment would destroy 30..62, which no archive
+contains (`core/node/tests/export_cut.rs`).
 
 **Seeding a fresh environment from a chosen snapshot.** `venue-node seed SNAPSHOT DATA_DIR [--capacity ...]`
 founds a brand-new `DATA_DIR` on `SNAPSHOT` instead of genesis: `journal.sbe` holds only that one `Snapshot`
@@ -139,7 +201,9 @@ venue-node replay ./venue-data/journal.sbe out.sbe && cmp out.sbe ./venue-data/r
 venue-node snapshot ./venue-data/journal.sbe snap.sbe
 venue-node embed-snapshot ./venue-data/journal.sbe   # only while nothing has it open (no `serve` running)
 venue-node recover ./venue-data/journal.sbe tail.results.sbe
+venue-node export-cut ./venue-data/journal.sbe ./venue-data/results.sbe ./segment   # changes neither file
 venue-node cut-journal ./venue-data/journal.sbe ./venue-data/results.sbe   # same "no live serve" caveat
+venue-node cut-journal ./venue-data/journal.sbe ./venue-data/results.sbe --require-shipped ./segment
 venue-node seed snap.sbe ./fresh-venue-data --capacity small
 venue-node import core/target/differential/fuzz-90000.json golden.journal
 ```

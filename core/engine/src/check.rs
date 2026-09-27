@@ -28,7 +28,6 @@ use venue_journal::self_match_prevention::SelfMatchPrevention;
 /// The incoming order as the check walks it.
 struct Taker {
     account_slot: u32,
-    account_id: u64,
     inst_slot: u32,
     side: Side,
     limit: u16,
@@ -53,7 +52,6 @@ impl Engine<'_> {
         let o = self.orders[slot as usize];
         let mut t = Taker {
             account_slot: o.account_slot,
-            account_id: o.account_id,
             inst_slot: o.instrument_slot,
             side: o.side,
             limit: o.tick,
@@ -198,8 +196,8 @@ impl Engine<'_> {
                 cur = next;
                 continue;
             }
-            if r.account_id == t.account_id {
-                // E-13.1
+            if self.effective_master(r.account_slot) == self.effective_master(t.account_slot) {
+                // E-13.1, D-33
                 match mode {
                     SelfMatchPrevention::CANCEL_RESTING => {
                         self.check_remove(cur)?;
@@ -226,13 +224,15 @@ impl Engine<'_> {
         let maker_side = opposite(t.side);
         let lot = self.instruments[t.inst_slot as usize].lot_step;
         let mode = self.accounts[t.account_slot as usize].self_match_prevention;
+        let mine = self.effective_master(t.account_slot);
         let head = self.level(t.inst_slot, maker_side, tick).head;
-        // E-13.1: the account's own orders at the tick, together, in ascending order ID.
+        // E-13.1, D-33: resting orders sharing the incoming order's effective master, at the tick, together, in
+        // ascending order ID.
         let mut own = 0;
         let mut cur = head;
         while cur != NONE {
             let r = self.orders[cur as usize];
-            if self.check_live(cur) && r.account_id == t.account_id {
+            if self.check_live(cur) && self.effective_master(r.account_slot) == mine {
                 self.scratch[own] = (r.id, u64::from(cur));
                 own += 1;
             }

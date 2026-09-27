@@ -24,7 +24,7 @@ macro_rules! named {
     };
 }
 
-named!(Kind { Deposit => "deposit", Withdrawal => "withdrawal" });
+named!(Kind { Deposit => "deposit", Withdrawal => "withdrawal", Internal => "internal" });
 named!(Method { DummyBank => "dummy_bank", DummyInstant => "dummy_instant", DummyFailing => "dummy_failing" });
 named!(State { Pending => "pending", Settled => "settled", Failed => "failed", Cancelled => "cancelled" });
 named!(Reason {
@@ -63,13 +63,17 @@ pub struct Transfer {
     pub client_id: String,
     pub kind: Kind,
     pub amount: u64,
-    pub method: Method,
+    /// The bank simulation this transfer settles through; none for an internal transfer, which never reaches the
+    /// bank (decisions D-34, G-22).
+    pub method: Option<Method>,
     pub state: State,
     pub reason: Option<Reason>,
     pub sequence: Option<u64>,
     pub created: u64,
     pub updated: u64,
     pub stage: Stage,
+    /// Where an internal transfer's money goes; none for a deposit or withdrawal, whose only account is `account`.
+    pub to_account: Option<u64>,
     /// When the reclaim or grant this stage waits on was sent without an answer coming back, if it was: the treasury
     /// does not know whether the sequencer group applied it, and leaves it to reconciliation to find out.
     pub in_doubt: Option<u64>,
@@ -80,7 +84,8 @@ impl Transfer {
     pub fn to_json(&self) -> Value {
         json!({
             "transferId": self.id.to_string(), "clientTransferId": self.client_id, "kind": self.kind.name(),
-            "amountCents": self.amount, "method": self.method.name(), "state": self.state.name(),
+            "amountCents": self.amount, "method": self.method.map(Method::name), "state": self.state.name(),
+            "toAccountId": self.to_account.map(|a| a.to_string()),
             "reason": self.reason.map(Reason::name), "sequence": self.sequence.map(|s| s.to_string()),
             "createdAt": clock::rfc3339(self.created), "updatedAt": clock::rfc3339(self.updated)
         })

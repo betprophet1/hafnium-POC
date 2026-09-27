@@ -63,13 +63,16 @@ fn transfer(v: &Value) -> Result<Transfer, String> {
         client_id: v["clientTransferId"].as_str().ok_or("a transfer record needs clientTransferId")?.to_string(),
         kind: v["kind"].as_str().and_then(Kind::parse).ok_or("a transfer record needs kind")?,
         amount: number("amountCents")?,
-        method: v["method"].as_str().and_then(Method::parse).ok_or("a transfer record needs method")?,
+        // This legacy format predates internal transfers (decisions D-34, G-22), so every record it holds is a
+        // deposit or a withdrawal, and both always name a method.
+        method: Some(v["method"].as_str().and_then(Method::parse).ok_or("a transfer record needs method")?),
         state: v["state"].as_str().and_then(State::parse).ok_or("a transfer record needs state")?,
         reason: v["reason"].as_str().and_then(Reason::parse),
         sequence: v["sequence"].as_u64(),
         created: number("created")?,
         updated: number("updated")?,
         stage: stage(&v["stage"])?,
+        to_account: None,
         in_doubt: v["inDoubt"].as_u64(),
     })
 }

@@ -25,6 +25,18 @@ python3 "$ROOT/interfaces/tools/audit_verify.py" --self-test
 python3 "$ROOT/interfaces/tools/audit_ship.py" --self-test
 python3 "$ROOT/interfaces/tools/snapshot_publish.py" --self-test
 python3 "$ROOT/interfaces/tools/snapshot_fetch.py" --self-test
+python3 "$ROOT/interfaces/tools/journal_ship.py" --self-test
+python3 "$ROOT/interfaces/tools/db_archive.py" --self-test
+
+# pg_dump refuses a server newer than itself, and nothing else here would notice: the database archiver's image
+# builds, self-tests and deploys cleanly with a client too old, then fails the first time it meets the real
+# server. Holding its base image to the one the chart runs is what makes the two equal by construction.
+server_image="$(sed -n 's/^ *tag: \(1[0-9]*\..*\)$/\1/p' "$ROOT/deploy/charts/venue-mini/values.yaml" | head -1)"
+archiver_base="$(sed -n 's/^FROM postgres:\(.*\)$/\1/p' "$ROOT/deploy/images/venue-dbarchive.Dockerfile")"
+[ -n "$server_image" ] || fail "could not read postgres.image.tag from values.yaml"
+[ "$server_image" = "$archiver_base" ] \
+  || fail "venue-dbarchive.Dockerfile is built FROM postgres:$archiver_base but the chart runs postgres:$server_image"
+echo "database archiver is built from the server's own image ($archiver_base)"
 
 step "Reference model: normative scenarios and random sequences"
 python3 "$ROOT/spec/engine/reference/run_scenarios.py"

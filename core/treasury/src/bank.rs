@@ -48,6 +48,9 @@ impl FakeBank {
         let salt = match kind {
             Kind::Deposit => 1,
             Kind::Withdrawal => 2,
+            // Never actually asked: an internal transfer's stage never becomes ToBank, so `receive` never calls
+            // this for one. Kept total so the function itself does not assume it.
+            Kind::Internal => 3,
         };
         let draw = mix(mix(self.seed ^ mix(transfer)) ^ salt);
         let span = self.max_delay_ms.saturating_sub(self.min_delay_ms).saturating_add(1);
@@ -255,7 +258,10 @@ impl Bank {
         if let Some(r) = self.receipts.get(&t.id) {
             return Ok(r.clone());
         }
-        let decision = self.fake.decide(t.id, t.kind, t.method);
+        // Only a deposit or withdrawal ever reaches the bank (an internal transfer's stage never becomes ToBank),
+        // and both always carry a method.
+        let method = t.method.expect("only a deposit or withdrawal reaches the bank, and both name a method");
+        let decision = self.fake.decide(t.id, t.kind, method);
         let receipt = Receipt {
             transfer: t.id,
             account: t.account,
@@ -388,13 +394,14 @@ mod tests {
             client_id: format!("c{id}"),
             kind,
             amount,
-            method,
+            method: Some(method),
             state: crate::transfer::State::Pending,
             reason: None,
             sequence: None,
             created: 0,
             updated: 0,
             stage: crate::transfer::Stage::ToBank,
+            to_account: None,
             in_doubt: None,
         }
     }

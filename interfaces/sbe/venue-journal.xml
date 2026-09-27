@@ -515,6 +515,13 @@
     <field name="windowMillis" id="6" type="Millis"/>
   </sbe:message>
 
+  <sbe:message name="SetMasterAccount" id="116" description="Groups accountId under masterAccountId's family for self-match prevention; set once and never reassigned (spec E-7.13, E-13.1)">
+    <field name="record" id="1" type="RecordHeader"/>
+    <field name="commandId" id="2" type="CommandId"/>
+    <field name="accountId" id="3" type="AccountId"/>
+    <field name="masterAccountId" id="4" type="AccountId"/>
+  </sbe:message>
+
   <sbe:message name="TransferOut" id="94" description="Event migration, written in the source group after halt and drain">
     <field name="record" id="1" type="RecordHeader"/>
     <field name="commandId" id="2" type="CommandId"/>

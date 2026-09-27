@@ -80,6 +80,7 @@ const LAYOUTS: &[Layout] = &[
     fixed(set_group_parameters_codec::SBE_TEMPLATE_ID, Kind::Command, set_group_parameters_codec::SBE_BLOCK_LENGTH),
     fixed(set_account_controls_codec::SBE_TEMPLATE_ID, Kind::Command, set_account_controls_codec::SBE_BLOCK_LENGTH),
     fixed(set_maker_protection_codec::SBE_TEMPLATE_ID, Kind::Command, set_maker_protection_codec::SBE_BLOCK_LENGTH),
+    fixed(set_master_account_codec::SBE_TEMPLATE_ID, Kind::Command, set_master_account_codec::SBE_BLOCK_LENGTH),
     fixed(set_fee_schedule_codec::SBE_TEMPLATE_ID, Kind::Command, set_fee_schedule_codec::SBE_BLOCK_LENGTH),
     fixed(set_fee_override_codec::SBE_TEMPLATE_ID, Kind::Command, set_fee_override_codec::SBE_BLOCK_LENGTH),
     fixed(remove_fee_override_codec::SBE_TEMPLATE_ID, Kind::Command, remove_fee_override_codec::SBE_BLOCK_LENGTH),

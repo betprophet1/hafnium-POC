@@ -126,6 +126,7 @@ class Account:
     event_cash: dict = field(default_factory=dict)          # eventId -> net cash the event paid (D-1)
     closed_only: bool = False
     self_match_prevention: str = "CANCEL_INCOMING"          # D-3
+    master_account_id: int = 0                               # D-33; 0 = none
     second: int = -1
     new_orders_in_second: int = 0
     fills_in_second: int = 0
@@ -198,6 +199,10 @@ class Engine:
 
     def account(self, account_id):
         return self.accounts.setdefault(account_id, Account())
+
+    def effective_master(self, account_id):                             # E-3.2, D-33
+        master = self.account(account_id).master_account_id
+        return master if master else account_id
 
     def position(self, account_id, instrument_id):
         return self.account(account_id).positions.get(instrument_id, 0)
@@ -592,6 +597,20 @@ class Engine:
                 self.maker_protection.pop(key, None)
             else:
                 self.maker_protection[key] = (inp["maxContractsFilledPerWindow"], inp["windowMillis"])
+            self.applied(cid)
+        self.command(inp, body)
+
+    def on_SetMasterAccount(self, inp):                                  # E-7.13
+        def body(inp, cid):
+            account_id, master_id = inp["accountId"], inp["masterAccountId"]
+            if account_id == 0 or master_id == 0 or account_id == master_id:
+                raise Reject("INVALID_COMMAND")
+            if self.account(master_id).master_account_id != 0:
+                raise Reject("INVALID_COMMAND")
+            acc = self.account(account_id)
+            if acc.master_account_id not in (0, master_id):
+                raise Reject("INVALID_COMMAND")
+            acc.master_account_id = master_id
             self.applied(cid)
         self.command(inp, body)
 
@@ -1078,7 +1097,7 @@ class Engine:
                     r = self.orders.get(rid)
                     if r is None:                                        # removed by lock restoration
                         continue
-                    if r.account_id == o.account_id:                     # E-13.1
+                    if self.effective_master(r.account_id) == self.effective_master(o.account_id):   # E-13.1, D-33
                         if mode == "CANCEL_RESTING":
                             self.remove(r, "SELF_MATCH_PREVENTED")
                             continue
@@ -1089,7 +1108,8 @@ class Engine:
                     self.fill(o, r, inst, tick, f)
                     left -= f
             else:
-                own = sorted((self.orders[x] for x in queue if self.orders[x].account_id == o.account_id),
+                mine = self.effective_master(o.account_id)
+                own = sorted((self.orders[x] for x in queue if self.effective_master(self.orders[x].account_id) == mine),
                              key=lambda r: r.order_id)
                 if own:
                     if mode == "CANCEL_INCOMING":

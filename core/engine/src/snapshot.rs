@@ -437,6 +437,7 @@ impl Engine<'_> {
             let initial = a.balance == 0
                 && a.reserved == 0
                 && !a.closed_only
+                && a.master_account_id == 0
                 && a.second.is_none()
                 && a.limits.is_none()
                 && a.fees_charged == 0
@@ -469,6 +470,7 @@ impl Engine<'_> {
             }
             w.i64(a.fees_charged)?;
             w.u64(a.fees_unit)?;
+            w.u64(a.master_account_id)?;
             // `reserved`, `resting_orders` and `first_order` are not written: a decoder recomputes the first two
             // from the orders and rebuilds the third in any order it likes (E-20.6). The account's own list is
             // kept in no useful order by design, so there is nothing in it to preserve.
@@ -1009,6 +1011,7 @@ impl Engine<'_> {
                 resting_orders: 0,
                 fees_charged: r.i64()?,
                 fees_unit: r.u64()?,
+                master_account_id: r.u64()?,
             };
             self.accounts_used = slot + 1;
             self.account_index

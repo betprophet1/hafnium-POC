@@ -1,0 +1,178 @@
+{{- if .Values.core.snapshots.enabled }}
+{{- $name := include "venue-mini.fullname" . }}
+{{- $s := .Values.core.snapshots }}
+{{- if not $s.to }}{{ fail "core.snapshots.to: say where snapshot pairs go" }}{{ end }}
+{{- if not $s.environment }}{{ fail "core.snapshots.environment: names the prefix one venue's pairs live under" }}{{ end }}
+---
+# Takes a snapshot **pair** of the live venue and publishes it, on a schedule. Nothing is embedded, nothing is
+# cut, nothing is deleted, and the venue is not stopped.
+#
+# This is the one part of the journal's lifecycle that needs no downtime, and the reason is worth stating: the
+# pair is computed by *replaying* the journal into a throwaway engine (E-20.10 — never the engine serving
+# traffic), and the replay stops at the sequence asked for, so it never reads the tail the node is still
+# appending to. Embedding a snapshot into the journal and cutting the journal are the operations that need the
+# writer stopped; taking one does not.
+#
+# The volume is mounted **read-only** to make that structural rather than a promise. It works because
+# `snapshots::compute` puts its scratch result log in a temp directory instead of beside the journal — writing
+# scratch into a data directory is exactly what would have made this job need write access to a live venue's
+# disk.
+#
+# Two containers because two images: `venue-view` lives in the venue image, and the AWS CLI and the publisher
+# live in the archive image. An initContainer writes the pair into an emptyDir the publisher then reads.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}-snapshot
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: snapshot
+spec:
+  schedule: {{ $s.schedule | quote }}
+  # One at a time: two of these would replay the journal at once on a node sized for one venue.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 1
+  # Kept, because a pair that stopped being taken is only visible in what it said when it failed — nothing
+  # downstream fills up to make the silence obvious.
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            {{- include "venue-mini.labels" . | nindent 12 }}
+            app.kubernetes.io/component: snapshot
+        spec:
+          restartPolicy: OnFailure
+          {{- with ($s.image.pullSecrets | default $.Values.image.pullSecrets) }}
+          imagePullSecrets:
+            {{- range . }}
+            - name: {{ . | quote }}
+            {{- end }}
+          {{- end }}
+          {{- include "venue-mini.scheduling" . | nindent 10 }}
+          securityContext:
+            {{- include "venue-mini.podSecurity" . | nindent 12 }}
+          initContainers:
+            # The previous pair, which a journal that has been cut *requires*: the units before the cut are in
+            # the archive, so a view built without it would silently hold only what followed. Finding nothing is
+            # not a failure — the first run has no predecessor, and an uncut journal needs none — so this exits
+            # 0 either way and `venue-view` is what refuses when one was actually needed.
+            - name: previous
+              image: "{{ $s.image.repository }}:{{ $s.image.tag | default $.Chart.AppVersion }}"
+              imagePullPolicy: {{ $s.image.pullPolicy }}
+              command: ["python3", "/opt/venue/snapshot_fetch.py"]
+              args:
+                - --from
+                - {{ $s.to | quote }}
+                - --environment
+                - {{ $s.environment | quote }}
+                - --pair
+                - /previous
+              env:
+                - name: AWS_REGION
+                  value: {{ $s.region | quote }}
+                - name: HOME
+                  value: /tmp
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 64Mi
+                limits:
+                  memory: 512Mi
+              securityContext:
+                {{- include "venue-mini.containerSecurity" . | nindent 16 }}
+              volumeMounts:
+                - name: previous
+                  mountPath: /previous
+                - name: tmp
+                  mountPath: /tmp
+            - name: take
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["venue-view"]
+              args:
+                - snapshot
+                - /var/lib/venue/journal.sbe
+                - /pair
+                # `trusted`, not a sequence: the result log's last confirmed group is the furthest a *pair* can
+                # be taken, because the view half needs results to pair each input with. It also means nothing
+                # has to know a sequence number in advance.
+                - --at
+                - trusted
+                - --results
+                - /var/lib/venue/results.sbe
+                - --from-pair
+                - /previous
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                # A whole replay through a real engine: this is the venue's own capacity profile, not a tool's
+                # working set. Give it what the core gets.
+                limits:
+                  memory: {{ $s.replayMemory | quote }}
+              securityContext:
+                {{- include "venue-mini.containerSecurity" . | nindent 16 }}
+              volumeMounts:
+                - name: journal
+                  mountPath: /var/lib/venue
+                  readOnly: true
+                - name: pair
+                  mountPath: /pair
+                - name: previous
+                  mountPath: /previous
+                - name: tmp
+                  mountPath: /tmp
+          containers:
+            - name: publish
+              image: "{{ $s.image.repository }}:{{ $s.image.tag | default $.Chart.AppVersion }}"
+              imagePullPolicy: {{ $s.image.pullPolicy }}
+              # The archive image's entrypoint is the database archiver; this wants the snapshot publisher
+              # beside it, which the same image already carries.
+              command: ["python3", "/opt/venue/snapshot_publish.py"]
+              args:
+                - --pair
+                - /pair
+                - --to
+                - {{ $s.to | quote }}
+                - --environment
+                - {{ $s.environment | quote }}
+              env:
+                # No credentials: the instance role through the metadata service, as the other shippers do.
+                - name: AWS_REGION
+                  value: {{ $s.region | quote }}
+                - name: HOME
+                  value: /tmp
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 64Mi
+                limits:
+                  memory: 512Mi
+              securityContext:
+                {{- include "venue-mini.containerSecurity" . | nindent 16 }}
+              volumeMounts:
+                - name: pair
+                  mountPath: /pair
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: journal
+              persistentVolumeClaim:
+                # The StatefulSet's volumeClaimTemplate names it, so it is derived here rather than configured.
+                claimName: journal-{{ $name }}-core-0
+                readOnly: true
+            - name: pair
+              emptyDir:
+                sizeLimit: {{ $s.pairSize | quote }}
+            - name: previous
+              emptyDir:
+                sizeLimit: {{ $s.pairSize | quote }}
+            - name: tmp
+              emptyDir:
+                sizeLimit: {{ $s.scratchSize | quote }}
+{{- end }}
