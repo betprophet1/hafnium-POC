@@ -313,7 +313,11 @@ pub struct Derived {
 /// A message on its way to a session, and where it came from. A message with no `derived` was not rendered from the
 /// journal — an answer, an error, a transfer, a quote — and the audit log keeps it in full.
 pub struct Queued {
-    pub text: String,
+    /// Shared, not owned: one book message goes to every subscriber of a topic, and at sixteen thousand
+    /// subscribers copying it per recipient was the whole of a 122ms conflate flush (ADR-0002). An `Arc<str>`
+    /// is built once and handed out; the copy into the socket's buffer still happens, but on whichever reactor
+    /// thread serves that session rather than on the one thread holding the hub's write lock.
+    pub text: Arc<str>,
     pub derived: Option<Derived>,
 }
 
@@ -357,13 +361,18 @@ impl Outbox {
         self
     }
 
-    pub fn send(&self, message: String) -> Result<(), SendError<Queued>> {
-        self.put(Queued { text: message, derived: None })
+    pub fn send(&self, message: impl Into<Arc<str>>) -> Result<(), SendError<Queued>> {
+        self.put(Queued { text: message.into(), derived: None })
     }
 
     /// A frame rendered from the results of `sequence`, which the journal holds.
-    pub fn send_derived(&self, message: String, kind: &'static str, sequence: u64) -> Result<(), SendError<Queued>> {
-        self.put(Queued { text: message, derived: Some(Derived { kind, sequence }) })
+    pub fn send_derived(
+        &self,
+        message: impl Into<Arc<str>>,
+        kind: &'static str,
+        sequence: u64,
+    ) -> Result<(), SendError<Queued>> {
+        self.put(Queued { text: message.into(), derived: Some(Derived { kind, sequence }) })
     }
 
     fn put(&self, message: Queued) -> Result<(), SendError<Queued>> {
@@ -700,7 +709,7 @@ impl Hub {
                         "quantity": r["quantity"], "takerSide": lower(&r["takerSide"]),
                         "at": price::format_timestamp(u(&r["result"]["sequencedAt"]))
                     });
-                    self.send_to_topic(&format!("trades.{instrument}"), &trade.to_string());
+                    self.send_to_topic(&format!("trades.{instrument}"), &Arc::from(trade.to_string()));
                 }
                 "MarketStateChanged" => {
                     let event = self.view.instruments.get(&instrument).map_or(0, |i| i.event);
@@ -708,7 +717,7 @@ impl Hub {
                         "type": "market", "sequence": id(sequence), "eventId": id(event),
                         "instrumentId": id(instrument), "state": lower(&r["state"])
                     });
-                    self.send_to_topic("markets", &market.to_string());
+                    self.send_to_topic("markets", &Arc::from(market.to_string()));
                 }
                 _ => {}
             }
@@ -724,14 +733,14 @@ impl Hub {
         // A released event and its markets are gone from `GET /v4/markets` and their books; followers forget them.
         for (event, _) in &released {
             let gone = json!({"type": "market", "sequence": id(sequence), "eventId": id(*event), "released": true});
-            self.send_to_topic("markets", &gone.to_string());
+            self.send_to_topic("markets", &Arc::from(gone.to_string()));
         }
         if input["msg"] == "SetEventPhase" && unit.results.iter().any(applied_ok) {
             let phase = json!({
                 "type": "market", "sequence": id(sequence), "eventId": id(u(&input["eventId"])),
                 "phase": lower(&input["phase"])
             });
-            self.send_to_topic("markets", &phase.to_string());
+            self.send_to_topic("markets", &Arc::from(phase.to_string()));
         }
         // After each market's own state change, the event's resolution as a whole: a void and a settlement both
         // show as markets leaving trading, and only this says which, and which state occurred.
@@ -745,7 +754,7 @@ impl Hub {
             let resolved = json!({
                 "type": "market", "sequence": id(sequence), "eventId": id(event), "resolution": self.resolution(event)
             });
-            self.send_to_topic("markets", &resolved.to_string());
+            self.send_to_topic("markets", &Arc::from(resolved.to_string()));
         }
     }
 
@@ -791,11 +800,11 @@ impl Hub {
     /// A message from the parlay service for some accounts' private sessions, presented as everything else is. It is
     /// not kept for sessions resuming by sequence: it is not from the journal and has none.
     pub fn deliver(&self, accounts: &[u64], message: &Value) {
-        let text = self.present(message.clone()).to_string();
+        let text: Arc<str> = Arc::from(self.present(message.clone()).to_string());
         for account in accounts {
             for key in self.by_account.get(account).into_iter().flatten() {
                 if let Some(s) = self.sessions.get(key) {
-                    let _ = s.tx.send(text.clone());
+                    let _ = s.tx.send(Arc::clone(&text));
                 }
             }
         }
@@ -804,10 +813,10 @@ impl Hub {
     /// A message from the parlay service for some sessions, by their keys, presented as everything else is. Not kept
     /// for resuming either.
     pub fn deliver_to_sessions(&self, keys: &[u64], message: &Value) {
-        let text = self.present(message.clone()).to_string();
+        let text: Arc<str> = Arc::from(self.present(message.clone()).to_string());
         for key in keys {
             if let Some(s) = self.sessions.get(key) {
-                let _ = s.tx.send(text.clone());
+                let _ = s.tx.send(Arc::clone(&text));
             }
         }
     }
@@ -860,9 +869,10 @@ impl Hub {
                 history.dropped_through = dropped;
             }
         }
+        let shared: Arc<str> = Arc::from(message.clone());
         for key in self.by_account.get(&account).into_iter().flatten() {
             if let Some(s) = self.sessions.get(key) {
-                let _ = s.tx.send_derived(message.clone(), kind, sequence);
+                let _ = s.tx.send_derived(Arc::clone(&shared), kind, sequence);
             }
         }
     }
@@ -871,17 +881,20 @@ impl Hub {
     /// the journal and has no sequence, so a client that reconnects reads the transfers again instead. Every session
     /// may see them: seeing transfers takes `read`, which every credential holds.
     pub fn send_transfer(&self, account: u64, message: &str) {
+        let shared: Arc<str> = Arc::from(message);
         for key in self.by_account.get(&account).into_iter().flatten() {
             if let Some(s) = self.sessions.get(key) {
-                let _ = s.tx.send(message.to_string());
+                let _ = s.tx.send(Arc::clone(&shared));
             }
         }
     }
 
-    fn send_to_topic(&self, topic: &str, message: &str) {
+    /// One message, every subscriber. The `Arc` is the point: this runs once per topic per flush over every
+    /// session subscribed to it, so a copy here is a copy per subscriber.
+    fn send_to_topic(&self, topic: &str, message: &Arc<str>) {
         for key in self.by_topic.get(topic).into_iter().flatten() {
             if let Some(s) = self.sessions.get(key) {
-                let _ = s.tx.send(message.to_string());
+                let _ = s.tx.send(Arc::clone(message));
             }
         }
     }
@@ -945,21 +958,35 @@ impl Hub {
 
     /// Sends the levels that moved since the last call to each book's subscribers. Calling this at a fixed rate is
     /// the conflation: one message per book per tick, carrying only what changed, whatever the churn.
-    pub fn flush_books(&mut self) {
-        for (instrument, levels) in std::mem::take(&mut self.dirty) {
+    /// The levels that have moved since the last flush, taken so the next window starts empty. The only part
+    /// of a flush that mutates anything, split out so the fan-out does not need the write lock: at sixteen
+    /// thousand subscribers the sending was 122ms of a 100ms cycle, which starved every other reader of the
+    /// hub and throttled market data from ten flushes a second to under five (ADR-0002).
+    /// Returns the sequence those levels are the state as of, too. The fan-out happens after the write lock
+    /// is dropped, by which time the feed thread may have moved the view on; a book message stamped with the
+    /// later sequence would tell a client it holds changes it was never sent. So the sequence is taken here,
+    /// with the levels, and the message carries that one.
+    pub fn take_dirty(&mut self) -> (BTreeMap<u64, Levels>, u64) {
+        (std::mem::take(&mut self.dirty), self.view.sequence)
+    }
+
+    /// Send what `take_dirty` took. Reads the hub only, so it runs under a read lock while the feed thread and
+    /// every request carry on.
+    pub fn publish_books(&self, dirty: BTreeMap<u64, Levels>, sequence: u64) {
+        for (instrument, levels) in dirty {
             let topic = format!("book.{instrument}");
             // An entry leaves the index with its last session, so a topic in it has someone to send to.
             if !self.by_topic.contains_key(&topic) {
                 continue;
             }
-            let message = self.levels_message(instrument, &levels, false);
+            let message: Arc<str> = Arc::from(self.levels_message(instrument, &levels, false, sequence));
             self.send_to_topic(&topic, &message);
         }
     }
 
     /// Levels as a client applies them: a quantity of zero means the level has gone. `snapshot` says this is the
     /// whole book rather than what changed, so a client knows to start again from it.
-    fn levels_message(&self, instrument: u64, levels: &Levels, snapshot: bool) -> String {
+    fn levels_message(&self, instrument: u64, levels: &Levels, snapshot: bool, sequence: u64) -> String {
         let ladder = ladder(&self.view, instrument);
         let changes: Vec<Value> = levels
             .iter()
@@ -976,7 +1003,7 @@ impl Hub {
         typed(
             "book",
             json!({
-                "instrumentId": id(instrument), "sequence": id(self.view.sequence),
+                "instrumentId": id(instrument), "sequence": id(sequence),
                 "state": market.map(|i| i.state.to_lowercase()),
                 "last": market.and_then(|i| i.last).map(|t| price::quote(ladder, t)),
                 "snapshot": snapshot, "changes": changes
@@ -995,7 +1022,7 @@ impl Hub {
                 levels.insert((false, tick), level);
             }
         }
-        self.levels_message(instrument, &levels, true)
+        self.levels_message(instrument, &levels, true, self.view.sequence)
     }
 
     pub fn book(&self, instrument: u64, depth: usize) -> Option<Value> {

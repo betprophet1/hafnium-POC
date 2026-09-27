@@ -178,6 +178,7 @@ pub struct Metrics {
     loop_turn: Family<Labels, Histogram>,
     feed_apply: Family<Labels, Histogram>,
     conflate_hold: Family<Labels, Histogram>,
+    conflate_publish: Family<Labels, Histogram>,
     hub_read_wait: Family<Labels, Histogram>,
     backlog: Family<Labels, Histogram>,
     slow_consumers: Counters,
@@ -237,6 +238,7 @@ impl Metrics {
             loop_turn: durations(),
             feed_apply: durations(),
             conflate_hold: durations(),
+            conflate_publish: durations(),
             hub_read_wait: durations(),
             backlog: Family::<Labels, Histogram>::new_with_constructor(Histogram::counts as fn() -> Histogram),
             slow_consumers: Counters::grid(&[("half", HALVES)]),
@@ -287,6 +289,11 @@ impl Metrics {
             "venue_gateway_conflate_hold_duration_seconds",
             "How long one conflate flush holds the hub's write lock. `flush_books` copies each book message              once per subscriber inside that lock, so this grows with the market-data population while              nothing else can read the hub (ADR-0002)",
             m.conflate_hold.clone(),
+        );
+        r.register(
+            "venue_gateway_conflate_publish_duration_seconds",
+            "The fan-out half of a flush: building each topic's message once and handing it to every              subscriber, under a read lock rather than excluding everyone",
+            m.conflate_publish.clone(),
         );
         r.register(
             "venue_gateway_hub_read_wait_duration_seconds",
@@ -374,6 +381,7 @@ impl Metrics {
             loop_turn: self.loop_turn.get_or_create_owned(&h(&[])),
             feed_apply: self.feed_apply.get_or_create_owned(&h(&[])),
             conflate_hold: self.conflate_hold.get_or_create_owned(&h(&[])),
+            conflate_publish: self.conflate_publish.get_or_create_owned(&h(&[])),
             hub_read_wait: self.hub_read_wait.get_or_create_owned(&h(&[])),
             backlog: self.backlog.get_or_create_owned(&h(&[])),
             feed_sequence: self.feed_sequence.get_or_create_owned(&h(&[])),
@@ -407,10 +415,14 @@ pub struct HalfMetrics {
     /// How long one feed unit takes to apply. `feed_behind` says how stale the view is; this says what that
     /// costs, which is the headroom on the one thread per half that applies every unit (ADR-0002).
     pub feed_apply: Histogram,
-    /// How long one conflate flush holds the hub's write lock, which is `flush_books` copying each book
-    /// message once per subscriber. Ten flushes a second, so mean hold x 10 is the fraction of every second
-    /// during which no reactor thread can read the hub at all.
+    /// The part of a conflate flush that holds the hub's write lock: taking the levels that moved and
+    /// expiring waiters. Ten flushes a second, so mean hold x 10 is the fraction of every second during
+    /// which no reactor thread can read the hub at all. The fan-out used to be inside this and was 122ms at
+    /// sixteen thousand subscribers; it is now `conflate_publish`.
     pub conflate_hold: Histogram,
+    /// The fan-out half, which holds only a read lock. Together with `conflate_hold` this says how much of a
+    /// flush excludes everyone and how much merely runs alongside them.
+    pub conflate_publish: Histogram,
     /// What that costs on the other side: how long a request thread waited for the read lock.
     pub hub_read_wait: Histogram,
     pub backlog: Histogram,

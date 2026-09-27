@@ -396,17 +396,25 @@ fn conflate(gateway: &Arc<Gateway>) {
         // Book topics carry at most ten snapshots a second (interface 1 README, market data).
         thread::sleep(Duration::from_millis(100));
         // Timed from before the lock is taken to after it is dropped: the flush excludes every reader of the
-        // hub for the whole of it, and `flush_books` copies each book message once per subscriber, so this
-        // is the term that grows with the market-data population (ADR-0002).
+        // hub for the whole of it, so this is what a flush costs everyone else.
+        // Two phases, because only the first needs to exclude anyone. Taking the moved levels and expiring
+        // the waiters mutates, and is microseconds; sending is O(subscribers) and merely reads, so it runs
+        // under a read lock with the feed thread and every request carrying on beside it. Doing both under
+        // the write lock cost 122ms a flush at sixteen thousand subscribers -- more than the 100ms cycle, so
+        // market data came out at under five snapshots a second instead of ten (ADR-0002).
         let started = monotonic();
-        {
+        let (dirty, sequence) = {
             let mut hub = conflater.hub_mut();
-            hub.flush_books();
+            let taken = hub.take_dirty();
             // Amendments and cancels waiting for an order the feed has not delivered are answered once past
             // their wait.
             hub.expire_awaiting();
-        }
+            taken
+        };
         conflater.metrics.conflate_hold.observe_duration(monotonic().duration_since(started));
+        let sending = monotonic();
+        conflater.hub().publish_books(dirty, sequence);
+        conflater.metrics.conflate_publish.observe_duration(monotonic().duration_since(sending));
     });
 }
 

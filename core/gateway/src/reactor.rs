@@ -580,7 +580,7 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
                     record_from_client(gateway, origin, session, text.as_str(), message.as_ref());
                     for reply in ws::handle(gateway, session, message) {
                         record_to_client(gateway, origin, session, &reply, true);
-                        if !queue(socket, reply, ending) {
+                        if !queue(socket, &reply, ending) {
                             return false;
                         }
                     }
@@ -593,7 +593,7 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
                     gateway.metrics.ws_message(metrics::OP_UNREADABLE, Some(400));
                     let refused = ws::binary_refused();
                     record_to_client(gateway, origin, session, &refused, true);
-                    if !queue(socket, refused, ending) {
+                    if !queue(socket, &refused, ending) {
                         return false;
                     }
                 }
@@ -607,7 +607,7 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
         for reply in ws::ready_replies(gateway, session) {
             answered = true;
             record_to_client(gateway, origin, session, &reply, true);
-            if !queue(socket, reply, ending) {
+            if !queue(socket, &reply, ending) {
                 return false;
             }
         }
@@ -620,7 +620,7 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
             conn.waiting.fetch_sub(1, Ordering::Relaxed);
             conn.behind.fetch_sub(message.text.len() as u64, Ordering::Relaxed);
             record_queued(gateway, origin, session, &message);
-            if !queue(socket, message.text, ending) {
+            if !queue(socket, &message.text, ending) {
                 return false;
             }
         }
@@ -851,7 +851,7 @@ fn record_queued(gateway: &Gateway, origin: &Origin, session: &Session, message:
 /// Queues a message for the client, and says whether the connection is still worth keeping. A would-block is not a
 /// failure: the message stays in the socket's own buffer and goes out on a later flush, when the loop is told the
 /// socket can take more. A connection dropped for being too far behind says so in `ending`.
-fn queue(socket: &mut WebSocket<Stream>, message: String, ending: &mut &'static str) -> bool {
+fn queue(socket: &mut WebSocket<Stream>, message: &str, ending: &mut &'static str) -> bool {
     match socket.write(Message::text(message)) {
         Ok(()) => true,
         Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => true,
