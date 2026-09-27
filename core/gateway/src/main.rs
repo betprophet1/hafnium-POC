@@ -395,10 +395,18 @@ fn conflate(gateway: &Arc<Gateway>) {
     named("gw-conflate", move || loop {
         // Book topics carry at most ten snapshots a second (interface 1 README, market data).
         thread::sleep(Duration::from_millis(100));
-        let mut hub = conflater.hub_mut();
-        hub.flush_books();
-        // Amendments and cancels waiting for an order the feed has not delivered are answered once past their wait.
-        hub.expire_awaiting();
+        // Timed from before the lock is taken to after it is dropped: the flush excludes every reader of the
+        // hub for the whole of it, and `flush_books` copies each book message once per subscriber, so this
+        // is the term that grows with the market-data population (ADR-0002).
+        let started = monotonic();
+        {
+            let mut hub = conflater.hub_mut();
+            hub.flush_books();
+            // Amendments and cancels waiting for an order the feed has not delivered are answered once past
+            // their wait.
+            hub.expire_awaiting();
+        }
+        conflater.metrics.conflate_hold.observe_duration(monotonic().duration_since(started));
     });
 }
 

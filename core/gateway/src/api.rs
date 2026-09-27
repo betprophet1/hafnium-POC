@@ -453,8 +453,15 @@ impl Gateway {
     }
 
     /// A read of `Hub`: concurrent with every other reader, but not with a writer (`hub_mut`).
+    ///
+    /// Timed, because a reader waiting here is a request stalled behind the conflate flush, which copies a
+    /// book message once per subscriber while holding the write lock. That cost grows with the market-data
+    /// population and shows up as latency rather than CPU, so it is invisible without this (ADR-0002).
     pub fn hub(&self) -> RwLockReadGuard<'_, Hub> {
-        read_locked(&self.hub)
+        let started = monotonic();
+        let guard = read_locked(&self.hub);
+        self.metrics.hub_read_wait.observe_duration(monotonic().duration_since(started));
+        guard
     }
 
     /// A write of `Hub`: excludes every reader and writer alike, same as the old single `Mutex<Hub>` always did.
