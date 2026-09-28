@@ -178,7 +178,9 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool, proxies: 
     if let Some(address) = &treasury {
         private_half = private_half.with_treasury(address);
     }
-    let gateway = crate::start_half(private_half, &feed);
+    // One unit per acquisition, so a test sees each applied as soon as it arrives rather than waiting
+    // for whatever else happened to be buffered behind it.
+    let gateway = crate::start_half(private_half, &feed, 1);
     if let Some(address) = treasury {
         crate::treasury::follow_updates(&gateway, address);
     }
@@ -190,6 +192,7 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool, proxies: 
             .with_trusted_proxies(proxies)
             .with_origins(vec!["http://app.test".into()]),
         &feed,
+        1,
     );
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
     let address = listener.local_addr().expect("its address").to_string();
@@ -197,7 +200,7 @@ fn venue_with(name: &str, public: bool, private: bool, treasury: bool, proxies: 
         public: public.then(|| Arc::clone(&public_half)),
         private: private.then(|| Arc::clone(&gateway)),
     };
-    thread::spawn(move || crate::serve_with(&halves, &listener, MAX_BEHIND));
+    thread::spawn(move || crate::serve_with(&halves, &listener, MAX_BEHIND, None, false));
     // Up to ten seconds for the feed to deliver the listing to both halves, counted in waits rather than read off a
     // clock.
     for wait in 0.. {
@@ -482,13 +485,13 @@ impl Fleet {
         let audit = Audit::start(&self.audit_dir, &instance, false).expect("an audit log");
         let hub = || Hub::new(Catalogue::load(CATALOGUE).expect("the mini venue's catalogue"));
         let public = (serve != Serve::Private)
-            .then(|| crate::start_half(Gateway::public(hub(), limits).with_audit(audit.clone()), &self.feed));
+            .then(|| crate::start_half(Gateway::public(hub(), limits).with_audit(audit.clone()), &self.feed, 1));
         let private = (serve != Serve::Public).then(|| {
             let half = Gateway::private(hub(), Submit::spawn(&self.ingress), limits)
                 .with_audit(audit.clone())
                 .with_identity(Some(self.identity.clone()), true)
                 .with_treasury(&self.treasury);
-            let half = crate::start_half(half, &self.feed);
+            let half = crate::start_half(half, &self.feed, 1);
             crate::treasury::follow_updates(&half, self.treasury.clone());
             Gateway::connect_parlays(&half, &self.parlay_proxy.address);
             half
@@ -496,7 +499,7 @@ impl Fleet {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a port for the gateway");
         let listening = listener.local_addr().expect("its address").to_string();
         let halves = crate::Halves { public: public.clone(), private: private.clone() };
-        thread::spawn(move || crate::serve_with(&halves, &listener, MAX_BEHIND));
+        thread::spawn(move || crate::serve_with(&halves, &listener, MAX_BEHIND, None, false));
         for half in public.iter().chain(private.iter()) {
             eventually("a gateway's half has the venue from the feed", || half.hub().market(MARKET).is_some());
         }

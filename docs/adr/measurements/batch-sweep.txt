@@ -1,0 +1,25 @@
+=== feed-batch=1 ===
+32 connection(s) over 8 instrument(s), 2305150 requests in 60857 ms: 37878 messages/s; round trip µs p50 601.680 p90 1024.306 p99 4610.182 p99.9 12517.161 max 208838.858; 8 maker(s), 65445 fills, 1075 fills/s; 933853 taker orders, 65445 traded (1:14), 840455 cancels; 16384 retail took 13246047 messages, 217658/s (808 each), sent 96439 orders, 96398 fills, p50 4245.251 p99 65036.128, 0 dropped; 8 watcher(s) took 16966 messages, 278/s
+    feed_apply       private  n=  2416723 mean      15.7us  total   37.87s =   63.1% of wall
+    feed_apply       public   n=  2416723 mean      12.9us  total   31.13s =   51.9% of wall
+    hub_read_wait    private  n=  3804969 mean      51.1us  total  194.33s =  323.9% of wall
+    hub_read_wait    public   n=      542 mean       3.3us  total    0.00s =    0.0% of wall
+    conflate_publish private  n=      612 mean      44.2us  total    0.03s =    0.0% of wall
+    conflate_publish public   n=      542 mean   12911.5us  total    7.00s =   11.7% of wall
+=== feed-batch=8 ===
+32 connection(s) over 8 instrument(s), 2399481 requests in 60925 ms: 39384 messages/s; round trip µs p50 577.725 p90 972.397 p99 4445.834 p99.9 13382.991 max 218770.855; 8 maker(s), 68513 fills, 1124 fills/s; 975637 taker orders, 68513 traded (1:14), 878061 cancels; 16384 retail took 13214234 messages, 216893/s (806 each), sent 96403 orders, 96361 fills, p50 3621.321 p99 58635.290, 0 dropped; 8 watcher(s) took 16912 messages, 277/s
+    feed_apply       private  n=  2511530 mean      14.7us  total   36.81s =   61.3% of wall
+    feed_apply       public   n=  2511530 mean      12.4us  total   31.03s =   51.7% of wall
+    hub_read_wait    private  n=  3952366 mean      50.1us  total  198.18s =  330.3% of wall
+    hub_read_wait    public   n=      540 mean       2.3us  total    0.00s =    0.0% of wall
+    conflate_publish private  n=      613 mean      34.6us  total    0.02s =    0.0% of wall
+    conflate_publish public   n=      540 mean   13685.3us  total    7.39s =   12.3% of wall
+=== feed-batch=32 ===
+32 connection(s) over 8 instrument(s), 2405466 requests in 60959 ms: 39460 messages/s; round trip µs p50 580.863 p90 984.797 p99 4200.930 p99.9 12390.231 max 210269.575; 8 maker(s), 68380 fills, 1121 fills/s; 979417 taker orders, 68380 traded (1:14), 881460 cancels; 16384 retail took 13040521 messages, 213922/s (795 each), sent 96270 orders, 96241 fills, p50 3719.237 p99 106486.246, 0 dropped; 8 watcher(s) took 16696 messages, 273/s
+    feed_apply       private  n=  2517203 mean      14.5us  total   36.59s =   61.0% of wall
+    feed_apply       public   n=  2517203 mean      12.0us  total   30.30s =   50.5% of wall
+    hub_read_wait    private  n=  3960272 mean      50.7us  total  200.70s =  334.5% of wall
+    hub_read_wait    public   n=      535 mean       3.7us  total    0.00s =    0.0% of wall
+    conflate_publish private  n=      613 mean      44.5us  total    0.03s =    0.0% of wall
+    conflate_publish public   n=      535 mean   14718.8us  total    7.87s =   13.1% of wall
+BATCHDONE

@@ -18,6 +18,8 @@ path = "src/main.rs"
 [dependencies]
 venue-engine = { path = "../engine" }
 venue-harness = { path = "../harness" }
+# The generated SBE decoders, so a feed frame can be read without inflating it into JSON (`wire::Frame`).
+venue_journal = { path = "../journal" }
 venue-node = { path = "../node" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

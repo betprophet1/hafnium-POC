@@ -1,6 +1,7 @@
 //! `venue-gateway`: interface 1, the REST and WebSocket gateway, in front of one node. The contract is
 //! `interfaces/gateway/`; this is its first implementation, for the mini venue.
 
+mod affinity;
 mod api;
 mod audit;
 mod bootstrap;
@@ -26,6 +27,13 @@ use api::{Gateway, Limits};
 use audit::Audit;
 use forwarded::TrustedProxies;
 use hub::Hub;
+/// The feed thread spends about 42% of itself in glibc's `malloc` and `free` (ADR-0002): applying one unit
+/// builds and drops a tree of small, short-lived `serde_json::Value` allocations, which is the pattern glibc's
+/// per-thread arenas serve worst. Swapping the allocator changes no semantics and no code but this line.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use limits::monotonic;
 use metrics::{IngressWatch, Metrics};
 use reactor::Reactors;
 use std::collections::BTreeMap;
@@ -51,7 +59,7 @@ const USAGE: &str = "usage:
                 [--identity ADDR] [--dev-tokens true] [--listen 127.0.0.1:8081] [--per-second 200] [--burst 400] [--logons-per-minute 30]
                 [--audit-dir ./gateway-audit] [--audit-instance HOSTNAME] [--audit-fsync true] [--trusted-proxies ADDRS]
                 [--allowed-origins ORIGINS] [--environments FILE] [--from-view FILE]
-                [--metrics ADDR]
+                [--metrics ADDR] [--reactor-threads N] [--pin-reactor-threads true]
 
 --serve is public, private or both: the halves of interface 1 this process serves. Public is market data on
 /v4/ws_public and GET /v4/markets; private is orders and accounts on /v4/ws_private, /v4/account and /v4/orders,
@@ -77,6 +85,14 @@ the gateway, an ingress: on a connection from one, the audit log also records th
 Forwarded header names. None by default, and those headers are never believed from any other address.
 --metrics serves Prometheus metrics at http://ADDR/metrics, apart from the client-facing --listen (none by default);
 VENUE_LOG_FORMAT=json writes the log as JSON lines (deploy/observability/metrics.md).
+--reactor-threads sizes the event-loop pool serving connections; without it, the host's own core count is asked
+(capped at 4, since past that on the hosts this was tuned against, contention between reactor threads for the
+same connections' work outweighs the benefit). Size it explicitly on a host with more to give.
+--pin-reactor-threads true pins each reactor thread to its own core instead of leaving it to the scheduler
+(false by default, matching every host this ran on before it existed). Measured to matter: raising
+--reactor-threads past the physical core count did nothing at all without it, since nothing kept a thread on
+the core whose cache it had warmed. Public and private each pin their own pool to a different range of cores,
+so the two never both claim core 0.
 Every flag can also be given as VENUE_<FLAG>, for example VENUE_FEED.";
 
 struct Args(BTreeMap<String, String>);
@@ -196,6 +212,16 @@ fn run(args: &Args) -> Result<(), Error> {
         burst: args.number("burst", 400)?,
         logons_per_minute: args.number("logons-per-minute", 30)?,
     };
+    let reactor_threads = args
+        .optional("reactor-threads")
+        .map(|v| v.parse::<usize>())
+        .transpose()
+        .map_err(|e| format!("--reactor-threads: {e}"))?;
+    let pin_reactor_threads = match args.get("pin-reactor-threads", Some("false"))?.as_str() {
+        "true" => true,
+        "false" => false,
+        other => return Err(format!("--pin-reactor-threads must be true or false, not {other}").into()),
+    };
     let serving = args.get("serve", Some("both"))?;
     let (public, private) = match serving.as_str() {
         "both" => (true, true),
@@ -237,6 +263,18 @@ fn run(args: &Args) -> Result<(), Error> {
     // genesis: that venue's journal holds no inputs at all, so a hub that asked for everything would be sent
     // nothing and serve an empty venue. Loaded once, before either half, so a bad path fails the process rather
     // than leaving one half up and wrong.
+    // How many feed units one acquisition of the hub's write lock applies. 1 is one per unit, which is what
+    // this was: releasing that lock wakes every reader queued on it, and the futex wake was 26% of the feed
+    // thread's time at tens of thousands of units a second (ADR-0002).
+    //
+    // 8 from measurement, not from the profile's 26%. Batching buys far less than that share suggests --
+    // `futex_wake` wakes every queued reader in one call, so fewer releases mean more readers woken per
+    // release rather than less work. At 16,384 customers: 1 -> 37,878 req/s, 8 -> 39,384, 32 -> 39,460, so
+    // almost all of a 4% gain is there by 8. Past it only the tail moves, and the wrong way: retail p99 was
+    // 65.0ms at 1, 58.6ms at 8 and 106.5ms at 32, which is a reader waiting out a longer hold.
+    //
+    // A batch never waits to fill: it is only ever what the feed had already sent.
+    let feed_batch = usize::try_from(args.number("feed-batch", 8)?)?;
     let founding = match args.optional("from-view").filter(|p| !p.is_empty()) {
         Some(path) => {
             venue_link::view::View::load(std::path::Path::new(&path)).map_err(|e| format!("--from-view {path}: {e}"))?
@@ -252,7 +290,7 @@ fn run(args: &Args) -> Result<(), Error> {
             let gateway = Gateway::public(Hub::founded_on(Catalogue::load(&catalogue_file)?, founding.clone()), limits)
                 .with_origins(origins.clone())
                 .with_metrics(metrics.half(api::Half::Public));
-            Some(start_half(gateway.with_audit(audit.clone()).with_trusted_proxies(proxies.clone()), &feed))
+            Some(start_half(gateway.with_audit(audit.clone()).with_trusted_proxies(proxies.clone()), &feed, feed_batch))
         } else {
             None
         },
@@ -283,7 +321,7 @@ fn run(args: &Args) -> Result<(), Error> {
             if !treasury.is_empty() {
                 gateway = gateway.with_treasury(&treasury);
             }
-            let half = start_half(gateway, &feed);
+            let half = start_half(gateway, &feed, feed_batch);
             if !treasury.is_empty() {
                 treasury::follow_updates(&half, treasury);
             }
@@ -304,7 +342,7 @@ fn run(args: &Args) -> Result<(), Error> {
         "serving",
         &[("listen", &listener.local_addr()?), ("halves", &serving), ("audit_dir", &audit_dir.display())],
     );
-    serve(&halves, &listener);
+    serve(&halves, &listener, reactor_threads, pin_reactor_threads);
     Ok(())
 }
 
@@ -318,9 +356,9 @@ struct Halves {
 /// A half that follows the node's feed and sends its book subscribers what changed, keeps checking the API keys
 /// its sessions use when it verifies keys, and (the private half, when it has an identity service) keeps
 /// reconciling subaccounts the engine has not yet been told to protect.
-fn start_half(gateway: Gateway, feed: &str) -> Arc<Gateway> {
+fn start_half(gateway: Gateway, feed: &str, feed_batch: usize) -> Arc<Gateway> {
     let gateway = Arc::new(gateway);
-    follow_feed(&gateway, feed.to_string());
+    follow_feed(&gateway, feed.to_string(), feed_batch);
     conflate(&gateway);
     if gateway.identity.serves_keys() {
         identity::keep_checking(&gateway);
@@ -329,18 +367,42 @@ fn start_half(gateway: Gateway, feed: &str) -> Arc<Gateway> {
     gateway
 }
 
+/// Which of `metrics::RESULTS` a template is. Anything unlisted is `other`, whose count going up is the sign
+/// that the list needs another entry rather than that nothing is being missed.
+fn result_kind(template: u16) -> usize {
+    use venue_journal::{
+        book_level_changed_codec as book, command_applied_codec as applied, fill_codec as fill,
+        order_accepted_codec as accepted, order_amended_codec as amended, order_cancelled_codec as cancelled,
+        order_reduced_codec as reduced, order_rejected_codec as rejected, position_changed_codec as position,
+        sleeve_changed_codec as sleeve,
+    };
+    let names = [
+        book::SBE_TEMPLATE_ID,
+        accepted::SBE_TEMPLATE_ID,
+        cancelled::SBE_TEMPLATE_ID,
+        amended::SBE_TEMPLATE_ID,
+        reduced::SBE_TEMPLATE_ID,
+        rejected::SBE_TEMPLATE_ID,
+        fill::SBE_TEMPLATE_ID,
+        position::SBE_TEMPLATE_ID,
+        sleeve::SBE_TEMPLATE_ID,
+        applied::SBE_TEMPLATE_ID,
+    ];
+    names.iter().position(|id| *id == template).unwrap_or(names.len())
+}
+
 /// Keeps the hub's view of the venue current from the node's feed, reconnecting for ever.
-fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
+fn follow_feed(gateway: &Arc<Gateway>, feed: String, feed_batch: usize) {
     let follower = Arc::clone(gateway);
     named("gw-feed", move || {
         let half = follower.half.name();
-        wire::follow_reporting(
+        wire::follow_batched(
             &feed,
             || {
                 // Carries on where it left off. This is the reader with most to gain from it: its view used to be
                 // rebuilt from the first input on every reconnect, so a moment's network trouble cost the whole
                 // journal, and that cost grew for as long as the venue ran.
-                let at = follower.hub().resume();
+                let at = follower.hub_mut().resume();
                 follower.metrics.feed_connected();
                 at
             },
@@ -348,15 +410,46 @@ fn follow_feed(gateway: &Arc<Gateway>, feed: String) {
                 // The node cannot honour that position — a different journal under the same address — so whatever
                 // this gateway kept is a view of a history that never happened.
                 log::warn("the feed is starting over; the view is being thrown away", &[("half", &half)]);
-                follower.hub().restart();
+                follower.hub_mut().restart();
             },
-            |unit| {
-                let record = &unit.input["record"];
-                let (sequence, at) = (record["sequence"].as_u64(), record["sequencedAt"].as_u64());
-                follower.hub().apply(&unit);
-                follower.metrics.feed_unit(sequence.unwrap_or(0), at.unwrap_or(0), venue_telemetry::wall_ns());
+            |units: &mut Vec<venue_link::wire::Unit>| {
+                // One acquisition for the batch. Releasing this lock wakes every reader queued on it, and
+                // that futex wake was 26% of this thread's time when it happened once a unit at tens of
+                // thousands of units a second (ADR-0002). The batch is only ever what the feed had already
+                // sent, so nothing waits to fill one.
+                //
+                // Timed from before the lock: all of it is this thread's, and this thread applies every unit
+                // the venue produces, so what it costs is the headroom the whole half has.
+                let started = monotonic();
+                {
+                    let mut hub = follower.hub_mut();
+                    for unit in units.iter() {
+                        hub.apply(unit);
+                    }
+                }
+                // Which results still cost a `Value`, counted after applying so it reflects what the readers
+                // actually asked for. `template` and `decoded` are both header reads, so counting is cheap
+                // and, unlike a profile, says which *kind* of result the decoding is spent on (ADR-0002).
+                for unit in units.iter() {
+                    for result in &unit.results {
+                        follower.metrics.feed_result(result_kind(result.template()), result.decoded());
+                    }
+                }
+                // Charged per unit, so the histogram still says what one unit costs however they were
+                // batched, and the two are comparable across a change to the batch size.
+                let each = monotonic().duration_since(started) / u32::try_from(units.len().max(1)).unwrap_or(1);
+                for unit in units.iter() {
+                    follower.metrics.feed_apply.observe_duration(each);
+                    let record = &unit.input["record"];
+                    follower.metrics.feed_unit(
+                        record["sequence"].as_u64().unwrap_or(0),
+                        record["sequencedAt"].as_u64().unwrap_or(0),
+                        venue_telemetry::wall_ns(),
+                    );
+                }
             },
             |e| log::warn("feed connection", &[("half", &half), ("feed", &feed), ("error", &e)]),
+            feed_batch,
         );
     });
 }
@@ -367,10 +460,26 @@ fn conflate(gateway: &Arc<Gateway>) {
     named("gw-conflate", move || loop {
         // Book topics carry at most ten snapshots a second (interface 1 README, market data).
         thread::sleep(Duration::from_millis(100));
-        let mut hub = conflater.hub();
-        hub.flush_books();
-        // Amendments and cancels waiting for an order the feed has not delivered are answered once past their wait.
-        hub.expire_awaiting();
+        // Timed from before the lock is taken to after it is dropped: the flush excludes every reader of the
+        // hub for the whole of it, so this is what a flush costs everyone else.
+        // Two phases, because only the first needs to exclude anyone. Taking the moved levels and expiring
+        // the waiters mutates, and is microseconds; sending is O(subscribers) and merely reads, so it runs
+        // under a read lock with the feed thread and every request carrying on beside it. Doing both under
+        // the write lock cost 122ms a flush at sixteen thousand subscribers -- more than the 100ms cycle, so
+        // market data came out at under five snapshots a second instead of ten (ADR-0002).
+        let started = monotonic();
+        let (dirty, sequence) = {
+            let mut hub = conflater.hub_mut();
+            let taken = hub.take_dirty();
+            // Amendments and cancels waiting for an order the feed has not delivered are answered once past
+            // their wait.
+            hub.expire_awaiting();
+            taken
+        };
+        conflater.metrics.conflate_hold.observe_duration(monotonic().duration_since(started));
+        let sending = monotonic();
+        conflater.hub().publish_books(dirty, sequence);
+        conflater.metrics.conflate_publish.observe_duration(monotonic().duration_since(sending));
     });
 }
 
@@ -379,23 +488,40 @@ fn conflate(gateway: &Arc<Gateway>) {
 const MAX_BEHIND: usize = 4 * 1024 * 1024;
 
 /// Accepts connections for ever and hands each one to an event loop of the half it is for, which serves it whether it
-/// is a WebSocket session or a REST request.
-fn serve(halves: &Halves, listener: &TcpListener) {
-    serve_with(halves, listener, MAX_BEHIND);
+/// is a WebSocket session or a REST request. `reactor_threads` overrides the auto-detected default (`--reactor-threads`,
+/// `VENUE_REACTOR_THREADS`); `None` keeps auto-detecting. `pin_reactor_threads` pins each one to its own core
+/// (`--pin-reactor-threads`, `affinity.rs`).
+fn serve(halves: &Halves, listener: &TcpListener, reactor_threads: Option<usize>, pin_reactor_threads: bool) {
+    serve_with(halves, listener, MAX_BEHIND, reactor_threads, pin_reactor_threads);
 }
 
 /// `serve`, with a WebSocket client allowed to fall `max_behind` bytes behind.
-fn serve_with(halves: &Halves, listener: &TcpListener, max_behind: usize) {
-    let threads = thread::available_parallelism().map_or(2, |n| n.get().min(4));
-    let start = |gateway: &Arc<Gateway>| Reactors::start(gateway, threads, max_behind);
-    let (public, private) =
-        match (halves.public.as_ref().map(start).transpose(), halves.private.as_ref().map(start).transpose()) {
-            (Ok(public), Ok(private)) => (public, private),
-            (Err(e), _) | (_, Err(e)) => {
-                log::error("event loops could not start", &[("error", &e)]);
-                return;
-            }
-        };
+fn serve_with(
+    halves: &Halves,
+    listener: &TcpListener,
+    max_behind: usize,
+    reactor_threads: Option<usize>,
+    pin_reactor_threads: bool,
+) {
+    // Capped at 4 by default: past that, contention between reactor threads for the same connections' work
+    // outweighs the benefit on the hosts this was tuned against. A host with more to give can say so directly
+    // rather than wait for a higher default that would need retuning for whatever the next host looks like.
+    let threads = reactor_threads.unwrap_or_else(|| thread::available_parallelism().map_or(2, |n| n.get().min(4)));
+    // Public and private each start their own pool; giving them different offsets into the same core list
+    // keeps the two from both pinning their first thread to core 0 (`Reactors::start`'s own doc comment).
+    let start = |gateway: &Arc<Gateway>, base: usize| {
+        Reactors::start(gateway, threads, max_behind, pin_reactor_threads.then_some(base))
+    };
+    let (public, private) = match (
+        halves.public.as_ref().map(|g| start(g, 0)).transpose(),
+        halves.private.as_ref().map(|g| start(g, threads)).transpose(),
+    ) {
+        (Ok(public), Ok(private)) => (public, private),
+        (Err(e), _) | (_, Err(e)) => {
+            log::error("event loops could not start", &[("error", &e)]);
+            return;
+        }
+    };
     if let (Some(public), Some(private)) = (&public, &private) {
         Reactors::join(public, private);
     }

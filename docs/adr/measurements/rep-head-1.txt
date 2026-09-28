@@ -1,0 +1,16 @@
+## arm=head rep=1 pid=18369
+=== trade32 ===
+32 connection(s) over 1 instrument(s), 304180 requests in 10346 ms: 29400 messages/s; round trip µs p50 982.455 p90 1611.800 p99 2197.795 p99.9 2806.920 max 22395.833; 8 maker(s), 505430 fills, 48852 fills/s
+=== trade128 ===
+128 connection(s) over 1 instrument(s), 304134 requests in 10109 ms: 30085 messages/s; round trip µs p50 3931.886 p90 5827.787 p99 8343.883 p99.9 9727.680 max 99096.772; 32 maker(s), 522321 fills, 51668 fills/s
+=== amend32 ===
+32 connection(s) over 1 instrument(s), 429644 amendments in 10053 ms: 42737 messages/s; round trip µs p50 403.949 p90 575.481 p99 5796.279 p99.9 126163.460 max 130325.844
+=== amend128 ===
+128 connection(s) over 1 instrument(s), 576605 amendments in 10656 ms: 54110 messages/s; round trip µs p50 1689.238 p90 5406.000 p99 7101.688 p99.9 7675.874 max 76350.842
+=== feed_apply ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 15.370458255
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 1624950
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 29.100198395
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 1624950
+too_far_behind=0
+REPDONE

@@ -82,6 +82,9 @@ struct Shared {
     incoming: Mutex<Vec<TcpStream>>,
     /// Whether a wake is already on its way.
     woken: AtomicBool,
+    /// This loop's nudge, as one `Arc` every connection on it shares. Its identity is what lets a fan-out
+    /// group sessions by loop and wake each once.
+    wake: Notify,
 }
 
 impl Shared {
@@ -92,8 +95,14 @@ impl Shared {
     }
 
     fn ready(&self, token: usize) {
-        locked(&self.ready).push(token);
+        self.ready_quiet(token);
         self.nudge();
+    }
+
+    /// Mark a connection ready without the syscall. For a caller fanning one message out to thousands of
+    /// sessions: each still has to be marked, but the loop only has to be woken once (`Outbox::send_deferred`).
+    fn ready_quiet(&self, token: usize) {
+        locked(&self.ready).push(token);
     }
 }
 
@@ -107,25 +116,50 @@ pub struct Reactors {
 
 impl Reactors {
     /// Starts `threads` loops serving connections for `gateway`'s half. A WebSocket client more than `max_behind`
-    /// bytes behind on what it has been sent is disconnected.
-    pub fn start(gateway: &Arc<Gateway>, threads: usize, max_behind: usize) -> std::io::Result<Arc<Self>> {
+    /// bytes behind on what it has been sent is disconnected. `pin_from`, when given, pins each loop's thread to
+    /// its own core starting at that index into `affinity::cores()` (round-robining if there are more threads
+    /// than cores) -- without it, more threads than physical cores buys nothing, since the scheduler is free to
+    /// move a thread off the core whose cache it just warmed. A caller starting two pinned pools (public and
+    /// private) gives them different `pin_from` values so the two do not both claim core 0.
+    pub fn start(
+        gateway: &Arc<Gateway>,
+        threads: usize,
+        max_behind: usize,
+        pin_from: Option<usize>,
+    ) -> std::io::Result<Arc<Self>> {
         let (mut polls, mut loops) = (Vec::new(), Vec::new());
         for _ in 0..threads.max(1) {
             let poll = Poll::new()?;
             let waker = Waker::new(poll.registry(), WAKER)?;
-            loops.push(Arc::new(Shared {
-                waker,
-                ready: Mutex::new(Vec::new()),
-                incoming: Mutex::new(Vec::new()),
-                woken: AtomicBool::new(false),
+            // Cyclic because the loop's nudge is the loop's own: one `Arc<dyn Fn>` per loop, handed to every
+            // connection on it, so a fan-out can group its sessions by loop identity and wake each once.
+            loops.push(Arc::new_cyclic(|weak: &std::sync::Weak<Shared>| {
+                let me = weak.clone();
+                Shared {
+                    waker,
+                    ready: Mutex::new(Vec::new()),
+                    incoming: Mutex::new(Vec::new()),
+                    woken: AtomicBool::new(false),
+                    wake: Arc::new(move || {
+                        if let Some(shared) = me.upgrade() {
+                            shared.nudge();
+                        }
+                    }),
+                }
             }));
             polls.push(poll);
         }
         let reactors = Arc::new(Self { loops, next: AtomicUsize::new(0), other: OnceLock::new() });
+        let cores = pin_from.map(|_| crate::affinity::cores()).unwrap_or_default();
+        let base = pin_from.unwrap_or(0);
         for (index, (poll, shared)) in polls.into_iter().zip(&reactors.loops).enumerate() {
             let (gateway, own, reactors) = (Arc::clone(gateway), Arc::clone(shared), Arc::clone(&reactors));
             let name = format!("gw-{}-{index}", gateway.half.name());
-            thread::Builder::new().name(name).spawn(move || run(poll, &own, &reactors, &gateway, max_behind))?;
+            let cores = cores.clone();
+            thread::Builder::new().name(name).spawn(move || {
+                crate::affinity::pin_current_thread(&cores, base + index);
+                run(poll, &own, &reactors, &gateway, max_behind)
+            })?;
         }
         Ok(reactors)
     }
@@ -182,6 +216,10 @@ struct Conn {
     queue: Receiver<Queued>,
     /// How many messages the hub has put on `queue` and this loop has not taken (`Outbox::waiting`).
     waiting: Arc<AtomicU64>,
+    /// How many bytes of those are waiting (`Outbox::behind`).
+    behind: Arc<AtomicU64>,
+    /// Whether the hub has had to drop messages for this session because it fell too far behind (`Outbox::over`).
+    over: Arc<AtomicBool>,
     notify: Notify,
     /// Whether the socket may hold input not yet read. The loop is told when new input arrives, not that input is
     /// still there, so a session that stopped reading at its limit remembers it has more to read.
@@ -230,7 +268,7 @@ fn run(mut poll: Poll, shared: &Arc<Shared>, reactors: &Reactors, gateway: &Arc<
         shared.woken.store(false, Ordering::SeqCst);
         let arrived = std::mem::take(&mut *locked(&shared.incoming));
         for stream in arrived {
-            if let Some(token) = take_on(gateway, &poll, shared, &mut conns, &mut free, stream) {
+            if let Some(token) = take_on(gateway, &poll, shared, &mut conns, &mut free, stream, max_behind) {
                 due.push(token);
             }
         }
@@ -278,6 +316,7 @@ fn take_on(
     conns: &mut Vec<Option<Conn>>,
     free: &mut Vec<usize>,
     stream: TcpStream,
+    max_behind: usize,
 ) -> Option<usize> {
     stream.set_nonblocking(true).ok()?;
     let _ = stream.set_nodelay(true);
@@ -296,12 +335,21 @@ fn take_on(
         let shared = Arc::clone(shared);
         Arc::new(move || shared.ready(token))
     };
+    // Split for the fan-out: marking a connection ready is per connection, waking its loop is per loop. The
+    // waker is the loop's own `Arc`, shared by every connection on it, so a fan-out can tell which sessions
+    // belong to the same loop and wake it once (ADR-0002).
+    let mark: Notify = {
+        let shared = Arc::clone(shared);
+        Arc::new(move || shared.ready_quiet(token))
+    };
     let (tx, queue) = mpsc::channel();
-    let outbox = Outbox::new(tx, Arc::clone(&notify));
+    let outbox = Outbox::new(tx, Arc::clone(&notify)).with_limit(max_behind).waking(mark, Arc::clone(&shared.wake));
     conns[token] = Some(Conn {
         socket: Some(Socket::Undecided(stream)),
         session: None,
         waiting: outbox.waiting(),
+        behind: outbox.behind(),
+        over: outbox.over(),
         outbox: Some(outbox),
         queue,
         notify,
@@ -508,6 +556,15 @@ fn serve_http(gateway: &Gateway, http: &mut Http, notify: &Notify, origin: &mut 
 
 /// A WebSocket connection: finish its handshake, then read, answer and send.
 fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
+    // A client the hub has had to drop messages for. `queue`'s own check below catches one that has filled the
+    // socket's write buffer, but a client the loops cannot drain fast enough never gets that far: the bytes wait
+    // on the hub's side of the queue instead, which `max_write_buffer_size` cannot see (`Outbox::put`). Its
+    // messages have gaps now, so the session cannot go on -- it reconnects and resumes from `history`.
+    if conn.over.load(Ordering::Relaxed) {
+        log::warn("disconnected a client too far behind on what it has been queued", &[("peer", &conn.origin.peer)]);
+        conn.ending = "too far behind";
+        return false;
+    }
     if matches!(conn.socket, Some(Socket::Handshake(_))) {
         let Some(Socket::Handshake(mid)) = conn.socket.take() else { return false };
         match mid.handshake() {
@@ -543,10 +600,13 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
             match socket.read() {
                 Ok(Message::Text(text)) => {
                     session.heard();
-                    record_from_client(gateway, origin, session, text.as_str());
-                    for reply in ws::handle(gateway, session, text.as_str()) {
+                    // Parsed once for both readers of it: the audit only wants to know whether this is a
+                    // heartbeat, and the dispatch wants the message. Viewers send heartbeats all day.
+                    let message = serde_json::from_str::<Value>(text.as_str()).ok();
+                    record_from_client(gateway, origin, session, text.as_str(), message.as_ref());
+                    for reply in ws::handle(gateway, session, message) {
                         record_to_client(gateway, origin, session, &reply, true);
-                        if !queue(socket, reply, ending) {
+                        if !queue(socket, &reply, ending) {
                             return false;
                         }
                     }
@@ -559,7 +619,7 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
                     gateway.metrics.ws_message(metrics::OP_UNREADABLE, Some(400));
                     let refused = ws::binary_refused();
                     record_to_client(gateway, origin, session, &refused, true);
-                    if !queue(socket, refused, ending) {
+                    if !queue(socket, &refused, ending) {
                         return false;
                     }
                 }
@@ -573,7 +633,7 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
         for reply in ws::ready_replies(gateway, session) {
             answered = true;
             record_to_client(gateway, origin, session, &reply, true);
-            if !queue(socket, reply, ending) {
+            if !queue(socket, &reply, ending) {
                 return false;
             }
         }
@@ -584,8 +644,9 @@ fn serve_ws(gateway: &Arc<Gateway>, conn: &mut Conn) -> bool {
         }
         while let Ok(message) = conn.queue.try_recv() {
             conn.waiting.fetch_sub(1, Ordering::Relaxed);
+            conn.behind.fetch_sub(message.text.len() as u64, Ordering::Relaxed);
             record_queued(gateway, origin, session, &message);
-            if !queue(socket, message.text, ending) {
+            if !queue(socket, &message.text, ending) {
                 return false;
             }
         }
@@ -771,10 +832,8 @@ fn record_refused_upgrade(gateway: &Gateway, conn: &mut Conn) {
 
 /// A text frame from the client. On the public half a heartbeat is not recorded: viewers send them all day, and
 /// nothing about one can be in dispute.
-fn record_from_client(gateway: &Gateway, origin: &Origin, session: &Session, text: &str) {
-    if gateway.half == Half::Public
-        && serde_json::from_str::<Value>(text).is_ok_and(|m| m.get("op").and_then(Value::as_str) == Some("heartbeat"))
-    {
+fn record_from_client(gateway: &Gateway, origin: &Origin, session: &Session, text: &str, message: Option<&Value>) {
+    if gateway.half == Half::Public && message.and_then(|m| m.get("op")).and_then(Value::as_str) == Some("heartbeat") {
         return;
     }
     let mut fields = about(gateway, origin, session.account(), session.api_key(), Some(session.id()));
@@ -818,7 +877,7 @@ fn record_queued(gateway: &Gateway, origin: &Origin, session: &Session, message:
 /// Queues a message for the client, and says whether the connection is still worth keeping. A would-block is not a
 /// failure: the message stays in the socket's own buffer and goes out on a later flush, when the loop is told the
 /// socket can take more. A connection dropped for being too far behind says so in `ending`.
-fn queue(socket: &mut WebSocket<Stream>, message: String, ending: &mut &'static str) -> bool {
+fn queue(socket: &mut WebSocket<Stream>, message: &str, ending: &mut &'static str) -> bool {
     match socket.write(Message::text(message)) {
         Ok(()) => true,
         Err(tungstenite::Error::Io(e)) if e.kind() == ErrorKind::WouldBlock => true,

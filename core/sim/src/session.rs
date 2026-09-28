@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::os::fd::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket};
 use venue_link::wire::Error;
@@ -112,6 +113,29 @@ impl Session {
                 return Ok(self.inbox.drain(..).collect());
             }
         }
+    }
+
+    /// The underlying descriptor, for a caller multiplexing thousands of these with epoll rather than giving
+    /// each one a thread. A thread apiece costs a wake-up per session per poll interval, which at tens of
+    /// thousands is more than the machine has to give (ADR-0002, the retail measurements).
+    pub fn fd(&self) -> RawFd {
+        self.socket.get_ref().as_raw_fd()
+    }
+
+    /// Non-blocking, for that same caller: epoll says which sessions have something, and each one is then
+    /// drained until it says `WouldBlock`. The handshake and the login have to happen before this.
+    pub fn set_nonblocking(&mut self, on: bool) -> Result<(), Error> {
+        self.socket.get_ref().set_nonblocking(on)?;
+        Ok(())
+    }
+
+    /// One message if one is ready, `None` if the socket would block. Anything already buffered comes first,
+    /// since a single read can carry several frames and epoll will not report them again.
+    pub fn try_read(&mut self) -> Result<Option<Value>, Error> {
+        if let Some(m) = self.inbox.pop_front() {
+            return Ok(Some(m));
+        }
+        self.read()
     }
 
     fn read(&mut self) -> Result<Option<Value>, Error> {

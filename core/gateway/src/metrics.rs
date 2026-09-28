@@ -105,6 +105,25 @@ pub enum Api {
 }
 const APIS: &[&str] = &["rest", "ws"];
 
+/// The feed results worth counting separately when asking which of them still cost a `serde_json::Value`.
+/// Anything else lands in `other`, which is the signal that this list wants extending.
+pub const RESULTS: &[&str] = &[
+    "book_level_changed",
+    "order_accepted",
+    "order_cancelled",
+    "order_amended",
+    "order_reduced",
+    "order_rejected",
+    "fill",
+    "position_changed",
+    "sleeve_changed",
+    "command_applied",
+    "other",
+];
+
+/// Whether the feed path turned that result into a `Value`.
+const DECODED: &[&str] = &["true", "false"];
+
 const REASONS: &[&str] = &["auth", "permission", "rate_limit", "validation", "not_found", "unavailable", "other"];
 
 /// Why a status is a refusal, as an index into `REASONS`; none for a success.
@@ -174,8 +193,13 @@ pub struct Metrics {
     http_duration: Family<Labels, Histogram>,
     ws_messages: Counters,
     refusals: Counters,
+    feed_results: Counters,
     rate_limited: Counters,
     loop_turn: Family<Labels, Histogram>,
+    feed_apply: Family<Labels, Histogram>,
+    conflate_hold: Family<Labels, Histogram>,
+    conflate_publish: Family<Labels, Histogram>,
+    hub_read_wait: Family<Labels, Histogram>,
     backlog: Family<Labels, Histogram>,
     slow_consumers: Counters,
     feed_sequence: Family<Labels, Gauge>,
@@ -230,8 +254,13 @@ impl Metrics {
             http_duration: durations(),
             ws_messages: Counters::grid(&[("half", HALVES), ("op", OPS), ("outcome", OUTCOMES)]),
             refusals: Counters::grid(&[("half", HALVES), ("api", APIS), ("reason", REASONS)]),
+            feed_results: Counters::grid(&[("half", HALVES), ("result", RESULTS), ("decoded", DECODED)]),
             rate_limited: Counters::grid(&[("half", HALVES), ("limit", LIMITS)]),
             loop_turn: durations(),
+            feed_apply: durations(),
+            conflate_hold: durations(),
+            conflate_publish: durations(),
+            hub_read_wait: durations(),
             backlog: Family::<Labels, Histogram>::new_with_constructor(Histogram::counts as fn() -> Histogram),
             slow_consumers: Counters::grid(&[("half", HALVES)]),
             feed_sequence: Family::default(),
@@ -270,8 +299,35 @@ impl Metrics {
             m.ws_messages.clone(),
         );
         r.register("venue_gateway_refusals", "Errors sent to clients, by reason", m.refusals.clone());
+        r.register(
+            "venue_gateway_feed_results",
+            "Results the feed carried, by kind, and whether applying the unit turned one into a \
+             `serde_json::Value`. Which kinds still cost a decode, and how many of them there are, is what \
+             decides whether finishing the typed migration is worth it (ADR-0002)",
+            m.feed_results.clone(),
+        );
         r.register("venue_gateway_rate_limited", "Flood limit hits", m.rate_limited.clone());
         r.register("venue_gateway_loop_turn_duration_seconds", "One event loop turn", m.loop_turn.clone());
+        r.register(
+            "venue_gateway_feed_apply_duration_seconds",
+            "Applying one feed unit to the hub: the work of the one thread per half that does it",
+            m.feed_apply.clone(),
+        );
+        r.register(
+            "venue_gateway_conflate_hold_duration_seconds",
+            "How long one conflate flush holds the hub's write lock. `flush_books` copies each book message              once per subscriber inside that lock, so this grows with the market-data population while              nothing else can read the hub (ADR-0002)",
+            m.conflate_hold.clone(),
+        );
+        r.register(
+            "venue_gateway_conflate_publish_duration_seconds",
+            "The fan-out half of a flush: building each topic's message once and handing it to every              subscriber, under a read lock rather than excluding everyone",
+            m.conflate_publish.clone(),
+        );
+        r.register(
+            "venue_gateway_hub_read_wait_duration_seconds",
+            "How long a request thread waited to take the hub's read lock. Near zero unless a writer is              holding it; this is what a long conflate flush costs order traffic",
+            m.hub_read_wait.clone(),
+        );
         r.register(
             "venue_gateway_outbound_backlog_messages",
             "Messages queued for a WebSocket connection when its loop came to send them",
@@ -351,6 +407,10 @@ impl Metrics {
             sessions_open: self.sessions_open.get_or_create_owned(&h(&[])),
             http_duration: ROUTES.iter().map(|r| self.http_duration.get_or_create_owned(&h(&[("route", r)]))).collect(),
             loop_turn: self.loop_turn.get_or_create_owned(&h(&[])),
+            feed_apply: self.feed_apply.get_or_create_owned(&h(&[])),
+            conflate_hold: self.conflate_hold.get_or_create_owned(&h(&[])),
+            conflate_publish: self.conflate_publish.get_or_create_owned(&h(&[])),
+            hub_read_wait: self.hub_read_wait.get_or_create_owned(&h(&[])),
             backlog: self.backlog.get_or_create_owned(&h(&[])),
             feed_sequence: self.feed_sequence.get_or_create_owned(&h(&[])),
             feed_behind: self.feed_behind.get_or_create_owned(&h(&[])),
@@ -380,6 +440,19 @@ pub struct HalfMetrics {
     pub sessions_open: Gauge,
     http_duration: Vec<Histogram>,
     pub loop_turn: Histogram,
+    /// How long one feed unit takes to apply. `feed_behind` says how stale the view is; this says what that
+    /// costs, which is the headroom on the one thread per half that applies every unit (ADR-0002).
+    pub feed_apply: Histogram,
+    /// The part of a conflate flush that holds the hub's write lock: taking the levels that moved and
+    /// expiring waiters. Ten flushes a second, so mean hold x 10 is the fraction of every second during
+    /// which no reactor thread can read the hub at all. The fan-out used to be inside this and was 122ms at
+    /// sixteen thousand subscribers; it is now `conflate_publish`.
+    pub conflate_hold: Histogram,
+    /// The fan-out half, which holds only a read lock. Together with `conflate_hold` this says how much of a
+    /// flush excludes everyone and how much merely runs alongside them.
+    pub conflate_publish: Histogram,
+    /// What that costs on the other side: how long a request thread waited for the read lock.
+    pub hub_read_wait: Histogram,
     pub backlog: Histogram,
     feed_sequence: Gauge,
     feed_behind: FloatGauge,
@@ -432,6 +505,14 @@ impl HalfMetrics {
                 .refusals
                 .inc(Counters::index(&[self.half, api as usize, reason], &[HALVES.len(), APIS.len(), REASONS.len()]));
         }
+    }
+
+    /// One result the feed carried: which kind, and whether anything asked for its JSON shape.
+    pub fn feed_result(&self, result: usize, decoded: bool) {
+        self.all.feed_results.inc(Counters::index(
+            &[self.half, result, usize::from(!decoded)],
+            &[HALVES.len(), RESULTS.len(), DECODED.len()],
+        ));
     }
 
     pub fn ws_message(&self, op: usize, refused_with: Option<u16>) {

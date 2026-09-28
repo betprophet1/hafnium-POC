@@ -5,14 +5,21 @@ use crate::limits::monotonic;
 use crate::price;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SendError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use venue_journal::message_header_codec::MessageHeaderDecoder;
+use venue_journal::side::Side;
+use venue_journal::{
+    book_level_changed_codec, collateral_released_codec, command_applied_codec, event_released_codec, fill_codec,
+    market_state_changed_codec, order_accepted_codec, order_amended_codec, order_cancelled_codec, order_reduced_codec,
+    order_rejected_codec, position_changed_codec, settlement_payout_codec, sleeve_changed_codec, ReadBuf,
+};
 use venue_link::catalogue::Catalogue;
 use venue_link::submit::Notify;
-use venue_link::view::{InstrumentView, Row, View};
-use venue_link::wire::Unit;
+use venue_link::view::{trimmed, InstrumentView, Row, View};
+use venue_link::wire::{Frame, Unit};
 
 /// Private messages kept per account for sessions resuming by sequence.
 const HISTORY: usize = 2_000;
@@ -48,10 +55,241 @@ pub fn ladder(view: &View, instrument: u64) -> &[Row] {
 }
 
 /// The executions an input's results mean for each account, from the view as it was before the input.
-pub fn executions(view: &View, results: &[Value], sequence: u64) -> Vec<(u64, Value)> {
+/// Takes the results as an iterator of `&Value` rather than a slice, so a caller holding feed frames can hand
+/// over what they decode to without collecting them first (`wire::Frame`).
+/// A frame's SBE header, for handing to a generated decoder.
+fn header_of(f: &Frame) -> MessageHeaderDecoder<ReadBuf<'_>> {
+    MessageHeaderDecoder::default().wrap(ReadBuf::new(f.bytes()), 0)
+}
+
+/// Whether a result is a `CommandApplied` saying so. The template is checked first, so a scan for one does not
+/// decode every other frame of the unit on the way past (ADR-0002).
+fn applied_ok(f: &Frame) -> bool {
+    f.template() == command_applied_codec::SBE_TEMPLATE_ID && f["outcome"] == "APPLIED"
+}
+
+/// The order id of an `OrderAccepted` frame, without decoding the rest of it.
+fn order_accepted_order_id(f: &Frame) -> u64 {
+    let mut dec = order_accepted_codec::OrderAcceptedDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    dec.order_id()
+}
+
+/// Results `executions` has nothing to say about, skipped before they are looked at rather than after: a frame
+/// is kept decoded once anything asks for it, so filtering here is what lets a book level cost nothing at all
+/// (ADR-0002).
+///
+/// Listed the way round that fails safely. A result missing from here costs a decode and nothing else. The
+/// first cut of this was an allow-list of the results `executions` does answer for, which is the same idea
+/// with the opposite failure: it omitted `OrderAmended`, and an amend confirmation stopped reaching the client
+/// with every test still passing.
+const NOT_EXECUTIONS: [u16; 4] = [
+    book_level_changed_codec::SBE_TEMPLATE_ID,
+    position_changed_codec::SBE_TEMPLATE_ID,
+    sleeve_changed_codec::SBE_TEMPLATE_ID,
+    command_applied_codec::SBE_TEMPLATE_ID,
+];
+
+/// The same, from feed frames, reading the two a trading load is made of straight out of the decoders.
+///
+/// `Fill` and `OrderAccepted` are handled here rather than through the JSON shape because this runs *before*
+/// `View::apply`, which reads those same two frames typed. Going through `&**f` decoded each of them into a
+/// `serde_json::Value` that the view then ignored -- the full construction *plus* a typed re-read, which is
+/// more work than not having the typed readers at all. Measured on a c6i.8xlarge, n=3 interleaved: it cost
+/// 25% of the request rate at 32 trading connections (ADR-0002, docs/adr/measurements).
+///
+/// The other four arms stay on the JSON path: they are listing and lifecycle traffic, rare next to fills, and
+/// each one kept typed is another place for a field to be read from the wrong offset. `accepted` is shared
+/// across both kinds of arm, because an `OrderCancelled` for an order the view has never seen is priced from
+/// what the `OrderAccepted` before it said.
+///
+/// `executions_agrees_however_the_results_are_read` checks this against `executions` over every arm, which is
+/// what the harness was built for: the typed reading and the JSON one of the same results, compared.
+pub fn executions_of(view: &View, results: &[Frame], sequence: u64) -> Vec<(u64, Value)> {
+    let mut out = Vec::new();
+    let mut accepted: BTreeMap<u64, (String, u64)> = BTreeMap::new();
+    for f in results {
+        let template = f.template();
+        if NOT_EXECUTIONS.contains(&template) {
+            continue;
+        }
+        if template == order_accepted_codec::SBE_TEMPLATE_ID {
+            accepted_execution(view, f, sequence, &mut accepted, &mut out);
+        } else if template == fill_codec::SBE_TEMPLATE_ID {
+            fill_executions(view, f, sequence, &mut out);
+        } else if template == order_cancelled_codec::SBE_TEMPLATE_ID {
+            cancelled_execution(view, f, sequence, &accepted, &mut out);
+        } else if template == order_amended_codec::SBE_TEMPLATE_ID {
+            amended_execution(view, f, sequence, &mut out);
+        } else if template == order_reduced_codec::SBE_TEMPLATE_ID {
+            reduced_execution(f, sequence, &mut out);
+        } else if template == order_rejected_codec::SBE_TEMPLATE_ID {
+            rejected_execution(f, sequence, &mut out);
+        } else {
+            execution(view, f, sequence, &mut accepted, &mut out);
+        }
+    }
+    out
+}
+
+/// An `OrderAccepted`, read typed. Also records what the order was, for a cancel later in the same unit.
+fn accepted_execution(
+    view: &View,
+    f: &Frame,
+    sequence: u64,
+    accepted: &mut BTreeMap<u64, (String, u64)>,
+    out: &mut Vec<(u64, Value)>,
+) {
+    let mut dec = order_accepted_codec::OrderAcceptedDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    let (order, tick, side) = (dec.order_id(), u64::from(dec.tick()), dec.side().to_string());
+    let quantity = u64::from(dec.quantity());
+    accepted.insert(order, (side.clone(), tick));
+    let mut e = json!({"type": "accepted", "sequence": id(sequence), "orderId": id(order),
+                       "instrumentId": id(dec.instrument_id())});
+    e["clientOrderId"] = json!(trimmed(&dec.client_order_id()));
+    e["side"] = json!(side.to_lowercase());
+    e["price"] = price::quote(ladder(view, dec.instrument_id()), tick);
+    e["quantity"] = json!(quantity);
+    e["remaining"] = json!(quantity);
+    out.push((dec.account_id(), e));
+}
+
+/// A `Fill`, read typed: one execution for each side of the trade, each with its own cash and fee.
+fn fill_executions(view: &View, f: &Frame, sequence: u64, out: &mut Vec<(u64, Value)>) {
+    let mut dec = fill_codec::FillDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    let instrument = dec.instrument_id();
+    let price = price::quote(ladder(view, instrument), u64::from(dec.tick()));
+    let (quantity, trade) = (u64::from(dec.quantity()), dec.trade_id());
+    let taker_buys = dec.taker_side() == Side::BUY;
+    let (buyer_cash, seller_cash) = (dec.buyer_cash_cents(), dec.seller_cash_cents());
+    let parties = [
+        (
+            "maker",
+            dec.maker_account_id(),
+            dec.maker_order_id(),
+            dec.maker_remaining(),
+            !taker_buys,
+            dec.maker_fee_cents(),
+        ),
+        (
+            "taker",
+            dec.taker_account_id(),
+            dec.taker_order_id(),
+            dec.taker_remaining(),
+            taker_buys,
+            dec.taker_fee_cents(),
+        ),
+    ];
+    for (role, account, order, remaining, buys, fee) in parties {
+        let mut e = json!({"type": "fill", "sequence": id(sequence), "orderId": id(order),
+                           "instrumentId": id(instrument)});
+        e["side"] = json!(if buys { "buy" } else { "sell" });
+        e["price"] = price.clone();
+        e["quantity"] = json!(quantity);
+        e["remaining"] = json!(u64::from(remaining));
+        e["tradeId"] = id(trade);
+        e["role"] = json!(role);
+        e["cashCents"] = json!(if buys { buyer_cash } else { seller_cash });
+        // Charged on top of the cash change, to the maker and taker at their own rates (spec E-10.11).
+        e["feeCents"] = json!(fee);
+        out.push((account, e));
+    }
+}
+
+pub fn executions<'a>(view: &View, results: impl IntoIterator<Item = &'a Value>, sequence: u64) -> Vec<(u64, Value)> {
     let mut out = Vec::new();
     let mut accepted: BTreeMap<u64, (String, u64)> = BTreeMap::new();
     for r in results {
+        execution(view, r, sequence, &mut accepted, &mut out);
+    }
+    out
+}
+
+/// An `OrderCancelled`, read typed. Priced from the view, or from what an `OrderAccepted` earlier in the same
+/// unit said when the view has never seen the order -- which is why `accepted` is threaded through the whole
+/// loop rather than rebuilt per arm.
+fn cancelled_execution(
+    view: &View,
+    f: &Frame,
+    sequence: u64,
+    accepted: &BTreeMap<u64, (String, u64)>,
+    out: &mut Vec<(u64, Value)>,
+) {
+    let mut dec = order_cancelled_codec::OrderCancelledDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    let (order, instrument) = (dec.order_id(), dec.instrument_id());
+    let mut e = json!({"type": "cancelled", "sequence": id(sequence), "orderId": id(order),
+                       "instrumentId": id(instrument)});
+    e["quantity"] = json!(dec.cancelled_quantity());
+    e["reason"] = json!(dec.reason().to_string().to_lowercase());
+    let known = view.orders.get(&order).map(|o| (o.side.clone(), o.tick)).or_else(|| accepted.get(&order).cloned());
+    if let Some((side, tick)) = known {
+        e["side"] = json!(side.to_lowercase());
+        e["price"] = price::quote(ladder(view, instrument), tick);
+    }
+    out.push((dec.account_id(), e));
+}
+
+/// An `OrderAmended`, read typed. The side comes from the view, which holds the order this amends.
+fn amended_execution(view: &View, f: &Frame, sequence: u64, out: &mut Vec<(u64, Value)>) {
+    let mut dec = order_amended_codec::OrderAmendedDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    let (order, instrument) = (dec.order_id(), dec.instrument_id());
+    let quantity = u64::from(dec.quantity());
+    let mut e = json!({"type": "amended", "sequence": id(sequence), "orderId": id(order),
+                       "instrumentId": id(instrument)});
+    if let Some(o) = view.orders.get(&order) {
+        e["side"] = json!(o.side.to_lowercase());
+    }
+    e["price"] = price::quote(ladder(view, instrument), u64::from(dec.tick()));
+    e["quantity"] = json!(quantity);
+    e["remaining"] = json!(quantity);
+    out.push((dec.account_id(), e));
+}
+
+/// An `OrderReduced`, read typed. Nothing here needs the view.
+fn reduced_execution(f: &Frame, sequence: u64, out: &mut Vec<(u64, Value)>) {
+    let mut dec = order_reduced_codec::OrderReducedDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    let mut e = json!({"type": "reduced", "sequence": id(sequence), "orderId": id(dec.order_id()),
+                       "instrumentId": id(dec.instrument_id())});
+    e["remaining"] = json!(dec.remaining_quantity());
+    out.push((dec.account_id(), e));
+}
+
+/// An `OrderRejected`, read typed. `originalOrderId` is optional in the schema -- absent when the engine never
+/// gave the order an id -- and the JSON path renders that absence as null, so the decoder's `None` has to
+/// become `Value::Null` rather than `id(0)`.
+fn rejected_execution(f: &Frame, sequence: u64, out: &mut Vec<(u64, Value)>) {
+    let mut dec = order_rejected_codec::OrderRejectedDecoder::default().header(header_of(f), 0);
+    let mut group = dec.result_decoder();
+    dec = group.parent().expect("the result group");
+    let original = dec.original_order_id().map_or(Value::Null, id);
+    let mut e = json!({"type": "rejected", "sequence": id(sequence), "orderId": original,
+                       "instrumentId": id(dec.instrument_id())});
+    e["clientOrderId"] = json!(trimmed(&dec.client_order_id()));
+    e["reason"] = json!(dec.reason().to_string().to_lowercase());
+    out.push((dec.account_id(), e));
+}
+
+/// One result's executions, through the JSON shape. The whole of `executions`, and the four rarer arms of
+/// `executions_of`, so that the two cannot drift apart on a message neither reads typed.
+fn execution(
+    view: &View,
+    r: &Value,
+    sequence: u64,
+    accepted: &mut BTreeMap<u64, (String, u64)>,
+    out: &mut Vec<(u64, Value)>,
+) {
+    {
         let instrument = u(&r["instrumentId"]);
         let quote = |tick: u64| price::quote(ladder(view, instrument), tick);
         let base = |kind: &str, order: Value| json!({"type": kind, "sequence": id(sequence), "orderId": order, "instrumentId": id(instrument)});
@@ -126,7 +364,6 @@ pub fn executions(view: &View, results: &[Value], sequence: u64) -> Vec<(u64, Va
             _ => {}
         }
     }
-    out
 }
 
 /// Takes a session out of one entry of an index, dropping the entry once it is empty.
@@ -155,8 +392,19 @@ pub struct Derived {
 /// A message on its way to a session, and where it came from. A message with no `derived` was not rendered from the
 /// journal — an answer, an error, a transfer, a quote — and the audit log keeps it in full.
 pub struct Queued {
-    pub text: String,
+    /// Shared, not owned: one book message goes to every subscriber of a topic, and at sixteen thousand
+    /// subscribers copying it per recipient was the whole of a 122ms conflate flush (ADR-0002). An `Arc<str>`
+    /// is built once and handed out; the copy into the socket's buffer still happens, but on whichever reactor
+    /// thread serves that session rather than on the one thread holding the hub's write lock.
+    pub text: Arc<str>,
     pub derived: Option<Derived>,
+}
+
+/// Whether `put` wakes the loop serving the session, or leaves that to the caller (`send_deferred`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    Now,
+    Deferred,
 }
 
 /// Where a session's messages go: its queue, and a way to tell whatever serves the session that something is waiting
@@ -168,32 +416,128 @@ pub struct Outbox {
     /// Messages sent and not yet taken off the queue by whatever serves the session, which takes one off as it takes
     /// each message (`taken`): the backlog the gateway's metrics report.
     waiting: Arc<AtomicU64>,
+    /// Bytes on the queue and not yet taken. `max_write_buffer_size` bounds only what has already reached the
+    /// socket, so without this a session the loops cannot drain fast enough grows this queue without limit --
+    /// the gateway then holds gigabytes for one client rather than dropping it (`reactor::serve_ws`).
+    behind: Arc<AtomicU64>,
+    /// Set the first time the queue would go past `max_behind`, and never cleared: whatever serves the session
+    /// closes it. Sticky because `put` stops queueing at the limit, so the backlog itself falls back under it and
+    /// a reader watching only `behind` would never see that the session had overrun.
+    over: Arc<AtomicBool>,
+    /// How many bytes may wait here before the session is closed. Unbounded unless `with_limit` says otherwise,
+    /// for the outboxes that serve no live client (`reconstruct`, tests).
+    max_behind: u64,
+    /// The fan-out pair, when whatever serves this session provided one: `mark` records that this connection
+    /// has something waiting, and `wake` is its loop's nudge -- one `Arc` shared by every session on that
+    /// loop, so its identity says which sessions can be woken together. Without it `send_deferred` falls
+    /// back to `notify`, which does both.
+    fanout: Option<(Notify, Notify)>,
 }
 
 impl Outbox {
     pub fn new(queue: Sender<Queued>, notify: Notify) -> Self {
-        Self { queue, notify, waiting: Arc::new(AtomicU64::new(0)) }
+        Self {
+            queue,
+            notify,
+            waiting: Arc::new(AtomicU64::new(0)),
+            behind: Arc::new(AtomicU64::new(0)),
+            over: Arc::new(AtomicBool::new(false)),
+            max_behind: u64::MAX,
+            fanout: None,
+        }
     }
 
-    pub fn send(&self, message: String) -> Result<(), SendError<Queued>> {
-        self.put(Queued { text: message, derived: None })
+    /// Supply the split pair a fan-out needs: marking this connection ready, and waking its loop.
+    #[must_use]
+    pub fn waking(mut self, mark: Notify, wake: Notify) -> Self {
+        self.fanout = Some((mark, wake));
+        self
+    }
+
+    /// The same, closed once `max_behind` bytes wait on it: what a client serving a real connection gets.
+    pub fn with_limit(mut self, max_behind: usize) -> Self {
+        self.max_behind = max_behind as u64;
+        self
+    }
+
+    pub fn send(&self, message: impl Into<Arc<str>>) -> Result<(), SendError<Queued>> {
+        self.put(Queued { text: message.into(), derived: None }, Wake::Now)
+    }
+
+    /// Queue without waking the loop that serves this session, for a caller fanning one message out to many
+    /// sessions: it wakes each loop once at the end instead of once per session.
+    ///
+    /// Waking is a write to the loop's eventfd, and the coalescing in `Shared::nudge` only holds while a wake
+    /// is outstanding -- a loop clears that flag before it processes its work, so a loop busy draining a
+    /// fan-out re-arms on every pass and takes another syscall each time. Over half of a 41ms flush at
+    /// sixteen thousand subscribers was `eventfd_write` (ADR-0002, docs/adr/measurements/conflate-profile.txt).
+    ///
+    /// The caller **must** call `notifier` for every session it defers, or the message waits for that loop's
+    /// next timeout.
+    pub fn send_deferred(&self, message: impl Into<Arc<str>>) -> Result<(), SendError<Queued>> {
+        self.put(Queued { text: message.into(), derived: None }, Wake::Deferred)?;
+        // Still has to be marked ready -- that part is per connection. Only the syscall is deferred.
+        if let Some((mark, _)) = &self.fanout {
+            mark();
+        }
+        Ok(())
+    }
+
+    /// This session's loop's nudge, for a caller that deferred. Sessions on one loop return the same `Arc`,
+    /// which is what makes one wake per loop possible; a session with no fan-out pair returns its own
+    /// `notify` and is simply woken on its own.
+    pub fn notifier(&self) -> &Notify {
+        self.fanout.as_ref().map_or(&self.notify, |(_, wake)| wake)
     }
 
     /// A frame rendered from the results of `sequence`, which the journal holds.
-    pub fn send_derived(&self, message: String, kind: &'static str, sequence: u64) -> Result<(), SendError<Queued>> {
-        self.put(Queued { text: message, derived: Some(Derived { kind, sequence }) })
+    pub fn send_derived(
+        &self,
+        message: impl Into<Arc<str>>,
+        kind: &'static str,
+        sequence: u64,
+    ) -> Result<(), SendError<Queued>> {
+        self.put(Queued { text: message.into(), derived: Some(Derived { kind, sequence }) }, Wake::Now)
     }
 
-    fn put(&self, message: Queued) -> Result<(), SendError<Queued>> {
+    fn put(&self, message: Queued, wake: Wake) -> Result<(), SendError<Queued>> {
+        // Past the limit the session is already on its way out, so holding more for it only grows what the
+        // gateway cannot send. The message is dropped rather than queued; a client that reconnects resumes from
+        // `history`, which says through what it missed (`since`, `dropped_through`).
+        let bytes = message.text.len() as u64;
+        if self.over.load(Ordering::Relaxed)
+            || self.behind.load(Ordering::Relaxed).saturating_add(bytes) > self.max_behind
+        {
+            self.over.store(true, Ordering::Relaxed);
+            // Still deferred if the caller asked: it will wake this loop with the rest, and a session on its
+            // way out does not need waking sooner than the others.
+            if wake == Wake::Now {
+                (self.notify)();
+            }
+            return Ok(());
+        }
         self.queue.send(message)?;
         self.waiting.fetch_add(1, Ordering::Relaxed);
-        (self.notify)();
+        self.behind.fetch_add(bytes, Ordering::Relaxed);
+        if wake == Wake::Now {
+            (self.notify)();
+        }
         Ok(())
     }
 
     /// The count of messages waiting, shared with whatever takes them off the queue.
     pub fn waiting(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.waiting)
+    }
+
+    /// The bytes waiting, shared with whatever takes them off the queue so its metrics can report the backlog.
+    pub fn behind(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.behind)
+    }
+
+    /// Whether this session has overrun its limit, shared with whatever serves it so it can close the connection.
+    pub fn over(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.over)
     }
 }
 
@@ -393,12 +737,12 @@ impl Hub {
     pub fn apply(&mut self, unit: &Unit) {
         let input = &unit.input;
         let sequence = u(&input["record"]["sequence"]);
-        let executions = executions(&self.view, &unit.results, sequence);
+        let executions = executions_of(&self.view, &unit.results, sequence);
         // Markets the engine releases with their events (E-8.4), found before the view forgets them.
         let released: Vec<(u64, Vec<u64>)> = unit
             .results
             .iter()
-            .filter(|r| r["msg"] == "EventReleased")
+            .filter(|r| r.template() == event_released_codec::SBE_TEMPLATE_ID)
             .map(|r| {
                 let event = u(&r["eventId"]);
                 (event, self.view.events.get(&event).map(|e| e.instruments.clone()).unwrap_or_default())
@@ -413,7 +757,14 @@ impl Hub {
         self.last_unit = Some((monotonic(), u(&input["record"]["sequencedAt"])));
         // The view has now applied this unit, so every order accepted at or before it can be forgotten here.
         self.last_sequence = self.last_sequence.max(sequence);
-        let highest = unit.results.iter().filter(|r| r["msg"] == "OrderAccepted").map(|r| u(&r["orderId"])).max();
+        // By template id and then straight out of the decoder: this runs over every result of every unit, and
+        // asking it through the JSON shape means decoding frames nothing else reads (ADR-0002).
+        let highest = unit
+            .results
+            .iter()
+            .filter(|r| r.template() == order_accepted_codec::SBE_TEMPLATE_ID)
+            .map(order_accepted_order_id)
+            .max();
         if let Some(highest) = highest.filter(|h| *h > self.highest_order) {
             self.highest_order = highest;
             self.awaiting.retain(|(order, _, notify)| {
@@ -441,57 +792,105 @@ impl Hub {
         let settled_event = unit
             .results
             .iter()
-            .find(|r| r["msg"] == "MarketStateChanged")
+            .find(|r| r.template() == market_state_changed_codec::SBE_TEMPLATE_ID)
             .map_or(0, |r| event_of(&self.view, u(&r["instrumentId"])));
         for r in &unit.results {
-            let instrument = u(&r["instrumentId"]);
-            match r["msg"].as_str().unwrap_or("") {
-                "PositionChanged" => accounts
-                    .entry(u(&r["accountId"]))
-                    .or_default()
-                    .push(json!({"instrumentId": id(instrument), "position": r["position"]})),
-                "SleeveChanged" => {
-                    accounts.entry(u(&r["accountId"])).or_default();
+            // The engine already said exactly what moved, so keep it rather than re-reading the book later.
+            // Read typed: a book level moves on nearly every unit and nothing else here looks at the frame, so
+            // this is the one result a busy feed never has to decode at all (ADR-0002).
+            if r.template() == book_level_changed_codec::SBE_TEMPLATE_ID {
+                let mut dec = book_level_changed_codec::BookLevelChangedDecoder::default().header(header_of(r), 0);
+                let mut group = dec.result_decoder();
+                dec = group.parent().expect("the result group");
+                let level = (dec.side() == Side::BUY, u64::from(dec.tick()));
+                let moved = (u64::from(dec.quantity()), u64::from(dec.order_count()));
+                self.dirty.entry(dec.instrument_id()).or_default().insert(level, moved);
+                continue;
+            }
+            // Dispatched on the template, and every field read out of the decoder.
+            //
+            // This match used to be on `r["msg"]`, with `r["instrumentId"]` read just above it -- two index
+            // operations that decode the whole frame into a `serde_json::Value` before anything knows whether
+            // this arm wants it. It ran for every result of every unit, which meant the typed readers
+            // elsewhere were reading a frame that had already been decoded here: `order_accepted` and `fill`
+            // were counted as decoded despite both having typed paths, and `sleeve_changed` -- the single
+            // most numerous result, whose arm needs one field -- was decoded in full 2.24M times a minute.
+            // Measured: 5.35M of 7.24M results decoded, against 1.89M that did not (ADR-0002,
+            // docs/adr/measurements/feed-mix.txt).
+            //
+            // The accepts, cancels, amends, reduces and rejects have no arm here at all, so with the
+            // dispatch typed they are never looked at again.
+            match r.template() {
+                position_changed_codec::SBE_TEMPLATE_ID => {
+                    let mut dec = position_changed_codec::PositionChangedDecoder::default().header(header_of(r), 0);
+                    let mut group = dec.result_decoder();
+                    dec = group.parent().expect("the result group");
+                    accounts
+                        .entry(dec.account_id())
+                        .or_default()
+                        .push(json!({"instrumentId": id(dec.instrument_id()), "position": dec.position()}));
                 }
-                "SettlementPayout" if u(&r["accountId"]) != 0 => {
+                sleeve_changed_codec::SBE_TEMPLATE_ID => {
+                    let mut dec = sleeve_changed_codec::SleeveChangedDecoder::default().header(header_of(r), 0);
+                    let mut group = dec.result_decoder();
+                    dec = group.parent().expect("the result group");
+                    accounts.entry(dec.account_id()).or_default();
+                }
+                settlement_payout_codec::SBE_TEMPLATE_ID => {
+                    let mut dec = settlement_payout_codec::SettlementPayoutDecoder::default().header(header_of(r), 0);
+                    let mut group = dec.result_decoder();
+                    dec = group.parent().expect("the result group");
+                    let (account, instrument) = (dec.account_id(), dec.instrument_id());
+                    if account == 0 {
+                        continue;
+                    }
                     let event = if instrument == 0 { settled_event } else { event_of(&self.view, instrument) };
                     let payout = json!({
                         "type": "payout", "sequence": id(sequence), "eventId": id(event), "instrumentId": id(instrument),
-                        "kind": lower(&r["kind"]), "positionClosed": r["positionClosed"], "cents": r["cents"]
+                        "kind": dec.kind().to_string().to_lowercase(), "positionClosed": dec.position_closed(),
+                        "cents": dec.cents()
                     });
-                    self.send_to_account(u(&r["accountId"]), sequence, "payout", payout.to_string());
+                    self.send_to_account(account, sequence, "payout", payout.to_string());
                 }
                 // A set burn: complete sets the account held went back as cash (spec E-14.3), which would
                 // otherwise show only as positions falling and cash rising.
-                "CollateralReleased" => {
+                collateral_released_codec::SBE_TEMPLATE_ID => {
+                    let mut dec =
+                        collateral_released_codec::CollateralReleasedDecoder::default().header(header_of(r), 0);
+                    let mut group = dec.result_decoder();
+                    dec = group.parent().expect("the result group");
                     let release = json!({
-                        "type": "release", "sequence": id(sequence), "eventId": id(u(&r["eventId"])),
-                        "kind": lower(&r["kind"]), "cents": r["cents"]
+                        "type": "release", "sequence": id(sequence), "eventId": id(dec.event_id()),
+                        "kind": dec.kind().to_string().to_lowercase(), "cents": dec.cents()
                     });
-                    self.send_to_account(u(&r["accountId"]), sequence, "release", release.to_string());
+                    self.send_to_account(dec.account_id(), sequence, "release", release.to_string());
                 }
-                "Fill" => {
+                fill_codec::SBE_TEMPLATE_ID => {
+                    let mut dec = fill_codec::FillDecoder::default().header(header_of(r), 0);
+                    let mut group = dec.result_decoder();
+                    let at = group.sequenced_at();
+                    dec = group.parent().expect("the result group");
+                    let instrument = dec.instrument_id();
                     let trade = json!({
                         "type": "trade", "sequence": id(sequence), "instrumentId": id(instrument),
-                        "tradeId": id(u(&r["tradeId"])), "price": self.quote(instrument, u(&r["tick"])),
-                        "quantity": r["quantity"], "takerSide": lower(&r["takerSide"]),
-                        "at": price::format_timestamp(u(&r["result"]["sequencedAt"]))
+                        "tradeId": id(dec.trade_id()), "price": self.quote(instrument, u64::from(dec.tick())),
+                        "quantity": dec.quantity(), "takerSide": dec.taker_side().to_string().to_lowercase(),
+                        "at": price::format_timestamp(at)
                     });
-                    self.send_to_topic(&format!("trades.{instrument}"), &trade.to_string());
+                    self.send_to_topic(&format!("trades.{instrument}"), &Arc::from(trade.to_string()));
                 }
-                "MarketStateChanged" => {
+                market_state_changed_codec::SBE_TEMPLATE_ID => {
+                    let mut dec =
+                        market_state_changed_codec::MarketStateChangedDecoder::default().header(header_of(r), 0);
+                    let mut group = dec.result_decoder();
+                    dec = group.parent().expect("the result group");
+                    let instrument = dec.instrument_id();
                     let event = self.view.instruments.get(&instrument).map_or(0, |i| i.event);
                     let market = json!({
                         "type": "market", "sequence": id(sequence), "eventId": id(event),
-                        "instrumentId": id(instrument), "state": lower(&r["state"])
+                        "instrumentId": id(instrument), "state": dec.state().to_string().to_lowercase()
                     });
-                    self.send_to_topic("markets", &market.to_string());
-                }
-                // The engine already said exactly what moved, so keep it rather than re-reading the book later.
-                "BookLevelChanged" => {
-                    let level = (r["side"] == "BUY", u(&r["tick"]));
-                    let moved = (u(&r["quantity"]), u(&r["orderCount"]));
-                    self.dirty.entry(instrument).or_default().insert(level, moved);
+                    self.send_to_topic("markets", &Arc::from(market.to_string()));
                 }
                 _ => {}
             }
@@ -507,14 +906,14 @@ impl Hub {
         // A released event and its markets are gone from `GET /v4/markets` and their books; followers forget them.
         for (event, _) in &released {
             let gone = json!({"type": "market", "sequence": id(sequence), "eventId": id(*event), "released": true});
-            self.send_to_topic("markets", &gone.to_string());
+            self.send_to_topic("markets", &Arc::from(gone.to_string()));
         }
-        if input["msg"] == "SetEventPhase" && unit.results.iter().any(|r| r["outcome"] == "APPLIED") {
+        if input["msg"] == "SetEventPhase" && unit.results.iter().any(applied_ok) {
             let phase = json!({
                 "type": "market", "sequence": id(sequence), "eventId": id(u(&input["eventId"])),
                 "phase": lower(&input["phase"])
             });
-            self.send_to_topic("markets", &phase.to_string());
+            self.send_to_topic("markets", &Arc::from(phase.to_string()));
         }
         // After each market's own state change, the event's resolution as a whole: a void and a settlement both
         // show as markets leaving trading, and only this says which, and which state occurred.
@@ -524,11 +923,11 @@ impl Hub {
             Some("ExpireParlay") => self.view.instruments.get(&u(&input["instrumentId"])).map(|i| i.event),
             _ => None,
         };
-        if let Some(event) = resolved.filter(|_| unit.results.iter().any(|r| r["outcome"] == "APPLIED")) {
+        if let Some(event) = resolved.filter(|_| unit.results.iter().any(applied_ok)) {
             let resolved = json!({
                 "type": "market", "sequence": id(sequence), "eventId": id(event), "resolution": self.resolution(event)
             });
-            self.send_to_topic("markets", &resolved.to_string());
+            self.send_to_topic("markets", &Arc::from(resolved.to_string()));
         }
     }
 
@@ -574,11 +973,11 @@ impl Hub {
     /// A message from the parlay service for some accounts' private sessions, presented as everything else is. It is
     /// not kept for sessions resuming by sequence: it is not from the journal and has none.
     pub fn deliver(&self, accounts: &[u64], message: &Value) {
-        let text = self.present(message.clone()).to_string();
+        let text: Arc<str> = Arc::from(self.present(message.clone()).to_string());
         for account in accounts {
             for key in self.by_account.get(account).into_iter().flatten() {
                 if let Some(s) = self.sessions.get(key) {
-                    let _ = s.tx.send(text.clone());
+                    let _ = s.tx.send(Arc::clone(&text));
                 }
             }
         }
@@ -587,10 +986,10 @@ impl Hub {
     /// A message from the parlay service for some sessions, by their keys, presented as everything else is. Not kept
     /// for resuming either.
     pub fn deliver_to_sessions(&self, keys: &[u64], message: &Value) {
-        let text = self.present(message.clone()).to_string();
+        let text: Arc<str> = Arc::from(self.present(message.clone()).to_string());
         for key in keys {
             if let Some(s) = self.sessions.get(key) {
-                let _ = s.tx.send(text.clone());
+                let _ = s.tx.send(Arc::clone(&text));
             }
         }
     }
@@ -643,9 +1042,10 @@ impl Hub {
                 history.dropped_through = dropped;
             }
         }
+        let shared: Arc<str> = Arc::from(message.clone());
         for key in self.by_account.get(&account).into_iter().flatten() {
             if let Some(s) = self.sessions.get(key) {
-                let _ = s.tx.send_derived(message.clone(), kind, sequence);
+                let _ = s.tx.send_derived(Arc::clone(&shared), kind, sequence);
             }
         }
     }
@@ -654,18 +1054,33 @@ impl Hub {
     /// the journal and has no sequence, so a client that reconnects reads the transfers again instead. Every session
     /// may see them: seeing transfers takes `read`, which every credential holds.
     pub fn send_transfer(&self, account: u64, message: &str) {
+        let shared: Arc<str> = Arc::from(message);
         for key in self.by_account.get(&account).into_iter().flatten() {
             if let Some(s) = self.sessions.get(key) {
-                let _ = s.tx.send(message.to_string());
+                let _ = s.tx.send(Arc::clone(&shared));
             }
         }
     }
 
-    fn send_to_topic(&self, topic: &str, message: &str) {
+    /// One message, every subscriber. The `Arc` is the point: this runs once per topic per flush over every
+    /// session subscribed to it, so a copy here is a copy per subscriber.
+    fn send_to_topic(&self, topic: &str, message: &Arc<str>) {
+        // One wake per loop, not per subscriber. There are a handful of loops and thousands of subscribers,
+        // so the scan for "have I already got this one" is a few pointer comparisons against a syscall.
+        let mut loops: Vec<&Notify> = Vec::new();
         for key in self.by_topic.get(topic).into_iter().flatten() {
             if let Some(s) = self.sessions.get(key) {
-                let _ = s.tx.send(message.to_string());
+                let _ = s.tx.send_deferred(Arc::clone(message));
+                let notify = s.tx.notifier();
+                if !loops.iter().any(|seen| Arc::ptr_eq(seen, notify)) {
+                    loops.push(notify);
+                }
             }
+        }
+        // Per topic rather than per flush: a flush is every book that moved, and holding the first topic's
+        // messages until the last one had been fanned out would add the whole flush to their delay.
+        for notify in loops {
+            notify();
         }
     }
 
@@ -728,21 +1143,35 @@ impl Hub {
 
     /// Sends the levels that moved since the last call to each book's subscribers. Calling this at a fixed rate is
     /// the conflation: one message per book per tick, carrying only what changed, whatever the churn.
-    pub fn flush_books(&mut self) {
-        for (instrument, levels) in std::mem::take(&mut self.dirty) {
+    /// The levels that have moved since the last flush, taken so the next window starts empty. The only part
+    /// of a flush that mutates anything, split out so the fan-out does not need the write lock: at sixteen
+    /// thousand subscribers the sending was 122ms of a 100ms cycle, which starved every other reader of the
+    /// hub and throttled market data from ten flushes a second to under five (ADR-0002).
+    /// Returns the sequence those levels are the state as of, too. The fan-out happens after the write lock
+    /// is dropped, by which time the feed thread may have moved the view on; a book message stamped with the
+    /// later sequence would tell a client it holds changes it was never sent. So the sequence is taken here,
+    /// with the levels, and the message carries that one.
+    pub fn take_dirty(&mut self) -> (BTreeMap<u64, Levels>, u64) {
+        (std::mem::take(&mut self.dirty), self.view.sequence)
+    }
+
+    /// Send what `take_dirty` took. Reads the hub only, so it runs under a read lock while the feed thread and
+    /// every request carry on.
+    pub fn publish_books(&self, dirty: BTreeMap<u64, Levels>, sequence: u64) {
+        for (instrument, levels) in dirty {
             let topic = format!("book.{instrument}");
             // An entry leaves the index with its last session, so a topic in it has someone to send to.
             if !self.by_topic.contains_key(&topic) {
                 continue;
             }
-            let message = self.levels_message(instrument, &levels, false);
+            let message: Arc<str> = Arc::from(self.levels_message(instrument, &levels, false, sequence));
             self.send_to_topic(&topic, &message);
         }
     }
 
     /// Levels as a client applies them: a quantity of zero means the level has gone. `snapshot` says this is the
     /// whole book rather than what changed, so a client knows to start again from it.
-    fn levels_message(&self, instrument: u64, levels: &Levels, snapshot: bool) -> String {
+    fn levels_message(&self, instrument: u64, levels: &Levels, snapshot: bool, sequence: u64) -> String {
         let ladder = ladder(&self.view, instrument);
         let changes: Vec<Value> = levels
             .iter()
@@ -759,7 +1188,7 @@ impl Hub {
         typed(
             "book",
             json!({
-                "instrumentId": id(instrument), "sequence": id(self.view.sequence),
+                "instrumentId": id(instrument), "sequence": id(sequence),
                 "state": market.map(|i| i.state.to_lowercase()),
                 "last": market.and_then(|i| i.last).map(|t| price::quote(ladder, t)),
                 "snapshot": snapshot, "changes": changes
@@ -778,7 +1207,7 @@ impl Hub {
                 levels.insert((false, tick), level);
             }
         }
-        self.levels_message(instrument, &levels, true)
+        self.levels_message(instrument, &levels, true, self.view.sequence)
     }
 
     pub fn book(&self, instrument: u64, depth: usize) -> Option<Value> {
@@ -875,6 +1304,8 @@ fn typed(kind: &str, mut body: Value) -> String {
 mod tests {
     use super::*;
     use std::sync::{mpsc, Arc};
+    use venue_link::view::OrderView;
+    use venue_link::wire::Frame;
 
     /// A session's outbox, and what arrives in it.
     fn outbox() -> (Outbox, mpsc::Receiver<Queued>) {
@@ -935,7 +1366,10 @@ mod tests {
     /// One unit off the feed: the input with its record header, and the results it produced.
     fn unit(sequence: u64, results: Vec<Value>) -> Unit {
         let record = json!({"sequence": sequence, "sequencedAt": 0, "sequencerGroup": 1});
-        Unit { input: json!({"msg": "NewOrder", "record": record}), results }
+        Unit {
+            input: Frame::of(&json!({"msg": "NewOrder", "record": record})),
+            results: results.iter().map(Frame::of).collect(),
+        }
     }
 
     fn accepted(order: u64) -> Value {
@@ -1004,11 +1438,11 @@ mod tests {
         let (follower, follower_rx) = outbox();
         let follower = hub.add_session(follower);
         hub.subscribe(follower, &["markets".to_string()], 10);
-        let applied = vec![json!({"msg": "CommandApplied", "outcome": "APPLIED"})];
+        let applied = [json!({"msg": "CommandApplied", "outcome": "APPLIED"})];
         let command = |sequence: u64, input: Value| {
             let mut input = input;
             input["record"] = json!({"sequence": sequence, "sequencedAt": sequence, "sequencerGroup": 1});
-            Unit { input, results: applied.clone() }
+            Unit { input: Frame::of(&input), results: applied.iter().map(Frame::of).collect() }
         };
         hub.apply(&command(1, json!({"msg": "DefineEvent", "eventId": 5, "stateCount": 2, "scheduledStart": 0})));
         let list = json!({"msg": "ListInstrument", "instrumentId": 50, "eventId": 5, "instrumentClass": "BINARY",
@@ -1016,8 +1450,11 @@ mod tests {
         hub.apply(&command(2, list));
         assert_eq!(hub.markets(None)["events"].as_array().map(Vec::len), Some(1));
         follower_rx.try_iter().count();
-        let mut tick = unit(3, vec![json!({"msg": "EventReleased", "eventId": 5})]);
-        tick.input["msg"] = json!("TimeTick");
+        let tick = Unit {
+            input: Frame::of(&json!({"msg": "TimeTick",
+                "record": {"sequence": 3, "sequencedAt": 0, "sequencerGroup": 1}})),
+            results: vec![Frame::of(&json!({"msg": "EventReleased", "eventId": 5}))],
+        };
         hub.apply(&tick);
         assert_eq!(hub.markets(None)["events"].as_array().map(Vec::len), Some(0));
         assert!(hub.market(50).is_none());
@@ -1033,9 +1470,336 @@ mod tests {
             "takerSide": "SELL", "mintedPairs": 10, "burnedPairs": 0, "buyerCashCents": -300, "sellerCashCents": -700,
             "makerFeeCents": -3, "takerFeeCents": 15
         });
-        let out = executions(&View::default(), &[fill], 9);
+        let out = executions(&View::default(), [&fill], 9);
         let fee = |account: u64| out.iter().find(|(a, _)| *a == account).map(|(_, e)| e["feeCents"].clone());
         assert_eq!(fee(1), Some(json!(-3)));
         assert_eq!(fee(2), Some(json!(15)));
+    }
+
+    /// A book level moving is the most frequent thing on a live feed, and nothing in the gateway needs its JSON
+    /// shape: the hub keeps the moved level for the next conflate flush and the view updates its book, both
+    /// straight out of the decoder. So applying one must leave the frame undecoded.
+    ///
+    /// This is asserted rather than timed because the decoded shape is kept once anything asks for it, so a
+    /// single reader still reaching for it costs the whole decode and shows up only as a slightly slower feed
+    /// thread. `Frame::decoded` makes that visible (ADR-0002).
+    #[test]
+    fn a_book_level_is_applied_without_decoding_it() {
+        let mut hub = hub();
+        let moved = Frame::of(&json!({
+            "msg": "BookLevelChanged",
+            "result": {"inputSequence": 9, "resultIndex": 0, "sequencedAt": 0, "sequencerGroup": 1},
+            "instrumentId": 10_010, "side": "BUY", "tick": 40, "quantity": 250, "orderCount": 2
+        }));
+        let input = Frame::of(&json!({"msg": "NewOrder",
+            "record": {"sequence": 9, "sequencedAt": 0, "sequencerGroup": 1}}));
+        let unit = Unit { input, results: vec![moved] };
+
+        hub.apply(&unit);
+
+        assert!(!unit.results[0].decoded(), "a book level change should never need its JSON shape");
+        assert_eq!(
+            hub.dirty.get(&10_010).and_then(|levels| levels.get(&(true, 40))),
+            Some(&(250, 2)),
+            "and the moved level is still what the engine said"
+        );
+    }
+
+    /// Every result that owes the client an execution must still produce one once the feed path stopped
+    /// decoding frames it has no use for.
+    ///
+    /// `executions_of` skips results before looking at them, which is what makes a book level free. The first
+    /// cut of that skipped by an allow-list of the results `executions` answers for, and the list omitted
+    /// `OrderAmended`: amend confirmations stopped reaching clients and all 98 tests still passed, because
+    /// nothing asserted this. So this asserts it, for every arm rather than the one that broke.
+    #[test]
+    fn every_result_that_owes_an_execution_still_produces_one() {
+        let result = json!({"inputSequence": 3, "resultIndex": 0, "sequencedAt": 0, "sequencerGroup": 1});
+        let owed = [
+            (
+                "accepted",
+                json!({"msg": "OrderAccepted", "result": result, "orderId": 1, "accountId": 7,
+                                "sessionId": 1, "clientOrderId": "c1", "instrumentId": 10_010, "side": "BUY",
+                                "tick": 40, "quantity": 5, "reservedCents": 200}),
+            ),
+            (
+                "rejected",
+                json!({"msg": "OrderRejected", "result": result, "accountId": 7, "sessionId": 1,
+                                "clientOrderId": "c2"}),
+            ),
+            (
+                "amended",
+                json!({"msg": "OrderAmended", "result": result, "orderId": 1, "accountId": 7,
+                               "instrumentId": 10_010}),
+            ),
+            (
+                "cancelled",
+                json!({"msg": "OrderCancelled", "result": result, "orderId": 1, "accountId": 7,
+                                 "instrumentId": 10_010}),
+            ),
+            (
+                "reduced",
+                json!({"msg": "OrderReduced", "result": result, "orderId": 1, "accountId": 7,
+                               "instrumentId": 10_010}),
+            ),
+            (
+                "fill",
+                json!({"msg": "Fill", "result": result, "tradeId": 9, "instrumentId": 10_010, "tick": 40,
+                            "quantity": 2, "makerOrderId": 1, "makerAccountId": 7, "makerRemaining": 3,
+                            "takerOrderId": 2, "takerAccountId": 8, "takerRemaining": 0, "takerSide": "SELL"}),
+            ),
+        ];
+        let view = View::default();
+        for (kind, message) in owed {
+            let frames = [Frame::of(&message)];
+            let out = executions_of(&view, &frames, 3);
+            assert!(
+                out.iter().any(|(_, e)| e["type"] == json!(kind)),
+                "a {kind} execution should reach the client, got {out:?} for {message}"
+            );
+            // And filtering frames before looking at them must change nothing against reading them all.
+            // Compared against the decoded frame rather than the literal above, so that what is being checked
+            // is the filtering and not the schema filling in fields the literal left out.
+            let unfiltered = executions(&view, frames.iter().map(|f| &**f), 3);
+            assert_eq!(out, unfiltered, "filtering frames changed what a {kind} produces");
+        }
+    }
+
+    /// A view with enough in it that the arms which consult one have something to find: a cent ladder so
+    /// `quote` converts a tick to a real price, and a resting order so the branches that look one up are taken
+    /// rather than skipped.
+    fn view_for_executions() -> View {
+        let mut view = View::default();
+        view.ladders
+            .insert(1, (0..=100).map(|t| Row { numerator: t, denominator: 100, complement: 100 - t }).collect());
+        view.instruments.insert(
+            10_010,
+            InstrumentView { event: 7, table: 1, lot: 1, state: "OPEN".into(), ..InstrumentView::default() },
+        );
+        view.orders.insert(
+            700,
+            OrderView {
+                account: 7,
+                instrument: 10_010,
+                side: "SELL".into(),
+                tick: 60,
+                remaining: 40,
+                client_order_id: "resting".into(),
+                filled: 0,
+                filled_yes_cents: 0,
+                expires_at: None,
+            },
+        );
+        view
+    }
+
+    /// Every arm of `executions`, in an order that exercises what it carries between them.
+    ///
+    /// Two things here are deliberate and easy to lose. `OrderAccepted` for order 701 is followed by an
+    /// `OrderCancelled` for the same order, which is *not* in the view: that arm falls back to the `accepted`
+    /// map the earlier result populated, so the two cannot be read independently of each other. And the `Fill`
+    /// carries distinct non-zero `buyerCashCents`, `sellerCashCents`, `makerFeeCents` and `takerFeeCents`, so a
+    /// reader that crossed two of them over would be caught rather than agreeing at zero.
+    fn execution_corpus() -> Vec<Value> {
+        let result = |n: u64| {
+            json!({"inputSequence": n, "resultIndex": 0, "sequencedAt": 1_727_000_000_000_000_000u64,
+                                     "sequencerGroup": 1})
+        };
+        vec![
+            json!({"msg": "OrderAccepted", "result": result(1), "orderId": 701, "accountId": 11, "sessionId": 3,
+                   "clientOrderId": "cl-701", "instrumentId": 10_010, "side": "BUY", "tick": 40, "quantity": 25,
+                   "reservedCents": 1_000}),
+            // Cancelled for an order the view has never seen: only the `accepted` map above can price it.
+            json!({"msg": "OrderCancelled", "result": result(2), "orderId": 701, "accountId": 11,
+                   "instrumentId": 10_010, "cancelledQuantity": 25, "reason": "CLIENT_REQUEST"}),
+            // And one the view does know, which takes the other branch.
+            json!({"msg": "OrderCancelled", "result": result(3), "orderId": 700, "accountId": 7,
+                   "instrumentId": 10_010, "cancelledQuantity": 40, "reason": "EVENT_START"}),
+            json!({"msg": "OrderAmended", "result": result(4), "orderId": 700, "accountId": 7,
+                   "instrumentId": 10_010, "tick": 55, "quantity": 30}),
+            json!({"msg": "OrderReduced", "result": result(5), "orderId": 700, "accountId": 7,
+                   "instrumentId": 10_010, "remainingQuantity": 12}),
+            json!({"msg": "OrderRejected", "result": result(6), "accountId": 11, "sessionId": 3,
+                   "clientOrderId": "cl-702", "originalOrderId": 701, "reason": "DUPLICATE_CLIENT_ORDER_ID"}),
+            // And one the engine never gave an id, because `originalOrderId` is optional in the schema and
+            // its absence renders as null rather than zero. Without this the corpus never exercised the
+            // absent case: typing the arm as `id(unwrap_or(0))` passed, and would have told a client that a
+            // rejected order had id "0".
+            json!({"msg": "OrderRejected", "result": result(6), "accountId": 11, "sessionId": 3,
+                   "clientOrderId": "cl-703", "reason": "MALFORMED"}),
+            json!({"msg": "Fill", "result": result(7), "tradeId": 900, "instrumentId": 10_010, "tick": 40,
+                   "quantity": 9, "makerOrderId": 700, "makerAccountId": 7, "makerRemaining": 3,
+                   "takerOrderId": 701, "takerAccountId": 11, "takerRemaining": 16, "takerSide": "BUY",
+                   "buyerCashCents": 360, "sellerCashCents": 540, "makerFeeCents": 7, "takerFeeCents": 13}),
+            // The other side of the trade, so a reader that has maker and taker the wrong way round shows up.
+            json!({"msg": "Fill", "result": result(8), "tradeId": 901, "instrumentId": 10_010, "tick": 70,
+                   "quantity": 4, "makerOrderId": 701, "makerAccountId": 11, "makerRemaining": 12,
+                   "takerOrderId": 700, "takerAccountId": 7, "takerRemaining": 0, "takerSide": "SELL",
+                   "buyerCashCents": 280, "sellerCashCents": 120, "makerFeeCents": 2, "takerFeeCents": 5}),
+        ]
+    }
+
+    /// The differential harness for `executions`, built before anything in it is read typed.
+    ///
+    /// `executions` is the last of the feed path still going through `serde_json::Value`, and it is the worst
+    /// of it to move: six arms, state carried between them, two callers giving it results from different
+    /// places, and the cash and fee fields of a trade. A field taken from the wrong place there does not fail
+    /// -- a client is told it paid a different amount, and nothing says so.
+    ///
+    /// So this compares the ways of reading the same results and fails if they differ. Today that is frames
+    /// against the JSON they decode to, which guards the filtering in `executions_of`. When a typed reader
+    /// lands, it is one more path through the same corpus, compared the same way.
+    ///
+    /// Both whole and one at a time: the batch is what exercises the `accepted` map that the cancel arm reads,
+    /// and the singles are what name the result that disagreed when one does. Stage 2 taught that an
+    /// end-of-run comparison hides a divergence a later result happens to overwrite.
+    #[test]
+    fn executions_agrees_however_the_results_are_read() {
+        let view = view_for_executions();
+        let corpus = execution_corpus();
+        let frames: Vec<Frame> = corpus.iter().map(Frame::of).collect();
+        // Against what the frames decode to, not the literals above: the schema fills in fields a literal
+        // leaves out, and that difference is not the one being looked for.
+        let decoded: Vec<Value> = frames.iter().map(|f| (**f).clone()).collect();
+
+        let whole_frames = executions_of(&view, &frames, 99);
+        let whole_json = executions(&view, decoded.iter(), 99);
+        assert_eq!(whole_frames, whole_json, "the two readings of the whole unit disagree");
+
+        for (i, (frame, value)) in frames.iter().zip(&decoded).enumerate() {
+            let one_frame = executions_of(&view, std::slice::from_ref(frame), 99);
+            let one_json = executions(&view, [value], 99);
+            assert_eq!(one_frame, one_json, "result {i} reads differently as a frame than as JSON: {value}");
+        }
+
+        // The corpus has to be doing something, or two readings of nothing would agree.
+        assert_eq!(whole_json.len(), 11, "six arms, a fill counted for each side, two rejections: {whole_json:?}");
+        let kinds: BTreeSet<&str> = whole_json.iter().filter_map(|(_, e)| e["type"].as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["accepted", "amended", "cancelled", "fill", "rejected", "reduced"].into_iter().collect(),
+            "every arm is covered"
+        );
+        // And the cancel that only the `accepted` map could price carries a price at all.
+        let cancelled_701 = whole_json
+            .iter()
+            .find(|(_, e)| e["type"] == json!("cancelled") && e["orderId"] == json!("701"))
+            .expect("the cancel of the order the view never saw");
+        assert!(
+            cancelled_701.1["price"].is_object(),
+            "priced from what the accept said, since the view has no such order: {:?}",
+            cancelled_701.1
+        );
+    }
+
+    /// Everyone subscribed gets the message, and each loop is woken once rather than once per subscriber.
+    ///
+    /// Waking is an `eventfd` write, and over half of a 41ms flush at sixteen thousand subscribers was those
+    /// syscalls (ADR-0002). `send_to_topic` therefore marks each connection ready without waking, then wakes
+    /// each distinct loop once, which makes a forgotten wake a message that sits until the loop's next
+    /// timeout rather than an error.
+    ///
+    /// Built the way the reactor builds it, which is what the first attempt at this got wrong: the
+    /// per-connection closure is its own `Arc` -- it captures that connection's token -- and only the loop's
+    /// nudge is shared. Deduplicating on the per-connection closure therefore never matches, so it woke every
+    /// session anyway and turned the scan quadratic; the flush went from 41ms to 180ms. Hence a distinct
+    /// `mark` per session here, a shared `wake` per loop, and a count of each.
+    #[test]
+    fn a_topic_wakes_each_loop_once_however_many_subscribe() {
+        let mut hub = hub();
+        // Two loops, five sessions: four on the first and one on the second, as a reactor pool would have it.
+        let woken = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+        let marked = Arc::new(AtomicU64::new(0));
+        let wakes: Vec<Notify> = woken
+            .iter()
+            .map(|count| {
+                let count = Arc::clone(count);
+                Arc::new(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }) as Notify
+            })
+            .collect();
+
+        let mut receivers = Vec::new();
+        for i in 0..5_u64 {
+            let (tx, rx) = mpsc::channel();
+            let on = usize::from(i == 4);
+            // Distinct per connection, as `take_on` makes it.
+            let mark: Notify = {
+                let marked = Arc::clone(&marked);
+                Arc::new(move || {
+                    marked.fetch_add(1, Ordering::SeqCst);
+                })
+            };
+            let outbox = Outbox::new(tx, Arc::clone(&mark)).waking(mark, Arc::clone(&wakes[on]));
+            let key = hub.add_session(outbox);
+            hub.subscribe(key, &["book.10010".to_string()], 10);
+            receivers.push(rx);
+        }
+        // Subscribing sends each session the book as it stands, which wakes it; only the flush is under test.
+        for count in &woken {
+            count.store(0, Ordering::SeqCst);
+        }
+        marked.store(0, Ordering::SeqCst);
+        for rx in &receivers {
+            while rx.try_recv().is_ok() {}
+        }
+
+        hub.dirty.entry(10_010).or_default().insert((true, 40), (250, 2));
+        let (dirty, sequence) = hub.take_dirty();
+        hub.publish_books(dirty, sequence);
+
+        for (i, rx) in receivers.iter().enumerate() {
+            let got = rx.try_recv().expect("every subscriber is sent the book that moved");
+            assert!(got.text.contains("\"type\":\"book\""), "subscriber {i} got {}", got.text);
+        }
+        assert_eq!(marked.load(Ordering::SeqCst), 5, "every connection is still marked ready, one by one");
+        assert_eq!(woken[0].load(Ordering::SeqCst), 1, "the loop with four subscribers is woken once");
+        assert_eq!(woken[1].load(Ordering::SeqCst), 1, "and the loop with one, once");
+    }
+
+    /// The results a trading venue is mostly made of, applied without any of them being decoded.
+    ///
+    /// `Hub::apply` used to dispatch on `r["msg"]`, having read `r["instrumentId"]` just above it, for every
+    /// result of every unit. Both index a `Frame`, so both decode it -- which meant the typed readers
+    /// elsewhere were reading frames this loop had already turned into a `serde_json::Value`. Measured on a
+    /// realistic load: 5.35M of 7.24M results decoded, `order_accepted` and `fill` among them despite both
+    /// having typed paths, and `sleeve_changed` -- the most numerous result of all, whose arm wants one
+    /// field -- decoded 2.24M times a minute (ADR-0002, docs/adr/measurements/feed-mix.txt).
+    ///
+    /// So this asserts the negative, which is the only way that mistake is visible: nothing here may be
+    /// decoded. An accept, a cancel and an amend have no arm in the hub's loop at all; a book level, a
+    /// sleeve and a position have typed ones in the hub or the view. `Frame::decoded` reports it.
+    #[test]
+    fn a_units_results_are_applied_without_decoding_them() {
+        let mut hub = hub();
+        let result = |n: u64| json!({"inputSequence": n, "resultIndex": 0, "sequencedAt": 0, "sequencerGroup": 1});
+        let results: Vec<Frame> = [
+            json!({"msg": "OrderAccepted", "result": result(9), "orderId": 5, "accountId": 7, "sessionId": 1,
+                   "clientOrderId": "c", "instrumentId": 10_010, "side": "BUY", "tick": 40, "quantity": 5,
+                   "reservedCents": 200}),
+            json!({"msg": "BookLevelChanged", "result": result(9), "instrumentId": 10_010, "side": "BUY",
+                   "tick": 40, "quantity": 250, "orderCount": 2}),
+            json!({"msg": "SleeveChanged", "result": result(9), "accountId": 7, "availableCents": 900,
+                   "reservedCents": 100}),
+            json!({"msg": "PositionChanged", "result": result(9), "accountId": 7, "instrumentId": 10_010,
+                   "position": 5}),
+        ]
+        .iter()
+        .map(Frame::of)
+        .collect();
+        let input = Frame::of(&json!({"msg": "NewOrder",
+            "record": {"sequence": 9, "sequencedAt": 0, "sequencerGroup": 1}}));
+        let unit = Unit { input, results };
+
+        hub.apply(&unit);
+
+        for (i, frame) in unit.results.iter().enumerate() {
+            assert!(!frame.decoded(), "result {i} (template {}) should not have been decoded", frame.template());
+        }
+        // And it did the work: the level is kept for the flush, and the view took the sleeve and position.
+        assert_eq!(hub.dirty.get(&10_010).and_then(|l| l.get(&(true, 40))), Some(&(250, 2)));
+        assert_eq!(hub.view.sleeves.get(&7), Some(&(900, 100)));
+        assert_eq!(hub.view.positions.get(&(7, 10_010)), Some(&5));
     }
 }

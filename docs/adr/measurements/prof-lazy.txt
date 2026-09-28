@@ -1,0 +1,86 @@
+## arm=lazy pid=13150
+=== per-thread CPU ===
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+  13157 ubuntu    20   0 2746248  96424   4084 R  79.2   0.1   0:13.79 gw-feed
+  13153 ubuntu    20   0 2746248  96424   4084 R  69.8   0.1   0:11.56 gw-feed
+  13152 ubuntu    20   0 2746248  96424   4084 S  28.6   0.1   0:05.20 gateway+
+  13170 ubuntu    20   0 2746248  96424   4084 S  26.0   0.1   0:04.51 gw-priv+
+  13172 ubuntu    20   0 2746248  96424   4084 S  23.4   0.1   0:04.05 gw-priv+
+  13173 ubuntu    20   0 2746248  96424   4084 S  23.0   0.1   0:04.02 gw-priv+
+  13174 ubuntu    20   0 2746248  96424   4084 S  23.0   0.1   0:03.99 gw-priv+
+  13175 ubuntu    20   0 2746248  96424   4084 S  22.8   0.1   0:03.98 gw-priv+
+  13176 ubuntu    20   0 2746248  96424   4084 S  22.8   0.1   0:03.95 gw-priv+
+  13177 ubuntu    20   0 2746248  96424   4084 R  22.8   0.1   0:03.95 gw-priv+
+  13178 ubuntu    20   0 2746248  96424   4084 S  22.6   0.1   0:03.96 gw-priv+
+  13155 ubuntu    20   0 2746248  96424   4084 S  14.0   0.1   0:02.60 link-su+
+  13164 ubuntu    20   0 2746248  96424   4084 S  12.6   0.1   0:02.18 link-re+
+  13150 ubuntu    20   0 2746248  96424   4084 S   0.0   0.1   0:00.00 venue-g+
+  13154 ubuntu    20   0 2746248  96424   4084 S   0.0   0.1   0:00.00 gw-conf+
+[ perf record: Woken up 12 times to write data ]
+[ perf record: Captured and wrote 4.235 MB /home/ubuntu/venue/run/perf-lazy.data (109987 samples) ]
+=== self time by symbol ===
+     3.11%  gw-feed        [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     2.18%  gw-feed        venue-gateway      [.] venue_gateway::hub::Hub::apply
+     2.07%  gw-feed        venue-gateway      [.] mi_free
+     1.71%  gateway-audit  venue-gateway      [.] sha2::sha256::x86_sha::compress
+     1.64%  gw-feed        venue-gateway      [.] <alloc::string::String as core::fmt::Write>::write_str
+     1.47%  gw-feed        venue-gateway      [.] _mi_page_malloc_zero
+     1.46%  link-results   [kernel.kallsyms]  [k] finish_task_switch.isra.0
+     1.39%  gw-feed        venue-gateway      [.] alloc::collections::btree::map::BTreeMap<K,V,A>::insert
+     1.25%  gw-feed        venue-gateway      [.] <&mut serde_json::ser::Serializer<W,F> as serde_core::ser::Serializer>::serialize_str
+     1.18%  gw-feed        venue-gateway      [.] venue_link::view::View::apply
+     1.15%  gw-feed        venue-gateway      [.] serde_json::value::ser::<impl serde_core::ser::Serialize for serde_json::value::Value>::serialize
+     1.09%  gw-feed        venue-gateway      [.] alloc::collections::btree::map::BTreeMap<K,V,A>::insert
+     1.06%  gw-feed        venue-gateway      [.] mi_theap_malloc_aligned
+     1.05%  gw-feed        libc.so.6          [.] 0x00000000001986a5
+     1.02%  link-submit    [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     0.99%  gw-feed        venue-gateway      [.] alloc::collections::btree::map::IntoIter<K,V,A>::dying_next
+     0.91%  gw-private-0   [kernel.kallsyms]  [k] finish_task_switch.isra.0
+     0.85%  gw-feed        libc.so.6          [.] 0x00000000001986b7
+     0.83%  gw-private-1   [kernel.kallsyms]  [k] finish_task_switch.isra.0
+     0.80%  gw-private-5   [kernel.kallsyms]  [k] finish_task_switch.isra.0
+     0.80%  gw-feed        venue-gateway      [.] serde_json::value::ser::<impl serde_core::ser::Serialize for serde_json::value::Value>::serialize
+     0.80%  gw-private-2   [kernel.kallsyms]  [k] finish_task_switch.isra.0
+     0.80%  gw-private-6   [kernel.kallsyms]  [k] finish_task_switch.isra.0
+     0.79%  gw-private-7   [kernel.kallsyms]  [k] finish_task_switch.isra.0
+     0.78%  gw-private-3   [kernel.kallsyms]  [k] finish_task_switch.isra.0
+     0.72%  gateway-audit  venue-gateway      [.] <&T as core::fmt::LowerHex>::fmt
+     0.71%  gw-private-4   [kernel.kallsyms]  [k] finish_task_switch.isra.0
+     0.69%  gw-feed        [kernel.kallsyms]  [k] finish_task_switch.isra.0
+     0.69%  gw-feed        libc.so.6          [.] 0x0000000000198680
+     0.66%  gw-feed        libc.so.6          [.] 0x000000000019869e
+     0.63%  gw-private-1   [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     0.62%  gw-feed        venue-gateway      [.] core::ptr::drop_in_place<serde_json::value::Value>
+     0.62%  gateway-audit  venue-gateway      [.] core::fmt::write
+     0.62%  gw-private-3   [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     0.60%  gw-private-5   [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     0.60%  gw-private-6   [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     0.57%  gw-feed        venue-gateway      [.] mi_malloc_aligned
+     0.56%  gateway-audit  venue-gateway      [.] <core::fmt::Formatter>::pad_integral
+     0.56%  gw-private-7   [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+     0.55%  gw-private-2   [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+=== self time by object ===
+    54.24%  venue-gateway    
+    32.33%  [kernel.kallsyms]
+    12.95%  libc.so.6        
+     0.47%  [vdso]           
+     0.01%  [unknown]        
+=== by thread ===
+    37.14%  gw-feed      
+     7.04%  gateway-audit
+     6.36%  gw-private-0 
+     6.10%  gw-private-1 
+     6.06%  gw-private-2 
+     6.02%  gw-private-3 
+     6.01%  gw-private-4 
+     5.98%  gw-private-7 
+     5.97%  gw-private-6 
+     5.97%  gw-private-5 
+=== load result ===
+32 connection(s) over 1 instrument(s), 1773081 requests in 70623 ms: 25106 messages/s; round trip µs p50 1137.029 p90 1857.149 p99 2506.533 p99.9 3427.396 max 151688.402; 8 maker(s), 2950996 fills, 41785 fills/s
+=== feed_apply ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 34.880012118
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 1782426
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 55.99743084
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 1782426
+PROFDONE

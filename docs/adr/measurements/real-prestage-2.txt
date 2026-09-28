@@ -1,0 +1,13 @@
+## arm=prestage rep=2 pid=15615 gw=/home/ubuntu/prestage/core/target/perf/venue-gateway
+=== trade32 ===
+32 connection(s) over 8 instrument(s), 2908187 requests in 60470 ms: 48093 messages/s; round trip µs p50 513.753 p90 749.039 p99 3852.985 p99.9 4887.020 max 197035.107; 8 maker(s), 80120 fills, 1324 fills/s; 1100269 taker orders, 80120 traded (1:13), 990227 cancels
+=== trade128 ===
+128 connection(s) over 8 instrument(s), 3464551 requests in 60417 ms: 57343 messages/s; round trip µs p50 1960.781 p90 2797.794 p99 4021.380 p99.9 87804.931 max 597474.952; 32 maker(s), 128059 fills, 2119 fills/s; 1311813 taker orders, 128059 traded (1:10), 1180582 cancels
+=== feed_apply ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 39.379163712
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 6382733
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 84.871567404
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 6382733
+too_far_behind=0
+audit_bytes=12347633622
+REALDONE

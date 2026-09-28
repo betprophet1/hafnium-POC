@@ -1,0 +1,90 @@
+wrote /home/ubuntu/venue/run/load.json: 516 accounts, 512 of them for load (dev-load-0..dev-load-511)
+seed: rc=0 applied=537 refused=0
+seeding with a 6s client order ID window (the default is 7200s): the group takes up to 43690 new orders a second before its duplicate table fills
+## venue-shaped load, pid=16907, 32 vCPU
+## A: trading (makers resting, takers crossing), no watchers
+=== trade conns=4 ===
+4 connection(s) over 1 instrument(s), 140749 requests in 8158 ms: 17252 messages/s; round trip µs p50 202.873 p90 265.256 p99 1208.856 p99.9 2293.535 max 4243.793; 1 maker(s), 243815 fills, 29886 fills/s
+    rss_kB=54320 node=up
+=== trade conns=8 ===
+8 connection(s) over 1 instrument(s), 184745 requests in 8109 ms: 22782 messages/s; round trip µs p50 264.549 p90 390.368 p99 3502.062 p99.9 4558.993 max 11327.626; 2 maker(s), 329670 fills, 40654 fills/s
+    rss_kB=68356 node=up
+=== trade conns=16 ===
+16 connection(s) over 1 instrument(s), 234255 requests in 8093 ms: 28945 messages/s; round trip µs p50 435.514 p90 666.327 p99 3807.802 p99.9 4438.078 max 12264.374; 4 maker(s), 417128 fills, 51541 fills/s
+    rss_kB=82792 node=up
+=== trade conns=32 ===
+32 connection(s) over 1 instrument(s), 203409 requests in 8402 ms: 24209 messages/s; round trip µs p50 757.424 p90 1273.266 p99 1836.529 p99.9 52123.194 max 2027396.822; 8 maker(s), 342909 fills, 40812 fills/s
+    rss_kB=145348 node=up
+=== trade conns=64 ===
+64 connection(s) over 1 instrument(s), 306486 requests in 8557 ms: 35816 messages/s; round trip µs p50 1535.883 p90 2480.107 p99 3321.877 p99.9 3870.664 max 58552.063; 16 maker(s), 525039 fills, 61357 fills/s
+    rss_kB=146664 node=up
+=== trade conns=128 ===
+128 connection(s) over 1 instrument(s), 288055 requests in 8080 ms: 35650 messages/s; round trip µs p50 3273.289 p90 4553.976 p99 6979.431 p99.9 8016.563 max 674424.978; 32 maker(s), 502752 fills, 62221 fills/s
+    rss_kB=224616 node=up
+=== trade conns=256 ===
+256 connection(s) over 1 instrument(s), 234819 requests in 8082 ms: 29054 messages/s; round trip µs p50 7367.761 p90 9023.579 p99 15626.659 p99.9 28054.679 max 2011594.483; 64 maker(s), 433817 fills, 53676 fills/s
+    rss_kB=326848 node=up
+## B: amend-only at the same counts, for comparison
+=== amend conns=4 ===
+venue-sim: WebSocket protocol error: Connection reset without closing handshake
+    rss_kB=436100 node=up
+=== amend conns=8 ===
+8 connection(s) over 1 instrument(s), 287888 amendments in 8054 ms: 35744 messages/s; round trip µs p50 149.470 p90 185.447 p99 4310.947 p99.9 4425.194 max 470414.803
+    rss_kB=367616 node=up
+=== amend conns=16 ===
+16 connection(s) over 1 instrument(s), 396206 amendments in 8058 ms: 49169 messages/s; round trip µs p50 221.024 p90 305.456 p99 5404.151 p99.9 5678.829 max 9188.476
+    rss_kB=372176 node=up
+=== amend conns=32 ===
+32 connection(s) over 1 instrument(s), 427327 amendments in 8058 ms: 53031 messages/s; round trip µs p50 418.376 p90 560.538 p99 5682.160 p99.9 6038.195 max 23072.397
+    rss_kB=384424 node=up
+=== amend conns=64 ===
+64 connection(s) over 1 instrument(s), 393610 amendments in 8455 ms: 46553 messages/s; round trip µs p50 820.245 p90 1144.540 p99 6189.348 p99.9 121762.545 max 140394.320
+    rss_kB=403516 node=up
+=== amend conns=128 ===
+128 connection(s) over 1 instrument(s), 481285 amendments in 8095 ms: 59454 messages/s; round trip µs p50 1632.792 p90 5068.014 p99 7008.344 p99.9 7744.835 max 49177.018
+    rss_kB=463876 node=up
+=== amend conns=256 ===
+256 connection(s) over 1 instrument(s), 521728 amendments in 8079 ms: 64578 messages/s; round trip µs p50 3253.506 p90 6935.231 p99 8690.476 p99.9 10029.908 max 71554.226
+    rss_kB=317540 node=up
+## C: market data -- 32 trading connections, watchers rising
+=== trade conns=32 watchers=0 ===
+32 connection(s) over 1 instrument(s), 282948 requests in 8315 ms: 34028 messages/s; round trip µs p50 836.090 p90 1381.970 p99 1891.444 p99.9 2804.556 max 24191.594; 8 maker(s), 504062 fills, 60620 fills/s
+    rss_kB=338444 node=up
+=== trade conns=32 watchers=32 ===
+venue-sim: WebSocket protocol error: Connection reset without closing handshake
+    rss_kB=473204 node=up
+=== trade conns=32 watchers=128 ===
+32 connection(s) over 1 instrument(s), 268920 requests in 8327 ms: 32294 messages/s; round trip µs p50 834.168 p90 1370.812 p99 1855.544 p99.9 20426.493 max 293185.381; 8 maker(s), 475642 fills, 57120 fills/s; 128 watcher(s) took 10237 messages, 1229/s
+    rss_kB=371524 node=up
+=== trade conns=32 watchers=256 ===
+32 connection(s) over 1 instrument(s), 261467 requests in 8233 ms: 31758 messages/s; round trip µs p50 778.009 p90 1317.062 p99 1968.459 p99.9 3202.236 max 2001842.052; 8 maker(s), 494243 fills, 60031 fills/s; 256 watcher(s) took 20736 messages, 2518/s
+    rss_kB=360208 node=up
+=== per-thread CPU: 64 trading + 128 watching ===
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+  16916 ubuntu    20   0 6322168 434252   4072 R  90.2   0.7   2:04.59 gw-feed
+  16910 ubuntu    20   0 6322168 434252   4072 S  26.7   0.7   1:39.77 gw-feed
+  16909 ubuntu    20   0 6322168 434252   4072 D  24.8   0.7   0:53.22 gateway+
+  16928 ubuntu    20   0 6322168 434252   4072 S  13.2   0.7   0:42.28 gw-priv+
+  16930 ubuntu    20   0 6322168 434252   4072 S  13.0   0.7   0:44.89 gw-priv+
+  16933 ubuntu    20   0 6322168 434252   4072 S  12.0   0.7   0:41.53 gw-priv+
+  16929 ubuntu    20   0 6322168 434252   4072 S  11.8   0.7   0:44.91 gw-priv+
+  16934 ubuntu    20   0 6322168 434252   4072 R  11.8   0.7   0:41.66 gw-priv+
+  16931 ubuntu    20   0 6322168 434252   4072 R  11.4   0.7   0:45.19 gw-priv+
+  16932 ubuntu    20   0 6322168 434252   4072 S  11.2   0.7   0:44.79 gw-priv+
+  16935 ubuntu    20   0 6322168 434252   4072 S  11.0   0.7   0:42.64 gw-priv+
+  16913 ubuntu    20   0 6322168 434252   4072 S   5.6   0.7   0:35.88 link-su+
+  16914 ubuntu    20   0 6322168 434252   4072 S   5.2   0.7   0:27.81 link-re+
+  16911 ubuntu    20   0 6322168 434252   4072 S   0.4   0.7   0:00.15 gw-conf+
+  16920 ubuntu    20   0 6322168 434252   4072 S   0.2   0.7   0:00.10 gw-publ+
+  16922 ubuntu    20   0 6322168 434252   4072 S   0.2   0.7   0:00.10 gw-publ+
+  16923 ubuntu    20   0 6322168 434252   4072 S   0.2   0.7   0:00.11 gw-publ+
+final_rss_kB=445424
+too_far_behind=5
+audit_bytes=15997668336
+fail_stops=0
+=== feed_apply (compare: public 7.04us / private 14.09us at stages 2+3) ===
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 146.009066117
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 6025855
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 80.711838401
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 6424540
+DONE

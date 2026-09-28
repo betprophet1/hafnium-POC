@@ -121,7 +121,6 @@ pub mod encoder {
         pub fn entries_encoder(self, count: u16, entries_encoder: EntriesEncoder<Self>) -> EntriesEncoder<Self> {
             entries_encoder.wrap(self, count)
         }
-
     }
 
     #[derive(Debug, Default)]
@@ -133,7 +132,10 @@ pub mod encoder {
         initial_limit: usize,
     }
 
-    impl<'a, P> Writer<'a> for EntriesEncoder<P> where P: Writer<'a> + Default {
+    impl<'a, P> Writer<'a> for EntriesEncoder<P>
+    where
+        P: Writer<'a> + Default,
+    {
         #[inline]
         fn get_buf_mut(&mut self) -> &mut WriteBuf<'a> {
             if let Some(parent) = self.parent.as_mut() {
@@ -144,7 +146,10 @@ pub mod encoder {
         }
     }
 
-    impl<'a, P> Encoder<'a> for EntriesEncoder<P> where P: Encoder<'a> + Default {
+    impl<'a, P> Encoder<'a> for EntriesEncoder<P>
+    where
+        P: Encoder<'a> + Default,
+    {
         #[inline]
         fn get_limit(&self) -> usize {
             self.parent.as_ref().expect("parent missing").get_limit()
@@ -167,13 +172,12 @@ pub mod encoder {
         }
     }
 
-    impl<'a, P> EntriesEncoder<P> where P: Encoder<'a> + Default {
+    impl<'a, P> EntriesEncoder<P>
+    where
+        P: Encoder<'a> + Default,
+    {
         #[inline]
-        pub fn wrap(
-            mut self,
-            mut parent: P,
-            count: u16,
-        ) -> Self {
+        pub fn wrap(mut self, mut parent: P, count: u16) -> Self {
             let initial_limit = parent.get_limit();
             parent.set_limit(initial_limit + 4);
             parent.get_buf_mut().put_u16_at(initial_limit, Self::block_length());
@@ -560,9 +564,7 @@ pub mod encoder {
             };
             self
         }
-
     }
-
 } // end encoder
 
 pub mod decoder {
@@ -606,13 +608,7 @@ pub mod decoder {
     }
 
     impl<'a> BatchOrdersDecoder<'a> {
-        pub fn wrap(
-            mut self,
-            buf: ReadBuf<'a>,
-            offset: usize,
-            acting_block_length: u16,
-            acting_version: u16,
-        ) -> Self {
+        pub fn wrap(mut self, buf: ReadBuf<'a>, offset: usize, acting_block_length: u16, acting_version: u16) -> Self {
             let limit = offset + acting_block_length as usize;
             self.buf = buf;
             self.initial_offset = offset;
@@ -666,7 +662,6 @@ pub mod decoder {
         pub fn entries_decoder(self) -> EntriesDecoder<Self> {
             EntriesDecoder::default().wrap(self)
         }
-
     }
 
     #[derive(Debug, Default)]
@@ -678,21 +673,30 @@ pub mod decoder {
         offset: usize,
     }
 
-    impl<'a, P> ActingVersion for EntriesDecoder<P> where P: Reader<'a> + ActingVersion + Default {
+    impl<'a, P> ActingVersion for EntriesDecoder<P>
+    where
+        P: Reader<'a> + ActingVersion + Default,
+    {
         #[inline]
         fn acting_version(&self) -> u16 {
             self.parent.as_ref().unwrap().acting_version()
         }
     }
 
-    impl<'a, P> Reader<'a> for EntriesDecoder<P> where P: Reader<'a> + Default {
+    impl<'a, P> Reader<'a> for EntriesDecoder<P>
+    where
+        P: Reader<'a> + Default,
+    {
         #[inline]
         fn get_buf(&self) -> &ReadBuf<'a> {
             self.parent.as_ref().expect("parent missing").get_buf()
         }
     }
 
-    impl<'a, P> Decoder<'a> for EntriesDecoder<P> where P: Decoder<'a> + ActingVersion + Default {
+    impl<'a, P> Decoder<'a> for EntriesDecoder<P>
+    where
+        P: Decoder<'a> + ActingVersion + Default,
+    {
         #[inline]
         fn get_limit(&self) -> usize {
             self.parent.as_ref().expect("parent missing").get_limit()
@@ -704,11 +708,11 @@ pub mod decoder {
         }
     }
 
-    impl<'a, P> EntriesDecoder<P> where P: Decoder<'a> + ActingVersion + Default {
-        pub fn wrap(
-            mut self,
-            mut parent: P,
-        ) -> Self {
+    impl<'a, P> EntriesDecoder<P>
+    where
+        P: Decoder<'a> + ActingVersion + Default,
+    {
+        pub fn wrap(mut self, mut parent: P) -> Self {
             let initial_offset = parent.get_limit();
             let block_length = parent.get_buf().get_u16_at(initial_offset);
             let count = parent.get_buf().get_u16_at(initial_offset + 2);
@@ -741,7 +745,7 @@ pub mod decoder {
         pub fn advance(&mut self) -> SbeResult<Option<usize>> {
             let index = self.index.wrapping_add(1);
             if index >= self.count as usize {
-                 return Ok(None);
+                return Ok(None);
             }
             if let Some(parent) = self.parent.as_mut() {
                 self.offset = parent.get_limit();
@@ -874,8 +878,5 @@ pub mod decoder {
                 Some(value)
             }
         }
-
     }
-
 } // end decoder
-

@@ -40,7 +40,24 @@ pub fn capacity_profile(profile: &str) -> Result<Capacities, Error> {
 pub const DEMO_SETTLED_RETENTION_SECONDS: u64 = 1_800;
 
 /// D-12's window, restated here because E-7.4 replaces both group parameters together: see `group_parameters`.
+///
+/// This is half of a sizing rule, and the half a deployment chooses. The engine records one entry per new order
+/// for the whole window and the table does not evict early, so a group can take
+/// `Capacities::duplicates / window` new orders a second and no more before it fail-stops (spec §18). At this
+/// default that is about 36/s on `small`, 583/s on `launch` and 2,330/s on `scale` — so a venue expecting more
+/// new orders a second than that cannot get there by picking a larger profile, and has to shorten its window
+/// instead (`window_for`). Shortening is supported: E-7.4 takes a lower value and the engine reorders its
+/// expiry queue for it.
 pub const CLIENT_ORDER_ID_WINDOW_SECONDS: u64 = 7_200;
+
+/// The longest client order ID window a group of this capacity can keep while taking `orders_per_second` new
+/// orders, which is what `duplicates / rate` comes to, clamped to one second and never above the default. For
+/// sizing a test environment or a group against the order rate it is expected to see, rather than finding out
+/// from a fail-stop.
+pub fn window_for(profile: &Capacities, orders_per_second: u64) -> u64 {
+    let rate = orders_per_second.max(1);
+    (profile.duplicates as u64 / rate).clamp(1, CLIENT_ORDER_ID_WINDOW_SECONDS)
+}
 
 /// The demo default fee rates, in millionths: see `Catalogue::fees`.
 pub const DEMO_MAKER_RATE_MICROS: i64 = 17_500;
@@ -174,13 +191,13 @@ impl Catalogue {
     /// The venue-wide settings. E-7.4 replaces both of them together, so setting the order limit here also sets
     /// the client order ID window, and the window D-12 publishes has to be restated rather than left out — leaving
     /// it out would reset it to whatever this command carried.
-    fn group_parameters(order_ceiling: usize) -> Value {
+    fn group_parameters(order_ceiling: usize, id_window_seconds: u64) -> Value {
         command(
             "SetGroupParameters",
             "seed-limits".into(),
             json!({
                 "activeOrderLimit": active_order_limit(order_ceiling),
-                "clientOrderIdWindowSeconds": CLIENT_ORDER_ID_WINDOW_SECONDS
+                "clientOrderIdWindowSeconds": id_window_seconds
             }),
         )
     }
@@ -230,7 +247,16 @@ impl Catalogue {
     /// funded accounts and round 1 of every market, for a node running `profile`. The settings come first, so no
     /// order or listing can exist before the limit that bounds it, and no fill before the fees that apply to it.
     pub fn seed(&self, profile: &Capacities) -> Result<Vec<Value>, Error> {
-        let mut inputs = vec![Self::group_parameters(profile.orders), Self::listing_parameters(profile)];
+        self.seed_with(profile, CLIENT_ORDER_ID_WINDOW_SECONDS)
+    }
+
+    /// The same, with the client order ID window the group is to start on. A group that will take more new
+    /// orders a second than `duplicates / CLIENT_ORDER_ID_WINDOW_SECONDS` has to be founded on a shorter one,
+    /// since the window can only be shortened by replacing both group parameters (E-7.4) and the table
+    /// fail-stops when it fills: see `window_for`.
+    pub fn seed_with(&self, profile: &Capacities, id_window_seconds: u64) -> Result<Vec<Value>, Error> {
+        let mut inputs =
+            vec![Self::group_parameters(profile.orders, id_window_seconds), Self::listing_parameters(profile)];
         inputs.extend(self.fees());
         inputs.push(Self::cent_table());
         for a in &self.accounts {

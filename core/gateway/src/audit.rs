@@ -17,7 +17,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -29,12 +29,31 @@ pub const FORMAT: &str = "venue-audit/2";
 pub const RENDERER: u32 = 1;
 pub const COMPONENT: &str = "gateway";
 const ZEROS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-/// Records the queue holds: seconds of a busy gateway's private traffic.
-pub const CAPACITY: usize = 65_536;
+/// Batches the queue holds -- batches, not records: what a loop hands over is a `Vec<Record>`, so each place on
+/// the queue is a whole batch of up to `BATCH_BYTES`. At 65_536 places that was tens of gigabytes the writer
+/// could fall behind by, and a gateway whose disk could not keep up grew to gigabytes and stopped answering
+/// rather than pushing back. 256 places of at most 256 KiB is about 64 MiB, a second or two of a busy gateway's
+/// private traffic, after which `send` makes the loop wait (`STALL_WAITS`).
+pub const CAPACITY: usize = 256;
 /// How long a loop waits for room on a full queue, counted in millisecond waits, before the disk is taken to have hung.
 const STALL_WAITS: u32 = 10_000;
-/// Records written between syncs at most.
-const BATCH: usize = 1024;
+/// Records written between syncs at most: the size of one group commit. The sync, not the write, is what costs
+/// -- on network-attached storage it is milliseconds of uninterruptible waiting, and at 1024 it was about 77 of
+/// them a second under load, which measured as ~40% of the writer's thread and capped the whole gateway. Raising
+/// it trades a larger window of records that a machine (not a process -- see `flush`) could lose for proportionally
+/// fewer syncs.
+const BATCH: usize = 8192;
+/// The longest a record waits for its sync when the queue runs dry before `BATCH` is reached, so that a quiet log
+/// is still durable promptly rather than whenever the next record happens to arrive.
+const COMMIT_WINDOW: Duration = Duration::from_millis(10);
+/// What one batching thread gathers before it hands the batch over rather than waiting for its loop to come round
+/// to `flush`. A record about a frame holds a copy of that frame, and one pass of a busy loop records every frame
+/// of every connection it serves, so without this the batch is bounded only by how much one pass does: at enough
+/// connections that is gigabytes, held per loop thread.
+const BATCH_BYTES: usize = 256 * 1024;
+/// Counted against `BATCH_BYTES` for each record on top of the copies it owns, so that many small records bound the
+/// batch too, not only a few large ones.
+const RECORD_BYTES: usize = 128;
 /// What the writer holds before it goes to the kernel. A drain writes what was queued and then flushes, so this only
 /// decides how many writes a large drain takes: the full batch of records is about half a megabyte.
 const BUFFER: usize = 256 * 1024;
@@ -118,7 +137,9 @@ impl Default for Fields {
 struct Record {
     micros: u64,
     kind: &'static str,
-    fields: Fields,
+    /// The record's fields, already in the bytes they take in the line (`push_fields`). Only where the record
+    /// lands -- its number and what it chains to -- is left for the writer.
+    body: Vec<u8>,
 }
 
 thread_local! {
@@ -126,6 +147,8 @@ thread_local! {
     static BATCH_HERE: Cell<bool> = const { Cell::new(false) };
     /// What it has gathered since its last `Audit::flush`.
     static PENDING: RefCell<Vec<Record>> = const { RefCell::new(Vec::new()) };
+    /// What that has cost so far, against `BATCH_BYTES`.
+    static PENDING_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Says that this thread takes records in batches, which an event loop calls once at its start: it then hands a whole
@@ -194,9 +217,22 @@ impl Audit {
         if self.queue.is_none() {
             return;
         }
-        let record = Record { micros: wall_micros(), kind, fields };
+        // Rendered here rather than on the writer: this is the part of a record that costs, and it is the same
+        // whatever order the records land in, so it belongs on the thread that already has the message in hand.
+        let mut body = Vec::new();
+        push_fields(&mut body, &fields);
+        let bytes = body.len().saturating_add(RECORD_BYTES);
+        let record = Record { micros: wall_micros(), kind, body };
         if BATCH_HERE.with(Cell::get) {
             PENDING.with(|pending| pending.borrow_mut().push(record));
+            let held = PENDING_BYTES.with(|n| {
+                n.set(n.get().saturating_add(bytes));
+                n.get()
+            });
+            // Handed over mid-pass rather than held to the end of one: what a pass records has no bound of its own.
+            if held >= BATCH_BYTES {
+                self.flush();
+            }
         } else {
             self.send(vec![record]);
         }
@@ -209,6 +245,7 @@ impl Audit {
             return;
         }
         let batch = PENDING.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+        PENDING_BYTES.with(|n| n.set(0));
         if !batch.is_empty() {
             self.send(batch);
         }
@@ -417,7 +454,7 @@ struct Head<'a> {
 
 /// One record as its line, without the newline, appended to `out`: the writer keeps one buffer for every line it
 /// ever writes, so a record of any size is written without taking memory for it.
-fn push_line(out: &mut Vec<u8>, head: &Head<'_>, fields: &Fields) {
+fn push_line(out: &mut Vec<u8>, head: &Head<'_>, body: &[u8]) {
     let (n, prev) = (head.n, head.prev);
     out.extend_from_slice(b"{\"ts\":\"");
     push_timestamp(out, head.micros);
@@ -427,6 +464,16 @@ fn push_line(out: &mut Vec<u8>, head: &Head<'_>, fields: &Fields) {
     push_quoted(out, head.instance);
     out.extend_from_slice(b",\"kind\":");
     push_quoted(out, head.kind);
+    out.extend_from_slice(body);
+    out.extend_from_slice(b",\"prev\":\"");
+    out.extend_from_slice(prev.as_bytes());
+    out.extend_from_slice(b"\"}");
+}
+
+/// A record's fields as the bytes they take in the line, which is everything in it that does not depend on where
+/// the record lands in the log. Taken on whichever thread recorded it: masking and hashing a message both read
+/// the whole of it, and the writer has only one thread for every loop that feeds it (ADR-0002).
+fn push_fields(out: &mut Vec<u8>, fields: &Fields) {
     for item in &fields.0 {
         out.push(b',');
         match item {
@@ -451,9 +498,6 @@ fn push_line(out: &mut Vec<u8>, head: &Head<'_>, fields: &Fields) {
             }
         }
     }
-    out.extend_from_slice(b",\"prev\":\"");
-    out.extend_from_slice(prev.as_bytes());
-    out.extend_from_slice(b"\"}");
 }
 
 /// The file being written, and what the next line chains to.
@@ -541,13 +585,29 @@ impl Writer {
                     let mut batch = first;
                     loop {
                         for record in batch.drain(..) {
-                            self.append(record.micros, record.kind, &record.fields)?;
+                            self.append(record.micros, record.kind, &record.body)?;
                             written += 1;
                         }
                         if written >= BATCH as i64 {
                             break;
                         }
                         match records.try_recv() {
+                            Ok(next) => {
+                                batch = next;
+                                continue;
+                            }
+                            Err(TryRecvError::Disconnected) => break,
+                            Err(TryRecvError::Empty) => {}
+                        }
+                        // Nothing waiting. What has been written goes to the kernel now, so a gateway that is
+                        // killed loses none of it, but the sync to the disk waits: it is the expensive part, and
+                        // one of them for the records of a whole window beats one for each small batch that
+                        // happens to arrive alone. `COMMIT_WINDOW` is the longest a record waits for it.
+                        self.flush()?;
+                        let Some(rest) = COMMIT_WINDOW.checked_sub(monotonic().duration_since(started)) else {
+                            break;
+                        };
+                        match records.recv_timeout(rest) {
                             Ok(next) => batch = next,
                             Err(_) => break,
                         }
@@ -571,20 +631,28 @@ impl Writer {
 
     /// Appends one record, first rotating if it belongs to a later day than the file, or if the file has grown
     /// large enough that it should not grow further.
-    fn append(&mut self, micros: u64, kind: &str, fields: &Fields) -> io::Result<()> {
+    fn append(&mut self, micros: u64, kind: &str, body: &[u8]) -> io::Result<()> {
         self.rotate_if_past_midnight(micros)?;
         self.rotate_if_too_big(micros)?;
-        self.write_line(micros, kind, fields)
+        self.write_line(micros, kind, body)
+    }
+
+    /// The writer's own records -- the ones it makes rather than takes -- rendered here, since no loop is holding
+    /// them. There are a handful per file, against millions taken from the queue.
+    fn append_fields(&mut self, micros: u64, kind: &str, fields: &Fields) -> io::Result<()> {
+        let mut body = Vec::new();
+        push_fields(&mut body, fields);
+        self.write_line(micros, kind, &body)
     }
 
     /// One record, built in the buffer this writer keeps. It goes to the kernel with everything else the drain took
     /// (`sync`), not on its own: a record cost a write each, and there are six of them for every order.
-    fn write_line(&mut self, micros: u64, kind: &str, fields: &Fields) -> io::Result<()> {
+    fn write_line(&mut self, micros: u64, kind: &str, body: &[u8]) -> io::Result<()> {
         let mut line = std::mem::take(&mut self.line);
         line.clear();
         let head =
             Head { micros, n: self.next, component: &self.component, instance: &self.instance, kind, prev: &self.prev };
-        push_line(&mut line, &head, fields);
+        push_line(&mut line, &head, body);
         let digest = Sha256::digest(&line);
         line.push(b'\n');
         let len = line.len() as u64;
@@ -601,11 +669,17 @@ impl Writer {
     /// after it, a record is in the kernel and survives the gateway being killed, which is what bounds what a signal
     /// can lose to the records of the drain it interrupted. Only the machine going down loses what is not synced.
     fn sync(&mut self) -> io::Result<()> {
-        self.file.flush()?;
+        self.flush()?;
         if self.fsync {
             self.file.get_ref().sync_data()?;
         }
         Ok(())
+    }
+
+    /// Hands what has been written to the kernel without waiting for the disk. This is what bounds what a killed
+    /// gateway loses; only the machine going down loses what has been flushed but not yet synced.
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
     }
 
     fn rotate_if_past_midnight(&mut self, micros: u64) -> io::Result<()> {
@@ -656,7 +730,7 @@ impl Writer {
         if let Some(after) = after {
             open.put("after", after);
         }
-        self.write_line(micros, "open", &open)?;
+        self.append_fields(micros, "open", &open)?;
         self.sync()?;
         if self.fsync {
             // A new file is durable only once its directory entry is.
@@ -670,7 +744,7 @@ impl Writer {
         let mut close = Fields::new();
         close.put("reason", reason);
         close.put("records", self.next);
-        self.write_line(micros, "close", &close)?;
+        self.append_fields(micros, "close", &close)?;
         self.sync()
     }
 }
@@ -770,7 +844,9 @@ fn seal_earlier_files(
         close.put("records", n + 1);
         let mut text = Vec::new();
         let head = Head { micros, n: n + 1, component, instance, kind: "close", prev: &sha256_hex(&last) };
-        push_line(&mut text, &head, &close);
+        let mut body = Vec::new();
+        push_fields(&mut body, &close);
+        push_line(&mut text, &head, &body);
         let sealed = sha256_hex(&text);
         text.push(b'\n');
         let mut file = OpenOptions::new().append(true).open(&path)?;
@@ -862,15 +938,17 @@ mod tests {
 
     /// The text of a record's wire field, for tests that read records off the queue rather than out of a file.
     fn wire_of(record: &Record) -> String {
-        record
-            .fields
-            .0
-            .iter()
-            .find_map(|item| match item {
-                Item::Wire(_, text) => Some(text.clone()),
-                Item::Json(..) | Item::Digest(_) => None,
-            })
-            .unwrap_or_default()
+        let body = String::from_utf8_lossy(&record.body);
+        let at = body.find("\"msg\":\"").expect("a wire field") + 7;
+        let rest = &body[at..];
+        rest[..rest.find('"').expect("its closing quote")].to_string()
+    }
+
+    /// `Writer::append` for tests, which still hand it fields rather than the bytes a loop would have rendered.
+    fn appended(writer: &mut Writer, micros: u64, kind: &str, fields: &Fields) -> io::Result<()> {
+        let mut body = Vec::new();
+        push_fields(&mut body, fields);
+        writer.append(micros, kind, &body)
     }
 
     fn files(dir: &Path) -> Vec<PathBuf> {
@@ -895,8 +973,8 @@ mod tests {
     fn records_chain_and_a_new_day_closes_the_file_and_opens_the_next() {
         let dir = dir("rotate");
         let mut writer = Writer::open(&dir, COMPONENT, "test", false, LATE - 5).expect("opened");
-        writer.append(LATE - 1, "ws-frame", &fields("before midnight")).expect("written");
-        writer.append(LATE + 1, "ws-frame", &fields("after midnight")).expect("written");
+        appended(&mut writer, LATE - 1, "ws-frame", &fields("before midnight")).expect("written");
+        appended(&mut writer, LATE + 1, "ws-frame", &fields("after midnight")).expect("written");
         writer.close(LATE + 2, "shutdown").expect("closed");
         let files = files(&dir);
         let names: Vec<_> = files.iter().filter_map(|p| p.file_name()?.to_str()).collect();
@@ -920,9 +998,9 @@ mod tests {
     fn a_segment_past_the_size_limit_rotates_mid_day_like_a_new_day_would() {
         let dir = dir("size-rotate");
         let mut writer = Writer::open(&dir, COMPONENT, "test", false, LATE - 100_000).expect("opened");
-        writer.append(LATE - 99_000, "ws-frame", &fields("before the limit")).expect("written");
+        appended(&mut writer, LATE - 99_000, "ws-frame", &fields("before the limit")).expect("written");
         writer.bytes = MAX_SEGMENT_BYTES;
-        writer.append(LATE - 98_000, "ws-frame", &fields("past the limit")).expect("written");
+        appended(&mut writer, LATE - 98_000, "ws-frame", &fields("past the limit")).expect("written");
         writer.close(LATE - 97_000, "shutdown").expect("closed");
         let files = files(&dir);
         let names: Vec<_> = files.iter().filter_map(|p| p.file_name()?.to_str()).collect();
@@ -945,7 +1023,7 @@ mod tests {
         let dir = dir("tamper");
         let mut writer = Writer::open(&dir, COMPONENT, "test", false, LATE - 5).expect("opened");
         for text in ["one", "two", "three"] {
-            writer.append(LATE - 4, "ws-frame", &fields(text)).expect("written");
+            appended(&mut writer, LATE - 4, "ws-frame", &fields(text)).expect("written");
         }
         // As a drain does once its queue is empty: until then the records are the writer's, not the file's.
         writer.sync().expect("handed to the kernel");
@@ -963,7 +1041,7 @@ mod tests {
     fn a_file_left_open_is_sealed_by_the_next_start_and_a_cut_off_one_is_left_alone() {
         let dir = dir("seal");
         let mut first = Writer::open(&dir, COMPONENT, "test", false, LATE - 10).expect("opened");
-        first.append(LATE - 9, "ws-frame", &fields("left open")).expect("written");
+        appended(&mut first, LATE - 9, "ws-frame", &fields("left open")).expect("written");
         let left_open = first.path();
         drop(first);
         let mut second = Writer::open(&dir, COMPONENT, "test", false, LATE - 8).expect("opened again");
@@ -972,7 +1050,7 @@ mod tests {
         let segment = second.path();
         assert!(segment.to_string_lossy().ends_with(".2026-09-17.0001.jsonl"), "{}", segment.display());
         // Cut the second file part-way through a line, as a crash mid-write would, and the process with it.
-        second.append(LATE - 7, "ws-frame", &fields("cut")).expect("written");
+        appended(&mut second, LATE - 7, "ws-frame", &fields("cut")).expect("written");
         drop(second);
         let whole = fs::read(&segment).expect("read");
         fs::write(&segment, &whole[..whole.len() - 10]).expect("cut");
@@ -988,14 +1066,14 @@ mod tests {
     fn an_instance_another_live_process_is_writing_is_refused() {
         let dir = dir("instance-lock");
         let mut first = Writer::open(&dir, COMPONENT, "test", false, LATE - 10).expect("opened");
-        first.append(LATE - 9, "ws-frame", &fields("mine")).expect("written");
+        appended(&mut first, LATE - 9, "ws-frame", &fields("mine")).expect("written");
         let before = fs::read(first.path()).expect("read");
         let refused = Writer::open(&dir, COMPONENT, "test", false, LATE - 8).err().expect("a second writer refused");
         assert!(refused.to_string().contains("--audit-instance"), "{refused}");
         assert_eq!(fs::read(first.path()).expect("read"), before, "the live file was changed");
         assert_eq!(files(&dir).len(), 1, "a refused writer made a file");
         assert!(Writer::open(&dir, COMPONENT, "other", false, LATE - 8).is_ok(), "another instance was refused");
-        first.append(LATE - 7, "ws-frame", &fields("still mine")).expect("written");
+        appended(&mut first, LATE - 7, "ws-frame", &fields("still mine")).expect("written");
         assert_eq!(verify(&first.path()), Ok(false), "the live file's chain broke");
         drop(first);
         assert!(Writer::open(&dir, COMPONENT, "test", false, LATE - 6).is_ok(), "the instance stayed locked");

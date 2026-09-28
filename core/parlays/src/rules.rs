@@ -327,24 +327,24 @@ pub fn settle_input(parlay: u64, settlement: Settlement) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use venue_link::wire::Unit;
+    use venue_link::wire::{Frame, Unit};
 
     /// Applies one input to a view as the feed would deliver it: applied, at `at`.
     fn apply(view: &mut View, msg: Value, at: u64) {
         let mut input = msg;
         input["record"] = json!({"sequence": at, "sequencedAt": at, "sequencerGroup": 1});
-        let results = vec![json!({"msg": "CommandApplied", "outcome": "APPLIED"})];
-        view.apply(&Unit { input, results });
+        let results = [json!({"msg": "CommandApplied", "outcome": "APPLIED"})];
+        view.apply(&Unit { input: Frame::of(&input), results: results.iter().map(Frame::of).collect() });
     }
 
     fn state(view: &mut View, instrument: u64, state: &str, at: u64) {
         let mut unit_input = json!({"msg": "SetMarketState", "instrumentId": instrument, "state": state});
         unit_input["record"] = json!({"sequence": at, "sequencedAt": at, "sequencerGroup": 1});
-        let results = vec![
+        let results = [
             json!({"msg": "CommandApplied", "outcome": "APPLIED"}),
             json!({"msg": "MarketStateChanged", "instrumentId": instrument, "state": state}),
         ];
-        view.apply(&Unit { input: unit_input, results });
+        view.apply(&Unit { input: Frame::of(&unit_input), results: results.iter().map(Frame::of).collect() });
     }
 
     /// Three open binaries on events 1, 2 and 3 (instruments 100, 200, 300, YES paying in state 1), and a

@@ -1,0 +1,16 @@
+## arm=prestage rep=1 pid=14179
+=== trade32 ===
+32 connection(s) over 1 instrument(s), 384569 requests in 10105 ms: 38057 messages/s; round trip µs p50 758.390 p90 1287.729 p99 1849.744 p99.9 3363.344 max 25486.890; 8 maker(s), 650351 fills, 64359 fills/s
+=== trade128 ===
+128 connection(s) over 1 instrument(s), 348807 requests in 10135 ms: 34416 messages/s; round trip µs p50 3292.275 p90 4607.038 p99 7033.442 p99.9 8010.453 max 1789540.093; 32 maker(s), 615079 fills, 60688 fills/s
+=== amend32 ===
+32 connection(s) over 1 instrument(s), 591085 amendments in 10952 ms: 53970 messages/s; round trip µs p50 339.689 p90 477.229 p99 5747.894 p99.9 7072.727 max 1394920.375
+=== amend128 ===
+128 connection(s) over 1 instrument(s), 450035 amendments in 10063 ms: 44721 messages/s; round trip µs p50 1644.004 p90 5509.348 p99 7276.233 p99.9 157211.649 max 939969.531
+=== feed_apply ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 17.607982014
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 1784599
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 32.541124988
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 1784599
+too_far_behind=0
+REPDONE

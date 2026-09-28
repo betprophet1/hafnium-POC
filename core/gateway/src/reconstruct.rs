@@ -152,7 +152,7 @@ fn render(
         for message in rx.try_iter() {
             let Queued { text, derived } = message;
             if let Some(derived) = derived {
-                out.entry((account, derived.sequence, derived.kind.to_string())).or_default().push(text);
+                out.entry((account, derived.sequence, derived.kind.to_string())).or_default().push(text.to_string());
             }
         }
     }

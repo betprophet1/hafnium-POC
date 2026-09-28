@@ -14,5 +14,9 @@ workspace = true
 venue-link = { path = "../link" }
 serde_json = "1"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# epoll for the retail population: a thread per customer costs a wake-up per customer per poll interval,
+# which at tens of thousands is more than the machine has. `mio` rather than libc because the workspace
+# forbids unsafe, and it is already in the tree.
+mio = { version = "1", features = ["os-poll", "os-ext"] }
 # The dummy oracle's resolution cases, in PostgreSQL.
 venue-store = { path = "../store" }

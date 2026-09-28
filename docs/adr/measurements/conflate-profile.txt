@@ -1,0 +1,50 @@
+gw-conflate tid=6052 cpu_ticks=1110
+gw-conflate tid=6058 cpu_ticks=0
+profiling tid=6052
+[ perf record: Woken up 4 times to write data ]
+[ perf record: Captured and wrote 1.710 MB /home/ubuntu/venue/run/conflate.data (44629 samples) ]
+=== self time, flat ===
+    46.92%  gw-conflate  [kernel.kallsyms]  [k] _raw_spin_unlock_irq
+    25.98%  gw-conflate  venue-gateway      [.] venue_gateway::hub::Outbox::put
+     9.03%  gw-conflate  venue-gateway      [.] std::sys::backtrace::__rust_begin_short_backtrace
+     3.42%  gw-conflate  venue-gateway      [.] venue_gateway::reactor::take_on::{{closure}}
+     1.85%  gw-conflate  [kernel.kallsyms]  [k] do_syscall_64
+     1.48%  gw-conflate  [kernel.kallsyms]  [k] __fget_files
+     1.41%  gw-conflate  libc.so.6          [.] write
+     0.86%  gw-conflate  [kernel.kallsyms]  [k] handle_softirqs
+     0.65%  gw-conflate  venue-gateway      [.] <std::sync::mpmc::waker::SyncWaker>::notify
+     0.55%  gw-conflate  [kernel.kallsyms]  [k] vfs_write
+[ perf record: Woken up 232 times to write data ]
+Warning:
+Processed 7755 events and lost 1 chunks!
+
+Check IO/CPU overload!
+
+[ perf record: Captured and wrote 59.260 MB /home/ubuntu/venue/run/conflate-g.data (7333 samples) ]
+=== inclusive, by caller ===
+    60.79%     1.13%  gw-conflate  libc.so.6          [.] write
+    59.13%     0.00%  gw-conflate  [kernel.kallsyms]  [.] entry_SYSCALL_64_after_hwframe
+    59.03%     1.88%  gw-conflate  [kernel.kallsyms]  [.] do_syscall_64
+    56.80%     0.31%  gw-conflate  [kernel.kallsyms]  [k] x64_sys_call
+    56.48%     0.12%  gw-conflate  [kernel.kallsyms]  [.] __x64_sys_write
+    56.28%     0.30%  gw-conflate  [kernel.kallsyms]  [.] ksys_write
+    53.38%     0.65%  gw-conflate  [kernel.kallsyms]  [.] vfs_write
+    51.70%     0.40%  gw-conflate  [kernel.kallsyms]  [.] eventfd_write
+    50.89%    47.61%  gw-conflate  [kernel.kallsyms]  [k] _raw_spin_unlock_irq
+    24.18%    24.18%  gw-conflate  venue-gateway      [.] venue_gateway::hub::Outbox::put
+    14.54%     0.00%  gw-conflate  venue-gateway      [.] wake (inlined)
+    14.51%     0.00%  gw-conflate  venue-gateway      [.] write (inlined)
+     8.67%     8.67%  gw-conflate  venue-gateway      [.] std::sys::backtrace::__rust_begin_short_backtrace
+     8.02%     0.00%  gw-conflate  venue-gateway      [.] put (inlined)
+     5.45%     0.00%  gw-conflate  [kernel.kallsyms]  [.] irq_exit_rcu
+     5.45%     0.00%  gw-conflate  [kernel.kallsyms]  [.] __irq_exit_rcu
+     5.45%     1.19%  gw-conflate  [kernel.kallsyms]  [k] handle_softirqs
+     5.25%     0.00%  gw-conflate  [kernel.kallsyms]  [.] asm_common_interrupt
+     5.25%     0.00%  gw-conflate  [kernel.kallsyms]  [.] common_interrupt
+     4.27%     0.00%  gw-conflate  venue-gateway      [.] send<venue_gateway::hub::Queued> (inlined)
+     4.13%     0.03%  gw-conflate  [kernel.kallsyms]  [.] net_rx_action
+     4.05%     0.00%  gw-conflate  [kernel.kallsyms]  [.] __napi_poll
+     4.02%     0.10%  gw-conflate  [ena]              [.] ena_io_poll
+     3.52%     3.52%  gw-conflate  venue-gateway      [.] venue_gateway::reactor::take_on::{{closure}}
+     3.05%     0.00%  gw-conflate  venue-gateway      [.] __rust_begin_short_backtrace<venue_gateway::conflate::{closure_env#0}, ()> (inlined)
+CONFLATEDONE

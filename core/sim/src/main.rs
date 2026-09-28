@@ -4,8 +4,10 @@ mod bots;
 mod calendar;
 mod cases;
 mod client;
+mod gwload;
 mod oracle;
 mod resolution;
+mod retail;
 mod session;
 mod web;
 mod workload;
@@ -22,6 +24,12 @@ use venue_link::wire::{Error, Ids, Ingress};
 
 const USAGE: &str = "usage:
   venue-sim seed  --ingress ADDR --catalogue FILE [--capacity small]
+                  [--orders-per-second N | --id-window-seconds N]
+                  the client order ID window and the engine's duplicate table are one sizing rule: a group
+                  takes `duplicates / window` new orders a second and then fail-stops, which is about 36/s on
+                  `small` and 2 330/s on `scale` at the two-hour default. Found a venue that will see more on
+                  a shorter window -- no profile is large enough to hold a two-hour window at a high order
+                  rate, and the window can only be shortened by replacing both group parameters.
   venue-sim web   --ingress ADDR --feed ADDR --gateway ADDR --catalogue FILE [--listen 127.0.0.1:8080]
                   [--public-gateway ADDR] [--oracle 127.0.0.1:8082] [--treasury 127.0.0.1:8083] [--from-view FILE]
   venue-sim oracle --ingress ADDR --feed ADDR --catalogue FILE --calendar FILE --database-url URL [--capacity small]
@@ -36,6 +44,26 @@ const USAGE: &str = "usage:
                   [--order-limit N] [--id-window-seconds N]
                   (the last two default from the node's capacity profile: 3/4 of its orders, and its
                   client order ID table's entries / 120 000 seconds)
+  venue-sim catalogue --catalogue FILE --out FILE [--accounts 0] [--token-prefix dev-load-]
+                  [--first-id 9600000] [--cents 100000000]
+                  writes the catalogue with `accounts` more accounts on the end, one per connection a load run
+                  means to make: a gateway only knows the dev tokens its catalogue gave it, so they have to
+                  exist before it starts. Seed from the written file and start the gateway on it, and
+                  `gwload --token-prefix` then has an account per connection.
+  venue-sim gwload --gateway ADDR [--token dev-market-maker] [--instrument 10010] [--connections 1] [--seconds 10]
+                  [--instruments 1] [--ingress ADDR] [--token-prefix PREFIX]
+                  [--mode amend|trade] [--makers N] [--watchers N] [--public-gateway ADDR]
+                  --mode trade makes the connections a venue's own shape instead of one that never trades:
+                  the first --makers of them (a quarter by default) rest a large sell, amending it back up to
+                  size, and the rest cross it immediate-or-cancel, so every taker request is a fill with the
+                  executions and sleeve updates that follow. --watchers N adds N connections that only
+                  subscribe to the book on the public half and read, which is the market-data fan-out the
+                  order-entry measurement leaves out entirely.
+                  the gateway-facing counterpart to `venue-node load`: each connection logs in over
+                  /v4/ws_private, places one resting order, then amends it back and forth until the deadline,
+                  reporting messages/s and round-trip percentiles the same way.
+                  --instruments N > 1 spreads connections across N synthetic markets instead of one, most-popular-
+                  first with each one's share roughly half the last (needs --ingress, to list them on first).
 
 The bots are clients of the gateway. --gateway serves the private half (orders, accounts, sessions); --public-gateway,
 the gateway serving the public half (markets, books), defaults to it. The maker subscribes to requests for quote and answers them when its account is an
@@ -125,6 +153,8 @@ fn main() -> ExitCode {
         "maker" => maker(&a),
         "taker" => taker(&a),
         "workload" => workload(&a),
+        "gwload" => gwload(&a),
+        "catalogue" => catalogue(&a),
         _ => Err(USAGE.into()),
     });
     match outcome {
@@ -181,7 +211,28 @@ fn seed(args: &Args) -> Result<(), Error> {
     let mut ingress = Ingress::new(&args.get("ingress", None)?);
     // The order and listing limits are the node's own tables, so this must name the profile the node runs with.
     let profile = venue_link::catalogue::capacity_profile(&args.get("capacity", Some("small"))?)?;
-    let mut inputs = catalogue.seed(&profile)?.into_iter().peekable();
+    // The client order ID window and the duplicate table are one sizing rule: the group can take
+    // `duplicates / window` new orders a second before the table fills and the engine fail-stops. A venue
+    // expecting more says so with --orders-per-second and is founded on a window that fits, since the window
+    // can only be shortened by replacing both group parameters and no profile is large enough to make a
+    // two-hour window hold a high order rate. --id-window-seconds overrides the arithmetic outright.
+    let window = match args.optional("orders-per-second") {
+        Some(rate) => venue_link::catalogue::window_for(
+            &profile,
+            rate.parse::<u64>().map_err(|e| format!("--orders-per-second: {e}"))?,
+        ),
+        None => venue_link::catalogue::CLIENT_ORDER_ID_WINDOW_SECONDS,
+    };
+    let window = args.number("id-window-seconds", window)?;
+    if window < venue_link::catalogue::CLIENT_ORDER_ID_WINDOW_SECONDS {
+        eprintln!(
+            "seeding with a {window}s client order ID window (the default is {}s): the group takes up to {} new \
+             orders a second before its duplicate table fills",
+            venue_link::catalogue::CLIENT_ORDER_ID_WINDOW_SECONDS,
+            profile.duplicates as u64 / window.max(1)
+        );
+    }
+    let mut inputs = catalogue.seed_with(&profile, window)?.into_iter().peekable();
     let mut attempts = 0;
     while let Some(input) = inputs.peek() {
         match ingress.send(input.clone()) {
@@ -258,6 +309,75 @@ fn maker(args: &Args) -> Result<(), Error> {
     let api = client::Api::new(&gateway, &token).with_public(&public);
     let gateways = session::Gateways { private: gateway, public };
     bots::maker(&api, &gateways, &token, &config, Ids::new('m')?, Ids::new('q')?)
+}
+
+fn gwload(args: &Args) -> Result<(), Error> {
+    let config = gwload::Config {
+        gateway: args.get("gateway", None)?,
+        token: args.get("token", Some("dev-market-maker"))?,
+        instrument: args.number("instrument", 10010)?,
+        connections: usize::try_from(args.number("connections", 1)?)?,
+        seconds: args.number("seconds", 10)?,
+        ingress: args.optional("ingress"),
+        instruments: usize::try_from(args.number("instruments", 1)?)?,
+        token_prefix: args.optional("token-prefix").filter(|p| !p.is_empty()),
+        mode: match args.get("mode", Some("amend"))?.as_str() {
+            "amend" => gwload::Mode::Amend,
+            "trade" => gwload::Mode::Trade,
+            other => return Err(format!("--mode must be amend or trade, not {other}").into()),
+        },
+        makers: match args.optional("makers") {
+            Some(m) => Some(usize::try_from(m.parse::<u64>().map_err(|e| format!("--makers: {e}"))?)?),
+            None => None,
+        },
+        orders_per_trade: args.number("orders-per-trade", 10)?,
+        retail: usize::try_from(args.number("retail", 0)?)?,
+        retail_order_seconds: args.number("retail-order-seconds", 10)?,
+        retail_books: usize::try_from(args.number("retail-books", 2)?)?,
+        retail_workers: usize::try_from(
+            args.number("retail-workers", std::thread::available_parallelism().map_or(8, |n| n.get() as u64))?,
+        )?,
+        watchers: usize::try_from(args.number("watchers", 0)?)?,
+        public_gateway: args.optional("public-gateway").filter(|a| !a.is_empty()),
+    };
+    gwload::run(config)
+}
+
+/// Writes a catalogue with more accounts on the end, for a load run that wants one per connection. The accounts
+/// are only what `Catalogue::seed` and the gateway need of one: an id, the cents to grant it, and the dev token
+/// that logs in as it.
+fn catalogue(args: &Args) -> Result<(), Error> {
+    let base = args.get("catalogue", None)?;
+    let out = args.get("out", None)?;
+    let accounts = usize::try_from(args.number("accounts", 0)?)?;
+    let prefix = args.get("token-prefix", Some("dev-load-"))?;
+    let first = args.number("first-id", 9_600_000)?;
+    let cents = args.number("cents", 100_000_000)?;
+
+    let text = std::fs::read_to_string(&base).map_err(|e| format!("reading {base}: {e}"))?;
+    let mut doc: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("parsing {base}: {e}"))?;
+    let list = doc["accounts"].as_array_mut().ok_or("the catalogue has no accounts")?;
+    let taken: Vec<u64> = list.iter().filter_map(|a| a["id"].as_u64()).collect();
+    for i in 0..accounts {
+        let id = first + i as u64;
+        if taken.contains(&id) {
+            return Err(format!("account {id} is already in {base}; pass a --first-id past its accounts").into());
+        }
+        list.push(serde_json::json!({
+            "id": id,
+            "name": format!("Load {i}"),
+            "tab": serde_json::Value::Null,
+            "cents": cents,
+            "token": format!("{prefix}{i}"),
+        }));
+    }
+    let total = list.len();
+    std::fs::write(&out, serde_json::to_string_pretty(&doc)?).map_err(|e| format!("writing {out}: {e}"))?;
+    eprintln!(
+        "wrote {out}: {total} accounts, {accounts} of them for load ({prefix}0..{prefix}{})",
+        accounts.max(1) - 1
+    );
+    Ok(())
 }
 
 fn taker(args: &Args) -> Result<(), Error> {

@@ -1,0 +1,13 @@
+## arm=fix rep=3 pid=18048 gw=/home/ubuntu/venue/core/target/perf/venue-gateway
+=== trade32 ===
+32 connection(s) over 8 instrument(s), 3029373 requests in 60367 ms: 50182 messages/s; round trip µs p50 491.017 p90 772.826 p99 3673.351 p99.9 4757.265 max 161773.014; 8 maker(s), 82221 fills, 1362 fills/s; 1136982 taker orders, 82221 traded (1:13), 1023272 cancels
+=== trade128 ===
+128 connection(s) over 8 instrument(s), 3473227 requests in 60411 ms: 57493 messages/s; round trip µs p50 1962.199 p90 2822.063 p99 4159.449 p99.9 111703.633 max 354861.875; 32 maker(s), 127960 fills, 2118 fills/s; 1308735 taker orders, 127960 traded (1:10), 1177814 cancels
+=== feed_apply ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 41.135414451
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 6512675
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 89.705650567
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 6512675
+too_far_behind=0
+audit_bytes=12681620995
+REALDONE

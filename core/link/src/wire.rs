@@ -1,6 +1,7 @@
 //! Talking to a node: inputs through the ingress, everything that happened through the feed.
 
 use serde_json::{json, Value};
+use std::cell::OnceCell;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
@@ -8,6 +9,8 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 use venue_harness::codec;
+use venue_journal::message_header_codec::MessageHeaderDecoder;
+use venue_journal::ReadBuf;
 use venue_node::frames::{read_frame, write_frame, MAX_FRAME};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -60,10 +63,79 @@ impl Ingress {
     }
 }
 
+/// One frame as the node sent it, with the JSON shape of it made only if something asks.
+///
+/// The feed is SBE, and `venue_harness::codec` turns a frame into a `serde_json::Value` -- a `Map` of `String`
+/// keys and boxed values, read back by comparing those keys. That codec exists so the hand-computed scenarios in
+/// spec/engine/scenarios can be diffed against what the engine emits, and the feed path inherited it. It costs
+/// about 857ns a result where reading the same fields out of the generated decoder costs about 2ns
+/// (prototypes/feedapply), on the one thread per half that applies every unit (ADR-0002).
+///
+/// So a frame now carries its bytes, and `template` lets a reader dispatch on what it is and decode the fields it
+/// wants. Readers that still want the JSON shape get it through `Deref`, decoded once and kept -- which keeps
+/// every existing reader working and means nothing decodes a frame no one reads. The `Deref` is a migration aid,
+/// not the destination: it hides the cost of a full decode behind an index, and should go once the readers that
+/// need it have moved.
+pub struct Frame {
+    bytes: Vec<u8>,
+    value: OnceCell<Value>,
+}
+
+impl Frame {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes, value: OnceCell::new() }
+    }
+
+    /// A frame from the JSON shape of one, for a test that describes what the feed carried rather than holding
+    /// the bytes. Encoded through the same codec the node writes with, so what comes back out is what a reader
+    /// of the real feed would see, including whatever the schema does not carry.
+    pub fn of(value: &Value) -> Self {
+        let mut bytes = vec![0_u8; MAX_FRAME];
+        match codec::encode(value, &mut bytes) {
+            Ok(n) => {
+                bytes.truncate(n);
+                Self::new(bytes)
+            }
+            Err(e) => panic!("a frame the codec cannot encode: {e}: {value}"),
+        }
+    }
+
+    /// The bytes the node sent, for a reader decoding the fields it wants itself.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Whether anything has asked for the JSON shape of this frame yet. For tests that mean to check a reader
+    /// takes a frame typed rather than decoding it, which is otherwise only visible as a timing difference.
+    pub fn decoded(&self) -> bool {
+        self.value.get().is_some()
+    }
+
+    /// Which message this is, without decoding it: the schema's template id, for dispatch.
+    pub fn template(&self) -> u16 {
+        MessageHeaderDecoder::default().wrap(ReadBuf::new(&self.bytes), 0).template_id()
+    }
+}
+
+impl std::ops::Deref for Frame {
+    type Target = Value;
+
+    /// Decoded on the first ask and kept. A frame nothing asks about is never decoded at all.
+    fn deref(&self) -> &Value {
+        self.value.get_or_init(|| codec::decode(&self.bytes).unwrap_or(Value::Null))
+    }
+}
+
+impl std::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&**self, f)
+    }
+}
+
 /// One input from the feed, with its results.
 pub struct Unit {
-    pub input: Value,
-    pub results: Vec<Value>,
+    pub input: Frame,
+    pub results: Vec<Frame>,
 }
 
 /// The units a journal and the result log of replaying it make: what the feed carried, rebuilt from the files after
@@ -141,8 +213,12 @@ impl Iterator for Units {
     }
 }
 
-/// Every frame of a journal or result log, decoded, one at a time. A file cut off mid-frame ends where it was
-/// cut, as the node's own reader treats it.
+/// Every frame of a journal or result log, one at a time. A file cut off mid-frame ends where it was cut, as
+/// the node's own reader treats it.
+///
+/// Yields `Frame`, not `Value`: a frame carries its bytes and decodes only if something asks (`Frame`), and on
+/// this path the only thing that asks is the sequence peek below. Replay therefore costs one decode per frame
+/// it actually pairs rather than one per frame it reads.
 struct Frames {
     reader: BufReader<File>,
     frame: Vec<u8>,
@@ -155,11 +231,11 @@ impl Frames {
 }
 
 impl Iterator for Frames {
-    type Item = Result<Value, Error>;
+    type Item = Result<Frame, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match read_frame(&mut self.reader, &mut self.frame) {
-            Ok(Some(n)) => Some(codec::decode(&self.frame[..n]).map_err(Into::into)),
+            Ok(Some(n)) => Some(Ok(Frame::new(self.frame[..n].to_vec()))),
             Ok(None) => None,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => None,
             Err(e) => Some(Err(e.into())),
@@ -189,10 +265,42 @@ pub fn follow(addr: &str, on_connect: impl FnMut() -> u64, on_reset: impl FnMut(
 /// process that logs in its own format.
 pub fn follow_reporting(
     addr: &str,
+    on_connect: impl FnMut() -> u64,
+    on_reset: impl FnMut(),
+    mut on_unit: impl FnMut(Unit),
+    on_error: impl FnMut(&str),
+) -> ! {
+    follow_batched(
+        addr,
+        on_connect,
+        on_reset,
+        move |units: &mut Vec<Unit>| {
+            for unit in units.drain(..) {
+                on_unit(unit);
+            }
+        },
+        on_error,
+        1,
+    )
+}
+
+/// The same, handing over whatever units are already there rather than one at a time.
+///
+/// For a reader that pays something per batch as well as per unit. The gateway takes the hub's write lock
+/// around `apply`, and releasing it wakes every reader queued on it: a futex wake was 26% of the feed
+/// thread's time, once per unit at tens of thousands of units a second (ADR-0002,
+/// docs/adr/measurements/apply-profile.txt). Applying several units under one acquisition divides that.
+///
+/// A batch ends when the reader has nothing already buffered, so a quiet feed still hands over one unit at a
+/// time and waits for nothing. `most` caps it, because the whole batch is one hold of whatever lock the
+/// caller takes, and a reader queued behind it waits for all of it.
+pub fn follow_batched(
+    addr: &str,
     mut on_connect: impl FnMut() -> u64,
     mut on_reset: impl FnMut(),
-    mut on_unit: impl FnMut(Unit),
+    mut on_units: impl FnMut(&mut Vec<Unit>),
     mut on_error: impl FnMut(&str),
+    most: usize,
 ) -> ! {
     loop {
         match TcpStream::connect(addr) {
@@ -203,7 +311,7 @@ pub fn follow_reporting(
                         if !resuming {
                             on_reset();
                         }
-                        if let Err(e) = read_units(stream, &mut on_unit) {
+                        if let Err(e) = read_units(stream, &mut on_units, most.max(1)) {
                             on_error(&format!("{e}; reconnecting"));
                         }
                     }
@@ -225,21 +333,28 @@ fn open(stream: &mut TcpStream, resume_from: u64) -> Result<bool, Error> {
     Ok(answer[0] != 0)
 }
 
-fn read_units(stream: TcpStream, on_unit: &mut impl FnMut(Unit)) -> Result<(), Error> {
+fn read_units(stream: TcpStream, on_units: &mut impl FnMut(&mut Vec<Unit>), most: usize) -> Result<(), Error> {
     let mut reader = BufReader::new(stream);
     let mut frame = Vec::new();
+    let mut batch: Vec<Unit> = Vec::with_capacity(most);
     loop {
         let Some(n) = read_frame(&mut reader, &mut frame)? else { return Err("the feed ended".into()) };
-        let input = codec::decode(&frame[..n])?;
+        let input = Frame::new(frame[..n].to_vec());
         let mut results = Vec::new();
         loop {
             match read_frame(&mut reader, &mut frame)? {
                 Some(0) => break,
-                Some(m) => results.push(codec::decode(&frame[..m])?),
+                Some(m) => results.push(Frame::new(frame[..m].to_vec())),
                 None => return Err("the feed ended inside a unit".into()),
             }
         }
-        on_unit(Unit { input, results });
+        batch.push(Unit { input, results });
+        // Hand over as soon as there is nothing already read: a quiet feed never waits for a batch to fill,
+        // and a busy one batches by however far ahead it happens to be. Nothing here blocks to make a batch.
+        if batch.len() >= most || reader.buffer().is_empty() {
+            on_units(&mut batch);
+            batch.clear();
+        }
     }
 }
 

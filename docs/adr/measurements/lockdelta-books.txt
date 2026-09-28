@@ -1,0 +1,13 @@
+lockdelta uses the realistic mix
+32 connection(s) over 8 instrument(s), 2269112 requests in 60916 ms: 37249 messages/s; round trip µs p50 591.932 p90 1036.360 p99 4664.987 p99.9 18014.918 max 260684.263; 8 maker(s), 65468 fills, 1074 fills/s; 925370 taker orders, 65468 traded (1:14), 832820 cancels; 16384 retail took 10558847 messages, 173334/s (644 each), sent 96715 orders, 96545 fills, p50 7813.998 p99 93935.547, 0 dropped; 8 watcher(s) took 13568 messages, 222/s
+--- lock cost over one 60s run at retail=16384 ---
+  conflate_hold  public   n=      435  mean       9.7us  total    0.00s  =    0.0% of wall time
+  conflate_hold  private  n=      613  mean      45.2us  total    0.03s  =    0.0% of wall time
+  conflate_publish public   n=      435  mean   41016.8us  total   17.84s  =   29.7% of wall time
+  conflate_publish private  n=      613  mean      74.0us  total    0.05s  =    0.1% of wall time
+  hub_read_wait  public   n=      435  mean       4.1us  total    0.00s  =    0.0% of wall time
+  hub_read_wait  private  n=  3741674  mean      50.5us  total  188.81s  =  314.7% of wall time
+  feed_apply     public   n=  2380911  mean      15.8us  total   37.59s  =   62.7% of wall time
+  feed_apply     private  n=  2380911  mean      16.8us  total   39.98s  =   66.6% of wall time
+
+[exited with code 0]

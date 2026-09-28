@@ -1,0 +1,55 @@
+fd limit: 1048576
+capacity profile: launch (small caps at 4096 accounts)
+seed applied=16525
+gateway pid=13843
+=== retail=0 ===
+32 connection(s) over 8 instrument(s), 3138735 requests in 60425 ms: 51944 messages/s; round trip µs p50 487.758 p90 767.747 p99 3618.045 p99.9 4719.028 max 145912.736; 8 maker(s), 84234 fills, 1394 fills/s; 1159992 taker orders, 84234 traded (1:13), 1043980 cancels
+    gw_rss_kB=129820
+    gw_fds=44
+    gw_threads=25
+    too_far_behind=0
+=== retail=256 ===
+32 connection(s) over 8 instrument(s), 2966790 requests in 60371 ms: 49142 messages/s; round trip µs p50 518.868 p90 855.675 p99 3574.672 p99.9 4737.346 max 176786.860; 8 maker(s), 83477 fills, 1382 fills/s; 1205203 taker orders, 83477 traded (1:14), 1084671 cancels; 256 retail took 604160 messages, 10007/s (2360 each), sent 1280 orders, 1280 fills, p50 5901.481 p99 12593.922, 0 dropped
+    gw_rss_kB=195364
+    gw_fds=44
+    gw_threads=25
+    too_far_behind=0
+=== retail=1024 ===
+32 connection(s) over 8 instrument(s), 2552189 requests in 60242 ms: 42365 messages/s; round trip µs p50 607.417 p90 989.045 p99 3715.284 p99.9 5067.390 max 138926.780; 8 maker(s), 71735 fills, 1190 fills/s; 1035840 taker orders, 71735 traded (1:14), 932243 cancels; 1024 retail took 2380914 messages, 39522/s (2325 each), sent 5120 orders, 5120 fills, p50 6810.882 p99 15205.542, 0 dropped
+    gw_rss_kB=285596
+    gw_fds=44
+    gw_threads=25
+    too_far_behind=0
+=== retail=4096 ===
+32 connection(s) over 8 instrument(s), 2238015 requests in 60552 ms: 36960 messages/s; round trip µs p50 666.901 p90 1352.429 p99 3672.934 p99.9 8668.133 max 128373.870; 8 maker(s), 62018 fills, 1024 fills/s; 889433 taker orders, 62018 traded (1:14), 800475 cancels; 4096 retail took 8529301 messages, 140859/s (2082 each), sent 20480 orders, 20480 fills, p50 8464.701 p99 40513.598, 0 dropped
+    gw_rss_kB=435108
+    gw_fds=44
+    gw_threads=25
+    too_far_behind=0
+=== retail=16384 ===
+32 connection(s) over 8 instrument(s), 1104659 requests in 61749 ms: 17889 messages/s; round trip µs p50 1418.133 p90 2859.758 p99 6349.733 p99.9 21421.782 max 1258947.740; 8 maker(s), 31246 fills, 506 fills/s; 450824 taker orders, 31246 traded (1:14), 405726 cancels; 16384 retail took 22536184 messages, 364964/s (1375 each), sent 81920 orders, 81920 fills, p50 4963.900 p99 25963.323, 0 dropped
+    gw_rss_kB=608548
+    gw_fds=44
+    gw_threads=25
+    too_far_behind=0
+=== per-thread CPU at the end ===
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+  13858 ubuntu    20   0   14.0g 614436   4104 S   0.2   0.9   0:26.48 gw-publ+
+  13860 ubuntu    20   0   14.0g 614436   4104 S   0.2   0.9   0:26.59 gw-publ+
+  13871 ubuntu    20   0   14.0g 614436   4104 S   0.2   0.9   1:31.79 gw-priv+
+  13843 ubuntu    20   0   14.0g 614436   4104 S   0.0   0.9   0:00.39 venue-g+
+  13845 ubuntu    20   0   14.0g 614436   4104 S   0.0   0.9   1:42.80 gateway+
+  13846 ubuntu    20   0   14.0g 614436   4104 S   0.0   0.9   2:32.42 gw-feed
+  13847 ubuntu    20   0   14.0g 614436   4104 S   0.0   0.9   0:24.10 gw-conf+
+  13848 ubuntu    20   0   14.0g 614436   4104 S   0.0   0.9   1:29.65 link-su+
+  13850 ubuntu    20   0   14.0g 614436   4104 S   0.0   0.9   1:03.18 link-re+
+  13852 ubuntu    20   0   14.0g 614436   4104 S   0.0   0.9   3:25.75 gw-feed
+  13853 ubuntu    20   0   14.0g 614436   4104 S   0.0   0.9   0:00.06 gw-conf+
+  13854 ubuntu    20   0   14.0g 614436   4104 S   0.0   0.9   0:00.00 metrics
+  13856 ubuntu    20   0   14.0g 614436   4104 S   0.0   0.9   0:26.28 gw-publ+
+=== feed_apply ===
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 220.662278773
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 12157029
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 134.5189198
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 12157029
+RETAILDONE
