@@ -1,0 +1,163 @@
+{{- if .Values.core.cut.enabled }}
+{{- $name := include "venue-mini.fullname" . }}
+{{- $c := .Values.core.cut }}
+{{- if not $c.to }}{{ fail "core.cut.to: say where the cut segments go" }}{{ end }}
+{{- if not $c.environment }}{{ fail "core.cut.environment: names the prefix one venue's archive lives under" }}{{ end }}
+{{- if not $c.image.tag }}{{ fail "core.cut.image.tag: the commit of the image .github/workflows/cut-image.yml built" }}{{ end }}
+---
+# Cuts the live journal (interfaces/tools/journal_cut.py): stops the core, embeds a snapshot at the latest published
+# pair, archives what the cut removes, cuts, and starts the core again. **The venue is down while it runs**, for as
+# long as it takes to copy the journal and result log and put them in object storage: tens of minutes the first
+# time, minutes once the journal is short.
+#
+# Suspended by default, so nothing stops a venue on a schedule nobody chose. Run one by hand:
+#
+#   kubectl create job --from=cronjob/{{ $name }}-journal-cut {{ $name }}-journal-cut-1 -n {{ .Release.Namespace }}
+#
+# and run its checks first, which stop nothing, by upgrading once with `--set core.cut.dryRun=true`: the Job then
+# fetches the latest pair, measures the journal and the room to stage it, and reports, with the core left running.
+#
+# Why one container: the procedure must start the core again whatever fails after it has stopped it, and that is
+# only a `finally` if everything runs in one process. The image is the venue image plus Python and the AWS CLI.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}-journal-cut
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: journal-cut
+---
+# Exactly what the job does and nothing more: scale the one StatefulSet, and read the one pod it waits on.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}-journal-cut
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: journal-cut
+rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets/scale"]
+    resourceNames: [{{ printf "%s-core" $name | quote }}]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    resourceNames: [{{ printf "%s-core-0" $name | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-journal-cut
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: journal-cut
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}-journal-cut
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}-journal-cut
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}-journal-cut
+  labels:
+    {{- include "venue-mini.labels" . | nindent 4 }}
+    app.kubernetes.io/component: journal-cut
+spec:
+  schedule: {{ $c.schedule | quote }}
+  suspend: {{ $c.suspend }}
+  # Never two: they would both stop the core, and the second would cut a journal the first is cutting.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # No retry. A retry would stop the venue a second time after a failure somebody has not looked at yet.
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ $c.deadlineSeconds }}
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            {{- include "venue-mini.labels" . | nindent 12 }}
+            app.kubernetes.io/component: journal-cut
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ $name }}-journal-cut
+          # Long enough to start the core again after a SIGTERM, which is what the `finally` does.
+          terminationGracePeriodSeconds: 120
+          {{- with ($c.image.pullSecrets | default $.Values.image.pullSecrets) }}
+          imagePullSecrets:
+            {{- range . }}
+            - name: {{ . | quote }}
+            {{- end }}
+          {{- end }}
+          {{- include "venue-mini.scheduling" . | nindent 10 }}
+          securityContext:
+            {{- include "venue-mini.podSecurity" . | nindent 12 }}
+          containers:
+            - name: cut
+              image: "{{ $c.image.repository }}:{{ $c.image.tag }}"
+              imagePullPolicy: {{ $c.image.pullPolicy }}
+              args:
+                - --to
+                - {{ $c.to | quote }}
+                - --environment
+                - {{ $c.environment | quote }}
+                - --statefulset
+                - {{ printf "%s-core" $name | quote }}
+                - --data
+                - /var/lib/venue
+                - --work
+                - /work
+                - --margin-gib
+                - {{ $c.marginGiB | quote }}
+                {{- if $c.dryRun }}
+                - --dry-run
+                {{- end }}
+              env:
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                # No credentials: the instance role through the metadata service, as the other shippers do.
+                - name: AWS_REGION
+                  value: {{ $c.region | quote }}
+                - name: HOME
+                  value: /tmp
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                # `embed-snapshot` is a whole replay through a real engine at this venue's capacity profile.
+                limits:
+                  memory: {{ $c.replayMemory | quote }}
+              securityContext:
+                {{- include "venue-mini.containerSecurity" . | nindent 16 }}
+              volumeMounts:
+                - name: journal
+                  mountPath: /var/lib/venue
+                - name: work
+                  mountPath: /work
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: journal
+              persistentVolumeClaim:
+                # The StatefulSet's volumeClaimTemplate names it, so it is derived here rather than configured.
+                # Mounted read-write, and only touched once the core has stopped.
+                claimName: journal-{{ $name }}-core-0
+            # Where `export-cut` stages the segment: most of the journal and result log, on the node's disk. The
+            # tool checks there is room before it stops anything; this limit is the backstop.
+            - name: work
+              emptyDir:
+                sizeLimit: {{ $c.stagingSize | quote }}
+            - name: tmp
+              emptyDir:
+                sizeLimit: 256Mi
+{{- end }}

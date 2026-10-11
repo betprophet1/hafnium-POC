@@ -65,6 +65,39 @@ core:
       tag: ""
       pullPolicy: IfNotPresent
       pullSecrets: []
+  # Cutting the journal (interfaces/tools/journal_cut.py, templates/journal-cut.yaml): stop the core, embed a snapshot
+  # at the latest published pair, archive what the cut removes, cut, start the core. **The venue is down while it
+  # runs.** Without it the journal grows for ever (about 825 MB a day on the demo venue) and the volume fills.
+  #
+  # Needs a published snapshot pair for this `environment` (core.snapshots), because the cut is made at the latest
+  # one: that keeps the chain the scheduled snapshot job carries on from unbroken.
+  cut:
+    enabled: false
+    # Suspended: nothing stops a venue on a schedule nobody chose. Run one with `kubectl create job --from=cronjob/...`
+    # and unsuspend once it has been watched.
+    suspend: true
+    # Weekly, in the small hours: after the snapshot job (03:13), so the pair it cuts at is that night's.
+    schedule: "17 4 * * 0"
+    # Where the segments go, and whose they are: the same bucket and environment as the pairs.
+    to: ""
+    environment: ""
+    region: eu-central-1
+    # Run every check that can refuse, stop nothing. For the first run on a venue.
+    dryRun: false
+    # `embed-snapshot` is a whole replay at the venue's capacity profile: what the core gets.
+    replayMemory: 1Gi
+    # Free space to leave beyond the segment. The segment is most of the journal and result log, staged on the
+    # node's disk, and kubelet evicts pods below 10% free.
+    marginGiB: 6
+    stagingSize: 60Gi
+    # Give up after this long, which also starts the core again (the process handles SIGTERM).
+    deadlineSeconds: 7200
+    image:
+      # Built by .github/workflows/cut-image.yml on a venue image whose snapshot encoding the core reads.
+      repository: ghcr.io/your-github-org/venue-cut  # was: lordnacho
+      tag: ""
+      pullPolicy: IfNotPresent
+      pullSecrets: []
   storage:
     size: 1Gi
     # Whether the volume outlives the StatefulSet. True everywhere that matters: deleting a release must not take the
