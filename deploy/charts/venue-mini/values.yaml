@@ -61,7 +61,7 @@ core:
     image:
       # The publisher half: the archive image already carries snapshot_publish.py and the AWS CLI. The *taking*
       # half runs the venue image, which carries venue-view.
-      repository: ghcr.io/lordnacho/venue-dbarchive
+      repository: ghcr.io/your-github-org/venue-dbarchive  # was: lordnacho
       tag: ""
       pullPolicy: IfNotPresent
       pullSecrets: []
@@ -201,7 +201,7 @@ database:
     # against the pod.
     scratchSize: 2Gi
     image:
-      repository: ghcr.io/lordnacho/venue-dbarchive
+      repository: ghcr.io/your-github-org/venue-dbarchive  # was: lordnacho
       tag: ""
       pullPolicy: IfNotPresent
       pullSecrets: []
@@ -300,7 +300,7 @@ gateway:
       schedule: "17 * * * *"
       region: eu-central-1
       image:
-        repository: ghcr.io/lordnacho/venue-archive
+        repository: ghcr.io/your-github-org/venue-archive  # was: lordnacho
         tag: ""
         pullPolicy: IfNotPresent
         # What to pull it with, where that registry is not open. Its own, not the release-wide `image.pullSecrets`:

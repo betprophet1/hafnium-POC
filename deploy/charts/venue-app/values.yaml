@@ -5,7 +5,7 @@
 # belong together and are in different charts, so changing the host here means changing it there.
 
 image:
-  repository: ghcr.io/lordnacho/venue-app
+  repository: ghcr.io/your-github-org/venue-app  # was: lordnacho
   # The commit the app was exported from. No `latest`: which app is running is a thing to be able to say, and a tag
   # that moves makes "it works for me" unanswerable.
   tag: ""

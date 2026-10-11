@@ -87,6 +87,17 @@ else
   fi
 fi
 
+step "No one's own names in the tree"
+# The repository names no particular owner, registry or domain: each is a placeholder, with the value it replaced in
+# an adjacent "was:" or "original" note (deploy/aws/README.md). This keeps one from creeping back in.
+if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  leaked="$(git -C "$ROOT" grep -nIiE 'hafnium|lordnacho|phantu' -- . ':!check' | grep -viE 'was:|original' || true)"
+  [[ -z "$leaked" ]] || fail "a personal name outside a 'was:' note:"$'\n'"$leaked"
+  echo "ok"
+else
+  echo "not a git checkout: skipped"
+fi
+
 step "PostgreSQL for the database tests"
 # The image the chart runs (deploy/charts/venue-mini/values.yaml, postgres.image), pinned by tag and digest.
 POSTGRES_IMAGE="postgres:18.6-alpine3.24@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2"

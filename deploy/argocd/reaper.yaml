@@ -46,7 +46,7 @@ spec:
                       name: venue-github-token
                       key: token
                 - name: REPO
-                  value: LordNacho/prediction-exchange
+                  value: YOUR_GITHUB_ORG/prediction-exchange  # was: LordNacho
               command: ["/bin/sh", "-euo", "pipefail", "-c"]
               args:
                 - |
