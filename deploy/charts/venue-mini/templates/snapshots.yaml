@@ -91,7 +91,7 @@ spec:
                 - name: tmp
                   mountPath: /tmp
             - name: take
-              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              image: "{{ $s.takeImage.repository | default .Values.image.repository }}:{{ $s.takeImage.tag | default .Values.image.tag | default .Chart.AppVersion }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               command: ["venue-view"]
               args:
