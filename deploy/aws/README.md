@@ -44,7 +44,11 @@ here. On a fleet running continuously, that arithmetic reverses.
    the box lives in — that keeps billing permissions off this key entirely. `create_budget = true` makes it from
    here instead, where the key does have them.
 2. The rest: `tofu apply`
-3. `./venue.sh install` — k3s, ArgoCD, cert-manager, and the venue chart
+3. `VENUE_GITHUB_ORG=<owner> ./venue.sh install` — k3s, ArgoCD, cert-manager, and the venue chart. `<owner>` is the
+   GitHub user or organisation that owns your copy of this repository: the ArgoCD manifests and the image paths in
+   the chart values name a placeholder, and this puts yours in. Images the charts pull from a registry
+   (`core.snapshots`, `database.archive`, `gateway.audit.archive`, the retail app) default to
+   `ghcr.io/your-github-org/...`; set their `image.repository` to your own
 4. `./venue.sh stop` when you are done for the day
 
 Teardown is `tofu destroy`, which takes the disk with it.

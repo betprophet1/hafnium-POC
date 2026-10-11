@@ -120,9 +120,16 @@ case "${1:-}" in
     # from the same value the DNS was built with. One source for the name, and it never reaches the repository.
     domain=$("$TOFU" -chdir="$HERE" output -raw domain)
     argocd="$HERE/../argocd"
-    kubectl apply -f "$argocd/project.yaml" >/dev/null
-    sed "s/venue\\.example/$domain/" "$argocd/applicationset.yaml" | kubectl apply -f - >/dev/null
-    kubectl apply -f "$argocd/reaper.yaml" >/dev/null
+    # The same for the GitHub owner the repository and its images live under. The manifests carry YOUR_GITHUB_ORG
+    # (the API and the repository URL, case as GitHub spells it) and your-github-org (the ghcr.io path, which must
+    # be lower case); both come from the one variable.
+    org="${VENUE_GITHUB_ORG:?set VENUE_GITHUB_ORG to the GitHub user or organisation that owns this repository}"
+    org_lower=$(printf '%s' "$org" | tr '[:upper:]' '[:lower:]')
+    with_org() { sed "s/YOUR_GITHUB_ORG/$org/g; s/your-github-org/$org_lower/g" "$1"; }
+    with_org "$argocd/project.yaml" | kubectl apply -f - >/dev/null
+    sed "s/venue\\.example/$domain/" "$argocd/applicationset.yaml" \
+      | sed "s/YOUR_GITHUB_ORG/$org/g; s/your-github-org/$org_lower/g" | kubectl apply -f - >/dev/null
+    with_org "$argocd/reaper.yaml" | kubectl apply -f - >/dev/null
     kubectl apply -f "$argocd/pull-secret.yaml" >/dev/null
     kubectl apply -f "$argocd/namespace-cleanup.yaml" >/dev/null
     echo "   previews will answer on pr-<number>.$domain"
