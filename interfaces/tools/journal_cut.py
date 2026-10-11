@@ -139,12 +139,19 @@ def preflight(config, runner, work):
     # `export-cut` stages what the cut removes — nearly the whole journal and result log on a venue never cut. A
     # disk that fills here takes the node's other pods with it (kubelet evicts below 10% free), so the room is
     # checked now, with a margin, rather than found out half way.
-    need = journal.stat().st_size + results.stat().st_size + config.margin_gib * GIB
+    #
+    # And once more for the biggest half: shipping verifies an upload by downloading it back into the temp
+    # directory, so while the last file is verified the segment *and* a second copy of it are on the disk. The first
+    # real run was evicted there because the temp directory was a small volume; counting it here is what keeps
+    # that from being learned from a stopped venue again.
+    sizes = journal.stat().st_size, results.stat().st_size
+    need = sum(sizes) + max(sizes) + config.margin_gib * GIB
     free = shutil.disk_usage(work).free
     if free < need:
         raise Refused(
             f"not enough room to stage the segment: {free / GIB:.1f} GiB free, {need / GIB:.1f} GiB needed "
-            f"(journal + results + {config.margin_gib} GiB margin). Free some space, or grow the volume"
+            f"(journal + results + a read-back copy of the larger + {config.margin_gib} GiB margin). Free some "
+            "space, or grow the volume"
         )
     return at
 
@@ -310,6 +317,27 @@ def self_test():
                 failures.append(f"the disk refusal did not say why: {e}")
         if kube.calls:
             failures.append(f"a disk refusal still touched the core: {kube.calls}")
+
+    # The read-back copy: files of 100 bytes each need 100 + 100 + 100 (a second copy of the larger), so 250 free
+    # would have passed when only the segment was counted and must now be refused; 300 must pass.
+    real_usage = shutil.disk_usage
+    try:
+        for free, should_refuse in ((250, True), (300, False)):
+            shutil.disk_usage = lambda path, free=free: type("U", (), {"free": free})()
+            with tempfile.TemporaryDirectory() as d:
+                kube, log = FakeKube(), []
+                try:
+                    cut(config(d, dry_run=True), kube, fake_runner(log), **no_sleep)
+                    refused = False
+                except Refused:
+                    refused = True
+                if refused != should_refuse:
+                    failures.append(f"with {free} bytes free the read-back copy was "
+                                    f"{'not counted' if should_refuse else 'over-counted'}")
+                if kube.calls:
+                    failures.append(f"the room check touched the core: {kube.calls}")
+    finally:
+        shutil.disk_usage = real_usage
 
     with tempfile.TemporaryDirectory() as d:  # dry run: every check, no stop
         kube, log = FakeKube(), []
