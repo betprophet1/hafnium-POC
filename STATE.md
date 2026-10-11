@@ -259,8 +259,12 @@ published view half"* means the chain has no start — publish one pair by hand 
 
 ## 8. What is not done
 
-- **Nothing schedules a journal cut.** It is three commands run by hand and it needs the node stopped, because
-  there is no lock on a journal, so it stays a deliberate act rather than a cron entry.
+- **A journal cut is a job you start, not one that runs unattended.** `core.cut` (`templates/journal-cut.yaml`,
+  `interfaces/tools/journal_cut.py`) does the three commands for you: it stops the core, embeds a snapshot at the
+  latest published pair, archives what the cut removes, cuts, and starts the core again, always, from a `finally`.
+  The core is **down for the duration**, and there is still no lock on a journal, which is why the CronJob is
+  suspended by default and each run is a deliberate `kubectl create job --from=cronjob/...`. It refuses, before
+  stopping anything, without a published pair to cut at or without room on the disk to stage the segment.
 - **No chart passes `--from-view`.** Founding works and is proven twice over, but no deployed service uses it, so
   every deploy still restarts readers into a replay. This is the largest remaining gap: it is what would make a
   deploy cost seconds rather than a full backlog.

@@ -1,0 +1,60 @@
+# The image that cuts a live venue's journal (deploy/images/venue-cut.Dockerfile, interfaces/tools/journal_cut.py).
+#
+# Manual, and built on a venue image you name, because which `venue-node` embeds the snapshot is a decision: it
+# must write the encoding the running core reads. A push does not build it.
+name: cut image
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: The venue image to build on, with its tag (ghcr.io/<owner>/venue:<tag>).
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A registry path may not carry capitals and a GitHub owner may; there is no `lower()` in an expression.
+      - name: The registry path, lower-cased
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/venue-cut" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/images/venue-cut.Dockerfile
+          build-args: BASE=${{ inputs.base }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+      # The orchestrator checks itself where it will run, and the three programs it shells out to are there. A
+      # self-test that passes against fakes says nothing about an image missing the real ones.
+      - name: The tool checks itself in the image
+        run: docker run --rm ${{ env.IMAGE }}:${{ github.sha }} --self-test
+
+      - name: The programs it runs are present
+        run: docker run --rm --entrypoint sh ${{ env.IMAGE }}:${{ github.sha }} -c 'command -v venue-node && command -v aws && command -v python3 && aws --version'
+
+      - name: Say what was built
+        run: |
+          {
+            echo "### Journal cut image"
+            echo '`${{ env.IMAGE }}:${{ github.sha }}`, on `${{ inputs.base }}`'
+            echo
+            echo 'Set `core.cut.image.tag` to the commit.'
+          } >> "$GITHUB_STEP_SUMMARY"

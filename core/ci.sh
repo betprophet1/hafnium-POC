@@ -26,6 +26,7 @@ python3 "$ROOT/interfaces/tools/audit_ship.py" --self-test
 python3 "$ROOT/interfaces/tools/snapshot_publish.py" --self-test
 python3 "$ROOT/interfaces/tools/snapshot_fetch.py" --self-test
 python3 "$ROOT/interfaces/tools/journal_ship.py" --self-test
+python3 "$ROOT/interfaces/tools/journal_cut.py" --self-test
 python3 "$ROOT/interfaces/tools/db_archive.py" --self-test
 
 # pg_dump refuses a server newer than itself, and nothing else here would notice: the database archiver's image
