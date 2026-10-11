@@ -67,7 +67,20 @@ impl OwnedMemory {
             position_touches: vec![((0, 0), 0, 0); c.touches],
             sleeve_touches: vec![(0, 0, (0, 0)); c.touches],
             level_touches: vec![((0, 0, 0), 0, (0, 0)); c.touches],
-            scratch: vec![(0, 0); c.orders.max(c.instruments).max(s(c.holdings) / 2).max(s(c.event_cash) / 2)],
+            // The engine requires the first four (`scratch_needed`); the snapshot writer also copies the whole
+            // command-ID window and the duplicate table through it, so those are sized in as well. Without them a
+            // venue whose window had filled past the order count panicked taking a snapshot (index out of bounds),
+            // with nothing in the engine's own check to say why. A working buffer: the snapshot bytes do not
+            // depend on its size.
+            scratch: vec![
+                (0, 0);
+                c.orders
+                    .max(c.instruments)
+                    .max(s(c.holdings) / 2)
+                    .max(s(c.event_cash) / 2)
+                    .max(c.commands)
+                    .max(c.duplicates)
+            ],
             marks: vec![(0, 0, 0); c.touches],
             undo: vec![Undo::default(); c.undo],
             check_orders: vec![CheckOrder::default(); c.orders],
@@ -130,6 +143,18 @@ mod tests {
     fn tables_sized_by_their_rules_build() {
         // The larger profiles take seconds to allocate in a debug build; the launch stress runs build them.
         assert_eq!(build(&mut OwnedMemory::new(&Capacities::small())), Ok(()));
+    }
+
+    /// The snapshot writer copies the whole command-ID window and duplicate table through the scratch array, and
+    /// the engine's own size check does not ask for room for them. In the small profile the window is four times
+    /// the order count, so a scratch sized only by the engine's rule overflowed once enough commands had been
+    /// seen: index 16384 of 16384, taking a snapshot of a live venue.
+    #[test]
+    fn scratch_has_room_for_every_entry_the_snapshot_writer_copies_through_it() {
+        let c = Capacities::small();
+        let owned = OwnedMemory::new(&c);
+        assert!(owned.scratch.len() >= c.commands, "command window: {} < {}", owned.scratch.len(), c.commands);
+        assert!(owned.scratch.len() >= c.duplicates, "duplicates: {} < {}", owned.scratch.len(), c.duplicates);
     }
 
     #[test]
