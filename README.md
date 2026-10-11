@@ -13,6 +13,18 @@ Architecture, specifications and the core prototype for the new ProphetX predict
 | [`AGENTS.md`](AGENTS.md) | How to work here, including what an implementation may never change | — |
 | [`docs/legacy-comparison.md`](docs/legacy-comparison.md) | How this architecture compares to ProphetX's current production venue: what it fixes, what production still does that this doesn't yet | People |
 
+## Try it
+
+You need no cloud account to run the venue. Pick the first that fits:
+
+1. **On a laptop, no account.** Docker, [k3d](https://k3d.io), Helm and kubectl, then `deploy/laptop.sh up` and
+   `deploy/laptop.sh web`, and open http://127.0.0.1:8080. It runs the same chart as everything else, with synthetic
+   makers and takers and a dummy oracle, so there are markets moving as soon as it is up (`deploy/README.md`).
+2. **On your own AWS account.** `deploy/aws/` makes one small box, DNS and certificates under a domain you own. It
+   names no one's account: you give it your own profile, domain and GitHub owner (`deploy/aws/README.md`).
+3. **Read it first.** The blueprint says why, `interfaces/` and `spec/engine/` say what, `STATE.md` says where
+   state lives, and `core/WORK_PACKAGES.md` says how the core is built and in what order.
+
 The published blueprint is at https://claude.ai/code/artifact/5e4d2278-46dd-4f2c-a617-da87c3ae0831.
 
 `STATE.md` maps where every kind of state lives, what a restart does with it, how it is archived, and how a test
@@ -25,7 +37,8 @@ environment is founded on a chosen snapshot rather than on genesis.
 ```
 
 That runs, in order: the blueprint's structure, consistency and figure checks; a gate that no change touches the
-engine together with the specification; a throwaway PostgreSQL in a container for the database tests, when Docker is
+engine together with the specification; a check that the tree names no particular person's owner, registry or domain;
+a throwaway PostgreSQL in a container for the database tests, when Docker is
 usable; the interface catalogue and a check that the committed codec matches the
 schema; the reference model against every scenario and on random sequences; the Rust formatting, lints and tests;
 the Rust engine against the scenarios and the reference model's differential vectors; a golden replay through
