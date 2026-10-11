@@ -119,7 +119,13 @@ pub fn take_after(
     };
 
     let engine_out = dir.join(ENGINE);
-    let (engine_at, _) = venue_node::snapshots::take(journal, &engine_out, at)?;
+    // The engine half carries on from the previous pair's, as the view half does from its view, so the replay
+    // covers what happened since that pair and not everything since the journal's own embedded snapshot — which on
+    // a venue that is not cut grows every day. The two halves of a pair are taken at the same sequence (checked
+    // below), so the previous engine half is exactly as far on as the previous view. Absent, or beyond `at`, it
+    // is simply not used.
+    let previous_engine = previous.and_then(Path::parent).map(|d| d.join(ENGINE)).filter(|p| p.exists());
+    let (engine_at, _) = venue_node::snapshots::take_from(journal, &engine_out, at, previous_engine.as_deref())?;
     let view = View::replayed_from(base, journal, &paired, at);
     if !borrowed {
         // A byproduct of taking the view half, not part of the pair.

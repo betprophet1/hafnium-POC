@@ -11,7 +11,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use venue_engine::snapshot::{Refused, STATE_VERSION};
 use venue_engine::{Engine, PROTOCOL_VERSION};
@@ -36,19 +36,20 @@ fn sequence_of(frame: &[u8]) -> Option<u64> {
 ///
 /// A `Snapshot` frame already in the journal (from an earlier `embed`) is skipped rather than applied, the same
 /// way every reader of a journal skips one: it is not an input.
-fn compute(journal: &Path, at: Option<u64>) -> Result<(String, u64, Vec<u8>), Error> {
+///
+/// `base` is a snapshot file from an earlier `take` (the engine half of a published pair). When it is further on
+/// than the journal's own embedded snapshot, and not beyond `at`, the replay restores from it instead, so the work
+/// is proportional to what happened since the *previous* snapshot and not since the last cut (E-20.9: restoring
+/// gives the same state as replaying what it covers).
+fn compute(journal: &Path, at: Option<u64>, base: Option<&Path>) -> Result<(String, u64, Vec<u8>), Error> {
     let (profile, capacities) = journal_profile(journal)?;
     let mut owned = OwnedMemory::new(&capacities);
     let group = group_of(journal)?;
     let mut engine =
         Engine::new(engine_config(group)?, owned.memory()).map_err(|e| format!("engine construction: {e:?}"))?;
 
-    // Results are wanted by nobody here, but the engine must have somewhere to put them. This goes in a temp
-    // directory rather than beside the journal: taking a snapshot is otherwise a read-only operation on a data
-    // directory, and writing scratch into it is what would stop a scheduled job from mounting a live venue's
-    // volume read-only. The name carries the process id because two of these may run at once.
-    let scratch = std::env::temp_dir().join(format!("venue-snapshot-scratch-{}.tmp", std::process::id()));
-    let mut sink = BufWriter::new(File::create(&scratch)?);
+    // Results are wanted by nobody here, but the engine must have somewhere to put them.
+    let (mut sink, scratch) = scratch_sink()?;
 
     // Where to begin. A journal that has been `cut` no longer starts at sequence 1 — its first real input is
     // whatever followed the snapshot it was cut to — so replaying it through a *fresh* engine fail-stops on
@@ -56,9 +57,15 @@ fn compute(journal: &Path, at: Option<u64>) -> Result<(String, u64, Vec<u8>), Er
     // to know it too, and the same embedded snapshot is what makes it possible. Restoring is also simply
     // cheaper on a journal that has one, cut or not: the work becomes proportional to what has happened since,
     // which is what a snapshot is for. E-20.9 is what says the two give the same state.
-    let restored_to = match latest(journal)? {
-        Some((sequence, frame)) if at.is_none_or(|stop| sequence <= stop) => restore_into(&mut engine, &frame)?,
-        _ => 0,
+    let within = |found: Option<(u64, Vec<u8>)>| found.filter(|(sequence, _)| at.is_none_or(|stop| *sequence <= stop));
+    let embedded = within(latest(journal)?);
+    let carried = match base {
+        Some(path) => within(read_snapshot_file(path)?),
+        None => None,
+    };
+    let restored_to = match [embedded, carried].into_iter().flatten().max_by_key(|(sequence, _)| *sequence) {
+        Some((_, frame)) => restore_into(&mut engine, &frame)?,
+        None => 0,
     };
 
     let mut reader = BufReader::new(File::open(journal)?);
@@ -93,7 +100,9 @@ fn compute(journal: &Path, at: Option<u64>) -> Result<(String, u64, Vec<u8>), Er
         .into());
     }
     drop(sink);
-    let _ = std::fs::remove_file(&scratch);
+    if let Some(scratch) = scratch {
+        let _ = std::fs::remove_file(scratch);
+    }
 
     let (sequence, when) = engine.position();
     if let Some(stop) = at {
@@ -109,13 +118,44 @@ fn compute(journal: &Path, at: Option<u64>) -> Result<(String, u64, Vec<u8>), Er
     Ok((profile, sequence, frame))
 }
 
+/// Where the engine's results go while a snapshot is computed, which is nowhere: nobody reads them. `/dev/null`
+/// where there is one, so the replay's cost is the replay and not a result log as large as the work it covers
+/// (a pod's scratch volume is what that filled, and evicted). Elsewhere a temp file, which the caller removes. This
+/// is never beside the journal: taking a snapshot is otherwise a read-only operation on a data directory.
+fn scratch_sink() -> Result<(BufWriter<File>, Option<PathBuf>), Error> {
+    if let Ok(null) = OpenOptions::new().write(true).open("/dev/null") {
+        return Ok((BufWriter::new(null), None));
+    }
+    // The name carries the process id because two of these may run at once.
+    let scratch = std::env::temp_dir().join(format!("venue-snapshot-scratch-{}.tmp", std::process::id()));
+    Ok((BufWriter::new(File::create(&scratch)?), Some(scratch)))
+}
+
+/// The one `Snapshot` frame in a file written by `take`, with the sequence it describes.
+fn read_snapshot_file(path: &Path) -> Result<Option<(u64, Vec<u8>)>, Error> {
+    let mut reader = BufReader::new(File::open(path).map_err(|e| format!("snapshot {}: {e}", path.display()))?);
+    let mut buf = Vec::new();
+    let Some(n) = read_frame(&mut reader, &mut buf)? else { return Ok(None) };
+    if template_of(&buf[..n]) != Some(SNAPSHOT) {
+        return Err(format!("{} does not hold a Snapshot (template 53)", path.display()).into());
+    }
+    let at = sequence_of(&buf[..n]).ok_or("a Snapshot frame with no record header")?;
+    Ok(Some((at, buf[..n].to_vec())))
+}
+
 /// Replays `journal` and writes a snapshot of the state after sequence `at` — or after the last input, when `at`
 /// is `None` — into `out`. Returns the sequence it was taken at and how many bytes the state took.
 ///
 /// The engine is thrown away afterwards. Nothing is written to the journal being read: a snapshot belongs in the
 /// stream a *writer* is appending to, and this is a reader. `embed` is the writer this is beside.
 pub fn take(journal: &Path, out: &Path, at: Option<u64>) -> Result<(u64, usize), Error> {
-    let (profile, sequence, frame) = compute(journal, at)?;
+    take_from(journal, out, at, None)
+}
+
+/// The same, restoring from `base` — an earlier snapshot file, such as the engine half of the previously published
+/// pair — when it is further on than anything the journal embeds. A `base` beyond `at` is ignored, not an error.
+pub fn take_from(journal: &Path, out: &Path, at: Option<u64>, base: Option<&Path>) -> Result<(u64, usize), Error> {
+    let (profile, sequence, frame) = compute(journal, at, base)?;
     let len = frame.len();
     let mut file = BufWriter::new(File::create(out)?);
     write_frame(&mut file, &frame)?;
@@ -136,7 +176,7 @@ pub fn take(journal: &Path, out: &Path, at: Option<u64>) -> Result<(u64, usize),
 /// instance lock), so running this against one a node is still appending to races that writer; the discipline is
 /// the same one interface's "one live process per instance" already asks for, just not yet enforced here.
 pub fn embed(journal: &Path, at: Option<u64>) -> Result<(u64, usize), Error> {
-    let (profile, sequence, frame) = compute(journal, at)?;
+    let (profile, sequence, frame) = compute(journal, at, None)?;
     let len = frame.len();
     let mut file = BufWriter::new(OpenOptions::new().append(true).open(journal)?);
     write_frame(&mut file, &frame)?;
