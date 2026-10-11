@@ -24,7 +24,7 @@ spec:
   generators:
     - pullRequest:
         github:
-          owner: LordNacho
+          owner: YOUR_GITHUB_ORG  # was: LordNacho
           repo: prediction-exchange
           tokenRef:
             secretName: venue-github-token
@@ -51,7 +51,7 @@ spec:
     spec:
       project: venue-previews
       source:
-        repoURL: https://github.com/LordNacho/prediction-exchange.git
+        repoURL: https://github.com/YOUR_GITHUB_ORG/prediction-exchange.git  # was: LordNacho
         targetRevision: "{{ .head_sha }}"
         path: deploy/charts/venue-mini
         helm:
@@ -107,7 +107,7 @@ spec:
             # testing the wrong binary. The workflow in .github/workflows/preview-image.yml puts it there, tagged
             # with the same head this Application is rendered from, so the chart and the code move together.
             - name: image.repository
-              value: ghcr.io/lordnacho/venue
+              value: ghcr.io/your-github-org/venue  # was: lordnacho (lower case, as ghcr.io requires)
             - name: image.tag
               value: "{{ .head_sha }}"
             # A tag here is a commit, so it never comes to mean a different image and there is nothing to re-pull;

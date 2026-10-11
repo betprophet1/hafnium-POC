@@ -9,7 +9,7 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "icon": "./assets/expo.icon",
-      "bundleIdentifier": "ltd.hafnium.pmex"
+      "bundleIdentifier": "com.example.venue"
     },
     "android": {
       "adaptiveIcon": {
@@ -19,7 +19,7 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
-      "package": "ltd.hafnium.pmex"
+      "package": "com.example.venue"
     },
     "web": {
       "output": "static",

@@ -97,12 +97,16 @@ Android emulator reaches its host as `10.0.2.2`; neither can use `127.0.0.1`, wh
 
 ## Against the venue on AWS
 
-The deployed venue is `https://pmex.hafnium.ltd`, with a certificate a phone will accept, so nothing here needs a
-cleartext exception or an address on somebody's network:
+A venue deployed with `deploy/aws/` answers on the `domain` it was given, with a certificate a phone will accept, so
+nothing here needs a cleartext exception or an address on somebody's network. `venue.example.com` below stands for
+that domain (the original deployment's was `pmex.hafnium.ltd`):
 
 ```sh
-echo 'EXPO_PUBLIC_VENUE_URL=https://pmex.hafnium.ltd' > .env.local
+echo 'EXPO_PUBLIC_VENUE_URL=https://venue.example.com' > .env.local
 ```
+
+The bundle identifier in `app.json` (`com.example.venue`, for iOS and Android) is a placeholder: set it to one you
+own before building for a device (the original was `ltd.hafnium.pmex`).
 
 `EXPO_PUBLIC_*` is read at bundle time, not at launch, so a build made before that file existed keeps pointing where
 it was built — change it and build again rather than restarting the app.

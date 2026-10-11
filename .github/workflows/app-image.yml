@@ -22,7 +22,7 @@ on:
       venue_url:
         description: The venue the bundle is built to talk to.
         required: true
-        default: https://pmex.hafnium.ltd
+        default: https://venue.example.com  # was: https://pmex.hafnium.ltd
 
 permissions:
   contents: read
@@ -46,7 +46,7 @@ jobs:
       # `EXPO_PUBLIC_*` is inlined into the bundle at export, so the venue an image talks to is decided here and not
       # on the pod. A push builds against the live venue; a manual run may say otherwise.
       - name: The venue this bundle will talk to
-        run: echo "VENUE_URL=${{ inputs.venue_url || 'https://pmex.hafnium.ltd' }}" >> "$GITHUB_ENV"
+        run: echo "VENUE_URL=${{ inputs.venue_url || 'https://venue.example.com' }}" >> "$GITHUB_ENV"
 
       - uses: docker/setup-buildx-action@v3
 

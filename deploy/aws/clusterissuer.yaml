@@ -6,7 +6,7 @@
 # serves it.
 #
 # The cost is a certificate per preview, and Let's Encrypt counts its limits against the registered domain —
-# phantu.xyz, not pmex.phantu.xyz — so previews share a weekly quota of 50 with anything else issued on that domain.
+# example.com, not venue.example.com — so previews share a weekly quota of 50 with anything else issued on that domain.
 # At an eight-hour time limit that is roughly seven previews a day before it bites. If it ever does, the answer is
 # the wildcard and the credential that comes with it.
 #
