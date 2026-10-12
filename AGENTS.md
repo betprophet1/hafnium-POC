@@ -25,6 +25,11 @@ agent needs to build its core, and the core itself. Read this before changing an
 | `core/identity/` | The identity service of test environments: API keys with permissions behind the gateway's `/v4/keys`, kept hashed in an append-only store, and verified for the gateways. Its decisions are `interfaces/gateway/decisions.md`. Test environments only. |
 | `core/parlays/` | The parlay service: lists parlays, keeps the approved responders, routes requests for quote to those that subscribe, and settles each parlay from its legs. Test environments only. |
 | `core/sim/` | The mini venue's actors: synthetic makers (which also answer requests for quote) and takers, the dummy oracle and its calendar, demo markets and the web page. Test environments only. |
+| `core/observer/` | `venue-observer`: follows a node's feed like any downstream reader and derives the metrics the dashboards and alerts need (latency per hop, flow, fees, capacity headroom). Never talks to the engine and never writes to the node. |
+| `core/telemetry/` | Metrics and logs for the venue's processes (`deploy/observability/metrics.md`). Outside the engine, always: the engine gains no metrics code. |
+| `deploy/` | The mini-venue Helm chart and its images, the laptop cluster (`laptop.sh`), the AWS box (`aws/`), ArgoCD preview environments (`argocd/`) and observability. Deploying and operating the venue is `deploy/README.md`; what is on the disks and what a restart does is `STATE.md`. |
+| `STATE.md` | Where every kind of state lives, what a restart does with it, how the journal is snapshotted, archived and cut, and what is not done. |
+| `docs/` | Architecture decision records (`docs/adr/`) and the comparison with the current production venue (`docs/legacy-comparison.md`). |
 | `apps/retail/` | The retail app: one Expo project for the web, iOS and Android. `src/venue/` is the venue client with no React in it, tested in Node; `src/app/` is the screens. Test environments only. |
 | `adapters/fix/` | Interface 4, the FIX 4.4 adapter (Java, Artio) in front of the gateway's private half; its dialect is `interfaces/fix/`. Not part of the Rust workspace: `bootstrap.sh` fetches its JDK and Gradle, `test.sh` runs its integration test, `scripts/fix-shell.py` is a console for trying it by hand. |
 | `core/prototypes/` | Experiments behind blueprint claims. Learn from them; nothing depends on them. |
@@ -71,7 +76,8 @@ python3 spec/engine/reference/fuzz.py --seeds 50 --steps 300           # invaria
 (cd core && cargo run -p venue-harness --bin run-scenarios -- target/compiled target/differential)
 ```
 
-`./check` must pass before a change is proposed. Set `ENGINE_REQUIRED=1` once work package WP-5 has landed.
+`./check` must pass before a change is proposed. Engine results are required to pass by default; set
+`ENGINE_REQUIRED=0` to report them without failing, for work on the engine itself.
 Its last step, the FIX adapter's integration test, runs only once `adapters/fix/bootstrap.sh` has fetched the Java
 toolchain and is skipped otherwise; a change that touches the gateway's private half or `adapters/fix/` should run
 it. Each gateway test starts a node of its own, so `core/ci.sh` defaults `RUST_TEST_THREADS=4` for the workspace
