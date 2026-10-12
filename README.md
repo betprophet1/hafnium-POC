@@ -10,8 +10,15 @@ Architecture, specifications and the core prototype for the new ProphetX predict
 | [`core/`](core/) | The Rust core: engine, single-member node, test harness, generated codec, prototypes, CI gates and the work packages that build it | People and coding agents, against the gates |
 | [`adapters/`](adapters/) | Protocol adapters outside the Rust core: the FIX 4.4 adapter on Artio, in Java | People and coding agents, against the gates |
 | [`deploy/`](deploy/) | The mini-venue Helm chart, the core's image and the one-command laptop cluster | People and coding agents |
+| [`STATE.md`](STATE.md) | Where every kind of state lives, what a restart does with it, how it is archived and cut | People and coding agents |
+| [`docs/adr/`](docs/adr/) | Architecture decision records, with the measurements behind them | People |
 | [`AGENTS.md`](AGENTS.md) | How to work here, including what an implementation may never change | — |
 | [`docs/legacy-comparison.md`](docs/legacy-comparison.md) | How this architecture compares to ProphetX's current production venue: what it fixes, what production still does that this doesn't yet | People |
+
+**Test environments.** The treasury, identity service, oracle and the synthetic makers and takers are stand-ins for a
+demo venue, and its demo accounts use published development tokens (`deploy/charts/venue-mini/files/markets.json`,
+decision G-9 in `interfaces/gateway/decisions.md`). They are meant to be public. Nothing in this repository is a
+production credential.
 
 ## Try it
 
@@ -25,7 +32,8 @@ You need no cloud account to run the venue. Pick the first that fits:
 3. **Read it first.** The blueprint says why, `interfaces/` and `spec/engine/` say what, `STATE.md` says where
    state lives, and `core/WORK_PACKAGES.md` says how the core is built and in what order.
 
-The published blueprint is at https://claude.ai/code/artifact/5e4d2278-46dd-4f2c-a617-da87c3ae0831.
+The blueprint is a single HTML page: open [`blueprint/prediction-exchange.html`](blueprint/prediction-exchange.html)
+in a browser. It needs no server and no scripts; it only fetches web fonts, and falls back to system fonts offline.
 
 `STATE.md` maps where every kind of state lives, what a restart does with it, how it is archived, and how a test
 environment is founded on a chosen snapshot rather than on genesis.
