@@ -129,6 +129,38 @@ fn carrying_on_from_a_view_is_the_same_as_never_having_stopped() {
     );
 }
 
+/// The engine half carries on from the previous pair's, not from the journal's own snapshot, so a venue that is
+/// never cut does not replay everything since the last cut on every run (which, with the replay's results, is
+/// what filled a pod's scratch volume). It must give the *same bytes* the whole history gives, and it must be
+/// the previous engine half that is read: a corrupt one is refused rather than quietly replayed around.
+#[test]
+fn the_engine_half_carries_on_from_the_previous_pair() {
+    let dir = prepared("engine-carry");
+    let (journal, results) = (dir.join("journal.sbe"), dir.join("results.sbe"));
+    const AT: u64 = 90;
+
+    let whole = dir.join("whole");
+    pair::take(&journal, &whole, Some(AT), Some(&results)).expect("a pair from the whole history");
+    let first = dir.join("first");
+    pair::take(&journal, &first, Some(62), Some(&results)).expect("the first pair");
+
+    let carried = dir.join("carried");
+    pair::take_after(Some(&first.join(pair::VIEW)), &journal, &carried, Some(AT), Some(&results))
+        .expect("a pair carrying on from the first");
+    assert_eq!(
+        std::fs::read(carried.join(pair::ENGINE)).expect("the carried engine half"),
+        std::fs::read(whole.join(pair::ENGINE)).expect("the whole-history engine half"),
+        "carrying on from the previous engine half did not reproduce the one the whole history gives"
+    );
+
+    // Proof that the previous half is what was used: damage it and the same call must refuse.
+    std::fs::write(first.join(pair::ENGINE), b"not a snapshot at all").expect("damaged");
+    let again = dir.join("again");
+    let refused = pair::take_after(Some(&first.join(pair::VIEW)), &journal, &again, Some(AT), Some(&results))
+        .expect_err("a corrupt previous engine half was accepted");
+    assert!(!refused.to_string().is_empty());
+}
+
 /// An uncut journal still needs nothing, so the requirement is a consequence of cutting rather than a new tax
 /// on everybody.
 #[test]
