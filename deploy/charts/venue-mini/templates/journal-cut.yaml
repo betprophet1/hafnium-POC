@@ -128,6 +128,11 @@ spec:
                 # No credentials: the instance role through the metadata service, as the other shippers do.
                 - name: AWS_REGION
                   value: {{ $c.region | quote }}
+                # Where every temporary file goes. Shipping verifies an upload by downloading it back, so the
+                # largest object — the result log, ~10 GB on a venue never cut — is written out a second time. The
+                # first run's temp directory was the small `tmp` volume below and the pod was evicted for it.
+                - name: TMPDIR
+                  value: /work
                 - name: HOME
                   value: /tmp
               resources:
