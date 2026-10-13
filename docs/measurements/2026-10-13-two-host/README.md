@@ -82,6 +82,20 @@ read their messages. That is the cost of simulating that many clients, not a lea
 - **Housekeeping:** both boxes, the security group and the key pair were removed, and the account was checked
   afterwards. In total the boxes cost about $1.30.
 
+## Reproduce
+
+`deploy/loadtest/loadtest.sh` runs exactly this, and its README says what you need and what it costs:
+
+```sh
+export AWS_PROFILE=<your profile>
+deploy/loadtest/loadtest.sh all results/run          # about 25 minutes, about 80 cents
+python3 -I docs/measurements/2026-10-13-two-host/aggregate.py results/run
+```
+
+The scripts here ran from a scratch directory before that tool existed. `loadtest.sh` uses the same remote scripts
+and the same sequence, with the settings it took two attempts to find as its defaults: an on-demand client, and a
+c6i.4xlarge client to fit a 64-vCPU limit.
+
 ## Files
 
 | file | what |
