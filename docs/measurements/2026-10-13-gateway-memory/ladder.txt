@@ -1,0 +1,12 @@
+=== retail=0 ===
+32 connection(s) over 8 instrument(s), 2909641 requests in 60344 ms: 48217 messages/s; round trip µs p50 502.196 p90 719.737 p99 4468.250 p99.9 6927.710 max 157445.420; 8 maker(s), 76755 fills, 1271 fills/s; 1077768 taker orders, 76755 traded (1:14), 969981 cancels; 8 watcher(s) took 18928 messages, 313/s
+    gateway VmHWM_kb=182828 VmRSS_kb=182828 client_load=8.13 8.30 4.37
+=== retail=1024 ===
+32 connection(s) over 8 instrument(s), 3013701 requests in 60400 ms: 49895 messages/s; round trip µs p50 502.594 p90 723.905 p99 3971.234 p99.9 7814.717 max 130077.952; 8 maker(s), 80184 fills, 1327 fills/s; 1112665 taker orders, 80184 traded (1:13), 1001389 cancels; 1024 retail took 921008 messages, 15248/s (899 each), sent 6101 orders, 6098 fills, p50 1365.848 p99 52705.594, 0 dropped; 8 watcher(s) took 19088 messages, 316/s
+    gateway VmHWM_kb=297492 VmRSS_kb=267004 client_load=10.37 8.67 4.83
+=== retail=4096 ===
+32 connection(s) over 8 instrument(s), 2950018 requests in 60480 ms: 48776 messages/s; round trip µs p50 507.652 p90 769.018 p99 4468.055 p99.9 7873.395 max 133083.177; 8 maker(s), 80536 fills, 1331 fills/s; 1101423 taker orders, 80536 traded (1:13), 991267 cancels; 4096 retail took 3668019 messages, 60648/s (895 each), sent 24316 orders, 24298 fills, p50 1809.929 p99 23405.079, 0 dropped; 8 watcher(s) took 18686 messages, 308/s
+    gateway VmHWM_kb=502344 VmRSS_kb=502344 client_load=9.70 8.53 5.09
+=== retail=16384 ===
+32 connection(s) over 8 instrument(s), 2395477 requests in 61020 ms: 39257 messages/s; round trip µs p50 529.719 p90 1178.162 p99 4694.331 p99.9 11921.128 max 190329.985; 8 maker(s), 65752 fills, 1077 fills/s; 874280 taker orders, 65752 traded (1:13), 786841 cancels; 16384 retail took 13056788 messages, 213975/s (796 each), sent 95456 orders, 95363 fills, p50 13121.666 p99 163479.088, 0 dropped; 8 watcher(s) took 16879 messages, 276/s
+    gateway VmHWM_kb=794800 VmRSS_kb=598176 client_load=15.69 10.36 6.01
