@@ -68,6 +68,62 @@ The server samples the gateway's and the node's memory once a second, and the cl
 each load the server also records the gateway's feed-apply cost, any "too far behind", the audit log's size, and the
 gateway's peak memory and threads.
 
+## What the traffic looks like
+
+The generator (`venue-sim gwload`, `core/sim/src/gwload.rs`) has four kinds of client. The figures are from the
+two-host run of 2026-10-13 (`docs/measurements/2026-10-13-two-host/client.txt`).
+
+| client | what it does | sockets |
+|---|---|---|
+| **Market maker** (a quarter of the trading connections) | rests a sell on its book and keeps amending it back to size, so the takers never run out of liquidity | 1, private |
+| **Taker** (the other three quarters) | nine passive post-only buys a few ticks behind the makers, each cancelled before the next, then one order that crosses: about 10 orders per trade. An algorithmic account's shape, not an app user's | 1, private |
+| **Retail client** (`--retail`, ladder only) | logged in and subscribed to the book of 2 of the 8 markets, weighted towards the popular one; reads market data continuously and sends one order every 10 seconds | 2, private and public |
+| **Watcher** (`--watchers`, ladder only) | subscribes to every book and only reads: an API customer following the whole venue | 1, public |
+
+**The representative load is all professional traffic.** At 128 connections (32 makers, 96 takers) the 60k
+requests a second split into about 17.7k maker amends (29%), 22.3k taker orders and 20.1k cancels (71%), for about
+2,170 trades a second.
+
+**The ladder adds retail on top of 32 professional connections** (8 makers, 24 takers). At 16,384 retail clients:
+
+| | professional (32 connections) | retail (16,384 clients) |
+|---|---|---|
+| orders in | about 33.5k requests a second | about 1.6k orders a second (one per client every ~10 s) |
+| trades | about 940 fills a second | about 1,560 fills a second (nearly every retail order fills) |
+| market data out | 8 watchers, about 280 messages a second | about 213k messages a second (about 13 a second per client) |
+
+So retail is 4–5% of the order messages but about 60% of the trades, and almost all the outbound market data. The
+gateway's cost of retail is fanning book updates out to tens of thousands of sockets. That is where the memory per
+client goes, and why professional throughput fell 16% from 0 to 16,384 clients.
+
+**These proportions are assumptions, not production data.** They were chosen when ADR-0002 was written:
+- makers as a quarter of connections
+- ten orders per trade
+- one retail order every ten seconds
+- two markets per retail client
+- retail orders that cross
+
+Each is a generator flag (`--makers`, `--orders-per-trade`, `--retail-order-seconds`, `--retail-books`,
+`--retail`, `--watchers`). `loadtest.sh` does not take them as settings: they are written into its `run` step, so
+change them there. To make the test describe ProphetX traffic, take the real figures from the current production
+venue (orders per second by kind of client, order-to-trade ratio, sessions per user, markets followed) and set them.
+
+## How many connections, so far
+
+| kind | most tested | result |
+|---|---|---|
+| Retail clients | 16,384 (about 32,850 sockets on the gateway) | none dropped; 213k market-data messages a second delivered; gateway peak 816 MB |
+| Active trading connections | 128 here; 256 in ADR-0002's older runs | throughput levels off at about 60k messages a second; more connections queue rather than add capacity |
+
+**No connection limit has been found yet.** Nothing gave out at the top rung. The gateway's memory per retail
+client fell to about 40 KB there, but extending that to larger populations would be a guess. What is likely to
+bind first, none of it measured:
+- professional throughput under heavy retail load (−16% at 16,384 clients);
+- the gateway's thread count, which rose from 25 to 166 at the top rung for reasons nobody has looked into;
+- the test itself. One client box can hold only about 30,000 retail clients: two sockets each, against about
+  64,000 local ports. Going higher needs several client boxes, which `loadtest.sh` does not do yet, and more vCPUs
+  than a 64-vCPU on-demand limit allows.
+
 ## Reading the results
 
 `fetch` writes, for the full run: `client.txt` (the generator's report for each load, and the client's load
