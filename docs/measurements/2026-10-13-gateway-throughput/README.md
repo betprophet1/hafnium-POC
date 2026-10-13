@@ -60,9 +60,13 @@ replicate (two 60-second runs).
 
 ## Reproduce
 
-Use the scripts in `docs/adr/measurements/` (`launch2.sh`, `provision2.sh`, `real.sh`, `allreal.sh`). What was
-changed for this run, and nothing else: one host instead of two; on-demand in a chosen zone after spot capacity
-failed; only the three binaries built; one arm in `allreal.sh`. Then:
+**To measure the gateway today, use `deploy/loadtest/` instead** (README there). It runs this same load with the
+generator on a box of its own, which this run did not. On one box the 32-connection figure comes out about a third
+higher than across a network (`../2026-10-13-two-host/`), so compare a new number with that record, not this one.
+
+To repeat exactly this single-host run, use the scripts in `docs/adr/measurements/` (`launch2.sh`,
+`provision2.sh`, `real.sh`, `allreal.sh`). What was changed for this run, and nothing else: one host instead of two;
+on-demand in a chosen zone after spot capacity failed; only the three binaries built; one arm in `allreal.sh`. Then:
 
 ```sh
 python3 -I aggregate.py . ../../adr/measurements   # this run against ADR-0002's real-fix-* runs

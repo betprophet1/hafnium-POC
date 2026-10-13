@@ -1,0 +1,33 @@
+=== rep1-trade32 ===
+32 connection(s) over 8 instrument(s), 2353211 requests in 60011 ms: 39212 messages/s; round trip µs p50 634.374 p90 830.659 p99 4823.319 p99.9 6957.718 max 127052.576; 8 maker(s), 65072 fills, 1084 fills/s; 913143 taker orders, 65072 traded (1:14), 821818 cancels
+    client_load=1.12 0.71 0.29
+=== rep1-trade128 ===
+128 connection(s) over 8 instrument(s), 3601316 requests in 60021 ms: 60000 messages/s; round trip µs p50 1891.021 p90 2732.831 p99 6001.842 p99.9 34000.863 max 179626.086; 32 maker(s), 130293 fills, 2170 fills/s; 1337450 taker orders, 130293 traded (1:10), 1203652 cancels
+    client_load=1.04 0.79 0.35
+=== rep2-trade32 ===
+32 connection(s) over 8 instrument(s), 2355381 requests in 60009 ms: 39250 messages/s; round trip µs p50 639.883 p90 816.927 p99 4791.660 p99.9 6123.840 max 127225.841; 8 maker(s), 68046 fills, 1133 fills/s; 942246 taker orders, 68046 traded (1:13), 848008 cancels
+    client_load=1.50 0.99 0.45
+=== rep2-trade128 ===
+128 connection(s) over 8 instrument(s), 3573040 requests in 60019 ms: 59531 messages/s; round trip µs p50 1867.169 p90 2648.428 p99 6333.129 p99.9 47766.202 max 196874.742; 32 maker(s), 130899 fills, 2180 fills/s; 1337837 taker orders, 130899 traded (1:10), 1204003 cancels
+    client_load=1.05 0.95 0.47
+=== rep3-trade32 ===
+32 connection(s) over 8 instrument(s), 2386827 requests in 60010 ms: 39773 messages/s; round trip µs p50 622.365 p90 812.451 p99 4833.071 p99.9 6910.004 max 146153.682; 8 maker(s), 65396 fills, 1089 fills/s; 924537 taker orders, 65396 traded (1:14), 832070 cancels
+    client_load=1.33 1.01 0.53
+=== rep3-trade128 ===
+128 connection(s) over 8 instrument(s), 3570909 requests in 60019 ms: 59496 messages/s; round trip µs p50 1911.393 p90 2725.078 p99 6190.891 p99.9 31532.162 max 142870.010; 32 maker(s), 130741 fills, 2178 fills/s; 1335775 taker orders, 130741 traded (1:10), 1202148 cancels
+    client_load=1.48 1.13 0.60
+=== ladder-0 ===
+32 connection(s) over 8 instrument(s), 2394632 requests in 60010 ms: 39903 messages/s; round trip µs p50 605.835 p90 791.525 p99 4874.301 p99.9 6882.513 max 161934.799; 8 maker(s), 65559 fills, 1092 fills/s; 932533 taker orders, 65559 traded (1:14), 839266 cancels; 8 watcher(s) took 19216 messages, 320/s
+    client_load=1.16 1.08 0.63
+=== ladder-1024 ===
+32 connection(s) over 8 instrument(s), 2306977 requests in 60066 ms: 38407 messages/s; round trip µs p50 640.376 p90 831.977 p99 4803.718 p99.9 6676.326 max 125891.475; 8 maker(s), 63341 fills, 1054 fills/s; 898504 taker orders, 63341 traded (1:14), 808640 cancels; 1024 retail took 945548 messages, 15741/s (923 each), sent 6080 orders, 6077 fills, p50 1507.157 p99 21123.830, 0 dropped; 8 watcher(s) took 19114 messages, 318/s
+    client_load=0.71 0.94 0.62
+=== ladder-4096 ===
+32 connection(s) over 8 instrument(s), 2278711 requests in 60227 ms: 37835 messages/s; round trip µs p50 630.886 p90 881.786 p99 4866.787 p99.9 7124.853 max 128633.343; 8 maker(s), 63235 fills, 1049 fills/s; 886505 taker orders, 63235 traded (1:14), 797840 cancels; 4096 retail took 3676428 messages, 61042/s (897 each), sent 24403 orders, 24395 fills, p50 2293.331 p99 24738.904, 0 dropped; 8 watcher(s) took 18800 messages, 312/s
+    client_load=3.30 1.64 0.89
+=== ladder-16384 ===
+32 connection(s) over 8 instrument(s), 2034459 requests in 60803 ms: 33459 messages/s; round trip µs p50 683.191 p90 1239.047 p99 4926.628 p99.9 11966.494 max 130410.033; 8 maker(s), 57439 fills, 944 fills/s; 808510 taker orders, 57439 traded (1:14), 727645 cancels; 16384 retail took 12947491 messages, 212941/s (790 each), sent 94732 orders, 94677 fills, p50 8549.119 p99 66663.292, 0 dropped; 8 watcher(s) took 16928 messages, 278/s
+    client_load=3.16 1.98 1.07
+=== soak ===
+128 connection(s) over 8 instrument(s), 17503570 requests in 300070 ms: 58331 messages/s; round trip µs p50 1825.572 p90 2676.514 p99 6390.379 p99.9 128564.189 max 205485.875; 32 maker(s), 633167 fills, 2110 fills/s; 6486123 taker orders, 633167 traded (1:10), 5837462 cancels
+    client_load=1.39 1.57 1.17

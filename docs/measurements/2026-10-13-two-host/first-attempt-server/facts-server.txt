@@ -1,0 +1,4 @@
+kernel: Linux 7.0.0-1014-aws
+cpu: Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz
+vcpus: 32
+memory: 61 GiB

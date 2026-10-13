@@ -17,6 +17,7 @@ through ArgoCD. There is no compose file; the laptop runs the same chart.
 | `images/venue-app.Dockerfile`, `images/venue-app.nginx.conf` | The image `venue-app`: the retail app (`apps/retail`) exported for the web and served by nginx, for the demo at `app.<domain>` |
 | `charts/venue-app/` | That page on a hostname of its own: a Deployment, a Service and an Ingress, and nothing else — it talks to no service in the cluster |
 | `laptop.sh` | `up`, `web`, `expose`, `scale`, `restart` and `down` for a local k3d cluster, its API on loopback |
+| `loadtest/` | Throughput and memory of the gateway under load, on two throwaway EC2 boxes (`loadtest.sh all DIR`). Never on a laptop: see its README |
 
 ## On a laptop
 

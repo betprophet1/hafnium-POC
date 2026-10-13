@@ -43,6 +43,8 @@ pub struct Session {
     next_id: u64,
     last_sent: Instant,
     heartbeat: Duration,
+    /// False once the caller has said it will never read anything but replies (`discard_unsolicited`).
+    keep_unsolicited: bool,
 }
 
 impl Session {
@@ -53,7 +55,14 @@ impl Session {
         let (socket, _) = tungstenite::client(format!("ws://{gateway}{path}"), stream)
             .map_err(|e| format!("websocket handshake: {e}"))?;
         socket.get_ref().set_read_timeout(Some(Duration::from_millis(50)))?;
-        Ok(Self { socket, inbox: VecDeque::new(), next_id: 0, last_sent: monotonic(), heartbeat })
+        Ok(Self {
+            socket,
+            inbox: VecDeque::new(),
+            next_id: 0,
+            last_sent: monotonic(),
+            heartbeat,
+            keep_unsolicited: true,
+        })
     }
 
     /// A session on the public endpoint, for market data: no login. It heartbeats anyway, so a gateway that has gone
@@ -81,7 +90,18 @@ impl Session {
         Ok(())
     }
 
-    /// Sends a request and waits for the message answering it; every other message is kept for `poll`.
+    /// For a caller that only ever makes requests and never reads anything else: the load generator's trading loops.
+    /// Every order update and fill the gateway pushes on the session would otherwise wait in the inbox for a `poll`
+    /// that never comes, and a minute of load held about ten gigabytes that way
+    /// (docs/measurements/2026-10-13-gateway-memory). After this, `request` drops what is not its reply.
+    /// Not for a caller that polls: the synthetic maker reads its fills from the inbox.
+    pub fn discard_unsolicited(&mut self) {
+        self.keep_unsolicited = false;
+        self.inbox.clear();
+    }
+
+    /// Sends a request and waits for the message answering it; every other message is kept for `poll`, unless the
+    /// caller has asked for it to be discarded.
     pub fn request(&mut self, mut message: Value) -> Result<Value, Error> {
         self.next_id += 1;
         let id = format!("r{}", self.next_id);
@@ -93,7 +113,9 @@ impl Session {
                 if m["id"] == id.as_str() {
                     return Ok(m);
                 }
-                self.inbox.push_back(m);
+                if self.keep_unsolicited {
+                    self.inbox.push_back(m);
+                }
             }
         }
         Err("the gateway did not answer within 10 s".into())
@@ -151,5 +173,57 @@ impl Session {
             }
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    /// A gateway that answers each request only after pushing `noise` unsolicited messages, the way a busy session
+    /// gets order updates and fills between its replies.
+    fn noisy_gateway(requests: usize, noise: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+        let addr = listener.local_addr().expect("an address").to_string();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("a client");
+            let mut ws = tungstenite::accept(stream).expect("a handshake");
+            for _ in 0..requests {
+                let id = loop {
+                    if let Ok(Message::Text(text)) = ws.read() {
+                        let request: Value = serde_json::from_str(text.as_str()).expect("json");
+                        break request["id"].clone();
+                    }
+                };
+                for n in 0..noise {
+                    ws.send(Message::text(json!({"type": "orderUpdate", "n": n}).to_string())).expect("sent");
+                }
+                ws.send(Message::text(json!({"id": id, "type": "ack"}).to_string())).expect("sent");
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn unsolicited_messages_are_kept_for_poll_by_default() {
+        let addr = noisy_gateway(2, 5);
+        let mut session = Session::connect(&addr, "/", Duration::from_secs(30)).expect("connected");
+        for _ in 0..2 {
+            assert_eq!(session.request(json!({"op": "ping"})).expect("answered")["type"], "ack");
+        }
+        assert_eq!(session.inbox.len(), 10, "the synthetic maker relies on these reaching poll");
+    }
+
+    #[test]
+    fn a_session_that_never_polls_keeps_nothing() {
+        let addr = noisy_gateway(2, 5);
+        let mut session = Session::connect(&addr, "/", Duration::from_secs(30)).expect("connected");
+        session.discard_unsolicited();
+        for _ in 0..2 {
+            assert_eq!(session.request(json!({"op": "ping"})).expect("answered")["type"], "ack");
+        }
+        assert!(session.inbox.is_empty(), "the load generator's loops would hold every one of these for ever");
     }
 }

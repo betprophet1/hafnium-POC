@@ -197,6 +197,9 @@ fn list_instruments(ingress_addr: &str, n: usize) -> Result<Vec<u64>, Error> {
 /// round trip in nanoseconds.
 fn drive(gateway: &str, token: &str, instrument: u64, index: usize, deadline: Instant) -> Result<Vec<u64>, Error> {
     let (mut session, _welcome) = Session::open(gateway, token, 30)?;
+    // Only replies are read here, so what else the gateway pushes is dropped rather than kept for a poll that never
+    // comes: kept, it grew this process by gigabytes a minute (docs/measurements/2026-10-13-gateway-memory).
+    session.discard_unsolicited();
     let mut ids = Ids::new('g')?;
     // A tick nothing else is likely to be quoting at, so the order never trades and the amend loop measures
     // round trips rather than fills.
@@ -243,6 +246,9 @@ fn fills_in(reply: &Value) -> u64 {
 /// request being measured and how the book is replenished, so the liquidity never runs out from under the takers.
 fn drive_maker(gateway: &str, token: &str, instrument: u64, index: usize, deadline: Instant) -> Result<Outcome, Error> {
     let (mut session, _welcome) = Session::open(gateway, token, 30)?;
+    // Only replies are read here, so what else the gateway pushes is dropped rather than kept for a poll that never
+    // comes: kept, it grew this process by gigabytes a minute (docs/measurements/2026-10-13-gateway-memory).
+    session.discard_unsolicited();
     let mut ids = Ids::new('m')?;
     let mut place = json!({
         "op": "order", "clientOrderId": ids.fresh(), "instrumentId": instrument.to_string(), "action": "sell",
@@ -304,6 +310,9 @@ fn drive_taker(
     orders_per_trade: u64,
 ) -> Result<Outcome, Error> {
     let (mut session, _welcome) = Session::open(gateway, token, 30)?;
+    // Only replies are read here, so what else the gateway pushes is dropped rather than kept for a poll that never
+    // comes: kept, it grew this process by gigabytes a minute (docs/measurements/2026-10-13-gateway-memory).
+    session.discard_unsolicited();
     let mut ids = Ids::new('t')?;
     let mut out = Outcome::default();
     let mut n: u64 = 0;

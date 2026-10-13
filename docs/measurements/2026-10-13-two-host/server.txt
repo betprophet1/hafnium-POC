@@ -1,0 +1,99 @@
+=== rep1-trade32 ===
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 30.311574336
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 2364673
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 13.549285609
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 2364673
+too_far_behind=0
+audit_bytes=4615481078
+gateway VmHWM_kb=100832 VmRSS_kb=91292 threads=25
+server_load=3.76 3.16 2.84
+=== rep1-trade128 ===
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 72.67718939
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 5966157
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 34.621434899
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 5966157
+too_far_behind=0
+audit_bytes=11629994567
+gateway VmHWM_kb=217480 VmRSS_kb=197344 threads=25
+server_load=6.10 3.99 3.15
+=== rep2-trade32 ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 17.24214201
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 2365490
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 28.346877333
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 2365490
+too_far_behind=0
+audit_bytes=4643031242
+gateway VmHWM_kb=100816 VmRSS_kb=95608 threads=25
+server_load=6.84 4.51 3.39
+=== rep2-trade128 ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 38.161632229
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 5938698
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 69.906719864
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 5938698
+too_far_behind=0
+audit_bytes=11612862923
+gateway VmHWM_kb=217372 VmRSS_kb=200040 threads=25
+server_load=8.14 5.37 3.76
+=== rep3-trade32 ===
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 29.467814694
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 2396823
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 13.987342088
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 2396823
+too_far_behind=0
+audit_bytes=4665226774
+gateway VmHWM_kb=94480 VmRSS_kb=91992 threads=25
+server_load=7.20 5.56 3.94
+=== rep3-trade128 ===
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 71.50855245
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 5967900
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 35.536872641
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 5967900
+too_far_behind=0
+audit_bytes=11617375711
+gateway VmHWM_kb=218472 VmRSS_kb=200744 threads=25
+server_load=7.47 5.93 4.17
+=== ladder-0 ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 14.584319781
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 2437225
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 27.207291527
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 2437225
+too_far_behind=0
+audit_bytes=4689699799
+gateway VmHWM_kb=183144 VmRSS_kb=177384 threads=25
+server_load=6.59 5.88 4.29
+=== ladder-1024 ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 16.477563987
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 2356885
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 29.001379744
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 2356885
+too_far_behind=0
+audit_bytes=4548503841
+gateway VmHWM_kb=267168 VmRSS_kb=231100 threads=25
+server_load=5.67 5.69 4.36
+=== ladder-4096 ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 18.128036629
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 2349720
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 29.282923723
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 2349720
+too_far_behind=0
+audit_bytes=4568205416
+gateway VmHWM_kb=391064 VmRSS_kb=260188 threads=25
+server_load=6.50 5.79 4.50
+=== ladder-16384 ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 24.108326778
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 2188267
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 30.30842181
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 2188267
+too_far_behind=0
+audit_bytes=4406137615
+gateway VmHWM_kb=834536 VmRSS_kb=469664 threads=25
+server_load=6.84 5.83 4.61
+=== soak ===
+venue_gateway_feed_apply_duration_seconds_sum{half="public"} 109.505810822
+venue_gateway_feed_apply_duration_seconds_count{half="public"} 17514123
+venue_gateway_feed_apply_duration_seconds_sum{half="private"} 199.661599801
+venue_gateway_feed_apply_duration_seconds_count{half="private"} 17514123
+too_far_behind=0
+audit_bytes=34130431728
+gateway VmHWM_kb=209704 VmRSS_kb=194200 threads=25
+server_load=9.04 7.60 5.70

@@ -86,6 +86,13 @@ adds only docs), the same build and load as the throughput record. `facts.txt` h
 security group and its key pair were removed afterwards, and the account was checked. The load itself ran for about
 17 minutes.
 
+## Reproduce
+
+Use `deploy/loadtest/` (README there). It runs these same three parts with memory sampled, but with the generator on
+a box of its own, and with the generator fix that came out of this record. The two-host result is in
+`../2026-10-13-two-host/`. This run had everything on one box, so the generator's growth here also pressed on the
+gateway's machine.
+
 ## Files
 
 | file | what |
