@@ -51,8 +51,9 @@ replicate (two 60-second runs).
 
 ## What this does not cover
 
-- **The gateway's memory.** Resident size was **not sampled**, and it is the thing that has been taking local
-  machines down. A rerun should record the gateway's resident memory against connection count.
+- **The gateway's memory.** Not sampled in this run. It was measured the same day in
+  [`../2026-10-13-gateway-memory/`](../2026-10-13-gateway-memory/README.md): the gateway stays under about 205 MB
+  at this load, and it was the load generator that grew without bound.
 - The ADR's other loads: the retail population sweeps from a separate client machine, amend-only, and the watcher
   ladders.
 - Anything on production-grade, pinned hardware, which is what a latency figure would need.

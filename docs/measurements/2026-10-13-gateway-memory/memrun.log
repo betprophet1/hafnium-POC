@@ -1,0 +1,15 @@
+start 2026-10-13T09:32:15Z
+A rep 1 done 09:34:32
+A rep 2 done 09:36:49
+A rep 3 done 09:39:06
+server up: capacity=launch accounts=33000 gateway pid=14786
+B retail 0 done 09:40:23
+server up: capacity=launch accounts=33000 gateway pid=16189
+B retail 1024 done 09:41:47
+server up: capacity=launch accounts=33000 gateway pid=18616
+B retail 4096 done 09:43:12
+server up: capacity=launch accounts=33000 gateway pid=24125
+B retail 16384 done 09:44:36
+server up: capacity=small accounts=512 gateway pid=41865
+C soak done 09:49:56
+MEMRUN-DONE
