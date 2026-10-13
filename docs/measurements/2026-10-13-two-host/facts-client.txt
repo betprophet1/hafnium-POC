@@ -1,0 +1,5 @@
+kernel: Linux 7.0.0-1014-aws
+cpu: Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz
+vcpus: 16
+memory: 30 GiB
+rustc: rustc 1.99.0 (b940084d7 2026-09-28)
