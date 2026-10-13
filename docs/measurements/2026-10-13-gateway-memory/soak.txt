@@ -1,0 +1,3 @@
+=== soak trade128 300s ===
+listed 8 synthetic instruments: Some(9500000)..Some(9500070)
+    gateway VmHWM_kb=211532 VmRSS_kb=211532
