@@ -29,7 +29,7 @@ agent needs to build its core, and the core itself. Read this before changing an
 | `core/telemetry/` | Metrics and logs for the venue's processes (`deploy/observability/metrics.md`). Outside the engine, always: the engine gains no metrics code. |
 | `deploy/` | The mini-venue Helm chart and its images, the laptop cluster (`laptop.sh`), the AWS box (`aws/`), ArgoCD preview environments (`argocd/`) and observability. Deploying and operating the venue is `deploy/README.md`; what is on the disks and what a restart does is `STATE.md`. |
 | `STATE.md` | Where every kind of state lives, what a restart does with it, how the journal is snapshotted, archived and cut, and what is not done. |
-| `docs/` | Architecture decision records (`docs/adr/`) and the comparison with the current production venue (`docs/legacy-comparison.md`). |
+| `docs/` | Architecture decision records (`docs/adr/`), dated measurement records with their raw output and conditions (`docs/measurements/`), and the comparison with the current production venue (`docs/legacy-comparison.md`). |
 | `apps/retail/` | The retail app: one Expo project for the web, iOS and Android. `src/venue/` is the venue client with no React in it, tested in Node; `src/app/` is the screens. Test environments only. |
 | `adapters/fix/` | Interface 4, the FIX 4.4 adapter (Java, Artio) in front of the gateway's private half; its dialect is `interfaces/fix/`. Not part of the Rust workspace: `bootstrap.sh` fetches its JDK and Gradle, `test.sh` runs its integration test, `scripts/fix-shell.py` is a console for trying it by hand. |
 | `core/prototypes/` | Experiments behind blueprint claims. Learn from them; nothing depends on them. |
